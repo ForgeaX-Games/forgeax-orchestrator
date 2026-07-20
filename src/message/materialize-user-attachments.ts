@@ -29,7 +29,10 @@ export function prepareUserAttachmentPayload(input: {
   const materialized = materializeFileAttachments(
     rawAttachments,
     input.uploadDir,
-    input.nativeAttachmentKinds,
+    // Always retain image/document path refs on the EventBus/WAL so UI refresh
+    // can re-render chips — even when the selected kernel is rented (no vision).
+    // composeTurnRequest still re-filters by the kernel's nativeAttachmentKinds.
+    Array.from(new Set<NativeAttachmentKind>([...input.nativeAttachmentKinds, 'image', 'document'])),
   );
   const contextContent = materialized.note
     ? `${input.content}\n\n${materialized.note}`

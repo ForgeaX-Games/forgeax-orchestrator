@@ -307,6 +307,9 @@ export function createCliRouter() {
                 providerId,
                 ...(usage ? { usage } : {}),
                 ...(turnReq.model ? { model: turnReq.model } : {}),
+                ...(turnReq.input.attachments?.length
+                  ? { attachments: turnReq.input.attachments as Array<Record<string, unknown>> }
+                  : {}),
                 toolEvents,
               });
             } catch (e) {

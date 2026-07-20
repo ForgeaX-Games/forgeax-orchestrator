@@ -25,6 +25,8 @@ export interface KernelTurnRecord {
   message: string;
   /** Model-visible user context. Defaults to message; may include durable attachment path notes. */
   contextText?: string;
+  /** Path-only attachments retained for UI refresh + model history (no base64). */
+  attachments?: Array<Record<string, unknown>>;
   /** 驱动本轮的内核/驱动 id(claude-code / codex / forgeax-core)。写进账本,
    *  刷新后 loadSession 据此还原 ForgeCard 的来源 badge(否则历史消息丢标记)。 */
   providerId?: string;
@@ -55,6 +57,35 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
   const pid = rec.providerId;
   // `content` is the UI projection; `llmMessage` is canonical model context.
   // Attachment base64 is never persisted: compose has replaced it with durable paths.
+  // Keep path-only `attachments` so refresh can re-render image chips.
+  let durableAtts = Array.isArray(rec.attachments)
+    ? rec.attachments
+      .map((att) => {
+        const kind = typeof att.kind === 'string' ? att.kind : 'file';
+        const path = typeof att.path === 'string' ? att.path : '';
+        if (!path) return null;
+        const mediaType = typeof att.mediaType === 'string' ? att.mediaType : undefined;
+        return { kind, path, ...(mediaType ? { mediaType } : {}) };
+      })
+      .filter((att): att is { kind: string; path: string; mediaType?: string } => !!att)
+    : [];
+  // Rented kernels leave only path notes in contextText — recover attachments[]
+  // for UI refresh the same way the chat formatter does for legacy WAL rows.
+  if (durableAtts.length === 0 && typeof rec.contextText === 'string') {
+    const re = /\[Attached (image|document|file): (.+?) \(([^,]+), [^)]+\)\]/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(rec.contextText)) !== null) {
+      const kind = m[1];
+      const path = m[2].trim();
+      const mediaType = m[3].trim();
+      if (!path) continue;
+      durableAtts.push({
+        kind,
+        path,
+        ...(mediaType && mediaType !== 'unknown type' ? { mediaType } : {}),
+      });
+    }
+  }
   led.append(ev({
     type: "user_input",
     ts: t0,
@@ -64,6 +95,7 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
     payload: {
       content: rec.message,
       llmMessage: { role: "user", content: [{ type: "text", text: rec.contextText ?? rec.message }] },
+      ...(durableAtts.length ? { attachments: durableAtts } : {}),
     },
   }));
   led.append(ev({ type: "hook:turnStart", ts: t0, source: `agent:${ap}`, payload: { turn: 1, ...(pid ? { providerId: pid } : {}) } }), ap);

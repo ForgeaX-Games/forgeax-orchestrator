@@ -86,6 +86,7 @@ describe("transcribeKernelTurn — host-owned, kernel-agnostic ledger", () => {
   test("durable attachment context survives history while visible bubble stays original and base64 is absent", async () => {
     const session = await getSessionManager().create({ displayName: "attachment-history" });
     const path = resolve(userRoot, "sessions", "upload.png");
+    // Simulate rented-kernel compose output: notes in contextText, no attachments[].
     transcribeKernelTurn(session, "forge", {
       message: "what is this?",
       contextText: `what is this?\n\n[Attached image: ${path} (image/png, 3B)]`,
@@ -96,9 +97,14 @@ describe("transcribeKernelTurn — host-owned, kernel-agnostic ledger", () => {
     });
     const events = await session.getOrCreateLedger("forge").readAllEvents();
     const user = events.find((e) => e.type === "user_input");
-    const payload = user?.payload as { content?: string; llmMessage?: { content?: Array<{ text?: string }> } };
+    const payload = user?.payload as {
+      content?: string;
+      llmMessage?: { content?: Array<{ text?: string }> };
+      attachments?: Array<{ kind?: string; path?: string; mediaType?: string }>;
+    };
     expect(payload.content).toBe("what is this?");
     expect(payload.llmMessage?.content?.[0]?.text).toContain(path);
+    expect(payload.attachments?.[0]).toEqual({ kind: "image", path, mediaType: "image/png" });
     expect(JSON.stringify(events)).not.toContain("QUJD");
   });
 

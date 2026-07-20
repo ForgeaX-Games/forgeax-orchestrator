@@ -109,7 +109,8 @@ describe('composeTurnRequest selected-kernel policy', () => {
     });
     const priorPath = (priorPayload.attachments as Array<{ path: string }>)[0]!.path;
     const currentPath = (currentPayload.attachments as Array<{ path: string }>)[0]!.path;
-    expect(JSON.stringify(current.history ?? []).split(priorPath)).toHaveLength(2);
+    // Path appears in text notes and (after ingress fix) image_file history parts.
+    expect(JSON.stringify(current.history ?? []).split(priorPath).length).toBeGreaterThanOrEqual(2);
     expect(JSON.stringify(current.history ?? [])).not.toContain(currentPath);
     expect(current.input.text.split(currentPath)).toHaveLength(2);
 
@@ -117,7 +118,7 @@ describe('composeTurnRequest selected-kernel policy', () => {
       message: 'next', agentId: 'forge', sessionId: session.sid, kernel: selected,
     });
     const historyJson = JSON.stringify(subsequent.history ?? []);
-    expect(historyJson.split(priorPath)).toHaveLength(2);
-    expect(historyJson.split(currentPath)).toHaveLength(2);
+    expect(historyJson.split(priorPath).length).toBeGreaterThanOrEqual(2);
+    expect(historyJson.split(currentPath).length).toBeGreaterThanOrEqual(2);
   });
 });

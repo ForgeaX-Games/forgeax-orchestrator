@@ -41,7 +41,9 @@ import { shouldDelegateHostToolConfirmation } from '../kernel/host-tool-confirma
 import { resolveKernel } from '../kernel/resolve-kernel';
 import { orchestrationProfileOf } from '../kernel/kernel-profile';
 import { prepareUserAttachmentPayload } from '../message/materialize-user-attachments';
-import { resolve as resolvePath } from 'node:path';
+import { resolve as resolvePath, basename, join } from 'node:path';
+import { existsSync, statSync } from 'node:fs';
+import { isPathInside } from '../kernel/materialize-file-attachments';
 
 function resolveAgentPath(session: Session, to: string): string {
   if (to.includes('#')) {
@@ -172,9 +174,17 @@ export function createSessionsRouter() {
     const sid = c.req.param('sid');
     const body = await c.req.json().catch(() => ({}));
     const content = body.content;
-    if (typeof content !== 'string' || !content) {
+    const rawPayloadEarly = body.payload && typeof body.payload === 'object'
+      ? body.payload as Record<string, unknown>
+      : {};
+    const hasAttachments = Array.isArray(rawPayloadEarly.attachments)
+      && (rawPayloadEarly.attachments as unknown[]).length > 0;
+    // Allow empty content when the user only pasted attachments — UI projects a
+    // placeholder, but also accept "" so image-only clients don't 400.
+    if (typeof content !== 'string' || (!content && !hasAttachments)) {
       return c.json({ error: 'content (string) required' }, 400);
     }
+    const resolvedContent = content || '(see attached file)';
     // 写时迁移(plan B PR2-compat):这是 UI 的主发消息端点。若 sid 还是 pre-PR2 老 session
     // (home/扁平),先把整份目录迁进当前项目 games/<bound-slug>/sessions/<sid>/,确保老历史 +
     // 新记录都落项目下。幂等;已在项目内 / 非老 session → no-op。必须在 open 之前(迁移会先
@@ -277,12 +287,12 @@ export function createSessionsRouter() {
     const rawPayload = body.payload && typeof body.payload === 'object'
       ? body.payload as Record<string, unknown>
       : {};
-    let safePayload: Record<string, unknown> = { ...rawPayload, content };
+    let safePayload: Record<string, unknown> = { ...rawPayload, content: resolvedContent };
     if (isUserInput) {
       try {
         const kernel = resolveKernel(target);
         safePayload = prepareUserAttachmentPayload({
-          content,
+          content: resolvedContent,
           payload: rawPayload,
           uploadDir: resolvePath(getPathManager().session(sid).root(), 'uploads'),
           nativeAttachmentKinds: orchestrationProfileOf(kernel).nativeAttachmentKinds,
@@ -291,8 +301,8 @@ export function createSessionsRouter() {
         const { attachments: _inlineAttachments, contextContent: _context, ...rest } = rawPayload;
         safePayload = {
           ...rest,
-          content,
-          contextContent: `${content}\n\n[Attachments could not be prepared: ${err instanceof Error ? err.message : String(err)}]`,
+          content: resolvedContent,
+          contextContent: `${resolvedContent}\n\n[Attachments could not be prepared: ${err instanceof Error ? err.message : String(err)}]`,
         };
       }
     }
@@ -309,6 +319,46 @@ export function createSessionsRouter() {
     };
     session.eventBus.emit(event);
     return c.json({ ok: true, to: target, msgId });
+  });
+
+  // Serve session upload files for chat history thumbnails (path-only ledger).
+  // Filename is basename-only; must resolve inside <session>/uploads/.
+  r.get('/:sid/uploads/:fileName', async (c) => {
+    const sid = c.req.param('sid');
+    const fileName = basename(c.req.param('fileName') || '');
+    if (!fileName || fileName === '.' || fileName === '..') {
+      return c.json({ error: 'invalid file name' }, 400);
+    }
+    let session: Session;
+    try {
+      session = await getSessionManager().open(sid);
+    } catch {
+      return c.json({ error: 'session not found' }, 404);
+    }
+    const uploadsDir = resolvePath(session.paths.root(), 'uploads');
+    const full = resolvePath(join(uploadsDir, fileName));
+    if (!isPathInside(uploadsDir, full) && full !== uploadsDir) {
+      return c.json({ error: 'path escape' }, 400);
+    }
+    if (!existsSync(full) || !statSync(full).isFile()) {
+      return c.json({ error: 'file not found' }, 404);
+    }
+    const ext = fileName.split('.').pop()?.toLowerCase();
+    const type =
+      ext === 'png' ? 'image/png'
+      : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+      : ext === 'gif' ? 'image/gif'
+      : ext === 'webp' ? 'image/webp'
+      : ext === 'pdf' ? 'application/pdf'
+      : 'application/octet-stream';
+    return new Response(Bun.file(full), {
+      headers: {
+        'content-type': type,
+        'content-disposition': `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+        'cache-control': 'private, max-age=3600',
+        'content-length': String(statSync(full).size),
+      },
+    });
   });
 
   // ── checkpoint 回退点路由 ────────────────────────────────────────────────

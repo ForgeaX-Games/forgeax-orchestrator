@@ -56,6 +56,7 @@ describe('native EventBus attachment persistence', () => {
 
     const modelMessage = eventToSessionMessage(stored as any);
     expect(modelMessage?.content[0]).toEqual({ type: 'text', text: expect.stringContaining('/uploads/shot.png') });
+    expect(modelMessage?.content.some((p: any) => p.type === 'image_file' && String(p.path).includes('/uploads/shot.png'))).toBe(true);
     const visible = adapt(stored, createAdapterState());
     expect(visible).toEqual([{ type: 'user_message', text: 'inspect this' }]);
   });

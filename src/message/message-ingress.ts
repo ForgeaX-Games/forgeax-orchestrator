@@ -45,9 +45,33 @@ export function eventToSessionMessage(event: Event): LLMMessage | null {
       ? (payload as Record<string, unknown>).contextContent as string
       : payload.content;
     const parts = sanitizeParts(normalizeContent(contextContent));
+    // Re-attach durable path media so host-owned history still carries vision
+    // blocks for prior turns (path notes alone are not enough for the model).
+    const mediaParts: ContentPart[] = [];
+    if (event.type === "user_input") {
+      const atts = Array.isArray((payload as Record<string, unknown>).attachments)
+        ? (payload as Record<string, unknown>).attachments as Array<Record<string, unknown>>
+        : [];
+      for (const att of atts) {
+        const path = typeof att.path === "string" ? att.path : "";
+        if (!path) continue;
+        const kind = typeof att.kind === "string" ? att.kind : "file";
+        const mimeType = typeof att.mediaType === "string" && att.mediaType
+          ? att.mediaType
+          : kind === "image" ? "image/png" : "application/octet-stream";
+        if (kind === "image") {
+          mediaParts.push({ type: "image_file", path, mimeType });
+        } else if (kind === "document" || kind === "file") {
+          mediaParts.push({ type: "file", path, mimeType });
+        }
+      }
+    }
+    const content = prefix
+      ? [{ type: "text" as const, text: `${prefix}\n` }, ...parts, ...mediaParts]
+      : [...parts, ...mediaParts];
     return {
       role: "user",
-      content: prefix ? [{ type: "text", text: `${prefix}\n` }, ...parts] : parts,
+      content,
       ts: event.ts || Date.now(),
     };
   }
