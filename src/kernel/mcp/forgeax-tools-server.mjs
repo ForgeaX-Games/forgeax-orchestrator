@@ -346,14 +346,35 @@ if (process.env.FORGEAX_DISABLE_UI_BRIDGE === '1') {
   delete TOOLS.ui_screenshot;
 }
 
-// P2-14 对外驱动面收口:FORGEAX_FXT_EXPOSE=名单(逗号分隔)→ 只保留白名单内工具。
-// 外部 MCP client 驱动 Studio 时建议只开 ui_*(见文件头);留空 = 全量(内核 profile
-// 路径零回归)。
+// Snapshot every builtin name BEFORE the expose trim so we can dedupe bridged
+// specs against builtins regardless of the allowlist (a builtin name must never
+// be host-bridged — the local impl is authoritative).
+const BUILTIN_NAMES = new Set(Object.keys(TOOLS));
+
+// P2-14 对外驱动面收口 + 双层白名单(codex-mcp-tool-parity §5.2):
+// FORGEAX_FXT_EXPOSE=名单(逗号分隔)= 本轮精确工具集。留空 = 全量(内核 profile
+// 历史路径零回归)。allowlist 必须**同时**约束 tools/list(下发面)与 tools/call
+// (执行面)——client 端 enabled_tools 是第一道闸,server 端 allowlist 是纵深第二道。
 const EXPOSE = (process.env.FORGEAX_FXT_EXPOSE ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-if (EXPOSE.length > 0) {
-  const keep = new Set(EXPOSE);
+const EXPOSE_SET = EXPOSE.length > 0 ? new Set(EXPOSE) : null;
+/** 空 allowlist(未设 env)= 全量放行;否则只放行名单内。 */
+function isExposed(name) {
+  return EXPOSE_SET === null || EXPOSE_SET.has(name);
+}
+// Trim builtin TOOLS to the exposed set (removes unexposed builtins from the map).
+if (EXPOSE_SET) {
   for (const name of Object.keys(TOOLS)) {
-    if (!keep.has(name)) delete TOOLS[name];
+    if (!EXPOSE_SET.has(name)) delete TOOLS[name];
+  }
+}
+
+// Bridged (host-tool) specs, deduped against builtins: a name implemented as a
+// builtin is served locally, never host-bridged. Keyed by name for O(1) call-side
+// existence checks (prevents bridging ARBITRARY unknown tool names — §5.2 rule 5).
+const BRIDGED_BY_NAME = new Map();
+for (const t of BRIDGED) {
+  if (t && typeof t.name === 'string' && !BUILTIN_NAMES.has(t.name)) {
+    BRIDGED_BY_NAME.set(t.name, t);
   }
 }
 
@@ -370,6 +391,23 @@ process.stdin.on('data', (d) => {
 
 function send(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 
+/** Structured MCP `not_found` for an unknown / unexposed / undeclared tool call.
+ *  Returned as an `isError` tool result (not a JSON-RPC error) so the model sees
+ *  a clean "tool not found" instead of the call silently succeeding or hanging.
+ *  Carries a machine-readable `structuredContent.code:'not_found'` for callers
+ *  that parse it, plus a `not_found:` text prefix for humans/tests. */
+function sendNotFound(id, name, why) {
+  send({
+    jsonrpc: '2.0',
+    id,
+    result: {
+      isError: true,
+      content: [{ type: 'text', text: `not_found: tool "${name ?? ''}" ${why}` }],
+      structuredContent: { code: 'not_found', tool: name ?? null },
+    },
+  });
+}
+
 function handle(msg) {
   const { id, method, params } = msg;
   if (method === 'initialize') {
@@ -381,19 +419,26 @@ function handle(msg) {
   } else if (method === 'notifications/initialized') {
     /* no response */
   } else if (method === 'tools/list') {
-    // 内置工具 + 桥接(host-tool)工具规格。
+    // 下发面 allowlist:内置工具(已按 EXPOSE 裁过)+ 桥接工具(去内置重名 + EXPOSE 过滤)。
     const builtin = Object.values(TOOLS).map((t) => t.spec);
-    const bridged = BRIDGED.map((t) => ({
-      name: t.name,
-      description: t.description ?? '',
-      inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
-    }));
+    const bridged = [];
+    for (const t of BRIDGED_BY_NAME.values()) {
+      if (!isExposed(t.name)) continue;
+      bridged.push({
+        name: t.name,
+        description: t.description ?? '',
+        inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
+      });
+    }
     send({ jsonrpc: '2.0', id, result: { tools: [...builtin, ...bridged] } });
   } else if (method === 'tools/call') {
     const name = params?.name;
     const args = params?.arguments ?? {};
-    const tool = TOOLS[name];
     dbg(`call ${name} ${JSON.stringify(args)}`);
+    // 执行面 allowlist(纵深第二道):未曝光 / 未知 / 未声明的工具一律结构化 not_found,
+    // **绝不**把任意 tool name 直接桥到宿主(§5.2 rule 5)。
+    if (!isExposed(name)) return sendNotFound(id, name, 'not exposed this turn');
+    const tool = TOOLS[name];
     if (tool) {
       // 内置工具:本地执行(支持 sync 或 async run —— query_world/capture_frame 走 HTTP 取数)。
       // run 返回 { content: [...] } → 原样作 MCP result(ui_screenshot 回 image block);
@@ -411,7 +456,8 @@ function handle(msg) {
         });
       return;
     }
-    // host-tool:桥回宿主执行(异步;fail-closed)。
+    // host-tool:必须在本轮 specs 里声明过(BRIDGED_BY_NAME)才桥回宿主执行(异步;fail-closed)。
+    if (!BRIDGED_BY_NAME.has(name)) return sendNotFound(id, name, 'unknown tool');
     bridgeCall(name, args).then((r) => {
       send({ jsonrpc: '2.0', id, result: { ...(r.isError ? { isError: true } : {}), content: [{ type: 'text', text: r.text }] } });
     });

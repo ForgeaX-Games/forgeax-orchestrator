@@ -7,6 +7,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   KernelEventQueue,
   classifyApproval,
+  classifyElicitation,
   createCodexNotifState,
   mapCodexNotification,
 } from '../src/kernel/codex-appserver';
@@ -86,6 +87,79 @@ describe('codex-appserver mapNotification', () => {
     const st = createCodexNotifState();
     const q = drain((q) => mapCodexNotification('some/experimental/event', { x: 1 }, st, q));
     expect(await collect(q)).toEqual([]);
+  });
+
+  test('mcpToolCall started → tool.call with mcp__server__tool name', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('item/started', { item: { id: 'm1', type: 'mcpToolCall', server: 'fxt', tool: 'echo', arguments: { text: 'hi' } } }, st, q);
+    q.end();
+    const out = await collect(q);
+    expect(out[0]).toEqual({ kind: 'tool.call', callId: 'm1', name: 'mcp__fxt__echo', args: { text: 'hi' } });
+  });
+
+  test('mcpToolCall completed → tool.result ok with extracted text result', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('item/started', { item: { id: 'm2', type: 'mcpToolCall', server: 'fxt', tool: 'echo', arguments: { text: 'x' } } }, st, q);
+    mapCodexNotification('item/completed', { item: { id: 'm2', type: 'mcpToolCall', status: 'completed', result: { content: [{ type: 'text', text: '[forgeax_echo] x' }] } } }, st, q);
+    q.end();
+    const out = await collect(q);
+    expect(out[0].kind).toBe('tool.call');
+    expect(out[1]).toEqual({ kind: 'tool.result', callId: 'm2', ok: true, result: '[forgeax_echo] x' });
+  });
+
+  test('mcpToolCall completed (no prior started) still emits a call then result', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('item/completed', { item: { id: 'm3', type: 'mcpToolCall', server: 'fxt', tool: 'list_games', status: 'completed', result: { content: [{ type: 'text', text: '{"count":0}' }] } } }, st, q);
+    q.end();
+    const out = await collect(q);
+    expect(out[0]).toEqual({ kind: 'tool.call', callId: 'm3', name: 'mcp__fxt__list_games', args: {} });
+    expect(out[1]).toEqual({ kind: 'tool.result', callId: 'm3', ok: true, result: '{"count":0}' });
+  });
+
+  test('mcpToolCall failed → tool.result not ok with error message', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('item/started', { item: { id: 'm4', type: 'mcpToolCall', server: 'fxt', tool: 'boom' } }, st, q);
+    mapCodexNotification('item/completed', { item: { id: 'm4', type: 'mcpToolCall', status: 'failed', error: { message: 'kaboom' } } }, st, q);
+    q.end();
+    const out = await collect(q);
+    expect(out[1]).toEqual({ kind: 'tool.result', callId: 'm4', ok: false, error: 'kaboom' });
+  });
+
+  test('mcpToolCall preserves structuredContent alongside text', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('item/completed', { item: { id: 'm5', type: 'mcpToolCall', server: 'fxt', tool: 'q', status: 'completed', result: { content: [{ type: 'text', text: 't' }], structuredContent: { a: 1 } } } }, st, q);
+    q.end();
+    const out = await collect(q);
+    const res = out.find((e) => e.kind === 'tool.result') as any;
+    expect(res.result).toEqual({ text: 't', structuredContent: { a: 1 } });
+  });
+
+  test('duplicate item/started for same id emits only one tool.call', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('item/started', { item: { id: 'd1', type: 'mcpToolCall', server: 'fxt', tool: 'echo' } }, st, q);
+    mapCodexNotification('item/started', { item: { id: 'd1', type: 'mcpToolCall', server: 'fxt', tool: 'echo' } }, st, q);
+    q.end();
+    const out = await collect(q);
+    expect(out.filter((e) => e.kind === 'tool.call').length).toBe(1);
+  });
+});
+
+describe('codex-appserver classifyElicitation', () => {
+  test('mcpServer/elicitation/request → decline reply', () => {
+    expect(classifyElicitation('mcpServer/elicitation/request')).toEqual({ reply: { action: 'decline' } });
+  });
+  test('elicitation/create → decline reply', () => {
+    expect(classifyElicitation('elicitation/create')).toEqual({ reply: { action: 'decline' } });
+  });
+  test('non-elicitation method → null', () => {
+    expect(classifyElicitation('item/started')).toBeNull();
+    expect(classifyElicitation('item/commandExecution/requestApproval')).toBeNull();
   });
 });
 

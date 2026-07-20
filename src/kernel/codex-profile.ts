@@ -107,8 +107,15 @@ export function ensureCodexHooksConfig(projectRoot: string): boolean {
  * systemPrompt(charter/persona)+ dynamicSuffix 由编排层 composeTurnRequest 提供。
  * `hooksActive` = ensureCodexHooksConfig 写入成功 → 附 `--dangerously-bypass-hook-trust`
  * (只信任我们自己刚写的 hook;用户自带 hooks.json 时不加,交 codex 自己的 trust 流程)。
+ * `mcpOverrides` = codex-mcp.buildCodexMcpOverrides() 产的 `-c mcp_servers.fxt.*` 参数对
+ * (本轮工具经 fxt MCP 下发)。空数组 = 无工具轮,零回归。
  */
-export function buildCodexArgs(req: TurnRequest, codexThreadId: string | undefined, hooksActive = false): string[] {
+export function buildCodexArgs(
+  req: TurnRequest,
+  codexThreadId: string | undefined,
+  hooksActive = false,
+  mcpOverrides: string[] = [],
+): string[] {
   // 诚实标注(no-op):中立 `systemPrompt.mode` 与 `req.toolPolicy` 在 codex headless **无落点**——
   // codex 无 `--system-prompt(-file)` flag(指令只能前置进 prompt,见下),也无 per-tool 放行/
   // 拒绝闸(headless 固定 approval_policy=never + sandbox_mode)。故 mode/toolPolicy 在此被忽略,
@@ -136,6 +143,8 @@ export function buildCodexArgs(req: TurnRequest, codexThreadId: string | undefin
     ...(hooksActive ? ['--dangerously-bypass-hook-trust'] : []),
     '-c',
     `approval_policy="${CODEX_APPROVAL_POLICY}"`,
+    // fxt MCP 注入(本轮工具);无工具轮为空(零回归)。放在 message 位置参数之前。
+    ...mcpOverrides,
     ...(req.model ? ['-m', req.model] : []),
   ];
 

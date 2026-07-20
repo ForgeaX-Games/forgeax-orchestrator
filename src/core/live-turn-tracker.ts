@@ -38,6 +38,7 @@ interface LiveTurn {
   startedAt: number;
   text: string;
   thinking: string;
+  hasToolActivity: boolean;
   sealedTextLen: number;
   sealedThinkingLen: number;
   toolCalls: Map<string, LiveToolCall>;
@@ -50,6 +51,44 @@ interface StreamChunk {
   name?: string;
   arguments?: string;
   arguments_delta?: string;
+}
+
+function extractAssistantContent(payload: Record<string, unknown>): {
+  text: string;
+  thinking: string;
+  hasToolCalls: boolean;
+} {
+  const raw = (payload.llmMessage ?? payload.msg) as {
+    content?: unknown;
+    thinking?: unknown;
+    toolCalls?: unknown;
+  } | undefined;
+  const content = raw?.content;
+  const text = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+        .filter((block): block is { type: string; text: string } =>
+          !!block && typeof block === "object" &&
+          (block as { type?: unknown }).type === "text" &&
+          typeof (block as { text?: unknown }).text === "string")
+        .map((block) => block.text)
+        .join("")
+      : "";
+  return {
+    text,
+    thinking: typeof raw?.thinking === "string" ? raw.thinking : "",
+    hasToolCalls: Array.isArray(raw?.toolCalls) && raw.toolCalls.length > 0,
+  };
+}
+
+/** 可见 assistant 正文:流式 text 非空,或本轮已封口过正文(sealedTextLen>0)。
+ *  仅 thinking / TTFT 不算 —— 刷新后可不续展示,但应 abort 请求。 */
+export function hasAssistantOutput(t: {
+  text: string;
+  sealedTextLen: number;
+}): boolean {
+  return t.text.trim().length > 0 || t.sealedTextLen > 0;
 }
 
 export class LiveTurnTracker {
@@ -80,6 +119,15 @@ export class LiveTurnTracker {
     }));
   }
 
+  /** 仅 thinking / 等首 token 的 emitter。正文或工具活动都可恢复,不得 abort。 */
+  thinkingOnlyEmitterIds(): string[] {
+    const out: string[] = [];
+    for (const [emitterId, t] of this.turns) {
+      if (!hasAssistantOutput(t) && !t.hasToolActivity) out.push(emitterId);
+    }
+    return out;
+  }
+
   private onEvent(event: Event, emitterId?: string): void {
     if (!emitterId) return;
     const payload = (event.payload ?? {}) as Record<string, unknown>;
@@ -90,6 +138,7 @@ export class LiveTurnTracker {
         startedAt: event.ts,
         text: "",
         thinking: "",
+        hasToolActivity: false,
         sealedTextLen: 0,
         sealedThinkingLen: 0,
         toolCalls: new Map(),
@@ -107,6 +156,7 @@ export class LiveTurnTracker {
         if (chunk.type === "text" && chunk.text) t.text += chunk.text;
         else if (chunk.type === "thinking" && chunk.text) t.thinking += chunk.text;
         else if (chunk.type === "tool_call" && chunk.id) {
+          t.hasToolActivity = true;
           const prev = t.toolCalls.get(chunk.id);
           t.toolCalls.set(chunk.id, {
             callId: chunk.id,
@@ -115,6 +165,7 @@ export class LiveTurnTracker {
             status: prev?.status ?? "running",
           });
         } else if (chunk.type === "tool_call_delta" && chunk.id) {
+          t.hasToolActivity = true;
           const prev = t.toolCalls.get(chunk.id);
           const prevArgs = typeof prev?.args === "string" ? prev.args : "";
           t.toolCalls.set(chunk.id, {
@@ -126,10 +177,31 @@ export class LiveTurnTracker {
         }
         return;
       }
+      case "stream:tool_use": {
+        const callId = payload.toolUseId as string | undefined;
+        if (!callId) return;
+        t.hasToolActivity = true;
+        t.toolCalls.set(callId, {
+          callId,
+          name: typeof payload.name === "string" ? payload.name : "tool",
+          args: payload.input,
+          status: "running",
+        });
+        return;
+      }
+      case "stream:tool_result": {
+        const callId = payload.toolUseId as string | undefined;
+        if (!callId) return;
+        t.hasToolActivity = true;
+        const prev = t.toolCalls.get(callId);
+        if (prev) prev.status = payload.isError ? "error" : "done";
+        return;
+      }
       case "hook:toolCall": {
         const tc = payload.toolCall as { id?: string; name?: string } | undefined;
         const callId = tc?.id;
         if (!callId) return;
+        t.hasToolActivity = true;
         t.toolCalls.set(callId, {
           callId,
           name: (payload.name as string) ?? tc?.name ?? "tool",
@@ -146,6 +218,17 @@ export class LiveTurnTracker {
         return;
       }
       case "hook:assistantMessage": {
+        // CLI / bridge paths can emit only the sealed assistantMessage without
+        // preceding stream:llm text. Keep the snapshot and abort policy correct
+        // in that regime instead of misclassifying visible output as thinking-only.
+        const sealed = extractAssistantContent(payload);
+        if (sealed.hasToolCalls) t.hasToolActivity = true;
+        if (sealed.text && t.text.slice(t.sealedTextLen) !== sealed.text) {
+          t.text = t.text.slice(0, t.sealedTextLen) + sealed.text;
+        }
+        if (sealed.thinking && t.thinking.slice(t.sealedThinkingLen) !== sealed.thinking) {
+          t.thinking = t.thinking.slice(0, t.sealedThinkingLen) + sealed.thinking;
+        }
         t.sealedTextLen = t.text.length;
         t.sealedThinkingLen = t.thinking.length;
         return;

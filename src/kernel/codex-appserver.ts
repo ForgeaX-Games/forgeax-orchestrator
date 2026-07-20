@@ -48,10 +48,46 @@ export interface CodexNotifState {
   lastUsage?: { inputTokens?: number; outputTokens?: number; cacheRead?: number };
   /** 是否已 push 过终态(turn/completed | error),供脊梁兜底判断。 */
   ended: boolean;
+  /** 已发过 tool.call 的 item.id(去重:同一 item 的重复 started 不重发 call)。 */
+  toolCallsOpened: Set<string>;
 }
 
 export function createCodexNotifState(): CodexNotifState {
-  return { outputByItem: new Map(), lastUsage: undefined, ended: false };
+  return { outputByItem: new Map(), lastUsage: undefined, ended: false, toolCallsOpened: new Set() };
+}
+
+/** MCP 工具名统一为 `mcp__{server}__{tool}`(plan §9.1)。缺 server 时退化为
+ *  `mcp__{tool}`,再退化为 item.tool / item.name / 'mcp'。 */
+function mcpToolName(it: any): string {
+  const server = typeof it?.server === 'string' && it.server.trim() ? it.server.trim() : '';
+  const tool = typeof it?.tool === 'string' && it.tool.trim()
+    ? it.tool.trim()
+    : (typeof it?.name === 'string' && it.name.trim() ? it.name.trim() : '');
+  if (server && tool) return `mcp__${server}__${tool}`;
+  if (tool) return `mcp__${tool}`;
+  return 'mcp';
+}
+
+/** 从 MCP completed item 抽取 result,保留 content / structuredContent(plan §9.1)。
+ *  纯文本 content → 返回 join 后的文本;含 structuredContent → 返回 {text, structuredContent};
+ *  非标准形状 → 原样透传 item.result。 */
+function extractMcpResult(it: any): unknown {
+  const r = it?.result;
+  if (r && typeof r === 'object') {
+    const content = Array.isArray(r.content) ? r.content : null;
+    if (content) {
+      const text = content
+        .filter((c: any) => c?.type === 'text' && typeof c.text === 'string')
+        .map((c: any) => c.text)
+        .join('\n');
+      if (r.structuredContent !== undefined) return { text, structuredContent: r.structuredContent };
+      // 含非文本 content(如 image block)→ 保留整个 content 数组。
+      const hasNonText = content.some((c: any) => c?.type && c.type !== 'text');
+      return hasNonText ? { content } : text;
+    }
+    return r;
+  }
+  return r ?? '';
 }
 
 function usageEvent(state: CodexNotifState): KernelEvent {
@@ -93,19 +129,44 @@ export function mapCodexNotification(
     case 'item/started': {
       const it = params?.item;
       if (!it?.id) return;
+      // 去重:同一 item.id 只发一次 tool.call(plan §9.1 按 item.id 去重)。
+      const openCall = (name: string, args: unknown): void => {
+        if (state.toolCallsOpened.has(it.id)) return;
+        state.toolCallsOpened.add(it.id);
+        queue.push({ kind: 'tool.call', callId: it.id, name, args });
+      };
       if (it.type === 'commandExecution') {
-        queue.push({ kind: 'tool.call', callId: it.id, name: 'Bash', args: { command: it.command, cwd: it.cwd } });
+        openCall('Bash', { command: it.command, cwd: it.cwd });
       } else if (it.type === 'fileChange') {
-        queue.push({ kind: 'tool.call', callId: it.id, name: 'Edit', args: { changes: it.changes ?? it.fileChanges ?? null } });
+        openCall('Edit', { changes: it.changes ?? it.fileChanges ?? null });
       } else if (it.type === 'mcpToolCall') {
-        queue.push({ kind: 'tool.call', callId: it.id, name: it.tool ?? it.name ?? 'mcp', args: it.arguments ?? {} });
+        openCall(mcpToolName(it), it.arguments ?? {});
       }
       return;
     }
     case 'item/completed': {
       const it = params?.item;
       if (!it?.id) return;
-      if (it.type === 'commandExecution' || it.type === 'fileChange' || it.type === 'mcpToolCall') {
+      if (it.type === 'mcpToolCall') {
+        // 极少数情况直接发 completed(无 started)→ 补一条 call。
+        if (!state.toolCallsOpened.has(it.id)) {
+          state.toolCallsOpened.add(it.id);
+          queue.push({ kind: 'tool.call', callId: it.id, name: mcpToolName(it), args: it.arguments ?? {} });
+        }
+        const ok = it.status === 'completed' || it.status === 'succeeded';
+        if (ok) {
+          queue.push({ kind: 'tool.result', callId: it.id, ok: true, result: extractMcpResult(it) });
+        } else {
+          const errText = (it.error && typeof it.error === 'object' && typeof it.error.message === 'string')
+            ? it.error.message
+            : (typeof it.error === 'string' ? it.error : '');
+          const resText = extractMcpResult(it);
+          const msg = errText || (typeof resText === 'string' ? resText : JSON.stringify(resText)) || (it.status ? String(it.status) : 'failed');
+          queue.push({ kind: 'tool.result', callId: it.id, ok: false, error: msg });
+        }
+        return;
+      }
+      if (it.type === 'commandExecution' || it.type === 'fileChange') {
         const ok = it.status === 'completed' || it.status === 'succeeded';
         const out = state.outputByItem.get(it.id) ?? (typeof it.aggregatedOutput === 'string' ? it.aggregatedOutput : '');
         state.outputByItem.delete(it.id);
@@ -142,6 +203,19 @@ export function mapCodexNotification(
     default:
       return; // 容忍未知 notification(实验协议漂移)
   }
+}
+
+/** MCP elicitation server-request 分类(plan §9.3)。fxt 不主动发 elicitation,但
+ *  app-server 仍可能转发某个 MCP server 的 elicitation/request;client 必须显式
+ *  decline/cancel 不支持的表单/URL,**绝不**误判为「用户已批准」。返回一个安全的
+ *  拒绝应答体;非 elicitation 方法返回 null(交由审批分类继续)。 */
+export function classifyElicitation(method: string): { reply: { action: 'decline' } } | null {
+  const isElicit =
+    method === 'mcpServer/elicitation/request' ||
+    method === 'elicitation/create' ||
+    method.endsWith('/elicitation/request') ||
+    method.includes('elicitation');
+  return isElicit ? { reply: { action: 'decline' } } : null;
 }
 
 /** 审批 server-request 的分类 + 版本差异。返回 null = 非审批类(脊梁应报错让 codex 别挂)。 */

@@ -21,6 +21,8 @@ export interface WsClientData {
 // ring buffer 只为覆盖秒级网络抖动/后台 tab 冻结;超窗走全量恢复(resume-gap)。
 const RING_MAX_FRAMES = 512;
 const RING_MAX_BYTES = 256 * 1024;
+/** 最后观众断开后的宽限:覆盖 F5 闪断;到期仍无连接则 abort 仅-thinking turn。 */
+const VIEWER_GONE_GRACE_MS = 2_000;
 
 interface SessionSub {
   conns: Set<ServerWebSocket<WsClientData>>;
@@ -34,6 +36,10 @@ export class WsHub {
   /** 每 sid 一个共享 eventBus observer:序列化一次 → ring → 对 conns 循环 send
    *  (多 tab 同步 §4.1;替代旧的 per-connection observer + per-connection stringify)。 */
   private subs = new Map<string, SessionSub>();
+  /** sid → timer:无人观看宽限结束后 abort thinking-only live turns。 */
+  private orphanAbortTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Async open/migration 中、尚未进入 SessionSub 的连接数。 */
+  private pendingSessionAttaches = new Map<string, number>();
 
   add(ws: ServerWebSocket<WsClientData>): void {
     this.clients.add(ws);
@@ -58,8 +64,23 @@ export class WsHub {
     try { ws.send(JSON.stringify(event)); } catch { /* ignore */ }
   }
 
+  /** A replacement viewer has begun attaching. Cancel orphan abortion before
+   * async session open/migration so a slow F5 cannot lose the timer race. */
+  beginSessionAttach(sid: string): void {
+    this.pendingSessionAttaches.set(sid, (this.pendingSessionAttaches.get(sid) ?? 0) + 1);
+    this.clearOrphanAbort(sid);
+  }
+
+  /** Re-arm orphan handling when an attempted attach did not become live. */
+  sessionAttachFailed(sid: string): void {
+    this.finishPendingAttach(sid);
+    this.maybeScheduleThinkingOnlyAbort(sid);
+  }
+
   attachSession(ws: ServerWebSocket<WsClientData>, session: Session): void {
     const sid = session.sid;
+    this.finishPendingAttach(sid);
+    this.clearOrphanAbort(sid);
     let sub = this.subs.get(sid);
     if (!sub) {
       const created: SessionSub = { conns: new Set(), ring: [], ringBytes: 0, unsub: () => {} };
@@ -88,12 +109,59 @@ export class WsHub {
     const sid = ws.data.sid;
     if (!sid) return;
     const sub = this.subs.get(sid);
-    if (!sub) return;
+    if (!sub) {
+      this.maybeScheduleThinkingOnlyAbort(sid);
+      return;
+    }
     sub.conns.delete(ws);
     if (sub.conns.size === 0) {
       sub.unsub();
       this.subs.delete(sid);
+      this.maybeScheduleThinkingOnlyAbort(sid);
     }
+  }
+
+  private finishPendingAttach(sid: string): void {
+    const next = (this.pendingSessionAttaches.get(sid) ?? 0) - 1;
+    if (next > 0) this.pendingSessionAttaches.set(sid, next);
+    else this.pendingSessionAttaches.delete(sid);
+  }
+
+  private maybeScheduleThinkingOnlyAbort(sid: string): void {
+    if ((this.pendingSessionAttaches.get(sid) ?? 0) > 0) return;
+    const sub = this.subs.get(sid);
+    if (sub && sub.conns.size > 0) return;
+    this.scheduleThinkingOnlyAbort(sid);
+  }
+
+  private clearOrphanAbort(sid: string): void {
+    const t = this.orphanAbortTimers.get(sid);
+    if (t !== undefined) {
+      clearTimeout(t);
+      this.orphanAbortTimers.delete(sid);
+    }
+  }
+
+  /** 宽限后仍无 WS 观众:仅 abort 尚无 assistant 正文的 live turn(有正文的继续跑等重连)。 */
+  private scheduleThinkingOnlyAbort(sid: string): void {
+    this.clearOrphanAbort(sid);
+    const timer = setTimeout(() => {
+      this.orphanAbortTimers.delete(sid);
+      if ((this.pendingSessionAttaches.get(sid) ?? 0) > 0) return;
+      const live = this.subs.get(sid);
+      if (live && live.conns.size > 0) return;
+      const session = getSessionManager().peek(sid);
+      if (!session) return;
+      for (const emitterId of session.liveTurns.thinkingOnlyEmitterIds()) {
+        try {
+          session.scheduler.interruptAgents(emitterId);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`[ws] thinking-only abort failed sid=${sid} agent=${emitterId}: ${msg}\n`);
+        }
+      }
+    }, VIEWER_GONE_GRACE_MS);
+    this.orphanAbortTimers.set(sid, timer);
   }
 
   /** 断线续传:`(sgen, since)` 在 ring 窗口内则逐帧补发并返回 true;
@@ -127,6 +195,7 @@ export function createWsHandler(hub: WsHub): WebSocketHandler<WsClientData> {
         hub.send(ws, { type: 'hello', id: ws.data.id });
         return;
       }
+      hub.beginSessionAttach(sid);
 
       try {
         // 写时迁移(plan B PR2-compat)前移到 WS 连接时:打开老 session 的聊天连接即把它迁入
@@ -141,7 +210,10 @@ export function createWsHandler(hub: WsHub): WebSocketHandler<WsClientData> {
         // detachSession 早已跑过(此 sid 尚无 sub → no-op),此刻再 attach 会为一条死连接
         // 建 per-sid observer + ring,而它永远到不了 conns.size===0 → observer 永久泄漏。
         // 非 OPEN 就直接放弃(bun 单线程,过了此闸下面同步块不会再被 close 插队)。
-        if (ws.readyState !== 1 /* OPEN */) return;
+        if (ws.readyState !== 1 /* OPEN */) {
+          hub.sessionAttachFailed(sid);
+          return;
+        }
 
         // 以下同步串行(bun 单线程):挂订阅 → hello → 补发/快照。期间不可能有事件
         // 插队,快照原子性(§3.2)天然成立。
@@ -165,6 +237,7 @@ export function createWsHandler(hub: WsHub): WebSocketHandler<WsClientData> {
           });
         }
       } catch (err: any) {
+        hub.sessionAttachFailed(sid);
         hub.send(ws, { type: 'error', message: `attach session ${sid} failed: ${err?.message ?? err}` });
       }
     },

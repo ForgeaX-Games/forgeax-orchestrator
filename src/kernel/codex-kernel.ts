@@ -51,9 +51,29 @@ import {
   AppServerUnavailable,
   KernelEventQueue,
   classifyApproval,
+  classifyElicitation,
   createCodexNotifState,
   mapCodexNotification,
 } from './codex-appserver';
+import {
+  materializeForgeaxToolsRuntime,
+  type ForgeaxToolsRuntime,
+} from './mcp/forgeax-tools-runtime';
+import {
+  assertCodexMcpSupported,
+  buildCodexMcpOverrides,
+  CodexMcpError,
+} from './codex-mcp';
+import { codexHomeKey, codexHomeMutex, ensureCodexSessionHome } from './codex-session-home';
+
+/** Emit a structured turn failure (the neutral spine has no codex_mcp_* code, so
+ *  the machine code rides in the `protocol` message prefix). Keeps the B5
+ *  invariant: turn.usage precedes turn.done. */
+function* codexMcpFailure(message: string): Generator<KernelEvent> {
+  yield { kind: 'turn.usage' };
+  yield { kind: 'error', error: { code: 'protocol', message } };
+  yield { kind: 'turn.done', reason: 'error' };
+}
 
 export class CodexKernel implements AgentKernel {
   readonly id = 'codex';
@@ -70,6 +90,7 @@ export class CodexKernel implements AgentKernel {
   };
 
   private binaryPromise?: Promise<string>;
+  private versionPromise?: Promise<string>;
   /** threadId → codex thread_id(exec 路径:收到 thread.started 后记下,用于 exec resume)。 */
   private readonly threadIdMap = new Map<string, string>();
   /** threadId → codex app-server thread id(app-server 路径:thread/start 后记下,用于 thread/resume)。 */
@@ -82,6 +103,19 @@ export class CodexKernel implements AgentKernel {
       envVarName: 'CODEX_CLI_PATH',
       defaultBinary: 'codex',
     }));
+  }
+
+  /** Cached `codex --version` line (for the MCP capability gate). Empty on error
+   *  → treated as unsupported by the gate (fail-closed for a tools turn). */
+  private version(): Promise<string> {
+    return (this.versionPromise ??= (async () => {
+      try {
+        const { stdout } = await runCapture(await this.binary(), ['--version']);
+        return stdout.trim().split('\n')[0] ?? '';
+      } catch {
+        return '';
+      }
+    })());
   }
 
   /** 真实模型目录:app-server JSON-RPC `model/list`(TUI /model 同源)。
@@ -146,15 +180,31 @@ export class CodexKernel implements AgentKernel {
    *  - fallback 必须在 yield 任何事件**之前**判定(AppServerUnavailable 在 ensureStarted 抛),
    *    否则会半截重跑。 */
   async *runTurn(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {
+    // 版本能力闸(plan §5.5):有工具轮但 codex 版本低于底线 → 明确失败,不静默丢工具。
+    // 空工具轮任何版本放行。两条执行路径统一在此判定,fallback 也不会绕过。
+    const hasTools = (req.tools?.length ?? 0) > 0;
+    if (hasTools) {
+      try {
+        assertCodexMcpSupported(await this.version(), true);
+      } catch (e) {
+        if (e instanceof CodexMcpError) {
+          yield* codexMcpFailure(`${e.code}: ${e.message}`);
+          return;
+        }
+        throw e;
+      }
+    }
+
     if (req.trustTier !== 'imported') {
       try {
         yield* this.runTurnAppServer(req, signal);
         return;
       } catch (e) {
         if (!(e instanceof AppServerUnavailable)) throw e;
-        // app-server 起不来 → 回退 exec(诚实降级:无审批闸,走 sandbox)。
+        // app-server transport 起不来 → 回退 exec。fallback **必须携带同一套 MCP 工具**
+        // (exec 路径会重新 materialize runtime),禁止退化成「无工具继续回答」(plan §6.2)。
         // eslint-disable-next-line no-console
-        console.warn(`[codex] app-server unavailable, falling back to exec (no approval): ${(e as Error).message}`);
+        console.warn(`[codex] app-server unavailable, falling back to exec (keeps same MCP tools): ${(e as Error).message}`);
       }
     }
     yield* this.runTurnExec(req, signal);
@@ -186,6 +236,44 @@ export class CodexKernel implements AgentKernel {
       env.FORGEAX_KERNEL = 'codex';
     }
 
+    // fxt MCP runtime(本轮工具)。materialize 失败 = fail-closed(plan §6.3),不回退 exec
+    // (exec 也会同样失败),直接结构化报错收尾。runtime.env(FORGEAX_* + specs + expose)
+    // 合并进 codex 进程 env → codex 起的 MCP 子进程继承(secrets/context 走 env 不走 argv)。
+    let runtime: ForgeaxToolsRuntime | undefined;
+    if ((req.tools?.length ?? 0) > 0) {
+      try {
+        runtime = await materializeForgeaxToolsRuntime(req, {
+          runtimeId: req.callId || req.hostSessionId || req.session.threadId || 'codex-appserver',
+        });
+      } catch (e) {
+        if (req.callId) CodexKernel.inflight.delete(req.callId);
+        yield* codexMcpFailure(`codex_mcp_materialize_failed: ${(e as Error).message}`);
+        return;
+      }
+    }
+    if (runtime) Object.assign(env, runtime.env);
+    const mcpOverrides = runtime ? buildCodexMcpOverrides(runtime) : [];
+    const globalArgs = [
+      ...(hooksActive ? ['--dangerously-bypass-hook-trust'] : []),
+      ...mcpOverrides,
+    ];
+
+    // 稳定隔离 CODEX_HOME + keyed mutex(plan §8):同一逻辑 session 跨 turn 复用目录
+    // (thread resume 不丢),同 home 串行(防 SQLite lock / session 损坏)。
+    const homeKey = codexHomeKey(req);
+    const releaseHome = await codexHomeMutex.acquire(homeKey);
+    let homeReleased = false;
+    const releaseHomeOnce = () => { if (!homeReleased) { homeReleased = true; releaseHome(); } };
+    try {
+      env.CODEX_HOME = await ensureCodexSessionHome(homeKey);
+    } catch (e) {
+      releaseHomeOnce();
+      await runtime?.cleanup();
+      if (req.callId) CodexKernel.inflight.delete(req.callId);
+      yield* codexMcpFailure(`codex_mcp_start_failed: session home unavailable: ${(e as Error).message}`);
+      return;
+    }
+
     const queue = new KernelEventQueue();
     const notifState = createCodexNotifState();
 
@@ -193,6 +281,14 @@ export class CodexKernel implements AgentKernel {
     // allow 即批 / ask 强制走卡),未命中 → 中立 requestPermission(= Studio 审批卡),
     // 都没有 → 默认放行(headless --force 类比,原基线)。
     const handleServerRequest = async (rpc: ServerRequest): Promise<unknown> => {
+      // MCP elicitation(server 向 client 要表单/URL):fxt 不主动发,但 client 仍须显式
+      // decline/cancel 不支持的 elicitation,且**绝不**把它误判为「用户已批准」(plan §9.3)。
+      const elicit = classifyElicitation(rpc.method);
+      if (elicit) {
+        // eslint-disable-next-line no-console
+        console.warn(`[codex] declining unsupported MCP elicitation: ${rpc.method} (id=${String(rpc.id)})`);
+        return elicit.reply;
+      }
       const cls = classifyApproval(rpc.method);
       if (!cls) throw new Error(`unhandled codex server-request: ${rpc.method}`);
       const p = (rpc.params ?? {}) as any;
@@ -220,9 +316,9 @@ export class CodexKernel implements AgentKernel {
       binary,
       cwd: projectRoot,
       env,
-      // hooksActive → 附 --dangerously-bypass-hook-trust(headless 无人确认 hook 信任;
-      // hook 是我们刚写入/校验过归属的,信任由构造保证)。
-      ...(hooksActive ? { globalArgs: ['--dangerously-bypass-hook-trust'] } : {}),
+      // globalArgs 注入在 `app-server` 子命令之前:hooksActive → --dangerously-bypass-hook-trust;
+      // 有工具轮 → `-c mcp_servers.fxt.*` 注册本轮 fxt MCP server(plan §6.1)。
+      ...(globalArgs.length ? { globalArgs } : {}),
       onNotification: (m, params) => mapCodexNotification(m, params, notifState, queue),
       onServerRequest: handleServerRequest,
       onExit: (code, tail) => {
@@ -247,11 +343,15 @@ export class CodexKernel implements AgentKernel {
     else ac.signal.addEventListener('abort', onAbort, { once: true });
 
     // 起不来 → 抛 AppServerUnavailable(在 yield 任何事件前),让 runTurn 回退 exec。
+    // 回退前必须释放 home mutex 且清理本轮 runtime——exec fallback 会重新 acquire + materialize
+    // (携带同一套 MCP 工具),不能持锁/漏临时文件。
     try {
       await client.ensureStarted();
     } catch (e) {
       ac.signal.removeEventListener('abort', onAbort);
       client.shutdown();
+      releaseHomeOnce();
+      await runtime?.cleanup();
       if (req.callId) CodexKernel.inflight.delete(req.callId);
       throw new AppServerUnavailable((e as Error).message);
     }
@@ -311,6 +411,8 @@ export class CodexKernel implements AgentKernel {
     } finally {
       ac.signal.removeEventListener('abort', onAbort);
       client.shutdown();
+      await runtime?.cleanup();
+      releaseHomeOnce();
       if (req.callId) CodexKernel.inflight.delete(req.callId);
     }
   }
@@ -324,20 +426,42 @@ export class CodexKernel implements AgentKernel {
     if (req.callId) CodexKernel.inflight.set(req.callId, ac);
 
     let credToken: string | undefined;
+    let runtime: ForgeaxToolsRuntime | undefined;
+    let releaseHome: (() => void) | undefined;
     try {
       const binary = await this.binary();
       const projectRoot = defaultProjectRoot();
       // settings.permissions 拦截面(046 楔子3):同 app-server 路径,工作区静态
       // hooks.json + FORGEAX_* env(exec 是 per-turn 进程,env 注入安全)。
       const hooksActive = ensureCodexHooksConfig(projectRoot);
-      const args = this.buildArgs(req, hooksActive);
+
+      // fxt MCP runtime(本轮工具)。materialize 失败 = fail-closed(plan §6.3)。
+      if ((req.tools?.length ?? 0) > 0) {
+        try {
+          runtime = await materializeForgeaxToolsRuntime(req, {
+            runtimeId: req.callId || req.hostSessionId || req.session.threadId || 'codex-exec',
+          });
+        } catch (e) {
+          yield* codexMcpFailure(`codex_mcp_materialize_failed: ${(e as Error).message}`);
+          return;
+        }
+      }
+      const mcpOverrides = runtime ? buildCodexMcpOverrides(runtime) : [];
+      const args = this.buildArgs(req, hooksActive, mcpOverrides);
+
+      // 稳定隔离 CODEX_HOME + keyed mutex(plan §8):同一逻辑 session 跨 turn 复用目录
+      // (exec resume 不丢),同 home 串行。
+      const homeKey = codexHomeKey(req);
+      releaseHome = await codexHomeMutex.acquire(homeKey);
+      const codexHome = await ensureCodexSessionHome(homeKey);
 
       // 凭据地板:imported → scrub。sidecar 路径(FORGEAX_SIDECAR=on)凭据由 sidecar cred-vault
       // 发 scoped token,本进程不跑 in-process cred-proxy 且剔真 key;非 sidecar 用 server 进程内代理。
       const useSidecar = sidecarEnabled();
-      let envOverride: Record<string, string | undefined> | undefined;
+      // 始终注入隔离 CODEX_HOME(其余键仅覆盖,不影响 process.env 继承)。
+      let envOverride: Record<string, string | undefined> = { CODEX_HOME: codexHome };
       if (req.trustTier === 'imported') {
-        envOverride = scrubbedSecretEnv();
+        envOverride = { ...envOverride, ...scrubbedSecretEnv() };
         if (!useSidecar) {
           const issued = await issueToken('openai');
           if (issued) {
@@ -355,6 +479,9 @@ export class CodexKernel implements AgentKernel {
           FORGEAX_KERNEL: 'codex',
         };
       }
+      // fxt runtime env(FORGEAX_* + specs + expose)合并进 codex 进程 env → codex 起的
+      // MCP 子进程继承(secrets/context 走 env 不走 argv)。放最后覆盖,确保 SID/AGENT 一致。
+      if (runtime) envOverride = { ...envOverride, ...runtime.env };
       const sidecarBaseId = req.callId || req.hostSessionId || req.session.threadId || req.session.agentId || 'kernel';
       const { lines, exit } = useSidecar
         ? sidecarSpawnJsonl<CodexRawEvent>(await ensureSidecar(), {
@@ -409,16 +536,19 @@ export class CodexKernel implements AgentKernel {
       for (const ev of flushCodexMapper(state, exitInfo, ac.signal.aborted)) yield ev;
     } finally {
       if (credToken) revokeToken(credToken);
+      await runtime?.cleanup();
+      releaseHome?.();
       if (req.callId) CodexKernel.inflight.delete(req.callId);
     }
   }
 
   /** 从中立 TurnRequest 拼 `codex exec [--json] ...` argv —— 委托给 codex-profile
-   *  (所有 Codex-isms 在那)。resume 的 codexThreadId 由首轮 thread.started 记下。 */
-  private buildArgs(req: TurnRequest, hooksActive = false): string[] {
+   *  (所有 Codex-isms 在那)。resume 的 codexThreadId 由首轮 thread.started 记下。
+   *  `mcpOverrides` = 本轮 fxt MCP 的 `-c` 参数(无工具轮为空)。 */
+  private buildArgs(req: TurnRequest, hooksActive = false, mcpOverrides: string[] = []): string[] {
     const tid = req.session.threadId?.trim();
     const codexThreadId = tid ? this.threadIdMap.get(tid) : undefined;
-    return buildCodexArgs(req, codexThreadId, hooksActive);
+    return buildCodexArgs(req, codexThreadId, hooksActive, mcpOverrides);
   }
 
   openHandle(callId: string): TurnHandle {
