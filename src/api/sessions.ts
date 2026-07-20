@@ -24,12 +24,17 @@ import { resolveAsk } from '../core/ask-user-registry';
 import { randomUUID } from 'node:crypto';
 import { registerPermission, resolvePermission } from '../core/permission-registry';
 import { registerPerception, resolvePerception, pushPerceptionNote } from './lib/perception-registry';
-import { acquireUiLease, setUiManifest, uiInvokeTimeoutMs, resolveFirstClassUiTool } from './lib/ui-manifest-registry';
+import { acquireUiLease, setUiManifest, uiInvokeTimeoutMs } from './lib/ui-manifest-registry';
 import { createSessionWithBootstrap } from './lib/session-create';
 import { getHostTool } from '../orchestration-seams';
 import type { PerceptionKind } from '../kernel/forgeax-builtin-tools';
 import { executeTool } from '../kits/tool/tool-executor';
-import { isForgeaxBuiltinTool, runForgeaxBuiltinTool, hostToolRunCtx } from '../kernel/forgeax-builtin-tools';
+import {
+  isForgeaxBuiltinTool,
+  runForgeaxBuiltinTool,
+  hostToolRunCtx,
+  preflightUiToolDispatch,
+} from '../kernel/forgeax-builtin-tools';
 import { checkKernelTool } from '../kernel/trust-gate';
 import { requestToolApproval, applyRememberOnReply } from '../kernel/tool-approval';
 import { getCheckpointManager, type RewindMode } from '../checkpoint/checkpoint-manager';
@@ -468,13 +473,11 @@ export function createSessionsRouter() {
     let toolName = typeof body.toolName === 'string' ? body.toolName : '';
     let args = body.args && typeof body.args === 'object' ? (body.args as Record<string, unknown>) : {};
     if (!toolName) return c.json({ ok: false, error: 'toolName required' }, 400);
-    // P1-9 一等工具化:ui_act_* 在信任闸**之前**反解回 ui_invoke(actionId),使权限
-    // (per-action 闸)/审计/执行全程只认识 ui_invoke 一条路(与 host-tool-bridge 同口径)。
-    const fcTool = resolveFirstClassUiTool(sid, toolName);
-    if (fcTool) {
-      args = { actionId: fcTool.actionId, args };
-      toolName = 'ui_invoke';
-    }
+    // Normalize catalog-derived ui_act_* and reject missing declarations before trust policy.
+    const preflight = preflightUiToolDispatch(toolName, args, sid);
+    if (preflight.rejection) return c.json({ ok: true, result: preflight.rejection });
+    toolName = preflight.name;
+    args = preflight.args as Record<string, unknown>;
 
     const session = getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
     const agent = session.scheduler.getAgent(agentPath);
@@ -496,7 +499,7 @@ export function createSessionsRouter() {
     // 否则绑 A、active 切 B 时会误判 A 自己的写。session 未绑则回落 active game。
     const projectRoot = defaultProjectRoot();
     const scopeGame = session.config?.defaultDir ?? getPathManager().resolveScope();
-    // sid 供 ui_invoke 的 per-action capability 查表(manifest 缓存按 sid 存,见 trust-gate)。
+    // sid 供 ui_invoke 的 per-action catalog projection 查询(见 trust-gate)。
     // rules = settings.permissions 分层载出(046 楔子1-补:settings deny/ask/allow 叠加 tier 基线)。
     const decision = checkKernelTool(trustTier, toolName, {
       args,
@@ -758,7 +761,7 @@ export function createSessionsRouter() {
   // → 拿到后 POST /perception-reply 解开本 hold 住的响应。镜像 permission 往返,但
   // 回的是 snapshot;超时 fail-soft(取数失败不挂死 turn,只是少一份证据)。
   const PERCEPTION_TIMEOUT_MS = 8_000;
-  /** ui_invoke 通道默认超时(略宽:要等 action 执行/受理);manifest 声明 timeoutMs 可放宽。 */
+  /** ui_invoke 通道默认超时(略宽:要等 action 执行/受理);catalog 声明 timeoutMs 可放宽。 */
   const UI_INVOKE_TIMEOUT_MS = 10_000;
   const PERCEPTION_KINDS: ReadonlySet<string> = new Set(['world', 'frame', 'ui_snapshot', 'ui_invoke']);
   r.post('/:sid/perception-query', async (c) => {
@@ -782,7 +785,7 @@ export function createSessionsRouter() {
       agent,
     );
 
-    // ui_invoke:超时按 manifest 声明放宽;ui_* 回灌须持有效 lease(声明与执行方同源)。
+    // ui_invoke:超时按 catalog 声明放宽;ui_* 回灌须持有效 lease(声明与执行方同源)。
     const timeoutMs =
       kind === 'ui_invoke'
         ? uiInvokeTimeoutMs(sid, (body.query as { actionId?: unknown } | null)?.actionId, UI_INVOKE_TIMEOUT_MS)
@@ -809,13 +812,12 @@ export function createSessionsRouter() {
   });
 
   // ── UI 语义操作层(产品 AI 化 P0)—————————————————————————————————————
-  // lease:多标签同 sid 时「最后获焦 tab」持有;manifest 权威来源与 ui_* 应答方都
-  // 绑定到持有者(displace 语义,心跳续期)。会话鉴权与 perception-reply 同级
-  // (session 绑定);manifest 是 trust-gate 的权限输入,故写入必须持有效 lease,
-  // 且这两个端点**不进** MCP 桥出面(.mjs 不暴露)。
+  // lease:多标签同 sid 时「最后获焦 tab」持有;runtime manifest projection 与 ui_*
+  // 应答方都绑定到持有者(displace 语义,心跳续期)。权限声明来自 server catalog;
+  // manifest 写入仍必须持有效 lease,且这两个端点**不进** MCP 桥出面(.mjs 不暴露)。
   //
-  // Origin 收口(架构师嘱咐,B6):这两个写端点是权限闸的信任锚——浏览器跨站发起
-  // 的写一律拒(防「恶意页面骗本机 server 改写权限声明」)。规则:无 Origin 头
+  // Origin 收口(架构师嘱咐,B6):这两个写端点是 runtime executor binding 的信任锚——
+  // 浏览器跨站发起的写一律拒(防恶意页面冒充本机 UI surface)。规则:无 Origin 头
   // (curl / 同进程 / 非浏览器)放行;有 Origin 时 hostname 须为 loopback、与本次
   // 请求 Host 同名,或落在 FORGEAX_UI_BRIDGE_ORIGINS(逗号分隔,给桌面 tauri://
   // 等形态)白名单内。fail-closed 403。

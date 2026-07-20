@@ -1,0 +1,507 @@
+/**
+ * Trusted server-side action declarations.
+ *
+ * M1 keeps these contract types local to forgeax-cli. Promote them to
+ * `@forgeax/types` in M2 once the server and UI projections share the contract.
+ */
+export type ActionCapability =
+  | 'read'
+  | 'write'
+  | 'delete'
+  | 'exec'
+  | 'network'
+  | 'credential'
+  | 'delegate'
+  | 'other';
+
+export type ActionSurface = 'ui' | 'server' | 'both';
+
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | readonly JsonValue[]
+  | { readonly [key: string]: JsonValue };
+
+export type JsonSchemaObject = { readonly [key: string]: JsonValue };
+
+export interface ActionCatalogEntry {
+  readonly id: string;
+  readonly title: string;
+  readonly description?: string;
+  readonly schema?: JsonSchemaObject;
+  readonly capability: ActionCapability;
+  readonly surface?: ActionSurface;
+  readonly timeoutMs?: number;
+  readonly firstClass?: boolean;
+}
+
+/**
+ * M1 migration bundle, transcribed from interface's 23 builtin actions and
+ * two trajectory actions. Client-only run/available/choices functions stay out.
+ */
+const ACTION_CATALOG_DECLARATIONS = [
+  {
+    id: 'app.set_mode',
+    title: '切换主模式',
+    description:
+      "Switch the app's main workspace: 'scene' (game editing) or 'ai' (AI · plugins & tools). Same as clicking the Scene / AI tabs.",
+    schema: {
+      type: 'object',
+      properties: { mode: { type: 'string', enum: ['scene', 'ai'] } },
+      required: ['mode'],
+    },
+    capability: 'write',
+    firstClass: true,
+    surface: 'ui',
+  },
+  {
+    id: 'panel.toggle_sidebar',
+    title: '折叠/展开侧栏',
+    description: 'Toggle the left sidebar collapsed state.',
+    capability: 'write',
+    surface: 'ui',
+  },
+  {
+    id: 'panel.toggle_chatpanel',
+    title: '折叠/展开聊天面板',
+    description: 'Toggle the chat panel collapsed state.',
+    capability: 'write',
+    surface: 'ui',
+  },
+  {
+    id: 'app.set_fullscreen',
+    title: '沉浸模式',
+    description: 'Enter or exit fullscreen (immersive) mode which hides all chrome around the main area.',
+    schema: { type: 'object', properties: { value: { type: 'boolean' } }, required: ['value'] },
+    capability: 'write',
+    surface: 'ui',
+  },
+  {
+    id: 'workbench.open',
+    title: '打开 Workbench',
+    description: "Open the workbench surface, optionally at a specific tab (e.g. 'plugins').",
+    schema: { type: 'object', properties: { tab: { type: 'string' } } },
+    capability: 'write',
+    firstClass: true,
+    surface: 'ui',
+  },
+  {
+    id: 'workbench.list_plugins',
+    title: '列出工作台插件',
+    description:
+      'List installed workbench plugins (id, name, description). Use this to tell the user what workbench tools exist and what each does, then guide them with workbench.open_plugin. Returns { count, plugins:[{id,name,description}] }.',
+    capability: 'read',
+    firstClass: true,
+    surface: 'ui',
+  },
+  {
+    id: 'workbench.open_plugin',
+    title: '打开工作台插件',
+    description:
+      "Open the workbench and expand a specific plugin by id — the concrete 'open this plugin' step. It switches to the workbench (AI) workspace, then expands that plugin's panel. Discover valid ids and what each does via workbench.list_plugins.",
+    schema: { type: 'object', properties: { extensionId: { type: 'string' } }, required: ['extensionId'] },
+    capability: 'write',
+    firstClass: true,
+    surface: 'ui',
+  },
+  {
+    id: 'role.create',
+    title: '创建新角色',
+    description:
+      'Mint a NEW teammate/agent role when no existing role in the roster fits. Args: id (single segment [a-zA-Z0-9_-]) + persona (markdown: who they are / what they are good at / when to delegate to them / what they produce) + optional displayName / role / avatar / color / scope("global"|"project") / tools(host-tool allow globs). The new role persists and joins the roster (delegate_to_subagent can then dispatch it). Duplicate ids are rejected, never overwritten. Discover existing roles first via role.list.',
+    schema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '单段 [a-zA-Z0-9_-];如 "level-designer"' },
+        persona: { type: 'string', description: '角色 markdown:是谁 / 擅长什么 / 何时被派 / 产出什么' },
+        displayName: {
+          type: 'object',
+          properties: { zh: { type: 'string' }, en: { type: 'string' } },
+        },
+        role: { type: 'string', description: "定位,如 'pillar' / 'artist' / 'peer'" },
+        avatar: { type: 'string', description: 'emoji / 单字符' },
+        color: { type: 'string', description: '#hex' },
+        scope: { type: 'string', enum: ['global', 'project'] },
+        tools: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['id', 'persona'],
+    },
+    capability: 'delegate',
+    firstClass: true,
+    surface: 'both',
+    timeoutMs: 15_000,
+  },
+  {
+    id: 'role.list',
+    title: '列出角色',
+    description:
+      'List all currently dispatchable roles (plugin agents + built-ins). Use this to tell the user which roles exist / check for duplicates before role.create. Returns { count, roles:[{id,role,displayName,source}] }.',
+    capability: 'read',
+    firstClass: true,
+    surface: 'both',
+  },
+  {
+    id: 'role.open',
+    title: '打开角色页',
+    description:
+      'Open the roles/team surface. With no args it switches to the AI workspace (where the roster lives). With { id } it also binds that role to the current chat session so its persona detail is shown. Use this to show the user the team or a specific teammate.',
+    schema: { type: 'object', properties: { id: { type: 'string' } } },
+    capability: 'read',
+    firstClass: true,
+    surface: 'ui',
+  },
+  {
+    id: 'overlay.open',
+    title: '打开浮层',
+    description: "Open an overlay by id (e.g. 'settings'). Optional param selects a section inside it.",
+    schema: {
+      type: 'object',
+      properties: { id: { type: 'string' }, param: { type: 'string' } },
+      required: ['id'],
+    },
+    capability: 'write',
+    surface: 'ui',
+  },
+  {
+    id: 'overlay.close',
+    title: '关闭浮层',
+    description: 'Close the currently open overlay, if any.',
+    capability: 'write',
+    surface: 'ui',
+  },
+  {
+    id: 'console.clear',
+    title: '清空控制台',
+    description:
+      "Clear a collected console buffer. source:'browser' (default) clears the studio-shell browser console buffer PLUS the cross-tier health entries (fatal region banners are preserved). source:'game' clears the in-app game/editor console (store.consoleLog). Neither touches the raw browser DevTools buffer.",
+    schema: { type: 'object', properties: { source: { type: 'string', enum: ['browser', 'game'] } } },
+    capability: 'write',
+    surface: 'ui',
+  },
+  {
+    id: 'console.read',
+    title: '读取控制台',
+    description:
+      "Read the studio's collected console feed. source:'browser' (default) = the full studio-shell browser console (ALL levels: log/info/warn/error/debug, captured into a 500-entry ring buffer) merged with cross-tier iframe/health signals (window.onerror, unhandled rejections, forwarded play/edit/plugin/engine health). source:'game' = the in-app game/editor console stream. Params: source ('browser'|'game'), level (filter), limit (default 50, max 200). Returns { source, total, count, lines } in the result. This is the studio's own captured console (a web page cannot read the raw browser DevTools buffer directly).",
+    schema: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', enum: ['browser', 'game'] },
+        level: { type: 'string' },
+        limit: { type: 'number' },
+      },
+    },
+    capability: 'read',
+    firstClass: true,
+    surface: 'ui',
+  },
+  {
+    id: 'network.clear',
+    title: '清空网络日志',
+    description: 'Clear the in-app network log panel (store.networkLog). NOT the browser DevTools network tab.',
+    capability: 'write',
+    surface: 'ui',
+  },
+  {
+    id: 'session.switch',
+    title: '切换会话',
+    description: 'Switch the active chat session to the given sid (see the session.tabs state slice for candidates).',
+    schema: { type: 'object', properties: { sid: { type: 'string' } }, required: ['sid'] },
+    capability: 'write',
+    firstClass: true,
+    surface: 'ui',
+    timeoutMs: 15_000,
+  },
+  {
+    id: 'session.create',
+    title: '新建会话',
+    description: 'Create a new chat session (optionally named) and switch to it.',
+    schema: { type: 'object', properties: { displayName: { type: 'string' } } },
+    capability: 'write',
+    firstClass: true,
+    surface: 'both',
+    timeoutMs: 20_000,
+  },
+  {
+    id: 'session.close',
+    title: '关闭会话',
+    description: 'Close (delete) a chat session by sid. Destructive: the session and its history are removed from disk.',
+    schema: { type: 'object', properties: { sid: { type: 'string' } }, required: ['sid'] },
+    capability: 'delete',
+    firstClass: true,
+    surface: 'both',
+    timeoutMs: 15_000,
+  },
+  {
+    id: 'session.rename',
+    title: '重命名会话',
+    description: 'Rename a chat session tab.',
+    schema: {
+      type: 'object',
+      properties: { sid: { type: 'string' }, displayName: { type: 'string' } },
+      required: ['sid', 'displayName'],
+    },
+    capability: 'write',
+    surface: 'both',
+  },
+  {
+    id: 'sessions.refresh',
+    title: '刷新会话列表',
+    description: 'Re-fetch the session list from the server.',
+    capability: 'read',
+    surface: 'both',
+  },
+  {
+    id: 'sessions.list',
+    title: '列出会话',
+    description: 'List chat sessions of the current game scope. Returns sid/displayName rows in stateDigest.',
+    capability: 'read',
+    surface: 'both',
+  },
+  {
+    id: 'game.switch',
+    title: '切换游戏',
+    description: 'Switch the pinned game (project) to the given slug. Sessions and preview re-scope to it.',
+    schema: { type: 'object', properties: { slug: { type: 'string' } }, required: ['slug'] },
+    capability: 'write',
+    firstClass: true,
+    surface: 'both',
+    timeoutMs: 20_000,
+  },
+  {
+    id: 'game.create',
+    title: '新建游戏',
+    description:
+      'Create a NEW game (project) from the template and give it its own dedicated chat session. Args: slug (required, 1-41 chars lowercase ASCII/digits/hyphens, must start with a letter/digit — e.g. "neon-runner") + optional name (display name) + optional brief (one line describing what game to make, recorded in FORGE.md for later). Fails with 409 if the slug already exists — use game.switch for existing games; list existing slugs to avoid collisions. NOTE: this does NOT switch the UI to the new game (switching mid-turn would break the active chat channel). Tell the user the game is ready and to open it from the top-bar game switcher; game.switch will land on its dedicated session.',
+    schema: {
+      type: 'object',
+      properties: {
+        slug: {
+          type: 'string',
+          description: '1-41 位小写字母/数字/连字符,首位字母或数字;如 "neon-runner"',
+        },
+        name: { type: 'string', description: '显示名(可选,缺省用 slug)' },
+        brief: { type: 'string', description: '一句话说明要做什么游戏(可选,写进 FORGE.md)' },
+      },
+      required: ['slug'],
+    },
+    capability: 'write',
+    firstClass: true,
+    surface: 'both',
+    timeoutMs: 20_000,
+  },
+  {
+    id: 'trajectory.read',
+    title: '读取操作轨迹',
+    description:
+      'Read the recent trajectory of UI operations performed on the page by BOTH the human and the AI, ordered oldest→newest. Every operation dispatched through the action registry is recorded (page mode switches, panel toggles, session/game/role/workbench ops, etc.). Use this to understand what the user just did before asking you something. Params: limit (default 50, max 200), source ("human"|"ai" to filter by who performed it). Returns { total, count, entries:[{seq,ts,id,title,source,capability,args}] } in the result.',
+    schema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number' },
+        source: { type: 'string', enum: ['human', 'ai'] },
+      },
+    },
+    capability: 'read',
+    firstClass: true,
+    surface: 'ui',
+  },
+  {
+    id: 'trajectory.clear',
+    title: '清空操作轨迹',
+    description:
+      'Clear the recorded UI operation trajectory buffer. Returns { cleared } — how many entries were removed.',
+    capability: 'write',
+    surface: 'ui',
+  },
+] as const satisfies readonly ActionCatalogEntry[];
+
+const VALID_CAPABILITIES: ReadonlySet<string> = new Set<ActionCapability>([
+  'read',
+  'write',
+  'delete',
+  'exec',
+  'network',
+  'credential',
+  'delegate',
+  'other',
+]);
+
+const VALID_SURFACES: ReadonlySet<string> = new Set<ActionSurface>(['ui', 'server', 'both']);
+
+interface ActionCatalogSnapshot {
+  readonly all: readonly ActionCatalogEntry[];
+  readonly firstClass: readonly ActionCatalogEntry[];
+  readonly byId: ReadonlyMap<string, ActionCatalogEntry>;
+}
+
+const EMPTY_ENTRIES = Object.freeze([]) as readonly ActionCatalogEntry[];
+
+let currentCatalog: ActionCatalogSnapshot = Object.freeze({
+  all: EMPTY_ENTRIES,
+  firstClass: EMPTY_ENTRIES,
+  byId: new Map<string, ActionCatalogEntry>(),
+});
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function invalidJson(path: string): never {
+  throw new Error(`schema contains a non-JSON value at ${path}`);
+}
+
+function cloneAndFreezeJson(value: unknown, path: string, ancestors: Set<object>): JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) invalidJson(path);
+    return value;
+  }
+  if (typeof value !== 'object') invalidJson(path);
+
+  const objectValue = value as object;
+  if (ancestors.has(objectValue)) invalidJson(path);
+  ancestors.add(objectValue);
+
+  if (Array.isArray(value)) {
+    const clone: JsonValue[] = [];
+    for (let index = 0; index < value.length; index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor?.enumerable || !('value' in descriptor)) invalidJson(`${path}[${index}]`);
+      clone.push(cloneAndFreezeJson(descriptor.value, `${path}[${index}]`, ancestors));
+    }
+    if (Reflect.ownKeys(value).length !== value.length + 1) invalidJson(path);
+    ancestors.delete(objectValue);
+    return Object.freeze(clone);
+  }
+
+  if (!isPlainObject(value)) invalidJson(path);
+  const clone: Record<string, JsonValue> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string') invalidJson(path);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !('value' in descriptor)) invalidJson(`${path}.${key}`);
+    Object.defineProperty(clone, key, {
+      value: cloneAndFreezeJson(descriptor.value, `${path}.${key}`, ancestors),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  ancestors.delete(objectValue);
+  return Object.freeze(clone);
+}
+
+function requireString(
+  raw: Record<string, unknown>,
+  field: 'id' | 'title',
+  declarationIndex: number,
+): string {
+  const value = raw[field];
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`ActionCatalog: declaration ${declarationIndex} has invalid ${field}`);
+  }
+  return value;
+}
+
+function compileEntry(raw: unknown, declarationIndex: number): ActionCatalogEntry {
+  if (!isPlainObject(raw)) {
+    throw new Error(`ActionCatalog: declaration ${declarationIndex} must be a plain object`);
+  }
+
+  const id = requireString(raw, 'id', declarationIndex);
+  const title = requireString(raw, 'title', declarationIndex);
+  const capability = raw.capability;
+  if (typeof capability !== 'string' || !VALID_CAPABILITIES.has(capability)) {
+    throw new Error(`ActionCatalog: action "${id}" has unsupported capability "${String(capability)}"`);
+  }
+
+  const description = raw.description;
+  if (description !== undefined && typeof description !== 'string') {
+    throw new Error(`ActionCatalog: action "${id}" has invalid description`);
+  }
+
+  let schema: JsonSchemaObject | undefined;
+  if (raw.schema !== undefined) {
+    if (!isPlainObject(raw.schema)) {
+      throw new Error(`ActionCatalog: action "${id}" schema must be a plain JSON object`);
+    }
+    try {
+      schema = cloneAndFreezeJson(raw.schema, '$', new Set()) as JsonSchemaObject;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`ActionCatalog: action "${id}" ${reason}`);
+    }
+  }
+
+  const surface = raw.surface;
+  if (surface !== undefined && (typeof surface !== 'string' || !VALID_SURFACES.has(surface))) {
+    throw new Error(`ActionCatalog: action "${id}" has unsupported surface "${String(surface)}"`);
+  }
+
+  const timeoutMs = raw.timeoutMs;
+  if (timeoutMs !== undefined && (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+    throw new Error(`ActionCatalog: action "${id}" has invalid timeoutMs`);
+  }
+
+  const firstClass = raw.firstClass;
+  if (firstClass !== undefined && typeof firstClass !== 'boolean') {
+    throw new Error(`ActionCatalog: action "${id}" has invalid firstClass flag`);
+  }
+
+  return Object.freeze({
+    id,
+    title,
+    ...(description !== undefined ? { description } : {}),
+    ...(schema !== undefined ? { schema } : {}),
+    capability: capability as ActionCapability,
+    ...(surface !== undefined ? { surface: surface as ActionSurface } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(firstClass !== undefined ? { firstClass } : {}),
+  });
+}
+
+/**
+ * Validate and publish a complete catalog in one swap. Failed builds leave the
+ * previously published snapshot untouched.
+ */
+export function buildActionCatalog(
+  declarations: readonly unknown[] = ACTION_CATALOG_DECLARATIONS,
+): readonly ActionCatalogEntry[] {
+  if (!Array.isArray(declarations)) {
+    throw new Error('ActionCatalog: declarations must be an array');
+  }
+
+  const byId = new Map<string, ActionCatalogEntry>();
+  const entries: ActionCatalogEntry[] = [];
+  for (const [index, raw] of declarations.entries()) {
+    const entry = compileEntry(raw, index);
+    if (byId.has(entry.id)) {
+      throw new Error(`ActionCatalog: duplicate action id "${entry.id}"`);
+    }
+    byId.set(entry.id, entry);
+    entries.push(entry);
+  }
+
+  const all = Object.freeze(entries);
+  const firstClass = Object.freeze(entries.filter((entry) => entry.firstClass === true));
+  const next = Object.freeze({ all, firstClass, byId });
+  currentCatalog = next;
+  return next.all;
+}
+
+export function catalogGet(id: string): ActionCatalogEntry | undefined {
+  return currentCatalog.byId.get(id);
+}
+
+export function catalogFirstClass(): readonly ActionCatalogEntry[] {
+  return currentCatalog.firstClass;
+}
+
+export function catalogAll(): readonly ActionCatalogEntry[] {
+  return currentCatalog.all;
+}

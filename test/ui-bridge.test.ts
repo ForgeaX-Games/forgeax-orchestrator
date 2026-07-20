@@ -1,11 +1,11 @@
 /** UI 语义操作层(产品 AI 化 P0)单测:
  *  - ui-manifest-registry:lease 生命周期(获焦 displace / 心跳续期 / TTL)、manifest
- *    写入的 lease 把关与声明消毒(非法 capability 整条丢弃,fail-closed)、超时查表。
- *  - trust-gate ui_invoke per-action 特判:capability 真值 = manifest 声明,**不信模型
- *    自报的 args**(防谎报);查不到声明 fail-closed ask。
+ *    写入的 lease 把关与 ActionCatalog runtime projection。
+ *  - trust-gate ui_invoke per-action 特判:capability 真值 = server ActionCatalog,**不信模型
+ *    或 UI manifest 自报的值**;catalog miss 由 dispatcher 前置返回 not_found。
  *  - perception-registry lease 把关:ui_* 回灌须持有效 lease,错 lease 不消费 pending。
  */
-import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
+import { describe, expect, test, beforeEach, afterEach, spyOn } from 'bun:test';
 import {
   acquireUiLease,
   validateUiLease,
@@ -15,10 +15,14 @@ import {
   clearUiStateForSession,
   firstClassUiToolSpecs,
   resolveFirstClassUiTool,
+  isUiActionRuntimeAvailable,
 } from '../src/api/lib/ui-manifest-registry';
 import { checkKernelTool, classifyTool } from '../src/kernel/trust-gate';
 import { registerPerception, resolvePerception } from '../src/api/lib/perception-registry';
 import { runForgeaxBuiltinTool } from '../src/kernel/forgeax-builtin-tools';
+import { makeInProcessExecuteTool } from '../src/kernel/host-tool-bridge';
+import { buildActionCatalog } from '../src/kernel/action-catalog';
+import { createSessionsRouter } from '../src/api/sessions';
 import { initOrchestrationSeams, resetOrchestrationSeams, getHostTool, getHostTools } from '../src/orchestration-seams';
 import uiBridgeContract from '../src/kernel/ui-bridge-contract.json';
 
@@ -28,7 +32,18 @@ function leaseFor(sid: string, clientId = 'tab-a'): string {
   return acquireUiLease(sid, clientId).leaseId;
 }
 
+function replyingBus(reply: unknown, lease: string, onPublish?: () => void) {
+  return {
+    publish(event: { payload?: unknown }) {
+      onPublish?.();
+      const reqId = (event.payload as { reqId?: string })?.reqId;
+      if (reqId) setTimeout(() => resolvePerception(reqId, reply, lease), 0);
+    },
+  };
+}
+
 beforeEach(() => {
+  buildActionCatalog();
   clearUiStateForSession(SID);
 });
 
@@ -56,60 +71,116 @@ describe('ui-manifest-registry — lease', () => {
   });
 });
 
-describe('ui-manifest-registry — manifest(权限输入,lease 把守)', () => {
+describe('ui-manifest-registry — manifest(runtime projection,lease 把守)', () => {
   const decl = (over: Record<string, unknown> = {}) => ({
-    id: 'game.delete',
-    title: 'Delete game',
+    id: 'session.close',
+    title: 'Close session',
     capability: 'delete',
     ...over,
   });
 
-  test('无/错 lease 拒写(信任锚:谁能写 manifest 谁就能改权限声明)', () => {
+  test('无/错 lease 拒写 runtime binding,但不影响 catalog 声明查询', () => {
     expect(setUiManifest(SID, [decl()], undefined).ok).toBe(false);
     expect(setUiManifest(SID, [decl()], 'bogus').ok).toBe(false);
-    expect(getUiAction(SID, 'game.delete')).toBeUndefined();
+    expect(getUiAction(SID, 'session.close')?.capability).toBe('delete');
+    expect(isUiActionRuntimeAvailable(SID, 'session.close')).toBe(false);
   });
 
-  test('持有效 lease 可写,可查表', () => {
+  test('持有效 lease 可绑定 catalog action runtime executor', () => {
     const lease = leaseFor(SID);
     const res = setUiManifest(SID, [decl()], lease);
     expect(res.ok).toBe(true);
     expect(res.accepted).toBe(1);
-    expect(getUiAction(SID, 'game.delete')?.capability).toBe('delete');
+    expect(getUiAction(SID, 'session.close')?.capability).toBe('delete');
+    expect(isUiActionRuntimeAvailable(SID, 'session.close')).toBe(true);
   });
 
-  test('非法 capability 整条丢弃(不降级 other——own tier other 会静默直放)', () => {
-    const lease = leaseFor(SID);
-    const res = setUiManifest(SID, [decl({ capability: 'superuser' }), decl({ id: 'ok.read', capability: 'read' })], lease);
-    expect(res.ok).toBe(true);
-    expect(res.accepted).toBe(1);
-    expect(res.dropped).toBe(1);
-    expect(getUiAction(SID, 'game.delete')).toBeUndefined();
-    expect(getUiAction(SID, 'ok.read')?.capability).toBe('read');
+  test('lease 被另一 tab 取代后,旧 manifest 不再表示 UI executor 在线', () => {
+    const lease = leaseFor(SID, 'tab-a');
+    setUiManifest(SID, [decl()], lease);
+    expect(isUiActionRuntimeAvailable(SID, 'session.close')).toBe(true);
+    leaseFor(SID, 'tab-b');
+    expect(isUiActionRuntimeAvailable(SID, 'session.close')).toBe(false);
   });
 
-  test('整表替换幂等 + timeoutMs clamp [1s,30s]', () => {
+  test('catalog 外 id 丢弃;已知 id 的 capability/surface 篡改被纠偏并审计', () => {
     const lease = leaseFor(SID);
-    setUiManifest(SID, [decl({ id: 'slow.op', capability: 'write', timeoutMs: 120_000 })], lease);
-    expect(uiInvokeTimeoutMs(SID, 'slow.op', 10_000)).toBe(30_000);
-    setUiManifest(SID, [decl({ id: 'slow.op', capability: 'write', timeoutMs: 5 })], lease);
-    expect(uiInvokeTimeoutMs(SID, 'slow.op', 10_000)).toBe(1_000);
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const res = setUiManifest(
+        SID,
+        [
+          decl({ capability: 'superuser', surface: 'ui', firstClass: false }),
+          decl({ id: 'outside.catalog', capability: 'read' }),
+        ],
+        lease,
+      );
+      expect(res).toMatchObject({ ok: true, accepted: 1, dropped: 1 });
+      expect(getUiAction(SID, 'session.close')).toMatchObject({
+        capability: 'delete',
+        surface: 'both',
+        firstClass: true,
+      });
+      expect(getUiAction(SID, 'outside.catalog')).toBeUndefined();
+      expect(isUiActionRuntimeAvailable(SID, 'outside.catalog')).toBe(false);
+      const audit = warn.mock.calls.flat().join('\n');
+      expect(audit).toContain('outside.catalog');
+      expect(audit).toContain('capability');
+      expect(audit).toContain('surface');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('manifest 超限行计入 dropped 并写审计摘要', () => {
+    const lease = leaseFor(SID);
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const actions = Array.from({ length: 500 }, () => decl());
+      actions.push(decl({ id: 'outside.catalog' }));
+      expect(setUiManifest(SID, actions, lease)).toMatchObject({ ok: true, accepted: 1, dropped: 1 });
+      expect(warn.mock.calls.flat().join('\n')).toContain('manifest exceeds 500-action limit');
+      expect(getUiAction(SID, 'outside.catalog')).toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('catalog timeout 是权威;manifest 不能放大或缩短', () => {
+    const lease = leaseFor(SID);
+    setUiManifest(SID, [decl({ id: 'role.create', capability: 'delegate', timeoutMs: 120_000 })], lease);
+    expect(uiInvokeTimeoutMs(SID, 'role.create', 10_000)).toBe(15_000);
+    setUiManifest(SID, [decl({ id: 'role.create', capability: 'delegate', timeoutMs: 5 })], lease);
+    expect(uiInvokeTimeoutMs(SID, 'role.create', 10_000)).toBe(15_000);
     expect(uiInvokeTimeoutMs(SID, 'unknown.op', 10_000)).toBe(10_000);
+  });
+
+  test('catalog timeout 仍 clamp 到 [1s,30s]', () => {
+    const declaration = {
+      id: 'timeout.probe',
+      title: 'Timeout probe',
+      capability: 'read',
+      surface: 'both',
+    } as const;
+    try {
+      buildActionCatalog([{ ...declaration, timeoutMs: 120_000 }]);
+      expect(uiInvokeTimeoutMs(SID, declaration.id, 10_000)).toBe(30_000);
+      buildActionCatalog([{ ...declaration, timeoutMs: 5 }]);
+      expect(uiInvokeTimeoutMs(SID, declaration.id, 10_000)).toBe(1_000);
+    } finally {
+      buildActionCatalog();
+    }
   });
 });
 
 describe('trust-gate — ui_invoke per-action 特判', () => {
-  test('capability 真值 = manifest 声明:delete → ask(own),不因子串分类落 other 直放', () => {
-    const lease = leaseFor(SID);
-    setUiManifest(SID, [{ id: 'session.close', title: '关闭会话', capability: 'delete' }], lease);
+  test('capability 真值 = catalog 声明:delete → ask(own),不依赖 manifest seed', () => {
     const d = checkKernelTool('own', 'ui_invoke', { args: { actionId: 'session.close' }, sid: SID });
     expect(d.outcome).toBe('ask');
     expect(d.capability).toBe('delete');
   });
 
-  test('防谎报:模型在 args 里自报 capability 被无视,以 manifest 为准', () => {
-    const lease = leaseFor(SID);
-    setUiManifest(SID, [{ id: 'session.close', title: '关闭会话', capability: 'delete' }], lease);
+  test('防谎报:模型在 args 里自报 capability 被无视,以 catalog 为准', () => {
     const d = checkKernelTool('own', 'ui_invoke', {
       args: { actionId: 'session.close', capability: 'read' }, // 谎报
       sid: SID,
@@ -118,29 +189,81 @@ describe('trust-gate — ui_invoke per-action 特判', () => {
     expect(d.capability).toBe('delete');
   });
 
-  test('read 声明 → own 直放;未注册 actionId / 缺 sid / 缺 actionId → fail-closed ask', () => {
-    const lease = leaseFor(SID);
-    setUiManifest(SID, [{ id: 'sessions.list', title: '列出会话', capability: 'read' }], lease);
+  test('read catalog 声明 → own 直放;绕过 dispatcher 的异常输入 → fail-closed deny', () => {
     expect(checkKernelTool('own', 'ui_invoke', { args: { actionId: 'sessions.list' }, sid: SID }).outcome).toBe('allow');
-    expect(checkKernelTool('own', 'ui_invoke', { args: { actionId: 'nope' }, sid: SID }).outcome).toBe('ask');
-    expect(checkKernelTool('own', 'ui_invoke', { args: { actionId: 'sessions.list' } }).outcome).toBe('ask');
-    expect(checkKernelTool('own', 'ui_invoke', { args: {}, sid: SID }).outcome).toBe('ask');
+    expect(checkKernelTool('own', 'ui_invoke', { args: { actionId: 'nope' }, sid: SID }).outcome).toBe('deny');
+    expect(checkKernelTool('own', 'ui_invoke', { args: { actionId: 'sessions.list' } }).outcome).toBe('deny');
+    expect(checkKernelTool('own', 'ui_invoke', { args: {}, sid: SID }).outcome).toBe('deny');
   });
 
-  test('imported:read 直放,write ask,credential 硬 deny', () => {
-    const lease = leaseFor(SID);
-    setUiManifest(
-      SID,
-      [
-        { id: 'a.read', title: 'r', capability: 'read' },
-        { id: 'a.write', title: 'w', capability: 'write' },
-        { id: 'a.cred', title: 'c', capability: 'credential' },
-      ],
-      lease,
-    );
-    expect(checkKernelTool('imported', 'ui_invoke', { args: { actionId: 'a.read' }, sid: SID }).outcome).toBe('allow');
-    expect(checkKernelTool('imported', 'ui_invoke', { args: { actionId: 'a.write' }, sid: SID }).outcome).toBe('ask');
-    expect(checkKernelTool('imported', 'ui_invoke', { args: { actionId: 'a.cred' }, sid: SID }).outcome).toBe('deny');
+  test('imported:catalog read 直放,write/delete ask', () => {
+    expect(checkKernelTool('imported', 'ui_invoke', { args: { actionId: 'sessions.list' }, sid: SID }).outcome).toBe('allow');
+    expect(checkKernelTool('imported', 'ui_invoke', { args: { actionId: 'session.create' }, sid: SID }).outcome).toBe('ask');
+    expect(checkKernelTool('imported', 'ui_invoke', { args: { actionId: 'session.close' }, sid: SID }).outcome).toBe('ask');
+  });
+
+  test('imported:catalog credential 仍经 UI 专用路径硬 deny', () => {
+    try {
+      buildActionCatalog([
+        { id: 'credential.probe', title: 'Credential probe', capability: 'credential', surface: 'both' },
+      ]);
+      expect(
+        checkKernelTool('imported', 'ui_invoke', { args: { actionId: 'credential.probe' }, sid: SID }),
+      ).toMatchObject({ outcome: 'deny', capability: 'credential' });
+    } finally {
+      buildActionCatalog();
+    }
+  });
+
+  test('unknown ui_invoke/ui_act_* 在真实 native 分发前置返回 not_found,不进 trust-gate', async () => {
+    let gateCalls = 0;
+    const bridge = makeInProcessExecuteTool('forge', {
+      checkKernelTool: (...args) => {
+        gateCalls++;
+        return checkKernelTool(...args);
+      },
+    });
+    const direct = await bridge('ui_invoke', { actionId: 'nope', args: {} }, SID);
+    expect(direct).toEqual({
+      status: 'rejected',
+      code: 'not_found',
+      reason: 'action "nope" not in server ActionCatalog',
+    });
+    expect(await bridge('ui_act_not_registered', {}, SID)).toEqual({
+      status: 'rejected',
+      code: 'not_found',
+      reason: 'action "ui_act_not_registered" not in server ActionCatalog',
+    });
+    expect(gateCalls).toBe(0);
+  });
+
+  test('unknown ui_invoke/ui_act_* 在 HTTP 分发前置返回 tool result,不打开 session', async () => {
+    const router = createSessionsRouter();
+    const call = async (toolName: string, args: Record<string, unknown>) => {
+      const response = await router.request(`/${SID}/kernel-tool`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ toolName, args }),
+      });
+      expect(response.status).toBe(200);
+      return response.json();
+    };
+    expect(await call('ui_invoke', { actionId: 'nope' })).toEqual({
+      ok: true,
+      result: {
+        status: 'rejected',
+        code: 'not_found',
+        reason: 'action "nope" not in server ActionCatalog',
+      },
+    });
+    expect(await call('ui_act_not_registered', {})).toEqual({
+      ok: true,
+      result: {
+        status: 'rejected',
+        code: 'not_found',
+        reason: 'action "ui_act_not_registered" not in server ActionCatalog',
+      },
+    });
   });
 
   test('ui_snapshot 归 read 直放(own+imported),不因 sh 子串误分 exec', () => {
@@ -169,17 +292,6 @@ describe('perception-registry — ui_* 回灌的 lease 把关', () => {
 });
 
 describe('ui_screenshot 往返 — dataUrl → ContentPart 图像块(P3)', () => {
-  /** 桩 eventBus:捕获 perception:query 的 reqId,异步用给定 snapshot 回灌
-   *  (perceptionQuery 先 publish 后 registerPerception,故必须延后 resolve)。 */
-  function replyingBus(reply: unknown, lease: string) {
-    return {
-      publish(event: { payload?: unknown }) {
-        const reqId = (event.payload as { reqId?: string })?.reqId;
-        if (reqId) setTimeout(() => resolvePerception(reqId, reply, lease), 0);
-      },
-    };
-  }
-
   test('成功回 dataUrl → [image, text meta] ContentPart 数组(模型看得到像素)', async () => {
     const lease = leaseFor(SID);
     const ctx = {
@@ -275,24 +387,40 @@ describe('trust-gate — ui_screenshot read 特判(P3)', () => {
 });
 
 describe('P1-9 一等工具化 — firstClass 派生与反解', () => {
-  test('firstClass 声明派生 ui_act_* ToolSpec;非 firstClass 不派生;反解回 actionId', () => {
-    const lease = leaseFor(SID);
-    setUiManifest(
-      SID,
-      [
-        { id: 'game.switch', title: '切换游戏', capability: 'write', firstClass: true },
-        { id: 'console.clear', title: '清空控制台', capability: 'write' },
-      ],
-      lease,
-    );
+  test('真冷启动:catalog firstClass 派生 role.* ToolSpec 并可反解,无需 manifest seed', () => {
     const specs = firstClassUiToolSpecs(SID);
-    expect(specs.map((s) => s.name)).toEqual(['ui_act_game_switch']);
-    expect(specs[0]!.description).toContain('切换游戏');
-    expect(specs[0]!.description).toMatch(/ui_snapshot/); // accepted 语义随身
+    const names = specs.map((s) => s.name);
+    expect(specs).toHaveLength(14);
+    expect(names).toContain('ui_act_role_create');
+    expect(names).toContain('ui_act_role_list');
+    expect(names).toContain('ui_act_game_switch');
+    expect(names).not.toContain('ui_act_console_clear');
+    const roleCreate = specs.find((s) => s.name === 'ui_act_role_create')!;
+    expect(roleCreate.description).toContain('创建新角色');
+    expect(roleCreate.description).toMatch(/ui_snapshot/);
+    expect(roleCreate.inputSchema).toMatchObject({ required: ['id', 'persona'] });
+    expect(resolveFirstClassUiTool(SID, 'ui_act_role_create')).toEqual({ actionId: 'role.create' });
+    expect(resolveFirstClassUiTool(SID, 'ui_act_role_list')).toEqual({ actionId: 'role.list' });
     expect(resolveFirstClassUiTool(SID, 'ui_act_game_switch')).toEqual({ actionId: 'game.switch' });
     expect(resolveFirstClassUiTool(SID, 'ui_act_console_clear')).toBeUndefined();
     expect(resolveFirstClassUiTool(SID, 'not_a_ui_tool')).toBeUndefined();
     expect(firstClassUiToolSpecs(undefined)).toEqual([]);
+  });
+
+  test('manifest 不能增删 catalog firstClass 暴露', () => {
+    const lease = leaseFor(SID);
+    setUiManifest(
+      SID,
+      [
+        { id: 'game.switch', title: 'Switch game', capability: 'write', firstClass: false },
+        { id: 'console.clear', title: 'Clear console', capability: 'write', firstClass: true },
+      ],
+      lease,
+    );
+    const names = firstClassUiToolSpecs(SID).map((s) => s.name);
+    expect(names).toContain('ui_act_game_switch');
+    expect(names).not.toContain('ui_act_console_clear');
+    expect(firstClassUiToolSpecs(SID).find((s) => s.name === 'ui_act_game_switch')?.description).toContain('切换游戏');
   });
 });
 
@@ -336,10 +464,102 @@ describe('P1-7 seam — HostToolSpec run 执行位', () => {
 describe('P1-8 headless 回落 — surface both/server 的 ui_invoke', () => {
   afterEach(() => resetOrchestrationSeams());
 
-  test('UI 不在线(往返超时)→ seam handler 执行并标 executedVia', async () => {
+  test('有效 lease + manifest binding → 先走 UI executor,不触发 headless handler', async () => {
     const lease = leaseFor(SID);
-    // timeoutMs:5 → clamp 到 1s(测试代价);surface:'both' 允许回落。
-    setUiManifest(SID, [{ id: 'sessions.list', title: '列会话', capability: 'read', surface: 'both', timeoutMs: 5 }], lease);
+    setUiManifest(SID, [{ id: 'sessions.list', title: 'List sessions', capability: 'read' }], lease);
+    let publishes = 0;
+    let handlerCalls = 0;
+    initOrchestrationSeams({
+      hostUiActions: [
+        { actionId: 'sessions.list', run: () => { handlerCalls++; return { status: 'completed' }; } },
+      ],
+    });
+    const out = (await runForgeaxBuiltinTool(
+      'ui_invoke',
+      { actionId: 'sessions.list', args: {} },
+      {
+        projectRoot: '/tmp',
+        agentId: 'forge',
+        sid: SID,
+        eventBus: {
+          publish: (event) => {
+            publishes++;
+            const reqId = (event.payload as { reqId?: string } | undefined)?.reqId;
+            if (reqId) setTimeout(() => resolvePerception(reqId, { status: 'completed', stateDigest: 'ui' }, lease), 0);
+          },
+        },
+      },
+    )) as { status: string; executedVia?: string; stateDigest?: unknown };
+    expect(out).toMatchObject({ status: 'completed', stateDigest: 'ui' });
+    expect(out.executedVia).toBeUndefined();
+    expect(handlerCalls).toBe(0);
+    expect(publishes).toBe(1);
+  });
+
+  test('live UI 返回 unavailable 后,surface both 回落 headless', async () => {
+    const lease = leaseFor(SID);
+    setUiManifest(SID, [{ id: 'sessions.list', title: 'List sessions', capability: 'read' }], lease);
+    let handlerCalls = 0;
+    initOrchestrationSeams({
+      hostUiActions: [
+        {
+          actionId: 'sessions.list',
+          run: () => {
+            handlerCalls++;
+            return { status: 'completed', stateDigest: 'headless' };
+          },
+        },
+      ],
+    });
+    const out = await runForgeaxBuiltinTool(
+      'ui_invoke',
+      { actionId: 'sessions.list', args: {} },
+      {
+        projectRoot: '/tmp',
+        agentId: 'forge',
+        sid: SID,
+        eventBus: replyingBus({ unavailable: true, reason: 'surface unavailable' }, lease),
+      },
+    );
+    expect(out).toMatchObject({ status: 'completed', stateDigest: 'headless', executedVia: 'headless' });
+    expect(handlerCalls).toBe(1);
+  });
+
+  test("live UI 返回 unavailable 后,surface:'ui' 保持 unavailable", async () => {
+    const lease = leaseFor(SID);
+    setUiManifest(
+      SID,
+      [{ id: 'panel.toggle_sidebar', title: 'Toggle sidebar', capability: 'write' }],
+      lease,
+    );
+    let handlerCalls = 0;
+    initOrchestrationSeams({
+      hostUiActions: [
+        {
+          actionId: 'panel.toggle_sidebar',
+          run: () => {
+            handlerCalls++;
+            return { status: 'completed' };
+          },
+        },
+      ],
+    });
+    const out = await runForgeaxBuiltinTool(
+      'ui_invoke',
+      { actionId: 'panel.toggle_sidebar', args: {} },
+      {
+        projectRoot: '/tmp',
+        agentId: 'forge',
+        sid: SID,
+        eventBus: replyingBus({ unavailable: true, reason: 'surface unavailable' }, lease),
+      },
+    );
+    expect(out).toEqual({ unavailable: true, reason: 'surface unavailable' });
+    expect(handlerCalls).toBe(0);
+  });
+
+  test('真冷启动:有 EventBus 但零 lease/manifest → 不 publish/不等超时,直接走 both handler', async () => {
+    let publishes = 0;
     initOrchestrationSeams({
       hostUiActions: [
         { actionId: 'sessions.list', run: () => ({ status: 'completed', stateDigest: [{ sid: 's1' }] }) },
@@ -348,24 +568,27 @@ describe('P1-8 headless 回落 — surface both/server 的 ui_invoke', () => {
     const out = (await runForgeaxBuiltinTool(
       'ui_invoke',
       { actionId: 'sessions.list', args: {} },
-      { projectRoot: '/tmp', agentId: 'forge', sid: SID, eventBus: { publish: () => {} } }, // 无人应答 → 超时
+      { projectRoot: '/tmp', agentId: 'forge', sid: SID, eventBus: { publish: () => publishes++ } },
     )) as { status: string; executedVia?: string; stateDigest?: unknown };
     expect(out.status).toBe('completed');
     expect(out.executedVia).toBe('headless');
     expect(out.stateDigest).toEqual([{ sid: 's1' }]);
-  }, 10_000);
+    expect(publishes).toBe(0);
+  });
 
-  test("surface:'ui' 不回落(unavailable 原样返回)", async () => {
-    const lease = leaseFor(SID);
-    setUiManifest(SID, [{ id: 'panel.toggle', title: '开合面板', capability: 'write', surface: 'ui', timeoutMs: 5 }], lease);
+  test("真冷启动:surface:'ui' 不回落且不 publish(unavailable 原样返回)", async () => {
+    let publishes = 0;
+    let handlerCalls = 0;
     initOrchestrationSeams({
-      hostUiActions: [{ actionId: 'panel.toggle', run: () => ({ status: 'completed' }) }],
+      hostUiActions: [{ actionId: 'panel.toggle_sidebar', run: () => { handlerCalls++; return { status: 'completed' }; } }],
     });
     const out = (await runForgeaxBuiltinTool(
       'ui_invoke',
-      { actionId: 'panel.toggle', args: {} },
-      { projectRoot: '/tmp', agentId: 'forge', sid: SID, eventBus: { publish: () => {} } },
+      { actionId: 'panel.toggle_sidebar', args: {} },
+      { projectRoot: '/tmp', agentId: 'forge', sid: SID, eventBus: { publish: () => publishes++ } },
     )) as { unavailable?: boolean };
     expect(out.unavailable).toBe(true);
-  }, 10_000);
+    expect(handlerCalls).toBe(0);
+    expect(publishes).toBe(0);
+  });
 });

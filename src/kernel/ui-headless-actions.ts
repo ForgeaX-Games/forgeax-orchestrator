@@ -11,6 +11,34 @@
 import { getSessionManager } from '../core/session-manager';
 import { createSessionWithBootstrap } from '../api/lib/session-create';
 import type { HostUiActionHandler } from '../orchestration-seams';
+import { getHostAuthoring, type AgentPackSpec } from '../tools/host-authoring';
+
+function roleSpec(args: Record<string, unknown>): AgentPackSpec {
+  const rawDisplayName =
+    args.displayName && typeof args.displayName === 'object' && !Array.isArray(args.displayName)
+      ? (args.displayName as Record<string, unknown>)
+      : undefined;
+  const displayName = rawDisplayName
+    ? {
+        ...(typeof rawDisplayName.zh === 'string' ? { zh: rawDisplayName.zh } : {}),
+        ...(typeof rawDisplayName.en === 'string' ? { en: rawDisplayName.en } : {}),
+      }
+    : undefined;
+  const tools =
+    Array.isArray(args.tools) && args.tools.every((tool) => typeof tool === 'string')
+      ? (args.tools as string[])
+      : undefined;
+  return {
+    id: typeof args.id === 'string' ? args.id : '',
+    persona: typeof args.persona === 'string' ? args.persona : '',
+    ...(displayName && Object.keys(displayName).length > 0 ? { displayName } : {}),
+    ...(typeof args.role === 'string' ? { role: args.role } : {}),
+    ...(typeof args.avatar === 'string' ? { avatar: args.avatar } : {}),
+    ...(typeof args.color === 'string' ? { color: args.color } : {}),
+    ...(args.scope === 'global' || args.scope === 'project' ? { scope: args.scope } : {}),
+    ...(tools ? { tools } : {}),
+  };
+}
 
 const BUILTIN: HostUiActionHandler[] = [
   {
@@ -45,6 +73,28 @@ const BUILTIN: HostUiActionHandler[] = [
       if (!sid) return { status: 'rejected', reason: 'session.close requires sid (string)' };
       await getSessionManager().delete(sid);
       return { status: 'completed', stateDigest: { closed: sid } };
+    },
+  },
+  {
+    // Keep role.create on the same HostAuthoring SSOT used by the UI tool path.
+    actionId: 'role.create',
+    run: async (args) => {
+      const authoring = getHostAuthoring();
+      const result = await authoring.createAgentPack(roleSpec(args));
+      if (!result.ok) return { status: 'rejected', reason: result.error };
+      await authoring.reloadExtensions();
+      return {
+        status: 'completed',
+        stateDigest: { id: result.id, scope: result.scope },
+      };
+    },
+  },
+  {
+    // role.list reads the same post-reload roster exposed by HostAuthoring.
+    actionId: 'role.list',
+    run: () => {
+      const roles = getHostAuthoring().listRoles();
+      return { status: 'completed', stateDigest: { count: roles.length, roles } };
     },
   },
 ];

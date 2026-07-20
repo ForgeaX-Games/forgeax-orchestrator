@@ -70,6 +70,8 @@ export interface RosterEntry {
 export interface HostAuthoring {
   /** 重扫插件层(L0/L1/L2),刷新 snapshot。让刚落盘的 agent-pack 生效。 */
   reloadExtensions(): Promise<void>;
+  /** 兼容 marketplace 插件工具(wb-team-forge tools.mjs 等)沿用的旧方法名,勿删。 */
+  reloadPlugins(): Promise<void>;
   /** 组装 + 自验 + 撞名查重 + 落盘一个 agent-pack。不 reload(调用方自行决定)。 */
   createAgentPack(spec: AgentPackSpec): Promise<CreateAgentPackResult>;
   /** 当前可派单角色(plugin agents + marketplace legacy)的合集,供 list_roles。 */
@@ -187,6 +189,10 @@ function buildAgentManifest(id: string, spec: AgentPackSpec): {
 export function createHostAuthoring(): HostAuthoring {
   return {
     async reloadExtensions() {
+      await reloadExtensions();
+    },
+
+    async reloadPlugins() {
       await reloadExtensions();
     },
 

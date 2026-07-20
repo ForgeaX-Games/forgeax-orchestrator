@@ -24,8 +24,15 @@ import type { Event } from '../core/types';
 import type { LayeredMemoryRef } from '../soul/types';
 import { soulMemoryRoot, searchMemory, classifyAndWrite } from '../soul';
 import { registerPerception } from '../api/lib/perception-registry';
-import { uiInvokeTimeoutMs, getUiAction } from '../api/lib/ui-manifest-registry';
+import {
+  uiInvokeTimeoutMs,
+  getUiAction,
+  isUiActionRuntimeAvailable,
+  isFirstClassUiToolName,
+  resolveFirstClassUiTool,
+} from '../api/lib/ui-manifest-registry';
 import { getHostUiAction, type HostToolRunCtx } from '../orchestration-seams';
+import { catalogGet } from './action-catalog';
 import { getBuiltinHeadlessUiAction } from './ui-headless-actions';
 
 /** 仅需 publish 的最小事件发布口(`EventBus` 类 / 绑定 bus / 测试桩皆满足)。 */
@@ -50,6 +57,56 @@ export function isForgeaxBuiltinTool(name: string): boolean {
   return BUILTIN_NAMES.has(name);
 }
 
+export interface UiActionNotFoundResult {
+  status: 'rejected';
+  code: 'not_found';
+  reason: string;
+}
+
+function notFoundUiAction(actionId: string): UiActionNotFoundResult {
+  return {
+    status: 'rejected',
+    code: 'not_found',
+    reason: `action ${JSON.stringify(actionId)} not in server ActionCatalog`,
+  };
+}
+
+/** Catalog existence preflight shared by direct builtin execution and both host dispatchers. */
+export function uiActionCatalogRejection(actionId: unknown): UiActionNotFoundResult | undefined {
+  const id = typeof actionId === 'string' ? actionId : '';
+  return catalogGet(id) ? undefined : notFoundUiAction(id);
+}
+
+export interface UiToolDispatchPreflight {
+  name: string;
+  args: unknown;
+  rejection?: UiActionNotFoundResult;
+}
+
+/** Normalize ui_act_* to ui_invoke and reject catalog misses before any trust policy runs. */
+export function preflightUiToolDispatch(
+  name: string,
+  args: unknown,
+  sid: string,
+): UiToolDispatchPreflight {
+  const normalizedArgs = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
+  const firstClass = resolveFirstClassUiTool(sid, name);
+  if (firstClass) {
+    return {
+      name: 'ui_invoke',
+      args: { actionId: firstClass.actionId, args: normalizedArgs },
+    };
+  }
+  if (isFirstClassUiToolName(name)) {
+    return { name, args: normalizedArgs, rejection: notFoundUiAction(name) };
+  }
+  if (name === 'ui_invoke') {
+    const rejection = uiActionCatalogRejection(normalizedArgs.actionId);
+    return { name, args: normalizedArgs, ...(rejection ? { rejection } : {}) };
+  }
+  return { name, args };
+}
+
 /** 感知/UI 往返的 query kind(闭合 union:server 端点与本模块共守)。 */
 export type PerceptionKind = 'world' | 'frame' | 'ui_snapshot' | 'ui_invoke' | 'ui_screenshot';
 
@@ -64,7 +121,7 @@ export interface BuiltinToolCtx {
   game?: string;
   /** 感知接地工具(query_world/capture_frame/ui_*)的会话总线;缺省则降级为 unavailable。 */
   eventBus?: EventPublisher;
-  /** 会话 id —— ui_* 往返的 lease 把关与 manifest 超时查表键;缺省时 ui_* 降级 unavailable。 */
+  /** 会话 id —— ui_* 往返的 lease/runtime binding 与 catalog projection 查询键。 */
   sid?: string;
 }
 
@@ -175,11 +232,21 @@ export async function runForgeaxBuiltinTool(
       return out;
     }
     case 'ui_invoke': {
-      // 超时按 manifest 里 action 声明的 timeoutMs 放宽(clamp [1s,30s]);慢 action 的
-      // 正道是 UI 侧快速回 accepted(受理即答),不是拉长超时硬等——见契约 description。
       const actionId = typeof args?.actionId === 'string' ? args.actionId : '';
-      const timeout = uiInvokeTimeoutMs(ctx.sid, actionId, UI_INVOKE_TIMEOUT_MS);
-      const out = await perceptionQuery(ctx, 'ui_invoke', { actionId: actionId || null, args: args?.args ?? {} }, timeout);
+      const rejection = uiActionCatalogRejection(actionId);
+      if (rejection) return rejection;
+      // 超时按 catalog 里 action 声明的 timeoutMs 放宽(clamp [1s,30s]);慢 action 的
+      // 正道是 UI 侧快速回 accepted(受理即答),不是拉长超时硬等——见契约 description。
+      // A live lease + accepted manifest row is only an executor binding. With no binding,
+      // cold-start dispatch must not wait for a UI timeout before trying the server surface.
+      const out = isUiActionRuntimeAvailable(ctx.sid, actionId)
+        ? await perceptionQuery(
+            ctx,
+            'ui_invoke',
+            { actionId, args: args?.args ?? {} },
+            uiInvokeTimeoutMs(ctx.sid, actionId, UI_INVOKE_TIMEOUT_MS),
+          )
+        : { unavailable: true, reason: `no live UI executor binding for action ${JSON.stringify(actionId)}` };
       // P1-8 headless 回落(方案 §5):UI 不在线(unavailable)且该 action 声明了
       // surface 'server'|'both' → 走宿主侧等价 handler(seam 注入优先,cli 内置次之;
       // handler 必须调与 UI run() 相同的内部实现,server 是行为 SSOT)。声明 'ui' 或

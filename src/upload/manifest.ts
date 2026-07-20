@@ -3,7 +3,7 @@
 // Policy (decision 2026-07-09, product owner): upload the ENTIRE `.forgeax`
 // directory — everything a user could want to restore — EXCEPT:
 //   - runtime garbage that regenerates itself (playwright cache, run/lock/
-//     sentinels, logs, node_modules, cache)
+//     sentinels, logs, node_modules, cache, checkpoints)
 //   - secret-bearing files by name (.env / .key / .pem / dev-stack.env …)
 //   - the upload feature's own local bookkeeping (upload.json / upload-log.jsonl)
 // A content-level secret scan (below) remains the fail-closed safety net for
@@ -31,6 +31,7 @@ export const EXCLUDE_SEGMENTS: readonly string[] = [
   "sentinels",
   "playwright-mcp", // MCP browser cache, tens of MB of pure runtime garbage
   "chrome-webgpu-profile", // Chrome profile: hundreds of MB AND carries login state/cookies
+  "checkpoints",    // content-addressed rewind blobs — multi-GB, regenerable, blows GitHub's 100MB blob cap
 ];
 
 /** Files excluded by exact basename — known runtime / secret-bearing files,

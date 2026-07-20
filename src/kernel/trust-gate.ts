@@ -128,8 +128,8 @@ export interface TrustContext {
   projectRoot?: string;
   /** 当前激活游戏 slug;省略 ⇒ 允许写入任意 `.forgeax/games/<slug>/`(任一游戏)。 */
   activeGame?: string;
-  /** 会话 id —— `ui_invoke` 的 per-action capability 查表键(manifest 缓存按 sid 存)。
-   *  缺省 ⇒ 查不到声明 ⇒ fail-closed ask。 */
+  /** 会话 id —— `ui_invoke` 的 per-action catalog projection 查询上下文。
+   *  缺省 ⇒ defensive fail-closed deny;正常 dispatcher 已在本闸前做存在性检查。 */
   sid?: string;
   /** settings.permissions 规则集(046 楔子1-补:host 注入,来自
    *  `api/lib/permission-settings.ts` 分层载出)。叠加在 tier 基线上,决策顺序:
@@ -161,9 +161,9 @@ export function checkKernelTool(
   const tier: TrustTier = trustTier ?? 'imported';
 
   // ui_invoke(UI 语义操作层):capability 不按工具名子串分类(会恒落 'other',own tier
-  // 通配直放 → 分级失效),而按 **manifest 里声明的** capability 查表(不信模型自报的
-  // args.capability,防谎报;manifest 写入被 lease + 会话鉴权把守)。查不到声明(UI 未
-  // 连 / 缓存重启丢失 / 假 actionId)→ fail-closed ask,交人判断。
+  // 通配直放 → 分级失效),而按 server ActionCatalog 查表(不信模型或 UI manifest
+  // 自报 capability)。Catalog miss 在 dispatcher 前置返回 not_found;这里仅保留
+  // defensive fail-closed deny。
   if (toolName === 'ui_invoke') return checkUiInvoke(tier, ctx);
   // ui_snapshot 是只读的 UI 感知取数(无副作用),归 read 直放。显式特判是为了绕开
   // classifyTool 的子串误分类('snapshot' 含 'sh' → 命中 exec),否则 imported 内核
@@ -224,7 +224,7 @@ export function checkKernelTool(
 /** 工具入参里可能携带目标路径的字段(按惯例)。 */
 const PATH_ARG_KEYS = ['path', 'file', 'filePath', 'file_path', 'filename', 'target', 'dir', 'directory'];
 
-/** `ui_invoke` 的 per-action 三档判定。capability 真值 = manifest 声明(查表键 sid+actionId);
+/** `ui_invoke` 的 per-action 三档判定。capability 真值 = server ActionCatalog;
  *  UI action 无路径可作 R2-08 作用域判定,故 imported tier 除显式信任的 read 外一律 ask
  *  (不静默放行不可信 pack 对 UI 的驱动)。own tier 沿用 TIER_ASK/TIER_DENY 口径
  *  (delete/credential 弹卡,其余直放)。 */
@@ -233,10 +233,10 @@ function checkUiInvoke(tier: TrustTier, ctx: TrustContext): TrustDecision {
     ctx.args && typeof ctx.args === 'object' && typeof (ctx.args as Record<string, unknown>).actionId === 'string'
       ? ((ctx.args as Record<string, unknown>).actionId as string)
       : '';
-  if (!actionId) return decide('ask', 'other', 'confirm ui_invoke without actionId (fail-closed)');
+  if (!actionId) return decide('deny', 'other', 'ui_invoke denied without actionId (fail-closed)');
   const decl = getUiAction(ctx.sid, actionId);
   if (!decl) {
-    return decide('ask', 'other', `confirm unregistered ui action "${actionId}" (no manifest declaration, fail-closed)`);
+    return decide('deny', 'other', `ui action "${actionId}" denied: catalog projection unavailable (fail-closed)`);
   }
   const cap = decl.capability;
   if (TIER_DENY[tier].has(cap)) {

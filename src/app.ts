@@ -53,6 +53,7 @@ import {
 } from './orchestration-seams';
 import { ensureUserDirDefaults } from './defaults/scaffold';
 import { initSessionManager } from './core/session-manager';
+import { buildActionCatalog } from './kernel/action-catalog';
 import './llm/register-all';
 
 /** Product-specific context injected by the shell into the orchestration layer. */
@@ -160,6 +161,7 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   // (registry 不直接 import event-bridge —— 断开 plugins→event-bridge→runner→plugins 环)
   onExtensionsReloaded(syncEventTriggerBindings);
   await reloadExtensions();
+  buildActionCatalog();
   await bootCliProviders();
 
   const app = new Hono();

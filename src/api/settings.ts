@@ -112,13 +112,15 @@ function parseEnv(raw: string): Record<string, string> {
 
 function serializeEnv(env: Record<string, string>, original?: string): string {
   // Preserve any comments / unknown lines from the original, just update
-  // recognized keys in place; append new keys at the end.
+  // recognized keys in place; append new keys at the end. Keys present in
+  // `original` but absent from `env` are dropped (cleared via PUT empty string).
   const seen = new Set<string>();
   const lines: string[] = [];
   if (original) {
     for (const line of original.split('\n')) {
       const m = /^\s*([A-Z_][A-Z0-9_]*)\s*=/.exec(line);
-      if (m && env[m[1]] !== undefined) {
+      if (m) {
+        if (!(m[1] in env)) continue; // deleted
         lines.push(`${m[1]}=${env[m[1]]}`);
         seen.add(m[1]);
       } else {
@@ -211,6 +213,14 @@ export function createSettingsRouter(): Hono {
     for (const [k, v] of Object.entries(body)) {
       if (!SAFE_ENV_KEYS.has(k)) continue;
       if (typeof v !== 'string') continue;
+      if (v === '') {
+        // Empty string = clear override (restore built-in defaults, e.g. upload token).
+        if (SIDECAR_CRED_KEYS.has(k) && (env[k] ?? '') !== '') credChanged = true;
+        delete env[k];
+        delete process.env[k];
+        touched++;
+        continue;
+      }
       if (SIDECAR_CRED_KEYS.has(k) && (env[k] ?? '') !== v) credChanged = true;
       env[k] = v;
       process.env[k] = v;   // live-apply so the running server picks it up without a restart (U3 first-run onboarding)

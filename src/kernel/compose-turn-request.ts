@@ -158,7 +158,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
 
   // 合并工具(去重,名字冲突时先到先得)→ 经 MCP 桥下发内核。
   // 优先级:FORGEAX_TOOLS(内置真值)> seam hostTools(产品壳注入,如 list_games/
-  //   query_world/capture_frame)> first-class UI action(manifest 派生)> extraTools
+  //   query_world/capture_frame)> first-class UI action(catalog 派生)> extraTools
   //   (agent host-tools/kits)> record.tools(soul-pack tools/*.json)> skill-derived。
   //   内置/host 工具在冲突时获胜,soul-pack 不能覆盖宿主真值工具。
   const seen = new Set(FORGEAX_TOOLS.map((t) => t.name));
@@ -174,7 +174,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   };
   // seam hostTools:只出墙可序列化三元组(run 是宿主侧执行体,永不过 wire)。
   pushDeduped(getHostTools().map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })));
-  // P1-9 一等工具化:manifest 里标 firstClass 的 UI action 派生独立 ToolSpec
+  // P1-9 一等工具化:server catalog 里标 firstClass 的 UI action 派生独立 ToolSpec
   //   (ui_act_*)。模型原生看到 schema、免一次 snapshot 发现往返;执行/权限在两个
   //   host 工具执行口被反解回 ui_invoke(actionId)走同一 per-action 闸与往返。
   pushDeduped(firstClassUiToolSpecs(input.sessionId));

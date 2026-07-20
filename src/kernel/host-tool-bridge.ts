@@ -17,8 +17,12 @@ import { loadAgentRecord } from '../soul';
 import { checkKernelTool } from './trust-gate';
 import { requestToolApproval } from './tool-approval';
 import { executeTool } from '../kits/tool/tool-executor';
-import { isForgeaxBuiltinTool, runForgeaxBuiltinTool, hostToolRunCtx } from './forgeax-builtin-tools';
-import { resolveFirstClassUiTool } from '../api/lib/ui-manifest-registry';
+import {
+  isForgeaxBuiltinTool,
+  runForgeaxBuiltinTool,
+  hostToolRunCtx,
+  preflightUiToolDispatch,
+} from './forgeax-builtin-tools';
 import { getHostTool } from '../orchestration-seams';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { getPathManager } from '../fs/path-manager';
@@ -58,13 +62,11 @@ export function makeInProcessExecuteTool(
   const _executeTool = deps.executeTool ?? executeTool;
   return async (name: string, args: unknown, sid?: string, agentId?: string): Promise<unknown> => {
     if (!sid) throw new Error('forgeax-core kernel: missing hostSessionId for host-tool bridge');
-    // P1-9 一等工具化:ui_act_* 在信任闸**之前**反解回 ui_invoke(actionId),使权限
-    // (per-action 闸)/审计/执行全程只认识 ui_invoke 一条路(闭合 union,不加新分支)。
-    const fc = resolveFirstClassUiTool(sid, name);
-    if (fc) {
-      args = { actionId: fc.actionId, args: (args ?? {}) as Record<string, unknown> };
-      name = 'ui_invoke';
-    }
+    // Normalize catalog-derived ui_act_* and reject missing declarations before trust policy.
+    const preflight = preflightUiToolDispatch(name, args, sid);
+    if (preflight.rejection) return preflight.rejection;
+    name = preflight.name;
+    args = preflight.args;
     // 审计同 `POST /:sid/kernel-tool`:单 start 计 durationMs,每个决策出口恰追加一行(append-only)。
     const start = Date.now();
     // 用本轮真实 agent(委派轮 = mochi 等)而非写死 defaultAgentPath:trustTier 求值、
@@ -92,7 +94,7 @@ export function makeInProcessExecuteTool(
     // active 切 B 时不会误判 A 自己的写。session 未绑则回落 active game。
     const projectRoot = defaultProjectRoot();
     const scopeGame = session.config?.defaultDir ?? getPathManager().resolveScope();
-    // sid 供 ui_invoke 的 per-action capability 查表(manifest 缓存按 sid 存,见 trust-gate)。
+    // sid 供 ui_invoke 的 per-action catalog projection 查询(见 trust-gate)。
     const decision = _checkKernelTool(trustTier, name, { args, projectRoot, activeGame: scopeGame, sid });
     tt('htb.decision', { name, agent: agentPath, sid, trustTier, outcome: decision.outcome, cap: decision.capability });
     if (decision.outcome === 'deny') {

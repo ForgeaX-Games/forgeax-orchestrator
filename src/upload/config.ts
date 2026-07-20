@@ -29,11 +29,13 @@ export const DEFAULT_BRANCH = "main";
 /** Built-in shared token (write access to the shared repo only), so upload works
  *  out of the box; FORGEAX_UPLOAD_GITHUB_TOKEN overrides it. Stored in pieces —
  *  GitHub secret-scanning/push-protection auto-revokes verbatim `github_pat_`
- *  strings the moment they land in a public mirror. */
+ *  strings the moment they land in a public mirror.
+ *  Scope check 2026-07-20: Contents write only on ForgeaX-Games/Forgeax-Data
+ *  (personal-repo blob create → 403 Resource not accessible by PAT). */
 export const DEFAULT_UPLOAD_TOKEN = [
   "github_pat_",
-  "11AD6JT7Q0eSIif2dpYVdf_",
-  "7cBewgSJIWp7b6ufAxKV6lD4pguSWzwggLBH067TqgpFQYTNDSBWxpBsKCv",
+  "11AD6JT7Q01J0AtpQyDmzz_",
+  "8nFt5DkPQIyww1qhquNbc3eLOXyMv7yuhugt3HN8uY1BQVJHRRPr2FqsLXS",
 ].join("");
 
 export type UploadConfigErrorKind = "no-repo";

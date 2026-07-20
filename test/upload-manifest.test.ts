@@ -26,10 +26,12 @@ describe("isExcluded predicate", () => {
     expect(isExcluded("games/moo/reel/scenarios.json")).toBe(false);
     expect(isExcluded("active-game.json")).toBe(false);
   });
-  test("prunes logs/debug/node_modules/cache/run/sentinels/playwright-mcp/chrome-profile", () => {
-    for (const seg of ["logs", "debug", "node_modules", "cache", "run", "sentinels", "playwright-mcp", "chrome-webgpu-profile"]) {
+  test("prunes logs/debug/node_modules/cache/run/sentinels/playwright-mcp/chrome-profile/checkpoints", () => {
+    for (const seg of ["logs", "debug", "node_modules", "cache", "run", "sentinels", "playwright-mcp", "chrome-webgpu-profile", "checkpoints"]) {
       expect(isExcluded(`games/x/${seg}/f`)).toBe(true);
     }
+    expect(isExcluded("checkpoints/blobs/ab/abc")).toBe(true);
+    expect(isExcluded("state/checkpoints/x")).toBe(true);
   });
   test("prunes backup dirs by directory-name predicate", () => {
     expect(isBackupDir("cow-level.bak-1781237317")).toBe(true);

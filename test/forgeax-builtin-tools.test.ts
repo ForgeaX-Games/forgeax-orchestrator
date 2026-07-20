@@ -8,10 +8,12 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isForgeaxBuiltinTool, runForgeaxBuiltinTool } from '../src/kernel/forgeax-builtin-tools';
+import { buildActionCatalog } from '../src/kernel/action-catalog';
 import { soulMemoryRoot } from '../src/soul';
 
 let TMP = '';
 beforeAll(() => {
+  buildActionCatalog();
   TMP = mkdtempSync(join(tmpdir(), 'fx-builtin-'));
 });
 afterAll(() => {
@@ -93,17 +95,37 @@ describe('memory_search', () => {
 });
 
 describe('ui_* 优雅降级(UI 语义操作层)', () => {
-  test('无 eventBus / 无 sid → ui_snapshot/ui_invoke 返回 unavailable(不抛)', async () => {
+  test('无 eventBus / 无 sid → ui_snapshot/已声明 ui_invoke 返回 unavailable(不抛)', async () => {
     const noBus = { projectRoot: join(TMP, 'p-perc'), agentId: 'forge' };
     const snap = (await runForgeaxBuiltinTool('ui_snapshot', {}, noBus)) as { unavailable: boolean };
     expect(snap.unavailable).toBe(true);
     const noSid = { ...noBus, eventBus: { publish: () => {} } };
-    const invoke = (await runForgeaxBuiltinTool('ui_invoke', { actionId: 'x' }, noSid)) as {
+    const invoke = (await runForgeaxBuiltinTool('ui_invoke', { actionId: 'role.open' }, noSid)) as {
       unavailable: boolean;
       reason?: string;
     };
     expect(invoke.unavailable).toBe(true);
-    expect(String(invoke.reason)).toContain('session');
+    expect(String(invoke.reason)).toContain('UI');
+  });
+
+  test('未声明 ui_invoke → not_found,不 publish UI perception', async () => {
+    let publishes = 0;
+    const invoke = await runForgeaxBuiltinTool(
+      'ui_invoke',
+      { actionId: 'x' },
+      {
+        projectRoot: join(TMP, 'p-perc'),
+        agentId: 'forge',
+        sid: 'never-connected',
+        eventBus: { publish: () => publishes++ },
+      },
+    );
+    expect(invoke).toEqual({
+      status: 'rejected',
+      code: 'not_found',
+      reason: 'action "x" not in server ActionCatalog',
+    });
+    expect(publishes).toBe(0);
   });
 
   test('无 eventBus / 无 sid → ui_screenshot 返回 unavailable(不抛,不转 ContentPart)', async () => {
