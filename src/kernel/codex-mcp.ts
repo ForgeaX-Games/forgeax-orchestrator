@@ -12,8 +12,9 @@
  * Invariants (docs/features/codex-mcp-tool-parity-plan.md §5.3 / §5.5 / §13.1):
  *   - Values are emitted by dedicated TOML string/array serializers — NEVER by
  *     assuming a JSON object is valid TOML, and NEVER by shell-quoting.
- *   - Secrets / session context go through the process ENV (see the runtime's
- *     `env`), never into argv (argv is world-readable via the process list).
+ *   - Secrets never go into argv. Codex app-server does not reliably inherit
+ *     arbitrary parent env vars into an MCP child, so the runtime's non-secret
+ *     `FORGEAX_*` context is also declared under `mcp_servers.fxt.env`.
  *   - `required=true` + `default_tools_approval_mode="approve"`: Codex must not
  *     add a second approval prompt for `fxt` tools; the host trust-gate stays the
  *     single permission authority.
@@ -154,6 +155,15 @@ export function buildCodexMcpOverrides(runtime: ForgeaxToolsRuntime): string[] {
   const argv: string[] = [];
   for (const [key, val] of pairs) {
     argv.push('-c', `${key}=${val}`);
+  }
+  // Codex app-server sanitizes the environment it gives to MCP children. The
+  // runtime env contains only FORGEAX_* context (no provider credentials), so
+  // pass that context through the MCP server's explicit env table. This is
+  // what makes dynamically wired host-tool specs discoverable; builtins work
+  // without it and therefore masked the bug in the original parity test.
+  for (const [name, value] of Object.entries(runtime.env)) {
+    if (!name.startsWith('FORGEAX_')) continue;
+    argv.push('-c', `${k}.env.${name}=${tomlString(value)}`);
   }
   return argv;
 }

@@ -76,6 +76,7 @@ async function echoTurn(
     },
     tools: [
       { name: 'echo', description: 'Echo back the given text.', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
+      { name: 'host_probe', description: 'A dynamically wired host-tool probe.', inputSchema: { type: 'object', properties: {} } },
     ],
     budget: { maxTurns: 6 },
     trustTier,
@@ -182,7 +183,7 @@ async function assertMcpRegistered(): Promise<{ ok: boolean; detail: string }> {
           // Some Codex builds only report server presence (tools nested elsewhere).
           // Server presence + our overrides having echo is enough for plumbing;
           // if tools are listed, require echo among them.
-          const toolsOk = tools.length === 0 || tools.includes('echo');
+          const toolsOk = tools.length === 0 || (tools.includes('echo') && tools.includes('host_probe'));
           return {
             ok: toolsOk,
             detail: `fxt registered; tools=[${tools.join(',')}] status=${JSON.stringify(fxt).slice(0, 400)}`,

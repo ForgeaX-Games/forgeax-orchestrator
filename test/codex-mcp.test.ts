@@ -74,7 +74,11 @@ describe('codex-mcp — buildCodexMcpOverrides', () => {
     command: '/abs/node',
     args: ['/abs/forgeax-tools-server.mjs'],
     enabledTools: ['ui_act_role_create', 'ui_act_role_list'],
-    env: {},
+    env: {
+      FORGEAX_TOOL_SPECS_FILE: '/tmp/x/tool-specs.json',
+      FORGEAX_SID: 'sid-1',
+      FORGEAX_FXT_EXPOSE: 'ui_act_role_create,ui_act_role_list',
+    },
     dir: '/tmp/x',
     specsFile: '/tmp/x/tool-specs.json',
     cleanup: async () => {},
@@ -92,12 +96,16 @@ describe('codex-mcp — buildCodexMcpOverrides', () => {
     expect(kv).toContain('mcp_servers.fxt.default_tools_approval_mode="approve"');
     expect(kv).toContain('mcp_servers.fxt.startup_timeout_sec=10');
     expect(kv).toContain('mcp_servers.fxt.tool_timeout_sec=100');
+    expect(kv).toContain('mcp_servers.fxt.env.FORGEAX_TOOL_SPECS_FILE="/tmp/x/tool-specs.json"');
+    expect(kv).toContain('mcp_servers.fxt.env.FORGEAX_SID="sid-1"');
+    expect(kv).toContain('mcp_servers.fxt.env.FORGEAX_FXT_EXPOSE="ui_act_role_create,ui_act_role_list"');
   });
 
   test('no secrets in argv (only config keys)', () => {
-    const argv = buildCodexMcpOverrides({ ...runtime, env: { OPENAI_API_KEY: 'sk-secret' } });
+    const argv = buildCodexMcpOverrides({ ...runtime, env: { OPENAI_API_KEY: 'sk-secret', FORGEAX_SID: 'sid-1' } });
     expect(argv.join(' ')).not.toContain('sk-secret');
     expect(argv.join(' ')).not.toContain('OPENAI_API_KEY');
+    expect(argv.join(' ')).toContain('FORGEAX_SID');
   });
 });
 
