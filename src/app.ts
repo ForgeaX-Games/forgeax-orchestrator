@@ -39,6 +39,7 @@ import { createPacksRouter } from './api/packs';
 import { createRuntimeRouter } from './api/runtime';
 import { createObservatoryRouter } from './api/observatory';
 import { createGameAssetsRouter } from '@forgeax/platform-io';
+import { createGameHostRouter } from '@forgeax/platform-io';
 import { createPrefsRouter } from '@forgeax/platform-io';
 import { sessionScope } from './api/lib/session-scope';
 import { bootCliProviders } from './cli-providers';
@@ -118,6 +119,10 @@ export interface ProductContext {
    *  the shell opens roots explicitly. Conditionally required + fail-fast when
    *  asset routers are injected (§3.4). */
   assetPathPolicy?: AssetPathPolicy;
+  /** Optional game-host version-prepare hook (product shell injects platform-specific
+   *  behavior, e.g. wb-game-video syncing its component set into the game dir before
+   *  a version is committed). game-host stays generic; app only passes it through. */
+  gameHostBeforeVersion?: (args: { slug: string; gameDir: string; project: unknown }) => void | Promise<void>;
 }
 
 export interface ForgeaxApp {
@@ -184,6 +189,10 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
 
   app.route('/api/files', createFilesRouter());
   app.route('/api/games', createGameAssetsRouter());
+  // Per-game package persistence + git versioning (game-host). Reuses the
+  // platform-io safe-path whitelist (.forgeax/games/<slug>). The optional
+  // version-prepare hook is injected by the product shell (§ ProductContext).
+  app.route('/api/game-host', createGameHostRouter({ beforeVersion: ctx.gameHostBeforeVersion }));
   app.route('/api/projects', createProjectsRouter());
   app.route('/api/fs', createFsBrowserRouter());
   app.route('/api/workspaces', createWorkspacesRouter({
