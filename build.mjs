@@ -68,6 +68,9 @@ writeFileSync(
     '',
   ].join('\n'),
 );
-writeFileSync('./dist/index.d.ts', 'export {};\n');
+writeFileSync(
+  './dist/index.d.ts',
+  'export declare const HEADLESS_ACTION_GRANDFATHER_IDS: readonly string[];\n',
+);
 
 console.log('[build] @forgeax/orchestrator → dist/ (%d js + %d mjs assets + 2 d.ts)', res.outputs.length, assets);

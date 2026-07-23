@@ -11,7 +11,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, writeFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import type { TurnRequest } from '@forgeax/agent-runtime';
 import {
@@ -374,6 +374,68 @@ describe('forgeax-tools-server — double allowlist (process-level)', () => {
       const names = (list.result.tools as Array<{ name: string }>).map((t) => t.name);
       expect(names).toContain('echo');
       expect(names).toContain('list_games');
+    } finally {
+      srv.close();
+    }
+  });
+
+  test('refreshes wired host-tool specs before list/call in the same MCP server process', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'fxt-refresh-'));
+    const specsFile = join(dir, 'specs.json');
+    writeFileSync(
+      specsFile,
+      JSON.stringify([{ name: 'old_host_tool', description: 'old', inputSchema: { type: 'object', properties: {} } }]),
+    );
+    const srv = spawnServer({ FORGEAX_TOOL_SPECS_FILE: specsFile });
+    try {
+      await srv.rpc('initialize', { protocolVersion: '2024-11-05' });
+      const before = await srv.rpc('tools/list');
+      const beforeNames = (before.result.tools as Array<{ name: string }>).map((t) => t.name);
+      expect(beforeNames).toContain('old_host_tool');
+      expect(beforeNames).not.toContain('late_host_tool');
+
+      writeFileSync(
+        specsFile,
+        JSON.stringify([{ name: 'late_host_tool', description: 'late', inputSchema: { type: 'object', properties: {} } }]),
+      );
+
+      const after = await srv.rpc('tools/list');
+      const afterNames = (after.result.tools as Array<{ name: string }>).map((t) => t.name);
+      expect(afterNames).toContain('late_host_tool');
+      expect(afterNames).not.toContain('old_host_tool');
+
+      const call = await srv.rpc('tools/call', { name: 'late_host_tool', arguments: {} });
+      expect(call.result.isError).toBe(true);
+      expect(call.result.structuredContent?.code).not.toBe('not_found');
+      expect(call.result.content?.[0]?.text).toContain('bridge unavailable');
+    } finally {
+      srv.close();
+    }
+  });
+
+  test('not_found carries active tools and a corrective hint for the model', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'fxt-hint-'));
+    const specsFile = join(dir, 'specs.json');
+    writeFileSync(
+      specsFile,
+      JSON.stringify([{ name: 'my_host_tool', description: 'x', inputSchema: { type: 'object', properties: {} } }]),
+    );
+    const srv = spawnServer({ FORGEAX_TOOL_SPECS_FILE: specsFile });
+    try {
+      await srv.rpc('initialize', { protocolVersion: '2024-11-05' });
+      const nf = await srv.rpc('tools/call', { name: 'totally_unknown', arguments: {} });
+      expect(nf.result.isError).toBe(true);
+      expect(nf.result.structuredContent?.code).toBe('not_found');
+      expect(nf.result.structuredContent?.activeTools).toContain('echo');
+      expect(nf.result.structuredContent?.activeTools).toContain('my_host_tool');
+      expect(nf.result.structuredContent?.hint).toContain('Active tools this turn');
+      expect(nf.result.content?.[0]?.text).toContain('stop retrying this name');
     } finally {
       srv.close();
     }

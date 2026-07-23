@@ -7,7 +7,8 @@
  * codex 自管凭据(~/.codex/auth.json,被复制进隔离 CODEX_HOME)或 OPENAI_API_KEY。
  * 非 .test.ts(真 CLI + 真模型)。手动跑:
  *   FORGEAX_KERNEL_IMPL=codex bun packages/orchestrator/test/codex-tools-e2e.ts
- * 退出码 = 失败数。设 CODEX_TOOLS_E2E_APPSERVER=1 额外跑 app-server(own)路径。
+ * 默认同时跑 exec(imported)与 app-server(own)。普通模式允许环境性 SKIP;
+ * golden 模式设 CODEX_TOOLS_E2E_REQUIRE_LIVE=1,任何模型侧 SKIP 都作为失败。
  */
 import { mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,15 +33,19 @@ const { ensureCodexSessionHome, codexHomeKey } = await import('../src/kernel/cod
 const { resolveBinary } = await import('../src/cli-providers/shared/resolve-binary');
 const { randomUUID } = await import('node:crypto');
 import type { KernelEvent, TurnRequest } from '@forgeax/agent-runtime';
+import type { CodexTurnTransport } from '../src/kernel/codex-kernel';
 
 type Status = 'PASS' | 'FAIL' | 'SKIP';
 const results: Array<{ name: string; status: Status; detail: string }> = [];
 const record = (name: string, status: Status, detail = '') => results.push({ name, status, detail });
+const requireLiveModel = process.env.CODEX_TOOLS_E2E_REQUIRE_LIVE === '1';
 
 async function safe(name: string, fn: () => Promise<{ ok: boolean; skip?: string; detail?: string }>): Promise<void> {
   try {
     const { ok, skip, detail } = await fn();
-    if (skip) record(name, 'SKIP', skip);
+    if (skip) {
+      record(name, requireLiveModel ? 'FAIL' : 'SKIP', skip);
+    }
     else record(name, ok ? 'PASS' : 'FAIL', ok ? 'PASS' : detail ?? '');
   } catch (e) {
     record(name, 'FAIL', e instanceof Error ? `${e.message}\n${e.stack}` : String(e));
@@ -54,7 +59,9 @@ function reachedModel(events: KernelEvent[]): boolean {
 }
 
 /** Run one echo tool turn against a fresh CodexKernel; collect KernelEvents. */
-async function echoTurn(trustTier: 'own' | 'imported'): Promise<{ events: KernelEvent[]; token: string }> {
+async function echoTurn(
+  trustTier: 'own' | 'imported',
+): Promise<{ events: KernelEvent[]; token: string; transports: CodexTurnTransport[] }> {
   const token = `CDXTOK-${randomUUID().slice(0, 8)}`;
   const req: TurnRequest = {
     session: { threadId: randomUUID(), agentId: 'forge' },
@@ -74,8 +81,12 @@ async function echoTurn(trustTier: 'own' | 'imported'): Promise<{ events: Kernel
     trustTier,
   };
   const events: KernelEvent[] = [];
-  for await (const ev of new CodexKernel().runTurn(req, new AbortController().signal)) events.push(ev);
-  return { events, token };
+  const transports: CodexTurnTransport[] = [];
+  const kernel = new CodexKernel({
+    onTransportSelected: (transport) => transports.push(transport),
+  });
+  for await (const ev of kernel.runTurn(req, new AbortController().signal)) events.push(ev);
+  return { events, token, transports };
 }
 
 /** Environmental block: the shared LLM proxy rejected the call (budget/quota/auth)
@@ -124,6 +135,7 @@ async function assertMcpRegistered(): Promise<{ ok: boolean; detail: string }> {
     tools: [
       { name: 'echo', description: 'Echo back the given text.', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
     ],
+    budget: { maxTurns: 1 },
     trustTier: 'own',
   };
   const runtime = await materializeForgeaxToolsRuntime(req, { runtimeId: `plumbing-${Date.now()}` });
@@ -202,7 +214,9 @@ async function main(): Promise<void> {
 
   // Primary (deterministic): force the EXEC path via trustTier='imported'.
   await safe('exec path · echo delivered → invoked → executed (fxt MCP round-trip)', async () => {
-    const { events, token } = await echoTurn('imported');
+    const { events, token, transports } = await echoTurn('imported');
+    if (transports.length !== 1 || transports[0] !== 'exec')
+      return { ok: false, detail: `imported turn selected unexpected transports: ${transports.join(',') || 'none'}` };
     const verdict = assertEcho(events, token);
     if (verdict.ok) return verdict;
     const envBlock = envBlockReason(events);
@@ -212,19 +226,18 @@ async function main(): Promise<void> {
     return verdict;
   });
 
-  // Secondary (opt-in): app-server (own) path. Set CODEX_TOOLS_E2E_APPSERVER=1.
-  if (process.env.CODEX_TOOLS_E2E_APPSERVER === '1') {
-    await safe('app-server path · echo delivered → invoked → executed (fxt MCP round-trip)', async () => {
-      const { events, token } = await echoTurn('own');
-      const verdict = assertEcho(events, token);
-      if (verdict.ok) return verdict;
-      const envBlock = envBlockReason(events);
-      if (envBlock) {
-        return { ok: false, skip: `LLM proxy blocked the model call (env, not code): ${envBlock} · plumbing-reached-codex=${reachedModel(events)}` };
-      }
-      return verdict;
-    });
-  }
+  await safe('app-server path · echo delivered → invoked → executed (fxt MCP round-trip)', async () => {
+    const { events, token, transports } = await echoTurn('own');
+    if (transports.length !== 1 || transports[0] !== 'app-server')
+      return { ok: false, detail: `own turn selected unexpected transports: ${transports.join(',') || 'none'}` };
+    const verdict = assertEcho(events, token);
+    if (verdict.ok) return verdict;
+    const envBlock = envBlockReason(events);
+    if (envBlock) {
+      return { ok: false, skip: `LLM proxy blocked the model call (env, not code): ${envBlock} · plumbing-reached-codex=${reachedModel(events)}` };
+    }
+    return verdict;
+  });
 }
 
 main()
@@ -240,7 +253,7 @@ main()
     console.log('=======================================');
     const passed = results.length - fails - skips;
     console.log(`${passed} passed · ${skips} skipped (env) · ${fails} failed  (of ${results.length})`);
-    // Exit code = hard failures only; env-blocked (SKIP) turns don't fail the suite.
+    // Golden mode turns environment blocks into FAIL inside safe().
     process.exit(fails);
   })
   .catch((e) => {

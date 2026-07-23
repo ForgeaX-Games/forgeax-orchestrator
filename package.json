@@ -24,6 +24,8 @@
     "pack:tgz": "npm pack",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:codex-tools-e2e": "bun test/codex-tools-e2e.ts",
+    "test:codex-tools-golden": "CODEX_TOOLS_E2E_REQUIRE_LIVE=1 bun test/codex-tools-e2e.ts",
     "lint:boundaries": "depcruise --config .dependency-cruiser.cjs src",
     "check:business-agnostic": "bun scripts/check-business-agnostic.mjs"
   },

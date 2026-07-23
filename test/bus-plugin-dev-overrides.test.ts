@@ -10,6 +10,7 @@ describe('bus plugin dev port overrides', () => {
           version: '0.1.0',
           kind: 'workbench',
           displayName: { zh: 'scene' },
+          source: { layer: 'L0', relativeManifestPath: 'wb-scene-generator/forgeax-extension.json' },
           entry: { standalone: { start: 'pnpm dev', port: 9555, readyProbe: '/', embeddedAlso: false } },
         },
         {
@@ -17,6 +18,7 @@ describe('bus plugin dev port overrides', () => {
           version: '0.1.0',
           kind: 'workbench',
           displayName: { zh: 'lowpoly' },
+          source: { layer: 'L0', relativeManifestPath: 'wb-3d-lowpoly/forgeax-extension.json' },
           entry: { standalone: { start: 'pnpm dev', port: 9565, readyProbe: '/', embeddedAlso: false } },
         },
       ],

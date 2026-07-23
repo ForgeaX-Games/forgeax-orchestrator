@@ -371,11 +371,32 @@ if (EXPOSE_SET) {
 // Bridged (host-tool) specs, deduped against builtins: a name implemented as a
 // builtin is served locally, never host-bridged. Keyed by name for O(1) call-side
 // existence checks (prevents bridging ARBITRARY unknown tool names — §5.2 rule 5).
-const BRIDGED_BY_NAME = new Map();
-for (const t of BRIDGED) {
-  if (t && typeof t.name === 'string' && !BUILTIN_NAMES.has(t.name)) {
-    BRIDGED_BY_NAME.set(t.name, t);
+function buildBridgedByName(specs) {
+  const byName = new Map();
+  for (const t of specs) {
+    if (t && typeof t.name === 'string' && !BUILTIN_NAMES.has(t.name)) {
+      byName.set(t.name, t);
+    }
   }
+  return byName;
+}
+let BRIDGED_BY_NAME = buildBridgedByName(BRIDGED);
+
+// The kernel can rewrite FORGEAX_TOOL_SPECS_FILE as the turn's wired tools
+// evolve (e.g. deferred tools loaded by tool_search). Do not keep a stale
+// process-start snapshot: refresh before list/call, then fail closed if the name
+// is still absent.
+function refreshBridgedByName() {
+  BRIDGED_BY_NAME = buildBridgedByName(loadBridgedSpecs());
+  return BRIDGED_BY_NAME;
+}
+
+function activeToolNames(bridgedByName = BRIDGED_BY_NAME) {
+  const names = new Set(Object.keys(TOOLS));
+  for (const t of bridgedByName.values()) {
+    if (isExposed(t.name)) names.add(t.name);
+  }
+  return [...names].sort();
 }
 
 let buf = '';
@@ -396,14 +417,18 @@ function send(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
  *  a clean "tool not found" instead of the call silently succeeding or hanging.
  *  Carries a machine-readable `structuredContent.code:'not_found'` for callers
  *  that parse it, plus a `not_found:` text prefix for humans/tests. */
-function sendNotFound(id, name, why) {
+function sendNotFound(id, name, why, bridgedByName = BRIDGED_BY_NAME) {
+  const activeTools = activeToolNames(bridgedByName);
+  const hint = activeTools.length > 0
+    ? `Active tools this turn: ${activeTools.join(', ')}. If the tool you need is listed, call it directly; otherwise stop retrying this name and choose an available tool.`
+    : 'No active tools are exposed this turn; stop retrying this name.';
   send({
     jsonrpc: '2.0',
     id,
     result: {
       isError: true,
-      content: [{ type: 'text', text: `not_found: tool "${name ?? ''}" ${why}` }],
-      structuredContent: { code: 'not_found', tool: name ?? null },
+      content: [{ type: 'text', text: `not_found: tool "${name ?? ''}" ${why}. ${hint}` }],
+      structuredContent: { code: 'not_found', tool: name ?? null, activeTools, hint },
     },
   });
 }
@@ -419,10 +444,11 @@ function handle(msg) {
   } else if (method === 'notifications/initialized') {
     /* no response */
   } else if (method === 'tools/list') {
+    const bridgedByName = refreshBridgedByName();
     // 下发面 allowlist:内置工具(已按 EXPOSE 裁过)+ 桥接工具(去内置重名 + EXPOSE 过滤)。
     const builtin = Object.values(TOOLS).map((t) => t.spec);
     const bridged = [];
-    for (const t of BRIDGED_BY_NAME.values()) {
+    for (const t of bridgedByName.values()) {
       if (!isExposed(t.name)) continue;
       bridged.push({
         name: t.name,
@@ -435,9 +461,10 @@ function handle(msg) {
     const name = params?.name;
     const args = params?.arguments ?? {};
     dbg(`call ${name} ${JSON.stringify(args)}`);
+    const bridgedByName = refreshBridgedByName();
     // 执行面 allowlist(纵深第二道):未曝光 / 未知 / 未声明的工具一律结构化 not_found,
     // **绝不**把任意 tool name 直接桥到宿主(§5.2 rule 5)。
-    if (!isExposed(name)) return sendNotFound(id, name, 'not exposed this turn');
+    if (!isExposed(name)) return sendNotFound(id, name, 'not exposed this turn', bridgedByName);
     const tool = TOOLS[name];
     if (tool) {
       // 内置工具:本地执行(支持 sync 或 async run —— query_world/capture_frame 走 HTTP 取数)。
@@ -457,7 +484,7 @@ function handle(msg) {
       return;
     }
     // host-tool:必须在本轮 specs 里声明过(BRIDGED_BY_NAME)才桥回宿主执行(异步;fail-closed)。
-    if (!BRIDGED_BY_NAME.has(name)) return sendNotFound(id, name, 'unknown tool');
+    if (!bridgedByName.has(name)) return sendNotFound(id, name, 'unknown tool', bridgedByName);
     bridgeCall(name, args).then((r) => {
       send({ jsonrpc: '2.0', id, result: { ...(r.isError ? { isError: true } : {}), content: [{ type: 'text', text: r.text }] } });
     });

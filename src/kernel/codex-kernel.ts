@@ -75,7 +75,15 @@ function* codexMcpFailure(message: string): Generator<KernelEvent> {
   yield { kind: 'turn.done', reason: 'error' };
 }
 
+export type CodexTurnTransport = 'app-server' | 'exec';
+
+export interface CodexKernelOptions {
+  readonly onTransportSelected?: (transport: CodexTurnTransport) => void;
+}
+
 export class CodexKernel implements AgentKernel {
+  constructor(private readonly options: CodexKernelOptions = {}) {}
+
   readonly id = 'codex';
   readonly displayName = CODEX_DRIVER_LABEL;
   readonly orchestrationProfile = RENTED_KERNEL_PROFILE;
@@ -355,6 +363,7 @@ export class CodexKernel implements AgentKernel {
       if (req.callId) CodexKernel.inflight.delete(req.callId);
       throw new AppServerUnavailable((e as Error).message);
     }
+    this.options.onTransportSelected?.('app-server');
 
     try {
       const tid = req.session.threadId?.trim();
@@ -419,6 +428,7 @@ export class CodexKernel implements AgentKernel {
 
   /** FALLBACK:legacy 一次性 `codex exec --json`(无审批,走 sandbox)。 */
   private async *runTurnExec(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {
+    this.options.onTransportSelected?.('exec');
     // 内部 AbortController:外部 signal 或 openHandle(callId).cancel 任一触发都中断。
     const ac = new AbortController();
     if (signal.aborted) ac.abort();
@@ -590,4 +600,3 @@ export class CodexKernel implements AgentKernel {
     }
   }
 }
-

@@ -1,14 +1,40 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
+  _resetActionCatalogValidationForTests,
   buildActionCatalog,
   catalogAll,
   catalogFirstClass,
   catalogGet,
+  HEADLESS_ACTION_GRANDFATHER_IDS,
+  type ActionCatalogBuildOptions,
   type ActionCatalogEntry,
 } from '../src/kernel/action-catalog';
 
+const CURRENT_HEADLESS_HANDLER_IDS = Object.freeze([
+  'sessions.list',
+  'session.create',
+  'session.close',
+  'role.create',
+  'role.list',
+]);
+
+function registryOptions(
+  overrides: Partial<ActionCatalogBuildOptions> = {},
+): ActionCatalogBuildOptions {
+  return {
+    headlessHandlerActionIds: CURRENT_HEADLESS_HANDLER_IDS,
+    grandfatheredHeadlessActionIds: HEADLESS_ACTION_GRANDFATHER_IDS,
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
+  _resetActionCatalogValidationForTests();
   buildActionCatalog();
+});
+
+afterEach(() => {
+  _resetActionCatalogValidationForTests();
 });
 
 describe('ActionCatalog', () => {
@@ -37,6 +63,91 @@ describe('ActionCatalog', () => {
     expect(catalogFirstClass()).toHaveLength(14);
     expect(JSON.parse(JSON.stringify(catalog))).toEqual(catalog);
     expect(catalog.every((entry) => !('run' in entry) && !('available' in entry))).toBe(true);
+  });
+
+  test('accepts the complete headless registry and the frozen four-item grandfather', () => {
+    expect(HEADLESS_ACTION_GRANDFATHER_IDS).toEqual([
+      'game.create',
+      'game.switch',
+      'session.rename',
+      'sessions.refresh',
+    ]);
+    expect(Object.isFrozen(HEADLESS_ACTION_GRANDFATHER_IDS)).toBe(true);
+
+    const catalog = buildActionCatalog(undefined, registryOptions());
+    expect(catalog.filter((entry) => entry.surface === 'both' || entry.surface === 'server')).toHaveLength(9);
+  });
+
+  test('revalidates later bare rebuilds with the last successful registry options', () => {
+    buildActionCatalog(undefined, registryOptions());
+    const before = catalogAll();
+
+    expect(() =>
+      buildActionCatalog([
+        ...before,
+        {
+          id: 'later.headless.action',
+          title: 'Later headless action',
+          capability: 'read',
+          surface: 'both',
+        },
+      ]),
+    ).toThrow('missing headless handler for action "later.headless.action"');
+    expect(catalogAll()).toBe(before);
+  });
+
+  test('rejects a missing headless handler without replacing the catalog', () => {
+    const before = catalogAll();
+    expect(() =>
+      buildActionCatalog(undefined, registryOptions({
+        headlessHandlerActionIds: CURRENT_HEADLESS_HANDLER_IDS.filter((id) => id !== 'role.list'),
+      })),
+    ).toThrow('missing headless handler for action "role.list"');
+    expect(catalogAll()).toBe(before);
+  });
+
+  test('rejects duplicate headless handlers', () => {
+    expect(() =>
+      buildActionCatalog(undefined, registryOptions({
+        headlessHandlerActionIds: [...CURRENT_HEADLESS_HANDLER_IDS, 'role.list'],
+      })),
+    ).toThrow('duplicate headless handler action "role.list"');
+  });
+
+  test('rejects orphan and non-headless handlers', () => {
+    expect(() =>
+      buildActionCatalog(undefined, registryOptions({
+        headlessHandlerActionIds: [...CURRENT_HEADLESS_HANDLER_IDS, 'outside.catalog'],
+      })),
+    ).toThrow('orphan headless handler "outside.catalog" is not declared');
+
+    expect(() =>
+      buildActionCatalog(undefined, registryOptions({
+        headlessHandlerActionIds: [...CURRENT_HEADLESS_HANDLER_IDS, 'role.open'],
+      })),
+    ).toThrow('orphan headless handler "role.open" targets non-headless surface "ui"');
+  });
+
+  test('forces a stale grandfather entry to be removed when a handler lands', () => {
+    expect(() =>
+      buildActionCatalog(undefined, registryOptions({
+        headlessHandlerActionIds: [...CURRENT_HEADLESS_HANDLER_IDS, 'game.create'],
+      })),
+    ).toThrow('headless grandfather "game.create" has a handler and must be removed');
+  });
+
+  test('rejects unknown and non-headless grandfather entries', () => {
+    expect(() =>
+      buildActionCatalog(undefined, registryOptions({
+        grandfatheredHeadlessActionIds: [...HEADLESS_ACTION_GRANDFATHER_IDS, 'outside.catalog'],
+      })),
+    ).toThrow('headless grandfather "outside.catalog" is not declared');
+
+    expect(() =>
+      buildActionCatalog(undefined, registryOptions({
+        grandfatheredHeadlessActionIds: [...HEADLESS_ACTION_GRANDFATHER_IDS, 'role.open'],
+      })),
+    ).toThrow('headless grandfather "role.open" targets non-headless surface "ui"');
   });
 
   test('rejects a duplicate id without publishing a partial catalog', () => {

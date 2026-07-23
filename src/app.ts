@@ -53,7 +53,11 @@ import {
 } from './orchestration-seams';
 import { ensureUserDirDefaults } from './defaults/scaffold';
 import { initSessionManager } from './core/session-manager';
-import { buildActionCatalog } from './kernel/action-catalog';
+import {
+  buildActionCatalog,
+  HEADLESS_ACTION_GRANDFATHER_IDS,
+} from './kernel/action-catalog';
+import { listBuiltinHeadlessUiActionIds } from './kernel/ui-headless-actions';
 import './llm/register-all';
 
 /** Product-specific context injected by the shell into the orchestration layer. */
@@ -133,6 +137,14 @@ export interface ForgeaxApp {
 export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp> {
   const { projectRoot } = ctx;
 
+  buildActionCatalog(undefined, {
+    headlessHandlerActionIds: [
+      ...listBuiltinHeadlessUiActionIds(),
+      ...(ctx.hostUiActions ?? []).map((handler) => handler.actionId),
+    ],
+    grandfatheredHeadlessActionIds: HEADLESS_ACTION_GRANDFATHER_IDS,
+  });
+
   try {
     loadBrand();
   } catch {
@@ -161,7 +173,6 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   // (registry 不直接 import event-bridge —— 断开 plugins→event-bridge→runner→plugins 环)
   onExtensionsReloaded(syncEventTriggerBindings);
   await reloadExtensions();
-  buildActionCatalog();
   await bootCliProviders();
 
   const app = new Hono();

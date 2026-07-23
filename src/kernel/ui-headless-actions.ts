@@ -99,6 +99,11 @@ const BUILTIN: HostUiActionHandler[] = [
   },
 ];
 
+/** 全量列出 cli 内置 headless action ids,供启动时与 ActionCatalog 交叉校验。 */
+export function listBuiltinHeadlessUiActionIds(): readonly string[] {
+  return BUILTIN.map((handler) => handler.actionId);
+}
+
 /** 按 actionId 取 cli 内置 headless handler(seam 未命中时的兜底)。 */
 export function getBuiltinHeadlessUiAction(actionId: string): HostUiActionHandler | undefined {
   return BUILTIN.find((h) => h.actionId === actionId);

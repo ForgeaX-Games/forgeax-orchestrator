@@ -8,7 +8,9 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { scanAllLayers } from './scanner';
+import type { ExtensionLayer } from './scanner';
 import { mergeManifests } from './merger';
+import type { MergedManifest } from './merger';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { computeAgentNaming, pickPersonName } from '../api/lib/agent-naming';
 
@@ -143,6 +145,11 @@ export interface ExtensionInfo {
   };
   /** 统一命名（kind=agent 才有）：title=「中文职能·英文名」，sub=灰字英文职能。 */
   naming?: { title: string; sub: string };
+  /** Browser-safe origin descriptor. `relativeManifestPath` is the manifest
+   *  path relative to the layer root (`<slug>/forgeax-extension.json`) — never
+   *  the absolute `originPath`, which would leak the host's home directory to
+   *  the shell strip. The UI rebuilds a filesystem path from `layer` + this. */
+  source: { layer: ExtensionLayer; relativeManifestPath: string };
   entry?: {
     frontend?: string;
     standalone?: {
@@ -209,13 +216,22 @@ export function applyExtensionDevPortOverridesForTest(
   return applyExtensionDevPortOverrides(items, overrides);
 }
 
-export async function loadExtensionList(): Promise<ExtensionInfo[]> {
-  const scan = await scanAllLayers();
-  const merged = mergeManifests(scan.found);
-  const items: ExtensionInfo[] = [];
-  for (const mergedManifest of merged.manifests) {
-    const m = mergedManifest.manifest as ExtensionManifest;
-    if (!m.id || !m.version || !m.kind || !m.displayName) continue;
+/** Derive the layer-relative manifest path from an absolute originPath.
+ *  Layer roots always end at `<layer-root>/<slug>/forgeax-extension.json`, so
+ *  the last two path segments are the browser-safe descriptor. Splitting on
+ *  both separators keeps this correct for Windows origin paths too. */
+function relativeManifestPathFrom(originPath: string): string {
+  const parts = originPath.split(/[\\/]/).filter(Boolean);
+  return parts.slice(-2).join('/');
+}
+
+/** Map one merged manifest to its slim, browser-facing ExtensionInfo. Returns
+ *  null for manifests missing required identity fields (caller skips them).
+ *  Every returned item carries a `source` descriptor built from the layer +
+ *  layer-relative manifest path — never the absolute originPath. */
+export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionInfo | null {
+  const m = mergedManifest.manifest as ExtensionManifest;
+  if (!m.id || !m.version || !m.kind || !m.displayName) return null;
       const slim: ExtensionInfo = {
         id: m.id,
         version: m.version,
@@ -224,6 +240,10 @@ export async function loadExtensionList(): Promise<ExtensionInfo[]> {
         description: m.description,
         icon: m.icon,
         experimental: m.experimental,
+        source: {
+          layer: mergedManifest.layer,
+          relativeManifestPath: relativeManifestPathFrom(mergedManifest.originPath),
+        },
       };
       if (m.provides?.workbench) {
         slim.workbench = {
@@ -326,7 +346,20 @@ export async function loadExtensionList(): Promise<ExtensionInfo[]> {
           };
         }
       }
-      items.push(slim);
+      return slim;
+}
+
+/** Test hook — exercise the single-manifest projection (incl. `source`)
+ *  without spinning up a disk scan. */
+export const projectExtensionInfoForTest = projectExtensionInfo;
+
+export async function loadExtensionList(): Promise<ExtensionInfo[]> {
+  const scan = await scanAllLayers();
+  const merged = mergeManifests(scan.found);
+  const items: ExtensionInfo[] = [];
+  for (const mergedManifest of merged.manifests) {
+    const slim = projectExtensionInfo(mergedManifest);
+    if (slim) items.push(slim);
   }
 
   applyExtensionDevPortOverrides(items, loadExtensionDevPortOverrides());

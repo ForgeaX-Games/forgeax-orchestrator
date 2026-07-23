@@ -37,6 +37,18 @@ export interface ActionCatalogEntry {
   readonly firstClass?: boolean;
 }
 
+export const HEADLESS_ACTION_GRANDFATHER_IDS = Object.freeze([
+  'game.create',
+  'game.switch',
+  'session.rename',
+  'sessions.refresh',
+] as const);
+
+export interface ActionCatalogBuildOptions {
+  readonly headlessHandlerActionIds: readonly string[];
+  readonly grandfatheredHeadlessActionIds: readonly string[];
+}
+
 /**
  * M1 migration bundle, transcribed from interface's 23 builtin actions and
  * two trajectory actions. Client-only run/available/choices functions stay out.
@@ -344,6 +356,7 @@ let currentCatalog: ActionCatalogSnapshot = Object.freeze({
   firstClass: EMPTY_ENTRIES,
   byId: new Map<string, ActionCatalogEntry>(),
 });
+let activeHeadlessRegistryOptions: Readonly<ActionCatalogBuildOptions> | undefined;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -465,12 +478,94 @@ function compileEntry(raw: unknown, declarationIndex: number): ActionCatalogEntr
   });
 }
 
+function isHeadlessSurface(entry: ActionCatalogEntry): boolean {
+  return entry.surface === 'server' || entry.surface === 'both';
+}
+
+function validateRegistryIds(
+  ids: readonly string[],
+  label: 'handler' | 'grandfather',
+  issues: string[],
+): Set<string> {
+  if (!Array.isArray(ids)) {
+    issues.push(`${label} action ids must be an array`);
+    return new Set();
+  }
+
+  const unique = new Set<string>();
+  for (const [index, id] of ids.entries()) {
+    if (typeof id !== 'string' || !id.trim() || id !== id.trim()) {
+      issues.push(`${label} action id at index ${index} is invalid`);
+      continue;
+    }
+    if (unique.has(id)) {
+      issues.push(`duplicate headless ${label} action ${JSON.stringify(id)}`);
+      continue;
+    }
+    unique.add(id);
+  }
+  return unique;
+}
+
+function validateHeadlessRegistry(
+  entries: readonly ActionCatalogEntry[],
+  byId: ReadonlyMap<string, ActionCatalogEntry>,
+  options: ActionCatalogBuildOptions,
+): void {
+  const issues: string[] = [];
+  const handlerIds = validateRegistryIds(options.headlessHandlerActionIds, 'handler', issues);
+  const grandfatherIds = validateRegistryIds(
+    options.grandfatheredHeadlessActionIds,
+    'grandfather',
+    issues,
+  );
+
+  for (const id of handlerIds) {
+    const entry = byId.get(id);
+    if (!entry) {
+      issues.push(`orphan headless handler ${JSON.stringify(id)} is not declared`);
+    } else if (!isHeadlessSurface(entry)) {
+      issues.push(
+        `orphan headless handler ${JSON.stringify(id)} targets non-headless surface ${JSON.stringify(entry.surface ?? 'ui')}`,
+      );
+    }
+  }
+
+  for (const id of grandfatherIds) {
+    const entry = byId.get(id);
+    if (!entry) {
+      issues.push(`headless grandfather ${JSON.stringify(id)} is not declared`);
+    } else if (!isHeadlessSurface(entry)) {
+      issues.push(
+        `headless grandfather ${JSON.stringify(id)} targets non-headless surface ${JSON.stringify(entry.surface ?? 'ui')}`,
+      );
+    } else if (handlerIds.has(id)) {
+      issues.push(`headless grandfather ${JSON.stringify(id)} has a handler and must be removed`);
+    }
+  }
+
+  for (const entry of entries) {
+    if (
+      isHeadlessSurface(entry) &&
+      !handlerIds.has(entry.id) &&
+      !grandfatherIds.has(entry.id)
+    ) {
+      issues.push(`missing headless handler for action ${JSON.stringify(entry.id)}`);
+    }
+  }
+
+  if (issues.length > 0) {
+    throw new Error(`ActionCatalog: headless registry mismatch:\n- ${issues.join('\n- ')}`);
+  }
+}
+
 /**
  * Validate and publish a complete catalog in one swap. Failed builds leave the
  * previously published snapshot untouched.
  */
 export function buildActionCatalog(
   declarations: readonly unknown[] = ACTION_CATALOG_DECLARATIONS,
+  options?: ActionCatalogBuildOptions,
 ): readonly ActionCatalogEntry[] {
   if (!Array.isArray(declarations)) {
     throw new Error('ActionCatalog: declarations must be an array');
@@ -487,11 +582,26 @@ export function buildActionCatalog(
     entries.push(entry);
   }
 
+  const validationOptions = options ?? activeHeadlessRegistryOptions;
+  if (validationOptions) validateHeadlessRegistry(entries, byId, validationOptions);
+
   const all = Object.freeze(entries);
   const firstClass = Object.freeze(entries.filter((entry) => entry.firstClass === true));
   const next = Object.freeze({ all, firstClass, byId });
   currentCatalog = next;
+  if (options) {
+    activeHeadlessRegistryOptions = Object.freeze({
+      headlessHandlerActionIds: Object.freeze([...options.headlessHandlerActionIds]),
+      grandfatheredHeadlessActionIds: Object.freeze([
+        ...options.grandfatheredHeadlessActionIds,
+      ]),
+    });
+  }
   return next.all;
+}
+
+export function _resetActionCatalogValidationForTests(): void {
+  activeHeadlessRegistryOptions = undefined;
 }
 
 export function catalogGet(id: string): ActionCatalogEntry | undefined {

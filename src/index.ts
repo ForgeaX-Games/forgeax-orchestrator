@@ -10,6 +10,7 @@
 // 装配全部 /api/* 路由 + boot;(b) 子路径导出仍开放给需要单独拿某个 router/helper 的场景。
 
 export * from './app';
+export { HEADLESS_ACTION_GRANDFATHER_IDS } from './kernel/action-catalog';
 
 // Boot / lifecycle helpers used by product shells.
 export { initPathManager } from './fs/path-manager';

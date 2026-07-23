@@ -21,7 +21,10 @@ import { checkKernelTool, classifyTool } from '../src/kernel/trust-gate';
 import { registerPerception, resolvePerception } from '../src/api/lib/perception-registry';
 import { runForgeaxBuiltinTool } from '../src/kernel/forgeax-builtin-tools';
 import { makeInProcessExecuteTool } from '../src/kernel/host-tool-bridge';
-import { buildActionCatalog } from '../src/kernel/action-catalog';
+import {
+  _resetActionCatalogValidationForTests,
+  buildActionCatalog,
+} from '../src/kernel/action-catalog';
 import { createSessionsRouter } from '../src/api/sessions';
 import { initOrchestrationSeams, resetOrchestrationSeams, getHostTool, getHostTools } from '../src/orchestration-seams';
 import uiBridgeContract from '../src/kernel/ui-bridge-contract.json';
@@ -43,9 +46,11 @@ function replyingBus(reply: unknown, lease: string, onPublish?: () => void) {
 }
 
 beforeEach(() => {
+  _resetActionCatalogValidationForTests();
   buildActionCatalog();
   clearUiStateForSession(SID);
 });
+afterEach(() => _resetActionCatalogValidationForTests());
 
 describe('ui-manifest-registry — lease', () => {
   test('acquire 授予;同 clientId 续期保持 leaseId 稳定', () => {
