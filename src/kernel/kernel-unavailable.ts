@@ -78,6 +78,11 @@ const FIX_HINTS: Record<string, { install?: string; login?: string; docs?: strin
     login: '在终端运行 `codebuddy` 完成登录',
     docs: 'https://www.codebuddy.ai/docs/cli/',
   },
+  'kimi-code': {
+    install: '安装 kimi 命令行工具并确保它在 PATH 中',
+    login: '运行 `kimi login` 完成登录',
+    docs: 'https://www.kimi.com/code/docs/kimi-code-cli/guides/getting-started.html',
+  },
   'forgeax-core': {},
 };
 

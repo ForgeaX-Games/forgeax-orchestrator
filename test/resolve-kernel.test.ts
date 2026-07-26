@@ -34,6 +34,11 @@ describe('resolveKernel — providerOverride 优先于全局 env', () => {
     expect(resolveKernel('forge', 'codebuddy').id).toBe('codebuddy');
   });
 
+  test('显式 kimi-code 命中,即便全局 env=codex', () => {
+    process.env.FORGEAX_KERNEL_IMPL = 'codex';
+    expect(resolveKernel('forge', 'kimi-code').id).toBe('kimi-code');
+  });
+
   test('无显式 → 回落全局 env', () => {
     process.env.FORGEAX_KERNEL_IMPL = 'codex';
     expect(resolveKernel('forge').id).toBe('codex');

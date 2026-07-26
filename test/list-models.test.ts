@@ -35,6 +35,7 @@ let prevCursorModels: string | undefined;
 let prevClaudeCodeModels: string | undefined;
 let prevCodexModels: string | undefined;
 let preva peer agent CLIModels: string | undefined;
+let prevKimiCodeModels: string | undefined;
 let realFetch: typeof fetch;
 
 function ctx() {
@@ -67,12 +68,14 @@ beforeEach(async () => {
   prevClaudeCodeModels = process.env.FORGEAX_CLAUDE_CODE_MODELS;
   prevCodexModels = process.env.FORGEAX_CODEX_MODELS;
   preva peer agent CLIModels = process.env.FORGEAX_CODEBUDDY_MODELS;
+  prevKimiCodeModels = process.env.FORGEAX_KIMI_CODE_MODELS;
   process.env.LITELLM_PROXY_BASE_URL = "https://test-proxy.invalid/v1";
   process.env.LITELLM_PROXY_KEY = "sk-test-1234567890";
   delete process.env.FORGEAX_CURSOR_AGENT_MODELS;
   delete process.env.FORGEAX_CLAUDE_CODE_MODELS;
   delete process.env.FORGEAX_CODEX_MODELS;
   delete process.env.FORGEAX_CODEBUDDY_MODELS;
+  delete process.env.FORGEAX_KIMI_CODE_MODELS;
   realFetch = globalThis.fetch;
   resetPathManager();
   await resetSessionManager();
@@ -95,6 +98,8 @@ afterEach(async () => {
   else process.env.FORGEAX_CODEX_MODELS = prevCodexModels;
   if (preva peer agent CLIModels === undefined) delete process.env.FORGEAX_CODEBUDDY_MODELS;
   else process.env.FORGEAX_CODEBUDDY_MODELS = preva peer agent CLIModels;
+  if (prevKimiCodeModels === undefined) delete process.env.FORGEAX_KIMI_CODE_MODELS;
+  else process.env.FORGEAX_KIMI_CODE_MODELS = prevKimiCodeModels;
   await resetSessionManager();
   resetPathManager();
   rmSync(userRoot, { recursive: true, force: true });
@@ -321,5 +326,17 @@ describe("list_models — disk + LiteLLM merge", () => {
     expect(resp.models.map((m) => m.id)).toEqual(["default-model", "gemini-3.1-pro", "gpt-5.5"]);
     expect(resp.models.every((m) => m.source === "driver")).toBe(true);
     expect(resp.models.every((m) => m.driverId === "codebuddy")).toBe(true);
+  });
+
+  test("kimi-code provider returns driver-scoped Kimi catalog", async () => {
+    process.env.FORGEAX_KIMI_CODE_MODELS = "k3, kimi-for-coding-highspeed";
+
+    const resp = await callListModels(["kimi-code"]);
+
+    expect(resp.live.source).toBe("skipped");
+    expect(resp.driver).toEqual({ id: "kimi-code", source: "env", ids: 2 });
+    expect(resp.models.map((m) => m.id)).toEqual(["k3", "kimi-for-coding-highspeed"]);
+    expect(resp.models.every((m) => m.source === "driver")).toBe(true);
+    expect(resp.models.every((m) => m.driverId === "kimi-code")).toBe(true);
   });
 });

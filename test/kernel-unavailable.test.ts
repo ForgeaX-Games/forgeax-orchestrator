@@ -66,6 +66,9 @@ describe('describeKernelUnavailable — 友好文案带 id + 成因 + 修复指�
   test('每个第三方内核都带官方 setup 文档链接', () => {
     expect(describeKernelUnavailable('claude-code', 'not-installed')).toContain('https://code.claude.com/docs/en/setup');
     expect(describeKernelUnavailable('codebuddy', 'not-logged-in')).toContain('https://www.codebuddy.ai/docs/cli/');
+    const kimi = describeKernelUnavailable('kimi-code', 'not-logged-in');
+    expect(kimi).toContain('kimi login');
+    expect(kimi).toContain('https://www.kimi.com/code/docs/kimi-code-cli/guides/getting-started.html');
   });
   test('unknown-id 带可用清单', () => {
     const m = describeKernelUnavailable('bogus', 'unknown-id', 'claude-code, codex');

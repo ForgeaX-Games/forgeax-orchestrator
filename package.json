@@ -30,6 +30,7 @@
     "check:business-agnostic": "bun scripts/check-business-agnostic.mjs"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^0.23.0",
     "@google/genai": "^1.0.0",
     "chokidar": "^4.0.0",
     "hono": "^4.6.0",

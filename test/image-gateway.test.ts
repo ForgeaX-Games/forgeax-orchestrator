@@ -237,7 +237,9 @@ describe("litellm-images vendor", () => {
     expect(Array.from(r.pngBytes.slice(0, 4))).toEqual([0x89, 0x50, 0x4e, 0x47]);
   });
 
-  test("modelOverride wins over defaultModel", async () => {
+  test("ignores modelOverride — always uses defaultModel (proxy model id)", async () => {
+    // modelOverride carries a semantic gateway id like 'litellm-image', not a
+    // real proxy model id; forwarding it makes the proxy 404.
     let body: Record<string, unknown> | undefined;
     const fetcher = (async (_url: string | URL | Request, init?: RequestInit) => {
       body = JSON.parse(init?.body as string);
@@ -254,7 +256,7 @@ describe("litellm-images vendor", () => {
       fetcher,
     });
     await v.generate({ prompt: "x", modelOverride: "premium-img" });
-    expect((body as Record<string, unknown>).model).toBe("premium-img");
+    expect((body as Record<string, unknown>).model).toBe("default-img");
   });
 
   test("HTTP error → throws with proxy message", async () => {

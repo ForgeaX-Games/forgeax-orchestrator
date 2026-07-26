@@ -17,6 +17,7 @@ import { ClaudeCodeKernel } from './claude-code-kernel';
 import { CodexKernel } from './codex-kernel';
 import { CursorKernel } from './cursor-kernel';
 import { CbcKernel } from './cbc-kernel';
+import { KimiCodeKernel } from './kimi-code-kernel';
 
 function ensureRegistered(): void {
   if (!getKernel('claude-code')) registerKernel(new ClaudeCodeKernel());
@@ -24,6 +25,7 @@ function ensureRegistered(): void {
   if (!getKernel('cursor-agent')) registerKernel(new CursorKernel());
   // codebuddy(cbc):the reference agent CLI 近同源分叉,spawn `codebuddy -p` 子进程,自管登录。
   if (!getKernel('codebuddy')) registerKernel(new CbcKernel());
+  if (!getKernel('kimi-code')) registerKernel(new KimiCodeKernel());
   // 原生内核(forgeax-core 等)不在此构造 —— 由产品壳注入进共享 registry(见上 DIP 说明)。
 }
 
