@@ -63,7 +63,7 @@ writeFileSync(
   './dist/kernel/forgeax-core-kernel.d.ts',
   [
     '// Minimal type shim (loosely typed on purpose — the consumer casts).',
-    'export declare function registerForgeaxCoreKernel(opts: { hostBridge: unknown }): void;',
+    'export declare function registerForgeaxCoreKernel(opts: { hostBridge: unknown; hostTurnSnapshot?: unknown }): void;',
     'export declare function getKernel(name: string): unknown;',
     '',
   ].join('\n'),

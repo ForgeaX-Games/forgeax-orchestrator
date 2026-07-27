@@ -38,6 +38,7 @@ import {
   type KernelModelCatalog,
   type TurnHandle,
   type TurnRequest,
+  type HostTurnSnapshotProvider,
   type ForkExtractRequest,
   type ForkExtractResult,
   getKernel,
@@ -110,6 +111,8 @@ export interface CreateForgeaxCoreKernelOpts {
    *  外部宿主(如 forgeax-studio)注入自己的桥:跑 studio handlers + 业务接缝
    *  (ownership/roster/production),使 studio 的写类/业务工具在 studio 侧执行。 */
   hostBridge?: HostExecuteToolFn;
+  /** Remote runtime live snapshot. Required when TurnRequest.liveHostContext is true. */
+  hostTurnSnapshot?: HostTurnSnapshotProvider;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -146,6 +149,8 @@ function toWire(req: TurnRequest): Record<string, unknown> {
     history: req.history,
     systemPrompt: req.systemPrompt,
     tools: req.tools,
+    toolsRevision: req.toolsRevision,
+    liveHostContext: req.liveHostContext,
     toolPolicy: req.toolPolicy,
     budget: req.budget,
     model: req.model,
@@ -170,6 +175,7 @@ interface TurnSink {
 interface ServeSession {
   sessionId: string;
   conn: RpcConnection;
+  capabilities: Set<string>;
   /** callId → 该轮 sink(供 notify 路由)。 */
   turns: Map<string, TurnSink>;
   inflight: number;
@@ -179,6 +185,11 @@ interface ServeSession {
   /** serve 子进程 stdout/stderr → per-session logger 的退订函数(evict 时调)。 */
   offData?: () => void;
   closing: boolean;
+}
+
+async function readServeCapabilities(conn: RpcConnection): Promise<Set<string>> {
+  const pong = await conn.request('ping') as { capabilities?: unknown };
+  return new Set(Array.isArray(pong?.capabilities) ? pong.capabilities.filter((v): v is string => typeof v === 'string') : []);
 }
 
 /** stable serve sessionId(命名空间避免与 rented 内核(codex 等)的 sessionId 撞)。 */
@@ -202,6 +213,7 @@ class ForgeaxCoreServeKernel implements AgentKernel {
   }
 
   private readonly hostBridge: HostExecuteToolFn;
+  private readonly hostTurnSnapshot?: HostTurnSnapshotProvider;
   /** sessionKey → 复用中的 serve 会话。 */
   private readonly sessions = new Map<string, ServeSession>();
   /** 并发首轮去重:sessionKey → 进行中的 spawn promise。 */
@@ -215,6 +227,7 @@ class ForgeaxCoreServeKernel implements AgentKernel {
 
   constructor(opts: CreateForgeaxCoreKernelOpts = {}) {
     this.hostBridge = opts.hostBridge ?? makeInProcessExecuteTool(opts.defaultAgentPath ?? 'forge');
+    this.hostTurnSnapshot = opts.hostTurnSnapshot;
     this.broadcast = opts.broadcast ?? ((): void => {});
     this.telemetrySink =
       opts.telemetrySink ??
@@ -286,6 +299,17 @@ class ForgeaxCoreServeKernel implements AgentKernel {
       s = await this.acquire(key, req, signal);
     } catch (e) {
       yield { kind: 'error', error: { code: 'protocol', message: `forgeax-core serve spawn: ${(e as Error).message}` } };
+      return;
+    }
+    if (req.liveHostContext && (!this.hostTurnSnapshot || !s.capabilities.has('hostTurnSnapshot.v1'))) {
+      this.evict(key, s, /* reap */ true);
+      yield {
+        kind: 'error',
+        error: {
+          code: 'protocol',
+          message: 'forgeax-core sidecar does not support required live host context (hostTurnSnapshot.v1)',
+        },
+      };
       return;
     }
 
@@ -403,7 +427,16 @@ class ForgeaxCoreServeKernel implements AgentKernel {
     });
 
     const conn = await connectWithRetry(grant.endpoint ?? endpoint, signal);
-    const s: ServeSession = { sessionId, conn, turns: new Map(), inflight: 0, idleTimer: null, closing: false };
+    const capabilities = await readServeCapabilities(conn);
+    const s: ServeSession = {
+      sessionId,
+      conn,
+      capabilities,
+      turns: new Map(),
+      inflight: 0,
+      idleTimer: null,
+      closing: false,
+    };
 
     // 一次性 notify:按 callId 路由事件到对应轮的 sink;telemetry 走旁路(落盘+广播)。
     conn.onNotify((method, params) => {
@@ -419,10 +452,20 @@ class ForgeaxCoreServeKernel implements AgentKernel {
     // 一次性反向 host-tool:p.sid 优先,缺省用当前轮兜底 hostSessionId。
     conn.setRequestHandler(async (method, params) => {
       if (method === 'hostTool') {
-        const p = (params ?? {}) as { name: string; args: unknown; sid?: string; agentId?: string; callId?: string };
+        const p = (params ?? {}) as {
+          name: string;
+          args: unknown;
+          sid?: string;
+          agentId?: string;
+          callId?: string;
+          turnCallId?: string;
+        };
         // p.agentId = facade 透来的本轮真实 agent(委派轮 = mochi 等);桥按它求 trustTier / 弹卡 / 选 context。
         // p.callId = 本轮工具调用 id;透传给宿主桥,供 studio 对齐前端 HITL 卡片的 pending key。
-        return this.hostBridge(p.name, p.args, p.sid ?? s.hostSessionId, p.agentId, p.callId);
+        return this.hostBridge(p.name, p.args, p.sid ?? s.hostSessionId, p.agentId, p.callId, p.turnCallId);
+      }
+      if (method === 'hostTurnSnapshot' && this.hostTurnSnapshot) {
+        return this.hostTurnSnapshot(params as Parameters<HostTurnSnapshotProvider>[0]);
       }
       throw Object.assign(new Error(`unknown method: ${method}`), { code: -32601 });
     });
@@ -525,15 +568,53 @@ class ForgeaxCoreServeKernel implements AgentKernel {
       },
     });
     const conn = await connectWithRetry(grant.endpoint ?? endpoint, signal);
-    this.callSession.set(callId, { sessionId, conn, turns: new Map(), inflight: 1, idleTimer: null, closing: false });
+    const capabilities = await readServeCapabilities(conn);
+    if (req.liveHostContext && (!this.hostTurnSnapshot || !capabilities.has('hostTurnSnapshot.v1'))) {
+      conn.close();
+      await sidecar.shutdownSession(sessionId).catch(() => {});
+      yield {
+        kind: 'error',
+        error: {
+          code: 'protocol',
+          message: 'forgeax-core sidecar does not support required live host context (hostTurnSnapshot.v1)',
+        },
+      };
+      return;
+    }
+    this.callSession.set(callId, {
+      sessionId,
+      conn,
+      capabilities,
+      turns: new Map(),
+      inflight: 1,
+      idleTimer: null,
+      closing: false,
+    });
     // serve 子进程 stdout/stderr → per-session logger(同复用路径;逃生闸亦保留可观测性)。
     const offData = this.attachServeLogRouting(sidecar, sessionId, req.hostSessionId, req.session.agentId || 'forge');
     conn.setRequestHandler(async (method, params) => {
       if (method === 'hostTool') {
-        const p = (params ?? {}) as { name: string; args: unknown; sid?: string; agentId?: string; callId?: string };
+        const p = (params ?? {}) as {
+          name: string;
+          args: unknown;
+          sid?: string;
+          agentId?: string;
+          callId?: string;
+          turnCallId?: string;
+        };
         // p.agentId 优先(facade 透来的本轮真实 agent);缺省回落本轮 req 的 session.agentId。
         // p.callId = 本轮工具调用 id;透传给宿主桥,供 studio 对齐前端 HITL 卡片的 pending key。
-        return this.hostBridge(p.name, p.args, p.sid ?? req.hostSessionId, p.agentId ?? req.session?.agentId, p.callId);
+        return this.hostBridge(
+          p.name,
+          p.args,
+          p.sid ?? req.hostSessionId,
+          p.agentId ?? req.session?.agentId,
+          p.callId,
+          p.turnCallId,
+        );
+      }
+      if (method === 'hostTurnSnapshot' && this.hostTurnSnapshot) {
+        return this.hostTurnSnapshot(params as Parameters<HostTurnSnapshotProvider>[0]);
       }
       throw Object.assign(new Error(`unknown method: ${method}`), { code: -32601 });
     });
