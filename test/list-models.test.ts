@@ -251,6 +251,27 @@ describe("list_models — disk + LiteLLM merge", () => {
     expect(resp.models.every((m) => m.live === false)).toBe(true);
   });
 
+  test("host-only LITELLM_PROXY_BASE_URL still hits /v1/models (not /models)", async () => {
+    // Settings often stores `http://host:3000` without `/v1`. Chat routing
+    // re-appends `/v1` via auto-resolver; the live catalog must do the same
+    // or it probes the SPA root and silently falls back to disk.
+    process.env.LITELLM_PROXY_BASE_URL = "https://test-proxy.invalid";
+    writeDiskCatalog({ "claude-opus-4-8": { contextWindow: 1000000, reasoning: true } });
+
+    mockFetch((url) => {
+      expect(url).toBe("https://test-proxy.invalid/v1/models");
+      return {
+        status: 200,
+        body: { data: [{ id: "claude-opus-4-8" }, { id: "claude-sonnet-4-6" }] },
+      };
+    });
+
+    const resp = await callListModels();
+    expect(resp.live.source).toBe("live");
+    expect(resp.live.ids).toBe(2);
+    expect(resp.models.map((m) => m.id)).toEqual(["claude-opus-4-8", "claude-sonnet-4-6"]);
+  });
+
   test("disk missing → only live entries (still returns live ids)", async () => {
     // no writeDiskCatalog call → file absent
     mockFetch(() => ({

@@ -1,6 +1,6 @@
 {
   "name": "@forgeax/orchestrator",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "private": true,
   "type": "module",
   "description": "ForgeaX reusable orchestration layer: R2 compose/resolve/toWire/checkTool, session/scheduler/tree, soul (digital life), kits, llm, kernel adaptors, ledger, HTTP api routers, ws, builtin kits/personas.",

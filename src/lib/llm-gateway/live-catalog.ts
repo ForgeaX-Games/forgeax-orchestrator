@@ -49,8 +49,17 @@ function cacheKey(baseUrl: string, apiKey: string): string {
   return `${baseUrl}::${apiKey.slice(-6)}`;
 }
 
+/** Strip trailing slash + optional `/v1` so Settings values of either
+ *  `http://host:3000` or `http://host:3000/v1` both resolve to
+ *  `{host}/v1/models`. Mirrors `auto-resolver.ts:normalizeProxyBase` —
+ *  without this, a host-only BASE_URL hits `/models` (often an HTML SPA
+ *  200) and the catalog silently falls back to disk models.json. */
+function normalizeProxyBase(raw: string): string {
+  return raw.replace(/\/+$/, '').replace(/\/v1$/, '');
+}
+
 export async function fetchLiveCatalog(opts: FetchLiveCatalogOpts = {}): Promise<LiveCatalogResult> {
-  const baseUrl = (opts.baseUrl ?? process.env.LITELLM_PROXY_BASE_URL ?? '').replace(/\/+$/, '');
+  const baseUrl = normalizeProxyBase(opts.baseUrl ?? process.env.LITELLM_PROXY_BASE_URL ?? '');
   const apiKey = opts.apiKey ?? process.env.LITELLM_PROXY_KEY ?? '';
   const now = Date.now();
 
@@ -67,7 +76,7 @@ export async function fetchLiveCatalog(opts: FetchLiveCatalogOpts = {}): Promise
   }
 
   const fetcher = opts.fetcher ?? fetch;
-  const url = `${baseUrl}/models`;
+  const url = `${baseUrl}/v1/models`;
   const controller = new AbortController();
   const timeoutMs = opts.timeoutMs ?? 5000;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
