@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { _setSnapshotForTests, _resetSnapshotForTests } from '../src/extensions/registry';
@@ -16,13 +16,13 @@ import { getEventBus, _resetEventBusForTests } from '../src/events/bus';
 
 const TMP = `/tmp/forgeax-skill-runner-${process.pid}`;
 const ROOTS = () => ({
-  L0: join(TMP, 'L0'),
-  L1: join(TMP, 'L1'),
-  L2: join(TMP, 'L2'),
+  builtin: join(TMP, 'builtin'),
+  user: join(TMP, 'user'),
+  project: join(TMP, 'project'),
 });
 
 async function reload() {
-  const scan = await scanAllLayers(ROOTS());
+  const scan = await scanAllExtensionOrigins(ROOTS());
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
   _setSnapshotForTests({
@@ -38,7 +38,7 @@ async function reload() {
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   _resetSnapshotForTests();
   _resetToolHandlerCacheForTests();
   _resetEventBusForTests();
@@ -52,7 +52,7 @@ afterEach(() => {
 });
 
 function writeManifest(dirName: string, body: Record<string, unknown>): string {
-  const dir = join(TMP, 'L1', dirName);
+  const dir = join(TMP, 'user', dirName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),

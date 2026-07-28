@@ -4,7 +4,7 @@
  * The deterministic baseline is `recordAsSkill()`: take recorded
  * `tool.starting` envelopes from the bus ledger (or supplied directly)
  * and synthesize a ts skill that re-issues each call in order. Output is
- * a complete L2 plugin directory:
+ * a complete project plugin directory:
  *
  *   forgeax-extension.json  — manifest with single `skill` provide
  *   skill.mjs            — esm module that calls ctx.callTool() per step
@@ -37,7 +37,7 @@ export interface RecordedToolCall {
 }
 
 export interface RecordSkillInput {
-  /** Project root that owns L2; defaults to cwd. */
+  /** Project root that owns project; defaults to cwd. */
   projectRoot: string;
   /** New plugin id, e.g. `@me/replay-foo`. The slug after `/` becomes the dir. */
   extensionId: string;
@@ -390,7 +390,7 @@ function readArgPath(args: unknown, path: string): unknown {
   return cur;
 }
 
-/** Record + LLM-distill a sequence of tool calls into an L2 plugin.
+/** Record + LLM-distill a sequence of tool calls into an project plugin.
  *  Failure of the LLM step degrades to the deterministic baseline —
  *  the loop always closes. */
 export async function distillRecordedSkill(

@@ -2,7 +2,7 @@
  * Doc 11 §performance budget — plugin reload latency.
  *
  * The audit punch-list flags Doc 11's "性能预算 / reload 时长 没基准" as
- * never-actioned. This file establishes the baseline: scanAllLayers +
+ * never-actioned. This file establishes the baseline: scanAllExtensionOrigins +
  * mergeManifests + buildKindRegistry over a synthesized fleet of 50
  * plugins (a generous upper bound for marketplace × user × project) must
  * complete inside the budget.
@@ -15,7 +15,7 @@
 import { describe, it, expect } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 
@@ -50,20 +50,20 @@ function seedFleet(root: string, count: number): void {
 }
 
 describe('Doc 11 — plugin reload perf budget', () => {
-  it(`scanAllLayers + buildKindRegistry over ${FLEET} plugins fits in ${FULL_BUDGET_MS}ms`, async () => {
+  it(`scanAllExtensionOrigins + buildKindRegistry over ${FLEET} plugins fits in ${FULL_BUDGET_MS}ms`, async () => {
     rmSync(TMP, { recursive: true, force: true });
     mkdirSync(TMP, { recursive: true });
     const roots = {
-      L0: join(TMP, 'L0'),
-      L1: join(TMP, 'L1'),
-      L2: join(TMP, 'L2'),
+      builtin: join(TMP, 'builtin'),
+      user: join(TMP, 'user'),
+      project: join(TMP, 'project'),
     };
     for (const r of Object.values(roots)) mkdirSync(r, { recursive: true });
-    seedFleet(roots.L1, FLEET);
+    seedFleet(roots.user, FLEET);
 
     try {
       const t0 = performance.now();
-      const scan = await scanAllLayers(roots);
+      const scan = await scanAllExtensionOrigins(roots);
       const t1 = performance.now();
       const merge = mergeManifests(scan.found);
       const kinds = buildKindRegistry(merge.manifests);

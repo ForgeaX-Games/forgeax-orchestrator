@@ -7,8 +7,8 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanAllLayers } from './scanner';
-import type { ExtensionLayer } from './scanner';
+import { scanAllExtensionOrigins } from './scanner';
+import type { ExtensionOrigin } from './scanner';
 import { mergeManifests } from './merger';
 import type { MergedManifest } from './merger';
 import { defaultProjectRoot } from '@forgeax/platform-io';
@@ -146,10 +146,10 @@ export interface ExtensionInfo {
   /** 统一命名（kind=agent 才有）：title=「中文职能·英文名」，sub=灰字英文职能。 */
   naming?: { title: string; sub: string };
   /** Browser-safe origin descriptor. `relativeManifestPath` is the manifest
-   *  path relative to the layer root (`<slug>/forgeax-extension.json`) — never
+   *  path relative to the origin root (`<slug>/forgeax-extension.json`) — never
    *  the absolute `originPath`, which would leak the host's home directory to
-   *  the shell strip. The UI rebuilds a filesystem path from `layer` + this. */
-  source: { layer: ExtensionLayer; relativeManifestPath: string };
+   *  the shell strip. The UI rebuilds a filesystem path from `origin` + this. */
+  source: { origin: ExtensionOrigin; relativeManifestPath: string };
   entry?: {
     frontend?: string;
     standalone?: {
@@ -216,8 +216,8 @@ export function applyExtensionDevPortOverridesForTest(
   return applyExtensionDevPortOverrides(items, overrides);
 }
 
-/** Derive the layer-relative manifest path from an absolute originPath.
- *  Layer roots always end at `<layer-root>/<slug>/forgeax-extension.json`, so
+/** Derive the origin-relative manifest path from an absolute originPath.
+ *  Extension roots always end at `<origin-root>/<slug>/forgeax-extension.json`, so
  *  the last two path segments are the browser-safe descriptor. Splitting on
  *  both separators keeps this correct for Windows origin paths too. */
 function relativeManifestPathFrom(originPath: string): string {
@@ -227,8 +227,8 @@ function relativeManifestPathFrom(originPath: string): string {
 
 /** Map one merged manifest to its slim, browser-facing ExtensionInfo. Returns
  *  null for manifests missing required identity fields (caller skips them).
- *  Every returned item carries a `source` descriptor built from the layer +
- *  layer-relative manifest path — never the absolute originPath. */
+ *  Every returned item carries a `source` descriptor built from the origin +
+ *  origin-relative manifest path — never the absolute originPath. */
 export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionInfo | null {
   const m = mergedManifest.manifest as ExtensionManifest;
   if (!m.id || !m.version || !m.kind || !m.displayName) return null;
@@ -241,7 +241,7 @@ export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionI
         icon: m.icon,
         experimental: m.experimental,
         source: {
-          layer: mergedManifest.layer,
+          origin: mergedManifest.origin,
           relativeManifestPath: relativeManifestPathFrom(mergedManifest.originPath),
         },
       };
@@ -354,7 +354,7 @@ export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionI
 export const projectExtensionInfoForTest = projectExtensionInfo;
 
 export async function loadExtensionList(): Promise<ExtensionInfo[]> {
-  const scan = await scanAllLayers();
+  const scan = await scanAllExtensionOrigins();
   const merged = mergeManifests(scan.found);
   const items: ExtensionInfo[] = [];
   for (const mergedManifest of merged.manifests) {
@@ -374,4 +374,3 @@ export async function loadExtensionList(): Promise<ExtensionInfo[]> {
 
   return items;
 }
-

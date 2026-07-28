@@ -3,8 +3,8 @@
  *
  *   forgeax-pack pack <extensionDir> [-o out.fxpack] [--closure]
  *   forgeax-pack inspect <pack.fxpack>
- *   forgeax-pack install <pack.fxpack> [--layer L1|L2] [--policy skip|overwrite|rename] [--ack-unsigned]
- *   forgeax-pack list [--layer L1|L2]
+ *   forgeax-pack install <pack.fxpack> [--origin user|project] [--policy skip|overwrite|rename] [--ack-unsigned]
+ *   forgeax-pack list [--origin user|project]
  *
  * Subcommands call the in-process exporter/importer modules directly — no
  * running daemon required. Useful for shipping agent packs offline (zip on
@@ -39,8 +39,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     const a = rest[i];
     if (a === '-o' || a === '--out') {
       flags.out = rest[++i];
-    } else if (a === '--layer') {
-      flags.layer = rest[++i];
+    } else if (a === '--origin') {
+      flags.origin = rest[++i];
     } else if (a === '--policy') {
       flags.policy = rest[++i];
     } else if (a === '--closure') {
@@ -146,7 +146,7 @@ async function cmdInspect(args: ParsedArgs): Promise<void> {
   if (trust.conflicts.length) {
     process.stdout.write(`conflicts:\n`);
     for (const c of trust.conflicts) {
-      process.stdout.write(`  - ${c.id}: ${c.existingLayer}@${c.existingVersion} → ${c.newVersion}\n`);
+      process.stdout.write(`  - ${c.id}: ${c.existingOrigin}@${c.existingVersion} → ${c.newVersion}\n`);
     }
   }
   if (trust.warnings.length) {
@@ -158,18 +158,18 @@ async function cmdInspect(args: ParsedArgs): Promise<void> {
 async function cmdInstall(args: ParsedArgs): Promise<void> {
   const file = args.positional[0];
   if (!file) {
-    process.stderr.write('Usage: forgeax-pack install <pack.fxpack> [--layer L1|L2] [--policy skip|overwrite|rename] [--ack-unsigned]\n');
+    process.stderr.write('Usage: forgeax-pack install <pack.fxpack> [--origin user|project] [--policy skip|overwrite|rename] [--ack-unsigned]\n');
     process.exit(2);
   }
-  const layer = (args.flags.layer === 'L2' ? 'L2' : 'L1') as 'L1' | 'L2';
-  const destRoot = layer === 'L1' ? homedir() : (args.flags.root ? resolve(String(args.flags.root)) : defaultProjectRoot());
+  const origin = (args.flags.origin === 'project' ? 'project' : 'user') as 'user' | 'project';
+  const destRoot = origin === 'user' ? homedir() : (args.flags.root ? resolve(String(args.flags.root)) : defaultProjectRoot());
   const policy = (args.flags.policy as 'skip' | 'overwrite' | 'rename' | undefined) ?? 'skip';
 
   await reloadExtensions(); // populate snapshot for conflict detection
   const result = await installPack({
     zipPath: resolve(file),
     destRoot,
-    destLayer: layer,
+    destinationOrigin: origin,
     conflictPolicy: policy,
     userAcknowledgedUnsigned: Boolean(args.flags.ackUnsigned),
   });
@@ -177,7 +177,7 @@ async function cmdInstall(args: ParsedArgs): Promise<void> {
     process.stderr.write(`install failed (${result.code}): ${result.error}\n`);
     process.exit(1);
   }
-  process.stdout.write(`installed to ${layer} (${destRoot}):\n`);
+  process.stdout.write(`installed to ${origin} (${destRoot}):\n`);
   for (const id of result.installed) process.stdout.write(`  + ${id}\n`);
   for (const id of result.skipped) process.stdout.write(`  = ${id} (skipped, already present)\n`);
   for (const [id, slug] of Object.entries(result.renamed)) process.stdout.write(`  ~ ${id} → ${slug}\n`);
@@ -185,13 +185,13 @@ async function cmdInstall(args: ParsedArgs): Promise<void> {
 }
 
 async function cmdList(args: ParsedArgs): Promise<void> {
-  const layer = (args.flags.layer === 'L2' ? 'L2' : args.flags.layer === 'L1' ? 'L1' : null) as 'L1' | 'L2' | null;
-  const roots: Array<{ layer: 'L1' | 'L2'; root: string }> = [];
-  if (!layer || layer === 'L1') roots.push({ layer: 'L1', root: homedir() });
-  if (!layer || layer === 'L2') roots.push({ layer: 'L2', root: defaultProjectRoot() });
+  const origin = (args.flags.origin === 'project' ? 'project' : args.flags.origin === 'user' ? 'user' : null) as 'user' | 'project' | null;
+  const roots: Array<{ origin: 'user' | 'project'; root: string }> = [];
+  if (!origin || origin === 'user') roots.push({ origin: 'user', root: homedir() });
+  if (!origin || origin === 'project') roots.push({ origin: 'project', root: defaultProjectRoot() });
 
-  for (const { layer: lyr, root } of roots) {
-    process.stdout.write(`# ${lyr} · ${root}\n`);
+  for (const { origin: installedOrigin, root } of roots) {
+    process.stdout.write(`# ${installedOrigin} · ${root}\n`);
     const ledger = readInstalled(root);
     const dir = join(root, '.forgeax', 'extensions');
     const onDisk = existsSync(dir) ? readdirSync(dir).filter((f) => {
@@ -227,10 +227,10 @@ Usage:
                               build a .fxpack from a plugin directory
   forgeax-pack inspect <pack.fxpack>
                               show manifest, trust state, and conflicts
-  forgeax-pack install <pack.fxpack> [--layer L1|L2] [--policy <skip|overwrite|rename>]
+  forgeax-pack install <pack.fxpack> [--origin user|project] [--policy <skip|overwrite|rename>]
                               [--ack-unsigned] [--root <projectRoot>]
-                              install a pack to L1 (~/.forgeax) or L2 (<projectRoot>/.forgeax)
-  forgeax-pack list [--layer L1|L2]
+                              install a pack to user (~/.forgeax) or project (<projectRoot>/.forgeax)
+  forgeax-pack list [--origin user|project]
                               show installed plugins on disk and in the install ledger
 `);
 }

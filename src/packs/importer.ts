@@ -103,7 +103,7 @@ function detectConflicts(
     if (hit) {
       out.push({
         id: np.id,
-        existingLayer: hit.layer,
+        existingOrigin: hit.origin,
         existingVersion: hit.manifest.version,
         newVersion: np.version,
       });
@@ -285,7 +285,7 @@ export async function installPack(input: FxpackInstallInput): Promise<FxpackInst
     for (const entry of inspect.manifest.contains) {
       const srcDir = join(staging, 'plugins', entry.id);
       // On-disk dir name is the id's slug (last segment after `/`). The
-      // scanner walks one level under the layer root, so a scope-prefixed
+      // scanner walks one level under the origin root, so a scope-prefixed
       // dir like `@me/foo` would land two levels deep and never be seen.
       // fork.ts already uses the same convention.
       const slash = entry.id.indexOf('/');
@@ -305,7 +305,7 @@ export async function installPack(input: FxpackInstallInput): Promise<FxpackInst
             id: entry.id,
             slug: `${slug}-${stamp}`,
             version: entry.version,
-            layer: input.destLayer,
+            origin: input.destinationOrigin,
             source: sourceTag,
             sha256: packSha,
             ts: new Date().toISOString(),
@@ -321,7 +321,7 @@ export async function installPack(input: FxpackInstallInput): Promise<FxpackInst
         id: entry.id,
         slug,
         version: entry.version,
-        layer: input.destLayer,
+        origin: input.destinationOrigin,
         source: sourceTag,
         sha256: packSha,
         ts: new Date().toISOString(),

@@ -1,7 +1,7 @@
 /**
  * Phase D3 — wb-character ToolRegistry contract.
  *
- * Verifies the real (pinned) marketplace plugin manifest at L1 default location:
+ * Verifies the real (pinned) marketplace plugin manifest at user default location:
  *   1. every declared character: tool lands in the snapshot
  *   2. backendPath resolves to ./server/tool-handlers.ts (the D3 file)
  *   3. callTool dispatches to the actual tool-handlers module
@@ -23,7 +23,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync, copyFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { _setSnapshotForTests, _resetSnapshotForTests } from '../src/extensions/registry';
@@ -32,7 +32,7 @@ import { _resetEventBusForTests } from '../src/events/bus';
 
 const REPO_ROOT = resolve(import.meta.dir, '../../..');
 const TMP = `/tmp/forgeax-wbc-tools-${process.pid}`;
-const PLUGIN_DIR = join(TMP, 'L1', 'wb-character');
+const PLUGIN_DIR = join(TMP, 'user', 'wb-character');
 
 const TOOL_IDS = [
   // AI-facing pipelines (exposedToAI:true).
@@ -95,10 +95,10 @@ function mirrorPluginToTmp() {
 }
 
 async function reload() {
-  const scan = await scanAllLayers({
-    L0: join(TMP, 'L0'),
-    L1: join(TMP, 'L1'),
-    L2: join(TMP, 'L2'),
+  const scan = await scanAllExtensionOrigins({
+    builtin: join(TMP, 'builtin'),
+    user: join(TMP, 'user'),
+    project: join(TMP, 'project'),
   });
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
@@ -116,7 +116,7 @@ async function reload() {
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   _resetSnapshotForTests();
   _resetToolHandlerCacheForTests();
   _resetEventBusForTests();
@@ -154,7 +154,7 @@ describe('wb-character ToolRegistry wiring', () => {
       args: { slug: 'nope-not-a-real-game' },
       caller: { kind: 'ai', threadId: 'th' },
     });
-    // We can't assert ok=true (storage layer expects a real game dir) — but
+    // We can't assert ok=true (storage origin expects a real game dir) — but
     // the point is: AI gating must not reject. So the *kind* of failure
     // must not be `forbidden`.
     if (!r.ok) expect(r.code).not.toBe('forbidden');

@@ -11,13 +11,13 @@ import { ToolRegistry } from '../src/kits/tool-registry';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { mergeManifests } from '../src/extensions/merger';
 import { _resetSnapshotForTests, _setSnapshotForTests } from '../src/extensions/registry';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { resolveToolDescriptorByWireName } from '../src/tools/registry';
 
 const TMP = `/tmp/forgeax-host-confirm-${process.pid}`;
 
 function manifest(dirName: string, tools: Array<Record<string, unknown>>): void {
-  const dir = join(TMP, 'L1', dirName);
+  const dir = join(TMP, 'user', dirName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),
@@ -34,8 +34,8 @@ function manifest(dirName: string, tools: Array<Record<string, unknown>>): void 
 }
 
 async function reload(): Promise<void> {
-  const roots = { L0: join(TMP, 'L0'), L1: join(TMP, 'L1'), L2: join(TMP, 'L2') };
-  const scan = await scanAllLayers(roots);
+  const roots = { builtin: join(TMP, 'builtin'), user: join(TMP, 'user'), project: join(TMP, 'project') };
+  const scan = await scanAllExtensionOrigins(roots);
   const merged = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merged.manifests);
   _setSnapshotForTests({
@@ -60,7 +60,7 @@ function tool(name: string, hostToolId?: string): ToolDefinition {
 
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
-  for (const layer of ['L0', 'L1', 'L2']) mkdirSync(join(TMP, layer), { recursive: true });
+  for (const origin of ['builtin', 'user', 'project']) mkdirSync(join(TMP, origin), { recursive: true });
   _resetSnapshotForTests();
 });
 

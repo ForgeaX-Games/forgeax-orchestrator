@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Hono } from 'hono';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import {
@@ -25,8 +25,8 @@ import { getEventBus, _resetEventBusForTests } from '../src/events/bus';
 
 const TMP = `/tmp/forgeax-confirm-api-${process.pid}`;
 
-function mkmanifest(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<string, unknown>): string {
-  const dir = join(TMP, layer, dirName);
+function mkmanifest(origin: 'builtin' | 'user' | 'project', dirName: string, body: Record<string, unknown>): string {
+  const dir = join(TMP, origin, dirName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),
@@ -37,13 +37,13 @@ function mkmanifest(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<str
 }
 
 const ROOTS = () => ({
-  L0: join(TMP, 'L0'),
-  L1: join(TMP, 'L1'),
-  L2: join(TMP, 'L2'),
+  builtin: join(TMP, 'builtin'),
+  user: join(TMP, 'user'),
+  project: join(TMP, 'project'),
 });
 
 async function reloadFromTmp() {
-  const scan = await scanAllLayers(ROOTS());
+  const scan = await scanAllExtensionOrigins(ROOTS());
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
   _setSnapshotForTests({
@@ -66,7 +66,7 @@ function makeApp() {
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   _resetSnapshotForTests();
   _resetToolHandlerCacheForTests();
   _resetEventBusForTests();
@@ -81,7 +81,7 @@ afterEach(() => {
 
 describe('POST /api/tools/confirm (w8 AC-10)', () => {
   it('allows a pending callTool via token+decision:allow (AC-10)', async () => {
-    const dir = mkmanifest('L1', 'api-allow', {
+    const dir = mkmanifest('user', 'api-allow', {
       id: '@x/api-allow',
       kind: 'tool',
       displayName: { zh: 'aa', en: 'aa' },
@@ -153,7 +153,7 @@ describe('POST /api/tools/confirm (w8 AC-10)', () => {
   });
 
   it('POST deny via token resolves callTool with user-rejected (AC-10 deny path)', async () => {
-    const dir = mkmanifest('L1', 'api-deny', {
+    const dir = mkmanifest('user', 'api-deny', {
       id: '@x/api-deny',
       kind: 'tool',
       displayName: { zh: 'ad', en: 'ad' },

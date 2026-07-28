@@ -7,7 +7,7 @@
  * imported eagerly — `entry.backend` is recorded as a path and the loader
  * exposes a `loadDriver()` helper that dynamic-imports lazily on first
  * `chat()` use. Eager import would couple every cli-provider plugin to
- * server boot, defeating the L0/L1/L2 layering.
+ * server boot, defeating the builtin/user/project layering.
  *
  * Built-in forgeax-native is the exception: it's already in-tree and
  * registered by `bootCliProviders()`, so its plugin manifest can omit
@@ -20,11 +20,11 @@ import type { Driver } from '@forgeax/agent-runtime';
 import { getDriver } from '@forgeax/agent-runtime';
 import type { MergedManifest } from '../merger';
 import type { KindLoadIssue } from './types';
-import type { ExtensionLayer } from '../scanner';
+import type { ExtensionOrigin } from '../scanner';
 
 export interface CliProviderEntry {
   extensionId: string;
-  layer: ExtensionLayer;
+  origin: ExtensionOrigin;
   /** ProvidesCliProvider.id — the Driver.id consumers use to look up. */
   providerId: string;
   displayName: string;
@@ -66,7 +66,7 @@ export function loadCliProvider(
   return {
     entry: {
       extensionId: m.id,
-      layer: merged.layer,
+      origin: merged.origin,
       providerId: cp.id,
       displayName: dn,
       manifest: m,

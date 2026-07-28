@@ -1,13 +1,13 @@
 /**
  * Phase B1 — ManifestScanner.
  *
- * Walks the three plugin layers (L0 builtin / L1 user / L2 project) and
+ * Walks the three extension origins (built-in / user-installed / project-specific) and
  * returns parsed ExtensionManifest[] tagged by origin. Zod-validation goes
  * through `@forgeax/types`, so any divergence between scanner and
  * marketplace manifest grammar surfaces here as a typed error.
  *
  * See docs/v2-vision/architecture-evolution/03-AGENT-SKILL-PLUGIN-TRINITY.md §2.1
- * for the L0/L1/L2 contract and 13-MIGRATION-ROADMAP §B1.
+ * for the origin precedence contract and 13-MIGRATION-ROADMAP §B1.
  */
 import { existsSync, statSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
@@ -19,16 +19,16 @@ import type { ExtensionManifest } from '@forgeax/types';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { assetRoot } from '@forgeax/platform-io';
 
-export type ExtensionLayer = 'L0' | 'L1' | 'L2';
+export type ExtensionOrigin = 'builtin' | 'user' | 'project';
 
 export interface ScannedManifest {
-  layer: ExtensionLayer;
+  origin: ExtensionOrigin;
   originPath: string;
   manifest: ExtensionManifest;
 }
 
 export interface ScanError {
-  layer: ExtensionLayer;
+  origin: ExtensionOrigin;
   originPath: string;
   reason: string;
 }
@@ -38,46 +38,46 @@ export interface ScanResult {
   errors: ScanError[];
 }
 
-/** Resolve the canonical root directory for each layer.
+/** Resolve the canonical root directory for each origin.
  *
- *  L0: `<repo>/packages/marketplace/extensions`
- *  L1: `~/.forgeax/extensions`
- *  L2: `<projectRoot>/.forgeax/extensions`
+ *  builtin: `<repo>/packages/marketplace/extensions`
+ *  user: `~/.forgeax/extensions`
+ *  project: `<projectRoot>/.forgeax/extensions`
  *
- *  Returns null for a layer when its root doesn't exist (so newcomers
+ *  Returns null for an origin when its root doesn't exist (so newcomers
  *  without ~/.forgeax don't trip an error). Caller can override roots
  *  via `opts` for tests. */
-/** ADR 0025 M3.5 — user-disk layer migration (the sanctioned compat
+/** ADR 0025 M3.5 — user-disk directory migration (the sanctioned compat
  *  exception, same family as the scanner's legacy-id normalize): machines
- *  from before the Extension rename carry `.forgeax/plugins` layer dirs.
+ *  from before the Extension rename carry `.forgeax/plugins` directories.
  *  Rename once at the single resolution point; idempotent — skipped when
  *  the new dir already exists or the legacy one is absent. */
-function migrateLegacyLayerDir(base: string): void {
+function migrateLegacyExtensionDir(base: string): void {
   const legacy = resolve(base, '.forgeax/plugins');
   const current = resolve(base, '.forgeax/extensions');
   try {
     if (safeIsDir(legacy) && !safeIsDir(current)) {
       renameSync(legacy, current);
-      console.warn(`[extensions/scanner] migrated legacy layer dir ${legacy} -> ${current}`);
+      console.warn(`[extensions/scanner] migrated legacy directory ${legacy} -> ${current}`);
     }
   } catch (e) {
-    console.warn(`[extensions/scanner] legacy layer dir migration failed (${legacy}): ${(e as Error).message}`);
+    console.warn(`[extensions/scanner] legacy directory migration failed (${legacy}): ${(e as Error).message}`);
   }
 }
 
-export function defaultLayerRoots(opts?: { repoRoot?: string; projectRoot?: string }): Record<ExtensionLayer, string | null> {
+export function defaultExtensionRoots(opts?: { repoRoot?: string; projectRoot?: string }): Record<ExtensionOrigin, string | null> {
   const repoRoot = opts?.repoRoot ?? findRepoRoot();
   const projectRoot = opts?.projectRoot ?? defaultProjectRoot();
-  migrateLegacyLayerDir(homedir());
-  if (projectRoot) migrateLegacyLayerDir(projectRoot);
+  migrateLegacyExtensionDir(homedir());
+  if (projectRoot) migrateLegacyExtensionDir(projectRoot);
   const candidates = (paths: string[]) => paths.find((p) => safeIsDir(p)) ?? null;
   return {
-    // L0 (host-bundled marketplace). assetRoot() resolves to `packages/` in dev
+    // builtin (host-bundled marketplace). assetRoot() resolves to `packages/` in dev
     // and `<Resources>/resources/` in the packaged .app, so this single
     // candidate covers both — crucial because findRepoRoot() can't locate a
     // `packages/marketplace` in the bundle (marketplace lives at
     // resources/marketplace) and would otherwise yield 0 plugins.
-    L0: candidates([
+    builtin: candidates([
       resolve(assetRoot(), 'marketplace/extensions'),
       ...(repoRoot
         ? [
@@ -86,8 +86,8 @@ export function defaultLayerRoots(opts?: { repoRoot?: string; projectRoot?: stri
           ]
         : []),
     ]),
-    L1: candidates([resolve(homedir(), '.forgeax/extensions')]),
-    L2: projectRoot ? candidates([resolve(projectRoot, '.forgeax/extensions')]) : null,
+    user: candidates([resolve(homedir(), '.forgeax/extensions')]),
+    project: projectRoot ? candidates([resolve(projectRoot, '.forgeax/extensions')]) : null,
   };
 }
 
@@ -113,7 +113,7 @@ function safeIsDir(p: string): boolean {
   }
 }
 
-async function scanLayer(layer: ExtensionLayer, root: string): Promise<ScanResult> {
+async function scanExtensionOrigin(origin: ExtensionOrigin, root: string): Promise<ScanResult> {
   const out: ScanResult = { found: [], errors: [] };
   // Async + withFileTypes — kills the per-entry statSync probe for "is this a
   // directory?" and the readdir itself stops blocking the event loop. The
@@ -123,7 +123,7 @@ async function scanLayer(layer: ExtensionLayer, root: string): Promise<ScanResul
   try {
     entries = await readdir(root, { withFileTypes: true });
   } catch (e) {
-    out.errors.push({ layer, originPath: root, reason: `readdir failed: ${(e as Error).message}` });
+    out.errors.push({ origin, originPath: root, reason: `readdir failed: ${(e as Error).message}` });
     return out;
   }
   for (const dirent of entries) {
@@ -138,7 +138,7 @@ async function scanLayer(layer: ExtensionLayer, root: string): Promise<ScanResul
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       if (code === 'ENOENT') continue; // not a plugin dir, just skip
-      out.errors.push({ layer, originPath: manifestPath, reason: (e as Error).message });
+      out.errors.push({ origin, originPath: manifestPath, reason: (e as Error).message });
       continue;
     }
     try {
@@ -148,12 +148,12 @@ async function scanLayer(layer: ExtensionLayer, root: string): Promise<ScanResul
         const reason = parsed.error
           ? parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
           : 'zod parse failed';
-        out.errors.push({ layer, originPath: manifestPath, reason });
+        out.errors.push({ origin, originPath: manifestPath, reason });
         continue;
       }
       // ADR 0025 M3 — persistent-id namespace migration: manifests authored
       // before the Extension rename carry `@forgeax-plugin/*`. Normalize at
-      // this single read point so user-forked L1/L2 extensions (old ids on
+      // this single read point so user-installed and project-specific extensions (old ids on
       // the user's disk — the sanctioned compat exception) keep resolving.
       if (typeof parsed.manifest.id === 'string' && parsed.manifest.id.startsWith('@forgeax-plugin/')) {
         const legacyId = parsed.manifest.id;
@@ -169,23 +169,23 @@ async function scanLayer(layer: ExtensionLayer, root: string): Promise<ScanResul
         parsed.manifest.entry?.standalone?.devOnly === true
       ) {
         out.errors.push({
-          layer,
+          origin,
           originPath: manifestPath,
           reason: 'entry.standalone.devOnly:true rejected under production (FORGEAX_NODE_ENV=production)',
         });
         continue;
       }
-      out.found.push({ layer, originPath: manifestPath, manifest: parsed.manifest });
+      out.found.push({ origin, originPath: manifestPath, manifest: parsed.manifest });
     } catch (e) {
-      out.errors.push({ layer, originPath: manifestPath, reason: (e as Error).message });
+      out.errors.push({ origin, originPath: manifestPath, reason: (e as Error).message });
     }
   }
   return out;
 }
 
-/** Doc 14 §4 spike — Safe Boot: when `FORGEAX_SAFE_BOOT=1`, skip L1+L2
+/** Doc 14 §4 spike — Safe Boot: when `FORGEAX_SAFE_BOOT=1`, skip user+project
  *  scans so the host can be edited without a broken plugin breaking it.
- *  L0 (in-tree marketplace) is always scanned because the host bundles it.
+ *  builtin (in-tree marketplace) is always scanned because the host bundles it.
  *  Returns `true` when safe-boot is active. */
 export function isSafeBoot(env: NodeJS.ProcessEnv = process.env): boolean {
   const v = env.FORGEAX_SAFE_BOOT;
@@ -201,20 +201,20 @@ export function isProduction(env: NodeJS.ProcessEnv = process.env): boolean {
   return v === 'production';
 }
 
-/** Scan all three layers. Caller usually passes the result through
+/** Scan all three extension origins. Caller usually passes the result through
  *  ManifestMerger to dedupe by id. Honours `FORGEAX_SAFE_BOOT=1` by
- *  scanning L0 only. */
-export async function scanAllLayers(
-  roots?: Partial<Record<ExtensionLayer, string | null>>,
+ *  scanning builtin only. */
+export async function scanAllExtensionOrigins(
+  roots?: Partial<Record<ExtensionOrigin, string | null>>,
 ): Promise<ScanResult> {
-  const resolved = { ...defaultLayerRoots(), ...(roots ?? {}) };
+  const resolved = { ...defaultExtensionRoots(), ...(roots ?? {}) };
   const merged: ScanResult = { found: [], errors: [] };
   const safe = isSafeBoot();
-  for (const layer of ['L0', 'L1', 'L2'] as const) {
-    if (safe && layer !== 'L0') continue;
-    const root = resolved[layer];
+  for (const origin of ['builtin', 'user', 'project'] as const) {
+    if (safe && origin !== 'builtin') continue;
+    const root = resolved[origin];
     if (!root) continue;
-    const r = await scanLayer(layer, root);
+    const r = await scanExtensionOrigin(origin, root);
     merged.found.push(...r.found);
     merged.errors.push(...r.errors);
   }

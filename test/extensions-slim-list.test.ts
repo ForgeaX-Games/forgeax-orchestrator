@@ -17,14 +17,14 @@ describe('extension slim list', () => {
         displayName: { zh: 'Arin' },
         provides: { agent: { id: 'arin', role: 'orchestrator' } },
       },
-      layer: 'L1',
+      origin: 'user',
       originPath: '/Users/you/.forgeax/extensions/agent-arin/forgeax-extension.json',
       shadowedBy: [],
     }) as Record<string, unknown> | null;
 
     expect(item).toMatchObject({
       source: {
-        layer: 'L1',
+        origin: 'user',
         relativeManifestPath: 'agent-arin/forgeax-extension.json',
       },
     });

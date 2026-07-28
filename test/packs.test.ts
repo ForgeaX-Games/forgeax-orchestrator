@@ -183,7 +183,7 @@ describe('packs importer', () => {
       bundleMeta: { id: '@me/conflicty', version: '0.2.0', title: { en: 'C' } },
     });
 
-    // Seed the snapshot with an older copy of the same id at L1.
+    // Seed the snapshot with an older copy of the same id at user.
     const seeded: ExtensionSnapshot = {
       ...emptySnapshot(),
       manifests: [
@@ -200,7 +200,7 @@ describe('packs importer', () => {
             compatibleWith: { 'forgeax-bus': '^1.0.0' },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           } as any,
-          layer: 'L1',
+          origin: 'user',
           originPath: '/tmp/seed',
           shadowedBy: [],
         },
@@ -212,7 +212,7 @@ describe('packs importer', () => {
     expect(insp.ok).toBe(true);
     if (!insp.ok) return;
     expect(insp.trust.conflicts).toEqual([
-      { id: '@me/conflicty', existingLayer: 'L1', existingVersion: '0.1.0', newVersion: '0.2.0' },
+      { id: '@me/conflicty', existingOrigin: 'user', existingVersion: '0.1.0', newVersion: '0.2.0' },
     ]);
   });
 
@@ -247,7 +247,7 @@ describe('packs importer', () => {
     const r = await installPack({
       zipPath: out,
       destRoot,
-      destLayer: 'L2',
+      destinationOrigin: 'project',
     });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
@@ -283,7 +283,7 @@ describe('packs importer', () => {
     const r = await installPack({
       zipPath: out,
       destRoot,
-      destLayer: 'L2',
+      destinationOrigin: 'project',
       conflictPolicy: 'skip',
     });
     expect(r.ok).toBe(true);
@@ -314,7 +314,7 @@ describe('packs importer', () => {
     const r = await installPack({
       zipPath: out,
       destRoot,
-      destLayer: 'L2',
+      destinationOrigin: 'project',
       conflictPolicy: 'overwrite',
     });
     expect(r.ok).toBe(true);
@@ -329,7 +329,7 @@ describe('packs importer', () => {
     const r = await installPack({
       zipPath: join(TMP, 'does-not-exist.fxpack'),
       destRoot: TMP,
-      destLayer: 'L1',
+      destinationOrigin: 'user',
     });
     expect(r.ok).toBe(false);
     if (r.ok) return;
@@ -354,19 +354,19 @@ describe('packs ledger', () => {
 
     const destRoot = join(TMP, 'led-dest');
     mkdirSync(destRoot, { recursive: true });
-    const r = await installPack({ zipPath: out, destRoot, destLayer: 'L2' });
+    const r = await installPack({ zipPath: out, destRoot, destinationOrigin: 'project' });
     expect(r.ok).toBe(true);
 
     const led = readInstalled(destRoot);
     expect(led).toHaveLength(1);
     expect(led[0].id).toBe('@me/ledgerable');
     expect(led[0].slug).toBe('ledgerable');
-    expect(led[0].layer).toBe('L2');
+    expect(led[0].origin).toBe('project');
     expect(led[0].sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(led[0].ts).toMatch(/T/);
 
     // re-install (overwrite) appends a 2nd entry — append-only invariant.
-    const r2 = await installPack({ zipPath: out, destRoot, destLayer: 'L2', conflictPolicy: 'overwrite' });
+    const r2 = await installPack({ zipPath: out, destRoot, destinationOrigin: 'project', conflictPolicy: 'overwrite' });
     expect(r2.ok).toBe(true);
     expect(readInstalled(destRoot)).toHaveLength(2);
 
@@ -419,7 +419,7 @@ describe('packs bundle closure', () => {
         {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           manifest: JSON.parse(readFileSync(join(depDir, 'forgeax-extension.json'), 'utf-8')) as any,
-          layer: 'L2',
+          origin: 'project',
           originPath: join(depDir, 'forgeax-extension.json'),
           shadowedBy: [],
         },
@@ -760,7 +760,7 @@ describe('packs trusted-keys', () => {
     const r = await installPack({
       zipPath: out,
       destRoot: dest,
-      destLayer: 'L1',
+      destinationOrigin: 'user',
       trustLookup: { projectRoot, homeDir: join(TMP, 'tk-empty-home') },
     });
     expect(r.ok).toBe(false);
@@ -848,7 +848,7 @@ describe('packs closure helper', () => {
       manifests: ['@me/a', '@me/b', '@me/c'].map((id) => ({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         manifest: JSON.parse(readFileSync(join(dirs[id], 'forgeax-extension.json'), 'utf-8')) as any,
-        layer: 'L2' as const,
+        origin: 'project' as const,
         originPath: join(dirs[id], 'forgeax-extension.json'),
         shadowedBy: [],
       })),
@@ -904,7 +904,7 @@ describe('packs closure helper', () => {
         {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           manifest: JSON.parse(readFileSync(join(depDir, 'forgeax-extension.json'), 'utf-8')) as any,
-          layer: 'L2',
+          origin: 'project',
           originPath: join(depDir, 'forgeax-extension.json'),
           shadowedBy: [],
         },
@@ -984,7 +984,7 @@ describe('packs trust-ack on unsigned install', () => {
     const r = await installPack({
       zipPath: out,
       destRoot,
-      destLayer: 'L2',
+      destinationOrigin: 'project',
       userAcknowledgedUnsigned: true,
     });
     expect(r.ok).toBe(true);
@@ -999,7 +999,7 @@ describe('packs trust-ack on unsigned install', () => {
     // Without the flag, no trust entry is written.
     const dest2 = join(TMP, 'no-ack-dest');
     mkdirSync(dest2, { recursive: true });
-    const r2 = await installPack({ zipPath: out, destRoot: dest2, destLayer: 'L2' });
+    const r2 = await installPack({ zipPath: out, destRoot: dest2, destinationOrigin: 'project' });
     expect(r2.ok).toBe(true);
     expect(readTrust(dest2)).toHaveLength(0);
 
@@ -1028,7 +1028,7 @@ describe('packs round-trip', () => {
 
     const destRoot = join(TMP, 'dest');
     mkdirSync(destRoot, { recursive: true });
-    const inst = await installPack({ zipPath: out, destRoot, destLayer: 'L2' });
+    const inst = await installPack({ zipPath: out, destRoot, destinationOrigin: 'project' });
     expect(inst.ok).toBe(true);
 
     // The installed plugin dir matches the source byte-for-byte on

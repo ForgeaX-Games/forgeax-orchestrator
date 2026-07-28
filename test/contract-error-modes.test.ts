@@ -21,7 +21,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ManifestSchema } from '@forgeax/types';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { _setSnapshotForTests, _resetSnapshotForTests } from '../src/extensions/registry';
@@ -34,10 +34,10 @@ import { _resetEventBusForTests } from '../src/events/bus';
 const TMP = `/tmp/forgeax-contract-errors-${process.pid}`;
 
 async function reload(): Promise<void> {
-  const scan = await scanAllLayers({
-    L0: join(TMP, 'L0'),
-    L1: join(TMP, 'L1'),
-    L2: join(TMP, 'L2'),
+  const scan = await scanAllExtensionOrigins({
+    builtin: join(TMP, 'builtin'),
+    user: join(TMP, 'user'),
+    project: join(TMP, 'project'),
   });
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
@@ -51,8 +51,8 @@ async function reload(): Promise<void> {
   });
 }
 
-function writePluginAt(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<string, unknown>): string {
-  const dir = join(TMP, layer, dirName);
+function writePluginAt(origin: 'builtin' | 'user' | 'project', dirName: string, body: Record<string, unknown>): string {
+  const dir = join(TMP, origin, dirName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),
@@ -65,7 +65,7 @@ function writePluginAt(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   _resetSnapshotForTests();
   _resetToolHandlerCacheForTests();
   _resetEventBusForTests();
@@ -123,10 +123,10 @@ describe('03 · manifest schema rejection contract', () => {
   });
 
   it('scanner surfaces malformed manifest as scanError, NOT a load crash', async () => {
-    const bad = join(TMP, 'L1', 'bad');
+    const bad = join(TMP, 'user', 'bad');
     mkdirSync(bad, { recursive: true });
     writeFileSync(join(bad, 'forgeax-extension.json'), '{ not json', 'utf-8');
-    const scan = await scanAllLayers({ L0: join(TMP, 'L0'), L1: join(TMP, 'L1'), L2: join(TMP, 'L2') });
+    const scan = await scanAllExtensionOrigins({ builtin: join(TMP, 'builtin'), user: join(TMP, 'user'), project: join(TMP, 'project') });
     expect(scan.errors.some((e) => e.originPath.includes('bad'))).toBe(true);
   });
 });
@@ -137,7 +137,7 @@ describe('03 · manifest schema rejection contract', () => {
  * ==========================================================================*/
 describe('04 · skill runner error contract', () => {
   it('row "entry.file 不存在" → load_error', async () => {
-    writePluginAt('L1', 'p', {
+    writePluginAt('user', 'p', {
       id: '@x/p',
       kind: 'skill',
       displayName: { en: 'p' },
@@ -150,7 +150,7 @@ describe('04 · skill runner error contract', () => {
   });
 
   it('row "tool.call 调到 requiresTools 没声明" → forbidden', async () => {
-    const toolDir = writePluginAt('L1', 't', {
+    const toolDir = writePluginAt('user', 't', {
       id: '@x/t',
       kind: 'tool',
       displayName: { en: 't' },
@@ -158,7 +158,7 @@ describe('04 · skill runner error contract', () => {
       provides: { tools: [{ id: 'side.x' }] },
     });
     writeFileSync(join(toolDir, 'h.mjs'), `export default { 'side.x': () => 'ok' };\n`, 'utf-8');
-    const skillDir = writePluginAt('L1', 's', {
+    const skillDir = writePluginAt('user', 's', {
       id: '@x/s',
       kind: 'skill',
       displayName: { en: 's' },
@@ -176,7 +176,7 @@ describe('04 · skill runner error contract', () => {
     // Re-write with a known filename matching what we declared.
     rmSync(skillDir, { recursive: true, force: true });
     const fname = `run-${crypto.randomUUID()}.mjs`;
-    const skillDir2 = writePluginAt('L1', 's', {
+    const skillDir2 = writePluginAt('user', 's', {
       id: '@x/s',
       kind: 'skill',
       displayName: { en: 's' },
@@ -207,7 +207,7 @@ describe('04 · skill runner error contract', () => {
   });
 
   it('py entry rejected as py_unsupported (deferred per ADR-0011)', async () => {
-    writePluginAt('L1', 'p', {
+    writePluginAt('user', 'p', {
       id: '@x/py',
       kind: 'skill',
       displayName: { en: 'p' },
@@ -233,7 +233,7 @@ describe('tool registry error contract', () => {
   });
 
   it('AI caller is rejected for tool that does NOT opt into exposedToAI → forbidden', async () => {
-    const dir = writePluginAt('L1', 'g', {
+    const dir = writePluginAt('user', 'g', {
       id: '@x/gated',
       kind: 'tool',
       displayName: { en: 'g' },
@@ -248,7 +248,7 @@ describe('tool registry error contract', () => {
   });
 
   it('handler that throws surfaces the thrown code instead of generic invoke_error', async () => {
-    const dir = writePluginAt('L1', 'b', {
+    const dir = writePluginAt('user', 'b', {
       id: '@x/boom',
       kind: 'tool',
       displayName: { en: 'b' },

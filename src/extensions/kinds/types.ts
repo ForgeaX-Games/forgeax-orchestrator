@@ -16,13 +16,13 @@ import type {
   SkillDefinition,
   ExtensionManifest,
 } from '@forgeax/types';
-import type { ExtensionLayer } from '../scanner';
+import type { ExtensionOrigin } from '../scanner';
 import type { CliProviderEntry } from './cli-provider';
 import type { ToolEntry } from './tool';
 
 export interface WorkbenchEntry {
   extensionId: string;
-  layer: ExtensionLayer;
+  origin: ExtensionOrigin;
   workbenchId: string;
   position: number;
   panelSize: 'sm' | 'md' | 'lg';
@@ -33,7 +33,7 @@ export interface WorkbenchEntry {
 
 export interface AgentEntry {
   extensionId: string;
-  layer: ExtensionLayer;
+  origin: ExtensionOrigin;
   /** Resolved 包含 avatarRules 等运行时附加字段; 大部分 callsite 只读 AgentDefinition 字段. */
   definition: ResolvedAgentDefinition;
   /** Absolute path to the persona .md (resolved at load time). */
@@ -45,7 +45,7 @@ export type { AgentDefinition };
 
 export interface SkillEntry {
   extensionId: string;
-  layer: ExtensionLayer;
+  origin: ExtensionOrigin;
   definition: SkillDefinition;
   /** Absolute path to the plugin dir holding this skill — runner resolves
    *  `definition.entry.file` against this. */

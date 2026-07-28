@@ -75,7 +75,7 @@ export function loadSkills(
     };
     out.entries.push({
       extensionId: m.id,
-      layer: merged.layer,
+      origin: merged.origin,
       definition: def,
       originDir: dirname(merged.originPath),
     });

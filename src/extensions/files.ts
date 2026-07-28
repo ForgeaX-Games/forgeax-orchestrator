@@ -1,7 +1,7 @@
 /**
  * Doc 09 §2.1 — minimum-viable plugin file editor backend.
  *
- * The wb-plugin-author panel needs to read/write files inside an L2 plugin
+ * The wb-plugin-author panel needs to read/write files inside an project plugin
  * directory. The constraints we enforce here are the only thing that keeps
  * this safe from shell injection / arbitrary disk writes:
  *

@@ -19,8 +19,8 @@ import { loadAgentRecord } from '../src/soul';
 
 const TMP = `/tmp/forgeax-agent-loader-${process.pid}`;
 
-function mkmanifest(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<string, unknown>): string {
-  const dir = join(TMP, layer, dirName);
+function mkmanifest(origin: 'builtin' | 'user' | 'project', dirName: string, body: Record<string, unknown>): string {
+  const dir = join(TMP, origin, dirName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),
@@ -31,15 +31,15 @@ function mkmanifest(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<str
 }
 
 const ROOTS = () => ({
-  L0: join(TMP, 'L0'),
-  L1: join(TMP, 'L1'),
-  L2: join(TMP, 'L2'),
+  builtin: join(TMP, 'builtin'),
+  user: join(TMP, 'user'),
+  project: join(TMP, 'project'),
 });
 
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   _resetSnapshotForTests();
 });
 
@@ -50,7 +50,7 @@ afterEach(() => {
 
 describe('AgentLoader', () => {
   it('listAgents/lookupAgent reflect registered agents', async () => {
-    const dir = mkmanifest('L0', 'agent-iori', {
+    const dir = mkmanifest('builtin', 'agent-iori', {
       id: '@forgeax-extension/agent-iori',
       kind: 'agent',
       displayName: { zh: 'iori' },
@@ -74,7 +74,7 @@ describe('AgentLoader', () => {
   });
 
   it('treats extension-provided agents as imported souls', async () => {
-    const dir = mkmanifest('L1', 'agent-poly', {
+    const dir = mkmanifest('user', 'agent-poly', {
       id: '@forgeax-extension/agent-poly',
       kind: 'agent',
       displayName: { zh: 'poly' },
@@ -95,8 +95,8 @@ describe('AgentLoader', () => {
     expect(record.trustTier).toBe('imported');
   });
 
-  it('treats host-bundled L0 extension agents as own souls', async () => {
-    const dir = mkmanifest('L0', 'agent-bundled-poly', {
+  it('treats host-bundled builtin extension agents as own souls', async () => {
+    const dir = mkmanifest('builtin', 'agent-bundled-poly', {
       id: '@forgeax-extension/agent-bundled-poly',
       kind: 'agent',
       displayName: { zh: 'bundled-poly' },
@@ -118,7 +118,7 @@ describe('AgentLoader', () => {
   });
 
   it('composeSystemPrompt concatenates persona + prompt-skill body', async () => {
-    const agentDir = mkmanifest('L0', 'agent-iori', {
+    const agentDir = mkmanifest('builtin', 'agent-iori', {
       id: '@forgeax-extension/agent-iori',
       kind: 'agent',
       displayName: { zh: 'iori' },
@@ -134,7 +134,7 @@ describe('AgentLoader', () => {
     });
     writeFileSync(join(agentDir, 'PERSONA.md'), 'PERSONA-BODY', 'utf-8');
 
-    const skillDir = mkmanifest('L0', 'skill-foo', {
+    const skillDir = mkmanifest('builtin', 'skill-foo', {
       id: '@forgeax-extension/skill-foo',
       kind: 'skill',
       displayName: { zh: 'foo' },
@@ -156,7 +156,7 @@ describe('AgentLoader', () => {
   });
 
   it('records warning when persona file is unreadable', async () => {
-    mkmanifest('L0', 'agent-broken', {
+    mkmanifest('builtin', 'agent-broken', {
       id: '@forgeax-extension/agent-broken',
       kind: 'agent',
       displayName: { zh: 'broken' },
@@ -178,7 +178,7 @@ describe('AgentLoader', () => {
   });
 
   it('records warning for unresolved skill ref', async () => {
-    const agentDir = mkmanifest('L0', 'agent-iori', {
+    const agentDir = mkmanifest('builtin', 'agent-iori', {
       id: '@forgeax-extension/agent-iori',
       kind: 'agent',
       displayName: { zh: 'iori' },
@@ -201,7 +201,7 @@ describe('AgentLoader', () => {
   });
 
   it('resolveSkill matches plugin source and inline source', async () => {
-    const skillDir = mkmanifest('L0', 'skill-foo', {
+    const skillDir = mkmanifest('builtin', 'skill-foo', {
       id: '@forgeax-extension/skill-foo',
       kind: 'skill',
       displayName: { zh: 'foo' },
@@ -234,7 +234,7 @@ describe('AgentLoader', () => {
   });
 
   it('skips ts/py-kind skills in the system prompt (deferred to SkillRunner)', async () => {
-    const agentDir = mkmanifest('L0', 'agent-iori', {
+    const agentDir = mkmanifest('builtin', 'agent-iori', {
       id: '@forgeax-extension/agent-iori',
       kind: 'agent',
       displayName: { zh: 'iori' },
@@ -250,7 +250,7 @@ describe('AgentLoader', () => {
     });
     writeFileSync(join(agentDir, 'PERSONA.md'), 'P', 'utf-8');
 
-    mkmanifest('L0', 'skill-ts', {
+    mkmanifest('builtin', 'skill-ts', {
       id: '@forgeax-extension/skill-ts',
       kind: 'skill',
       displayName: { zh: 'tx' },

@@ -7,7 +7,7 @@
  * registry, skill-runner, packs) cover each stage in isolation. This file
  * pins the *cross-stage invariants* the docs hinge on:
  *
- *   - 03 §2.1  L2 > L1 > L0 layering — a project copy beats user beats builtin
+ *   - 03 §2.1  project > user > builtin layering — a project copy beats user beats builtin
  *   - 03 §2.2  All four kinds (workbench/agent/skill/tool) survive a single
  *              scan/merge pass and end up in the right kinds[] slot
  *   - 03 §3    `dependencies` topo-sort: dep before dependent
@@ -24,7 +24,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import {
@@ -38,13 +38,13 @@ import { inspectPack, installPack } from '../src/packs/importer';
 
 const TMP = `/tmp/forgeax-arch-evo-${process.pid}`;
 const ROOTS = () => ({
-  L0: join(TMP, 'L0'),
-  L1: join(TMP, 'L1'),
-  L2: join(TMP, 'L2'),
+  builtin: join(TMP, 'builtin'),
+  user: join(TMP, 'user'),
+  project: join(TMP, 'project'),
 });
 
-function writePlugin(layer: 'L0' | 'L1' | 'L2', dirName: string, manifest: Record<string, unknown>, files: Record<string, string> = {}): string {
-  const dir = join(TMP, layer, dirName);
+function writePlugin(origin: 'builtin' | 'user' | 'project', dirName: string, manifest: Record<string, unknown>, files: Record<string, string> = {}): string {
+  const dir = join(TMP, origin, dirName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),
@@ -60,7 +60,7 @@ function writePlugin(layer: 'L0' | 'L1' | 'L2', dirName: string, manifest: Recor
 }
 
 async function reload(): Promise<ExtensionSnapshot> {
-  const scan = await scanAllLayers(ROOTS());
+  const scan = await scanAllExtensionOrigins(ROOTS());
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
   const snap: ExtensionSnapshot = {
@@ -78,7 +78,7 @@ async function reload(): Promise<ExtensionSnapshot> {
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   _resetSnapshotForTests();
   _resetToolHandlerCacheForTests();
 });
@@ -91,14 +91,14 @@ afterEach(() => {
 
 describe('architecture-evolution · trinity lifecycle', () => {
   it('one scan picks up workbench + agent + skill + tool simultaneously', async () => {
-    writePlugin('L1', 'wb-demo', {
+    writePlugin('user', 'wb-demo', {
       id: '@x/wb-demo',
       kind: 'workbench',
       displayName: { zh: 'wb', en: 'wb' },
       provides: { workbench: { id: 'wb-demo', position: 10, panelSize: 'md' } },
     });
     writePlugin(
-      'L1',
+      'user',
       'agent-demo',
       {
         id: '@x/agent-demo',
@@ -116,7 +116,7 @@ describe('architecture-evolution · trinity lifecycle', () => {
       { 'persona.md': '# demo persona\n' },
     );
     writePlugin(
-      'L1',
+      'user',
       'skill-demo',
       {
         id: '@x/skill-demo',
@@ -127,7 +127,7 @@ describe('architecture-evolution · trinity lifecycle', () => {
       { 'SKILL.md': '# greet\nhello\n' },
     );
     writePlugin(
-      'L1',
+      'user',
       'tool-demo',
       {
         id: '@x/tool-demo',
@@ -153,7 +153,7 @@ describe('architecture-evolution · trinity lifecycle', () => {
     expect(snap.manifests).toHaveLength(4);
   });
 
-  it('L2 > L1 > L0: project copy shadows user copy shadows builtin', async () => {
+  it('project > user > builtin: project copy shadows user copy shadows builtin', async () => {
     const id = '@x/layered';
     const baseManifest = {
       id,
@@ -161,26 +161,26 @@ describe('architecture-evolution · trinity lifecycle', () => {
       provides: { tools: [{ id: 'layered.t' }] },
       entry: { backend: './h.ts' },
     };
-    writePlugin('L0', 'layered', { ...baseManifest, displayName: { en: 'L0 builtin' } });
-    writePlugin('L1', 'layered', { ...baseManifest, displayName: { en: 'L1 user' } });
-    writePlugin('L2', 'layered', { ...baseManifest, displayName: { en: 'L2 project' } });
+    writePlugin('builtin', 'layered', { ...baseManifest, displayName: { en: 'built-in copy' } });
+    writePlugin('user', 'layered', { ...baseManifest, displayName: { en: 'user-installed copy' } });
+    writePlugin('project', 'layered', { ...baseManifest, displayName: { en: 'project-specific copy' } });
 
     const snap = await reload();
     const winner = snap.manifests.find((m) => m.manifest.id === id);
-    expect(winner?.layer).toBe('L2');
+    expect(winner?.origin).toBe('project');
     // Both lower layers recorded as shadowed, ordered most→least specific.
-    expect(winner?.shadowedBy.map((s) => s.layer)).toEqual(['L1', 'L0']);
+    expect(winner?.shadowedBy.map((s) => s.origin)).toEqual(['user', 'builtin']);
   });
 
   it('topo sort: dependency lands before dependent in manifests[]', async () => {
-    writePlugin('L1', 'lib', {
+    writePlugin('user', 'lib', {
       id: '@x/lib',
       kind: 'tool',
       displayName: { en: 'lib' },
       provides: { tools: [{ id: 'lib.t' }] },
       entry: { backend: './h.ts' },
     });
-    writePlugin('L1', 'consumer', {
+    writePlugin('user', 'consumer', {
       id: '@x/consumer',
       kind: 'tool',
       displayName: { en: 'consumer' },
@@ -195,7 +195,7 @@ describe('architecture-evolution · trinity lifecycle', () => {
 
   it('callTool dispatches a freshly-scanned tool handler end-to-end', async () => {
     writePlugin(
-      'L1',
+      'user',
       'tool-live',
       {
         id: '@x/tool-live',
@@ -224,8 +224,8 @@ describe('architecture-evolution · trinity lifecycle', () => {
   });
 
   it('.fxpack export → install → re-scan makes a new tool callable', async () => {
-    // Source plugin lives outside any layer root; we'll export then install
-    // it into L1 and verify the registry sees it via a normal scan.
+    // Source plugin lives outside any origin root; we'll export then install
+    // it into user and verify the registry sees it via a normal scan.
     const srcDir = join(TMP, 'src', 'roundtrip');
     mkdirSync(srcDir, { recursive: true });
     writeFileSync(
@@ -269,14 +269,14 @@ describe('architecture-evolution · trinity lifecycle', () => {
     expect(insp.trust.signed).toBe(false);
     expect(insp.trust.conflicts).toEqual([]);
 
-    // L1 = ~/.forgeax — installer expects destRoot to be the user home.
-    // We point destRoot at a tmp dir then scan that same path as the L1 root.
+    // user = ~/.forgeax — installer expects destRoot to be the user home.
+    // We point destRoot at a tmp dir then scan that same path as the user root.
     const userRoot = join(TMP, 'user-home');
     mkdirSync(userRoot, { recursive: true });
-    const inst = await installPack({ zipPath: fxpack, destRoot: userRoot, destLayer: 'L2' });
+    const inst = await installPack({ zipPath: fxpack, destRoot: userRoot, destinationOrigin: 'project' });
     // installPack writes <destRoot>/.forgeax/extensions/<id>/ regardless of
-    // destLayer — the layer label is metadata for the ledger; on-disk path
-    // is the same. We then point our L2 scan root at <destRoot>/.forgeax/extensions.
+    // destinationOrigin is metadata for the ledger; the on-disk path
+    // is the same. We then point our project scan root at <destRoot>/.forgeax/extensions.
     expect(inst.ok).toBe(true);
     if (!inst.ok) return;
     expect(inst.installed).toEqual(['@me/roundtrip']);
@@ -284,11 +284,11 @@ describe('architecture-evolution · trinity lifecycle', () => {
       existsSync(join(userRoot, '.forgeax/extensions/roundtrip/forgeax-extension.json')),
     ).toBe(true);
 
-    // Re-scan with the freshly-installed tree as a custom L2 root.
-    const scan = await scanAllLayers({
-      L0: join(TMP, 'L0'),
-      L1: join(TMP, 'L1'),
-      L2: join(userRoot, '.forgeax/extensions'),
+    // Re-scan with the freshly-installed tree as a custom project root.
+    const scan = await scanAllExtensionOrigins({
+      builtin: join(TMP, 'builtin'),
+      user: join(TMP, 'user'),
+      project: join(userRoot, '.forgeax/extensions'),
     });
     const merge = mergeManifests(scan.found);
     const kinds = buildKindRegistry(merge.manifests);

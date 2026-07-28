@@ -1,11 +1,11 @@
 /**
- * Phase D6 (2/4) — Fork an existing plugin into L1 or L2.
+ * Phase D6 (2/4) — Fork an existing plugin into user or project.
  *
  * "Fork & Vibe" path from 09-NON-EXPERT-AUTHORING.md §2.2:
  *   - copy <srcDir>/ → <destRoot>/.forgeax/extensions/<slug>/
  *   - patch forgeax-extension.json: rewrite `id`, append "(我的)" / "(mine)" to
  *     displayName so the fork is visually distinct in the sidebar
- *   - L1 has higher precedence than L0, so the fork immediately shadows the
+ *   - user has higher precedence than builtin, so the fork immediately shadows the
  *     original (the doc explicitly relies on this)
  *
  * Conflict policy is intentionally simple: if the target slug already exists
@@ -15,7 +15,7 @@
 import { mkdirSync, cpSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { defaultLayerRoots } from './scanner';
+import { defaultExtensionRoots } from './scanner';
 import { getExtensionSnapshot } from './registry';
 
 export interface ForkInput {
@@ -23,14 +23,14 @@ export interface ForkInput {
   srcId: string;
   /** target id; default is `<srcId>-mine` */
   newId?: string;
-  /** target layer; default L1 (so the fork shadows L0 for the same author) */
-  destLayer?: 'L1' | 'L2';
-  /** project root for L2 — required when destLayer='L2' */
+  /** target origin; default user (so the fork shadows builtin for the same author) */
+  destinationOrigin?: 'user' | 'project';
+  /** project root for project — required when destinationOrigin='project' */
   projectRoot?: string;
 }
 
 export type ForkResult =
-  | { ok: true; id: string; dir: string; layer: 'L1' | 'L2' }
+  | { ok: true; id: string; dir: string; origin: 'user' | 'project' }
   | { ok: false; code: 'not_found' | 'exists' | 'bad_input' | 'fs_error'; error: string };
 
 /** Build a default fork id. `@scope/foo` → `@scope/foo-mine`. */
@@ -69,18 +69,18 @@ export async function forkExtension(input: ForkInput): Promise<ForkResult> {
     return { ok: false, code: 'exists', error: `newId already loaded: ${newId}` };
   }
 
-  const layer = input.destLayer ?? 'L1';
-  const roots = defaultLayerRoots({ projectRoot: input.projectRoot });
-  let destLayerRoot: string;
-  if (layer === 'L1') {
-    destLayerRoot = roots.L1 ?? resolve(homedir(), '.forgeax/extensions');
+  const origin = input.destinationOrigin ?? 'user';
+  const roots = defaultExtensionRoots({ projectRoot: input.projectRoot });
+  let destinationRoot: string;
+  if (origin === 'user') {
+    destinationRoot = roots.user ?? resolve(homedir(), '.forgeax/extensions');
   } else {
     if (!input.projectRoot) {
-      return { ok: false, code: 'bad_input', error: 'projectRoot required for destLayer=L2' };
+      return { ok: false, code: 'bad_input', error: 'projectRoot required for destinationOrigin=project' };
     }
-    destLayerRoot = roots.L2 ?? resolve(input.projectRoot, '.forgeax/extensions');
+    destinationRoot = roots.project ?? resolve(input.projectRoot, '.forgeax/extensions');
   }
-  const destDir = join(destLayerRoot, slugFor(newId));
+  const destDir = join(destinationRoot, slugFor(newId));
   if (existsSync(destDir)) {
     return { ok: false, code: 'exists', error: `target dir already exists: ${destDir}` };
   }
@@ -88,7 +88,7 @@ export async function forkExtension(input: ForkInput): Promise<ForkResult> {
   const srcDir = dirname(src.originPath);
 
   try {
-    mkdirSync(destLayerRoot, { recursive: true });
+    mkdirSync(destinationRoot, { recursive: true });
     cpSync(srcDir, destDir, { recursive: true });
     // node_modules / build artefacts shouldn't ship; we keep cpSync simple here
     // and trust the fork to be a hand-authored plugin tree (not a built
@@ -107,7 +107,7 @@ export async function forkExtension(input: ForkInput): Promise<ForkResult> {
     return { ok: false, code: 'fs_error', error: (e as Error).message };
   }
 
-  return { ok: true, id: newId, dir: destDir, layer };
+  return { ok: true, id: newId, dir: destDir, origin };
 }
 
 function patchDisplayName(v: unknown, suffix: string): unknown {

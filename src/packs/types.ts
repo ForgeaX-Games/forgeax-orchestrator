@@ -95,7 +95,7 @@ export interface FxpackTrustDescriptor {
    *  snapshot. Empty when no conflicts. */
   conflicts: Array<{
     id: string;
-    existingLayer: 'L0' | 'L1' | 'L2';
+    existingOrigin: 'builtin' | 'user' | 'project';
     existingVersion: string;
     newVersion: string;
   }>;
@@ -174,8 +174,8 @@ export interface FxpackInstallInput {
   /** Where to install. We always write under <destRoot>/.forgeax/extensions/<id>/ */
   destRoot: string;
   trustLookup?: FxpackTrustLookup;
-  /** L1 (~/.forgeax/extensions) is the default; L2 picks <projectRoot>/.forgeax. */
-  destLayer: 'L1' | 'L2';
+  /** user (~/.forgeax/extensions) is the default; project picks <projectRoot>/.forgeax. */
+  destinationOrigin: 'user' | 'project';
   /** What to do when an id already exists at destRoot.
    *  - 'skip'      : leave the existing copy, drop the new one
    *  - 'overwrite' : nuke + replace (the doc reserves this for explicit confirm)

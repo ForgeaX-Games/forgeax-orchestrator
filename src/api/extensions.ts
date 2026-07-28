@@ -39,21 +39,21 @@ export function createExtensionsRouter(): Hono {
     return c.json(serialize(snap));
   });
 
-  /** D6 (2/4) — Fork an existing plugin to L1 or L2. */
+  /** D6 (2/4) — Fork an existing plugin to user or project. */
   router.post('/fork', async (c) => {
     const body = (await c.req.json().catch(() => null)) as {
       srcId?: string;
       newId?: string;
-      destLayer?: 'L1' | 'L2';
+      destinationOrigin?: 'user' | 'project';
       projectRoot?: string;
     } | null;
     if (!body?.srcId) {
-      return c.json({ ok: false, code: 'bad_input', error: 'expected { srcId, newId?, destLayer?, projectRoot? }' }, 400);
+      return c.json({ ok: false, code: 'bad_input', error: 'expected { srcId, newId?, destinationOrigin?, projectRoot? }' }, 400);
     }
     const result = await forkExtension({
       srcId: body.srcId,
       newId: body.newId,
-      destLayer: body.destLayer,
+      destinationOrigin: body.destinationOrigin,
       projectRoot: body.projectRoot,
     });
     if (result.ok) {
@@ -115,7 +115,7 @@ export function createExtensionsRouter(): Hono {
    *          recorded: [{ toolId, args }], requiresTools?,
    *          distill?: { model: string } }
    *
-   *  Without `distill`: writes a new L2 plugin that re-plays the recorded
+   *  Without `distill`: writes a new project plugin that re-plays the recorded
    *  calls verbatim (deterministic baseline).
    *  With `distill.model`: pipes the recording through `lib/llm-gateway`
    *  to enrich `description` + write a sidecar `skill.md`. LLM failure
@@ -166,7 +166,7 @@ export function createExtensionsRouter(): Hono {
   });
 
   /** Doc 09 §2.1 — wb-plugin-author backend. List / read / write files
-   *  inside an L2 plugin directory. Path-jail + extension whitelist + size
+   *  inside an project plugin directory. Path-jail + extension whitelist + size
    *  cap live in plugins/files.ts. */
   router.get('/files', (c) => {
     const root = c.req.query('root') ?? process.cwd();
@@ -233,7 +233,7 @@ function serialize(snap: ReturnType<typeof getExtensionSnapshot>) {
       id: m.manifest.id,
       version: m.manifest.version,
       kind: m.manifest.kind,
-      layer: m.layer,
+      origin: m.origin,
       originPath: m.originPath,
       shadowedBy: m.shadowedBy,
       displayName: m.manifest.displayName,
@@ -244,13 +244,13 @@ function serialize(snap: ReturnType<typeof getExtensionSnapshot>) {
     workbench: snap.kinds.workbench,
     agents: snap.kinds.agents.map((a) => ({
       extensionId: a.extensionId,
-      layer: a.layer,
+      origin: a.origin,
       personaPath: a.personaPath,
       definition: a.definition,
     })),
     skills: snap.kinds.skills.map((s) => ({
       extensionId: s.extensionId,
-      layer: s.layer,
+      origin: s.origin,
       id: s.definition.id,
       triggers: s.definition.triggers,
       entry: s.definition.entry,

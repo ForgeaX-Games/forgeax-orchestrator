@@ -24,12 +24,12 @@
 import { dirname, isAbsolute, resolve } from 'node:path';
 import type { ManifestToolEntry, ExtensionManifest } from '@forgeax/types';
 import type { MergedManifest } from '../merger';
-import type { ExtensionLayer } from '../scanner';
+import type { ExtensionOrigin } from '../scanner';
 import type { KindLoadIssue } from './types';
 
 export interface ToolEntry {
   extensionId: string;
-  layer: ExtensionLayer;
+  origin: ExtensionOrigin;
   toolId: string;
   /** Absolute path to args JSONSchema file, or the inline object. */
   argsSchema?: unknown;
@@ -95,7 +95,7 @@ export function loadTools(
     seen.add(t.id);
     entries.push({
       extensionId: m.id,
-      layer: merged.layer,
+      origin: merged.origin,
       toolId: t.id,
       argsSchema: normalizeSchemaRef(t.args, dir),
       returnsSchema: normalizeSchemaRef(t.returns, dir),

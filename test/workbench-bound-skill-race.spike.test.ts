@@ -33,7 +33,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { _setSnapshotForTests, _resetSnapshotForTests } from '../src/extensions/registry';
@@ -48,7 +48,7 @@ const ROOT_B = join(TMP, 'B');
 async function buildSnapshot(rootDir: string, includeWb: boolean) {
   // Workbench plugin contributes a tool the skill will call.
   if (includeWb) {
-    const wb = join(rootDir, 'L1', 'wb-host');
+    const wb = join(rootDir, 'user', 'wb-host');
     mkdirSync(join(wb, 'server'), { recursive: true });
     writeFileSync(
       join(wb, 'forgeax-extension.json'),
@@ -80,7 +80,7 @@ async function buildSnapshot(rootDir: string, includeWb: boolean) {
   }
 
   // Skill plugin always present — it's the caller, not the swapped piece.
-  const sk = join(rootDir, 'L1', 'wb-skill');
+  const sk = join(rootDir, 'user', 'wb-skill');
   mkdirSync(sk, { recursive: true });
   writeFileSync(
     join(sk, 'forgeax-extension.json'),
@@ -114,10 +114,10 @@ async function buildSnapshot(rootDir: string, includeWb: boolean) {
     `,
   );
 
-  const scan = await scanAllLayers({
-    L0: join(rootDir, 'L0'),
-    L1: join(rootDir, 'L1'),
-    L2: join(rootDir, 'L2'),
+  const scan = await scanAllExtensionOrigins({
+    builtin: join(rootDir, 'builtin'),
+    user: join(rootDir, 'user'),
+    project: join(rootDir, 'project'),
   });
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
@@ -134,7 +134,7 @@ async function buildSnapshot(rootDir: string, includeWb: boolean) {
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   for (const r of [ROOT_A, ROOT_B]) {
-    for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(r, l), { recursive: true });
+    for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(r, l), { recursive: true });
   }
   _resetSnapshotForTests();
   _resetToolHandlerCacheForTests();

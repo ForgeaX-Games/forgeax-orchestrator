@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getEventBus, _resetEventBusForTests, type EventEnvelope } from '../src/events/bus';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { _setSnapshotForTests, _resetSnapshotForTests } from '../src/extensions/registry';
@@ -110,7 +110,7 @@ describe('callTool auto-emit', () => {
   beforeEach(() => {
     rmSync(TMP, { recursive: true, force: true });
     mkdirSync(TMP, { recursive: true });
-    for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+    for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
     _resetSnapshotForTests();
     _resetToolHandlerCacheForTests();
   });
@@ -126,7 +126,7 @@ describe('callTool auto-emit', () => {
     // stale module body. (forgeax-extension.json is rebuilt to point at the
     // new file.)
     const handlerName = `h-${crypto.randomUUID()}.mjs`;
-    const dir = join(TMP, 'L1', 'demo');
+    const dir = join(TMP, 'user', 'demo');
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, 'forgeax-extension.json'),
@@ -142,7 +142,7 @@ describe('callTool auto-emit', () => {
       'utf-8',
     );
     writeFileSync(join(dir, handlerName), handler, 'utf-8');
-    const scan = await scanAllLayers({ L0: join(TMP, 'L0'), L1: join(TMP, 'L1'), L2: join(TMP, 'L2') });
+    const scan = await scanAllExtensionOrigins({ builtin: join(TMP, 'builtin'), user: join(TMP, 'user'), project: join(TMP, 'project') });
     const merge = mergeManifests(scan.found);
     const kinds = buildKindRegistry(merge.manifests);
     _setSnapshotForTests({

@@ -139,7 +139,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   if (rebirth && scopeSlug) {
     emitLifeEvent({ kind: 'rebirth.projected', agentId: input.agentId, into: scopeSlug, at: Date.now() });
   }
-  // L1 感知回灌(M8):上一轮后游戏运行期 console/preview error 排空进本轮 user 后缀,
+  // 运行期错误感知回灌(M8):上一轮后游戏运行期 console/preview error 排空进本轮 user 后缀,
   // 让 agent 看见自己写的代码在引擎里真实报的错(轮间注入,不进 system prompt)。
   const notes = drainPerceptionNotes(input.sessionId);
   const runtimeFeedback = notes.length

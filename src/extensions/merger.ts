@@ -1,22 +1,22 @@
 /**
  * Phase B1 — ManifestMerger.
  *
- * Dedupes scanned manifests by `id`, applying the L2 > L1 > L0 layering rule
- * (project beats user beats builtin), and topologically sorts the survivors
+ * Dedupes scanned manifests by `id`, applying explicit origin precedence
+ * (project-specific beats user-installed beats built-in), and topologically sorts the survivors
  * by `dependencies`. Shadowed entries are recorded so SettingsPanel can
  * surface "this builtin is overridden by your project copy" hints.
  *
  * See docs/v2-vision/architecture-evolution/03-AGENT-SKILL-PLUGIN-TRINITY.md §2.1.
  */
 import type { ExtensionManifest } from '@forgeax/types';
-import type { ExtensionLayer, ScannedManifest } from './scanner';
+import type { ExtensionOrigin, ScannedManifest } from './scanner';
 
 export interface MergedManifest {
   manifest: ExtensionManifest;
-  layer: ExtensionLayer;
+  origin: ExtensionOrigin;
   originPath: string;
   /** Lower-precedence copies of the same id, ordered most→least specific. */
-  shadowedBy: Array<{ layer: ExtensionLayer; originPath: string }>;
+  shadowedBy: Array<{ origin: ExtensionOrigin; originPath: string }>;
 }
 
 export interface MergeIssue {
@@ -31,9 +31,9 @@ export interface MergeResult {
   issues: MergeIssue[];
 }
 
-const LAYER_RANK: Record<ExtensionLayer, number> = { L0: 0, L1: 1, L2: 2 };
+const ORIGIN_RANK: Record<ExtensionOrigin, number> = { builtin: 0, user: 1, project: 2 };
 
-/** Apply L2 > L1 > L0 dedupe + topological sort.
+/** Apply project > user > builtin dedupe + topological sort.
  *
  *  Topo failures (unknown dep, cycle) are reported in `issues` and the
  *  affected plugin is appended at the end in id-stable order so callers
@@ -48,13 +48,13 @@ export function mergeManifests(scanned: ScannedManifest[]): MergeResult {
 
   const winners: MergedManifest[] = [];
   for (const [, copies] of byId) {
-    copies.sort((a, b) => LAYER_RANK[b.layer] - LAYER_RANK[a.layer]);
+    copies.sort((a, b) => ORIGIN_RANK[b.origin] - ORIGIN_RANK[a.origin]);
     const [head, ...rest] = copies;
     winners.push({
       manifest: head.manifest,
-      layer: head.layer,
+      origin: head.origin,
       originPath: head.originPath,
-      shadowedBy: rest.map((r) => ({ layer: r.layer, originPath: r.originPath })),
+      shadowedBy: rest.map((r) => ({ origin: r.origin, originPath: r.originPath })),
     });
   }
   // Stable order baseline before topo (id ascending) so equal-depth deps stay deterministic.

@@ -3,7 +3,7 @@
  *   POST /api/packs/export   → produce .fxpack from existing plugin ids
  *   POST /api/packs/inspect  → return TrustDescriptor for a pack at <path>
  *                              or uploaded multipart body
- *   POST /api/packs/install  → install a pack to L1/L2, then trigger reload
+ *   POST /api/packs/install  → install a pack to user/project, then trigger reload
  *
  * The export endpoint takes a JSON list of plugin ids — the server resolves
  * each one against the current PluginRegistry snapshot (so we know its
@@ -45,7 +45,7 @@ interface InspectBody {
 interface InstallBody {
   path: string;
   destRoot: string;
-  destLayer: 'L1' | 'L2';
+  destinationOrigin: 'user' | 'project';
   conflictPolicy?: 'skip' | 'overwrite' | 'rename';
   reload?: boolean;
   userAcknowledgedUnsigned?: boolean;
@@ -103,16 +103,16 @@ export function createPacksRouter(): Hono {
 
   r.post('/install', async (c) => {
     const body = (await c.req.json().catch(() => null)) as InstallBody | null;
-    if (!body?.path || !body.destRoot || !body.destLayer) {
+    if (!body?.path || !body.destRoot || !body.destinationOrigin) {
       return c.json(
-        { ok: false, error: 'expected { path, destRoot, destLayer, conflictPolicy?, reload? }', code: 'bad_request' },
+        { ok: false, error: 'expected { path, destRoot, destinationOrigin, conflictPolicy?, reload? }', code: 'bad_request' },
         400,
       );
     }
     const result = await installPack({
       zipPath: body.path,
       destRoot: body.destRoot,
-      destLayer: body.destLayer,
+      destinationOrigin: body.destinationOrigin,
       conflictPolicy: body.conflictPolicy,
       userAcknowledgedUnsigned: body.userAcknowledgedUnsigned,
     });

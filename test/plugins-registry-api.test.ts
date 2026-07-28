@@ -11,8 +11,8 @@ import { reloadExtensions, _resetSnapshotForTests } from '../src/extensions/regi
 
 const TMP = `/tmp/forgeax-registry-${process.pid}`;
 
-function mkmanifest(layer: string, dirName: string, body: Record<string, unknown>): void {
-  const dir = join(TMP, layer, dirName);
+function mkmanifest(origin: string, dirName: string, body: Record<string, unknown>): void {
+  const dir = join(TMP, origin, dirName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),
@@ -24,19 +24,19 @@ function mkmanifest(layer: string, dirName: string, body: Record<string, unknown
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2']) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project']) mkdirSync(join(TMP, l), { recursive: true });
   _resetSnapshotForTests();
 });
 
 describe('/api/plugins', () => {
   it('GET /manifests reflects the last loaded snapshot', async () => {
-    mkmanifest('L0', 'wb-x', {
+    mkmanifest('builtin', 'wb-x', {
       id: '@forgeax-extension/wb-x',
       kind: 'workbench',
       displayName: { zh: 'X' },
       provides: { workbench: { id: 'x', position: 110 } },
     });
-    await reloadExtensions({ roots: { L0: join(TMP, 'L0'), L1: join(TMP, 'L1'), L2: join(TMP, 'L2') } });
+    await reloadExtensions({ roots: { builtin: join(TMP, 'builtin'), user: join(TMP, 'user'), project: join(TMP, 'project') } });
 
     const app = new Hono();
     app.route('/api/plugins', createExtensionsRouter());
@@ -48,17 +48,17 @@ describe('/api/plugins', () => {
     expect(body.manifests[0]).toMatchObject({
       id: '@forgeax-extension/wb-x',
       kind: 'workbench',
-      layer: 'L0',
+      origin: 'builtin',
     });
     expect(body.workbench[0]).toMatchObject({ workbenchId: 'x', position: 110 });
   });
 
   it('POST /reload bumps generation and picks up new on-disk manifests', async () => {
-    const roots = { L0: join(TMP, 'L0'), L1: join(TMP, 'L1'), L2: join(TMP, 'L2') };
+    const roots = { builtin: join(TMP, 'builtin'), user: join(TMP, 'user'), project: join(TMP, 'project') };
     const before = await reloadExtensions({ roots });
     expect(before.manifests.length).toBe(0);
 
-    mkmanifest('L0', 'wb-late', {
+    mkmanifest('builtin', 'wb-late', {
       id: '@forgeax-extension/wb-late',
       kind: 'workbench',
       displayName: { zh: 'Late' },
@@ -81,9 +81,9 @@ describe('/api/plugins', () => {
   });
 
   it('serializes scan errors as issues with phase=scan', async () => {
-    mkdirSync(join(TMP, 'L0', 'broken'), { recursive: true });
-    writeFileSync(join(TMP, 'L0', 'broken', 'forgeax-extension.json'), '{ malformed', 'utf-8');
-    await reloadExtensions({ roots: { L0: join(TMP, 'L0'), L1: join(TMP, 'L1'), L2: join(TMP, 'L2') } });
+    mkdirSync(join(TMP, 'builtin', 'broken'), { recursive: true });
+    writeFileSync(join(TMP, 'builtin', 'broken', 'forgeax-extension.json'), '{ malformed', 'utf-8');
+    await reloadExtensions({ roots: { builtin: join(TMP, 'builtin'), user: join(TMP, 'user'), project: join(TMP, 'project') } });
 
     const app = new Hono();
     app.route('/api/plugins', createExtensionsRouter());

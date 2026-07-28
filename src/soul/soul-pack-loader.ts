@@ -291,11 +291,11 @@ async function synthFromLegacy(agentId: string, memory: LayeredMemoryRef): Promi
   const id = agentId.trim();
   const warnings: string[] = [];
 
-  // 来源/信任:builtin 编排者(forge/default/root) → forge/own;否则看 persona 解析来源。
+  // 来源/信任:内置编排者(forge/default/root) → forge/own;否则看 persona 解析来源。
   let source: SoulSource = 'forge';
   if (!OWN_BUILTIN_IDS.has(id)) {
     const resolved = await resolvePersonaForAgent(id).catch(() => null);
-    source = resolved?.source === 'plugin' && resolved.layer === 'L0'
+    source = resolved?.source === 'plugin' && resolved.origin === 'builtin'
       ? 'builtin'
       : resolved
         ? 'marketplace'

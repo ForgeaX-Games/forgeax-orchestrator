@@ -13,7 +13,7 @@ import { markHostToolDefinition } from '../src/kernel/host-tool-confirmation';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { mergeManifests } from '../src/extensions/merger';
 import { _resetSnapshotForTests, _setSnapshotForTests } from '../src/extensions/registry';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { callTool, _resetConfirmsForTests, _resetToolHandlerCacheForTests } from '../src/tools/registry';
 
 let root: string;
@@ -43,7 +43,7 @@ function bridgedTool(name: string, hostToolId: string): ToolDefinition {
 }
 
 async function loadTools(): Promise<void> {
-  const dir = join(extensionRoot, 'L1', 'host-tools');
+  const dir = join(extensionRoot, 'user', 'host-tools');
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),
@@ -79,12 +79,12 @@ async function loadTools(): Promise<void> {
     };\n`,
   );
   const roots = {
-    L0: join(extensionRoot, 'L0'),
-    L1: join(extensionRoot, 'L1'),
-    L2: join(extensionRoot, 'L2'),
+    builtin: join(extensionRoot, 'builtin'),
+    user: join(extensionRoot, 'user'),
+    project: join(extensionRoot, 'project'),
   };
   for (const dirPath of Object.values(roots)) mkdirSync(dirPath, { recursive: true });
-  const scan = await scanAllLayers(roots);
+  const scan = await scanAllExtensionOrigins(roots);
   const merged = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merged.manifests);
   _setSnapshotForTests({

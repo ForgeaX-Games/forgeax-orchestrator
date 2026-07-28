@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { recordAsSkill, distillRecordedSkill } from '../src/skills/record-as-skill';
 import type { LlmCompleter } from '../src/skills/record-as-skill';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 
@@ -46,16 +46,16 @@ describe('Doc 09 §2.3 — record-as-skill', () => {
     expect(existsSync(r.manifestPath)).toBe(true);
     expect(existsSync(r.skillPath)).toBe(true);
 
-    // Scanner should pick it up under the project's L2 root —
+    // Scanner should pick it up under the project's project root —
     // .forgeax/extensions/<slug> mirrors fork + install layout.
-    // Move it into a synthetic L2 root so scanAllLayers can see it.
-    const L2 = join(TMP, '.forgeax', 'extensions');
-    // Pin L0/L1 to empty dirs so we don't accidentally scan the host repo.
-    const L0 = join(TMP, '_empty_L0');
-    const L1 = join(TMP, '_empty_L1');
-    mkdirSync(L0, { recursive: true });
-    mkdirSync(L1, { recursive: true });
-    const scan = await scanAllLayers({ L0, L1, L2 });
+    // Move it into a synthetic project root so scanAllExtensionOrigins can see it.
+    const project = join(TMP, '.forgeax', 'extensions');
+    // Pin builtin/user to empty dirs so we don't accidentally scan the host repo.
+    const builtin = join(TMP, '_empty_builtin');
+    const user = join(TMP, '_empty_user');
+    mkdirSync(builtin, { recursive: true });
+    mkdirSync(user, { recursive: true });
+    const scan = await scanAllExtensionOrigins({ builtin, user, project });
     expect(scan.errors).toEqual([]);
     const merge = mergeManifests(scan.found);
     const kinds = buildKindRegistry(merge.manifests);

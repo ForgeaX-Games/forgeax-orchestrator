@@ -1,17 +1,17 @@
 /**
  * Phase B1 unit tests for scanner+merger. Builds disposable plugin trees in
- * /tmp and verifies the L2>L1>L0 override + topo + zod rejection paths.
+ * /tmp and verifies the project>user>builtin override + topo + zod rejection paths.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 
 const TMP = `/tmp/forgeax-plugins-${process.pid}`;
 
-function mkplugin(layer: 'L0' | 'L1' | 'L2', id: string, body: Record<string, unknown>): void {
-  const layerDir = join(TMP, layer, id.replace(/^@[^/]+\//, ''));
+function mkplugin(origin: 'builtin' | 'user' | 'project', id: string, body: Record<string, unknown>): void {
+  const layerDir = join(TMP, origin, id.replace(/^@[^/]+\//, ''));
   mkdirSync(layerDir, { recursive: true });
   writeFileSync(
     join(layerDir, 'forgeax-extension.json'),
@@ -30,7 +30,7 @@ function mkplugin(layer: 'L0' | 'L1' | 'L2', id: string, body: Record<string, un
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
 });
 
 afterEach(() => {
@@ -38,25 +38,25 @@ afterEach(() => {
 });
 
 const ROOTS = () => ({
-  L0: join(TMP, 'L0'),
-  L1: join(TMP, 'L1'),
-  L2: join(TMP, 'L2'),
+  builtin: join(TMP, 'builtin'),
+  user: join(TMP, 'user'),
+  project: join(TMP, 'project'),
 });
 
 describe('scanner + merger', () => {
-  it('finds manifests in each layer', async () => {
-    mkplugin('L0', '@forgeax-extension/wb-a', { provides: { workbench: { id: 'a' } } });
-    mkplugin('L1', '@forgeax-extension/wb-b', { provides: { workbench: { id: 'b' } } });
-    mkplugin('L2', '@forgeax-extension/wb-c', { provides: { workbench: { id: 'c' } } });
-    const r = await scanAllLayers(ROOTS());
+  it('finds manifests in each origin', async () => {
+    mkplugin('builtin', '@forgeax-extension/wb-a', { provides: { workbench: { id: 'a' } } });
+    mkplugin('user', '@forgeax-extension/wb-b', { provides: { workbench: { id: 'b' } } });
+    mkplugin('project', '@forgeax-extension/wb-c', { provides: { workbench: { id: 'c' } } });
+    const r = await scanAllExtensionOrigins(ROOTS());
     expect(r.errors.length).toBe(0);
-    expect(r.found.map((f) => f.layer).sort()).toEqual(['L0', 'L1', 'L2']);
+    expect(r.found.map((f) => f.origin).sort()).toEqual(['builtin', 'project', 'user']);
   });
 
-  it('follows symlinked plugin directories in L1', async () => {
-    mkplugin('L2', '@forgeax-extension/wb-linked', { provides: { workbench: { id: 'linked' } } });
-    const target = join(TMP, 'L2', 'wb-linked');
-    rmSync(join(TMP, 'L2', 'wb-linked'), { recursive: true, force: true });
+  it('follows symlinked plugin directories in user', async () => {
+    mkplugin('project', '@forgeax-extension/wb-linked', { provides: { workbench: { id: 'linked' } } });
+    const target = join(TMP, 'project', 'wb-linked');
+    rmSync(join(TMP, 'project', 'wb-linked'), { recursive: true, force: true });
     mkdirSync(target, { recursive: true });
     writeFileSync(
       join(target, 'forgeax-extension.json'),
@@ -70,47 +70,47 @@ describe('scanner + merger', () => {
       }),
       'utf-8',
     );
-    symlinkSync(target, join(TMP, 'L1', 'wb-linked'), 'dir');
+    symlinkSync(target, join(TMP, 'user', 'wb-linked'), 'dir');
 
-    const r = await scanAllLayers({ ...ROOTS(), L2: null });
+    const r = await scanAllExtensionOrigins({ ...ROOTS(), project: null });
     expect(r.errors).toEqual([]);
-    expect(r.found.map((f) => [f.layer, f.manifest.id])).toEqual([
-      ['L1', '@forgeax-extension/wb-linked'],
+    expect(r.found.map((f) => [f.origin, f.manifest.id])).toEqual([
+      ['user', '@forgeax-extension/wb-linked'],
     ]);
   });
 
   it('rejects malformed manifest with a structured error', async () => {
-    mkdirSync(join(TMP, 'L0', 'broken'), { recursive: true });
-    writeFileSync(join(TMP, 'L0', 'broken', 'forgeax-extension.json'), '{not json', 'utf-8');
-    const r = await scanAllLayers(ROOTS());
+    mkdirSync(join(TMP, 'builtin', 'broken'), { recursive: true });
+    writeFileSync(join(TMP, 'builtin', 'broken', 'forgeax-extension.json'), '{not json', 'utf-8');
+    const r = await scanAllExtensionOrigins(ROOTS());
     expect(r.errors.length).toBe(1);
-    expect(r.errors[0].layer).toBe('L0');
+    expect(r.errors[0].origin).toBe('builtin');
   });
 
-  it('L2 wins over L1 wins over L0 with shadowedBy chain', async () => {
+  it('project wins over user wins over builtin with shadowedBy chain', async () => {
     const id = '@forgeax-extension/wb-shared';
-    mkplugin('L0', id, { version: '0.1.0', provides: { workbench: { id: 'shared' } } });
-    mkplugin('L1', id, { version: '0.2.0', provides: { workbench: { id: 'shared' } } });
-    mkplugin('L2', id, { version: '0.3.0', provides: { workbench: { id: 'shared' } } });
-    const scan = await scanAllLayers(ROOTS());
+    mkplugin('builtin', id, { version: '0.1.0', provides: { workbench: { id: 'shared' } } });
+    mkplugin('user', id, { version: '0.2.0', provides: { workbench: { id: 'shared' } } });
+    mkplugin('project', id, { version: '0.3.0', provides: { workbench: { id: 'shared' } } });
+    const scan = await scanAllExtensionOrigins(ROOTS());
     const merged = mergeManifests(scan.found);
     expect(merged.manifests.length).toBe(1);
-    expect(merged.manifests[0].layer).toBe('L2');
+    expect(merged.manifests[0].origin).toBe('project');
     expect(merged.manifests[0].manifest.version).toBe('0.3.0');
-    expect(merged.manifests[0].shadowedBy.map((s) => s.layer)).toEqual(['L1', 'L0']);
+    expect(merged.manifests[0].shadowedBy.map((s) => s.origin)).toEqual(['user', 'builtin']);
   });
 
   it('topologically sorts by dependencies (deps before dependents)', async () => {
-    mkplugin('L0', '@forgeax-extension/wb-base', { provides: { workbench: { id: 'base' } } });
-    mkplugin('L0', '@forgeax-extension/wb-mid', {
+    mkplugin('builtin', '@forgeax-extension/wb-base', { provides: { workbench: { id: 'base' } } });
+    mkplugin('builtin', '@forgeax-extension/wb-mid', {
       provides: { workbench: { id: 'mid' } },
       dependencies: [{ id: '@forgeax-extension/wb-base' }],
     });
-    mkplugin('L0', '@forgeax-extension/wb-top', {
+    mkplugin('builtin', '@forgeax-extension/wb-top', {
       provides: { workbench: { id: 'top' } },
       dependencies: [{ id: '@forgeax-extension/wb-mid' }],
     });
-    const scan = await scanAllLayers(ROOTS());
+    const scan = await scanAllExtensionOrigins(ROOTS());
     const merged = mergeManifests(scan.found);
     const order = merged.manifests.map((m) => m.manifest.id);
     expect(order.indexOf('@forgeax-extension/wb-base'))
@@ -121,40 +121,40 @@ describe('scanner + merger', () => {
   });
 
   it('reports unknown-dependency without dropping the plugin', async () => {
-    mkplugin('L0', '@forgeax-extension/wb-orphan', {
+    mkplugin('builtin', '@forgeax-extension/wb-orphan', {
       provides: { workbench: { id: 'orphan' } },
       dependencies: [{ id: '@forgeax-extension/missing' }],
     });
-    const scan = await scanAllLayers(ROOTS());
+    const scan = await scanAllExtensionOrigins(ROOTS());
     const merged = mergeManifests(scan.found);
     expect(merged.issues.some((i) => i.kind === 'unknown-dependency')).toBe(true);
     expect(merged.manifests.map((m) => m.manifest.id)).toContain('@forgeax-extension/wb-orphan');
   });
 
   it('detects dependency cycles', async () => {
-    mkplugin('L0', '@forgeax-extension/wb-x', {
+    mkplugin('builtin', '@forgeax-extension/wb-x', {
       provides: { workbench: { id: 'x' } },
       dependencies: [{ id: '@forgeax-extension/wb-y' }],
     });
-    mkplugin('L0', '@forgeax-extension/wb-y', {
+    mkplugin('builtin', '@forgeax-extension/wb-y', {
       provides: { workbench: { id: 'y' } },
       dependencies: [{ id: '@forgeax-extension/wb-x' }],
     });
-    const scan = await scanAllLayers(ROOTS());
+    const scan = await scanAllExtensionOrigins(ROOTS());
     const merged = mergeManifests(scan.found);
     expect(merged.issues.some((i) => i.kind === 'cycle')).toBe(true);
   });
 
-  it('FORGEAX_SAFE_BOOT=1 skips L1+L2 scans (Doc 14 §4 spike)', async () => {
-    mkplugin('L0', '@forgeax-extension/wb-l0', { provides: { workbench: { id: 'l0' } } });
-    mkplugin('L1', '@forgeax-extension/wb-l1', { provides: { workbench: { id: 'l1' } } });
-    mkplugin('L2', '@forgeax-extension/wb-l2', { provides: { workbench: { id: 'l2' } } });
+  it('FORGEAX_SAFE_BOOT=1 skips user+project scans (Doc 14 §4 spike)', async () => {
+    mkplugin('builtin', '@forgeax-extension/wb-l0', { provides: { workbench: { id: 'l0' } } });
+    mkplugin('user', '@forgeax-extension/wb-l1', { provides: { workbench: { id: 'l1' } } });
+    mkplugin('project', '@forgeax-extension/wb-l2', { provides: { workbench: { id: 'l2' } } });
     const prev = process.env.FORGEAX_SAFE_BOOT;
     process.env.FORGEAX_SAFE_BOOT = '1';
     try {
-      const r = await scanAllLayers(ROOTS());
+      const r = await scanAllExtensionOrigins(ROOTS());
       expect(r.errors).toEqual([]);
-      expect(r.found.map((f) => f.layer)).toEqual(['L0']);
+      expect(r.found.map((f) => f.origin)).toEqual(['builtin']);
       expect(r.found.map((f) => f.manifest.id)).toEqual(['@forgeax-extension/wb-l0']);
     } finally {
       if (prev === undefined) delete process.env.FORGEAX_SAFE_BOOT;
@@ -163,18 +163,18 @@ describe('scanner + merger', () => {
   });
 
   it('rejects entry.standalone.devOnly:true under FORGEAX_NODE_ENV=production', async () => {
-    mkplugin('L0', '@forgeax-extension/wb-dev', {
+    mkplugin('builtin', '@forgeax-extension/wb-dev', {
       provides: { workbench: { id: 'dev' } },
       entry: { standalone: { start: 'bun --watch dev.ts', devOnly: true } },
     });
-    mkplugin('L0', '@forgeax-extension/wb-prod', {
+    mkplugin('builtin', '@forgeax-extension/wb-prod', {
       provides: { workbench: { id: 'prod' } },
       entry: { standalone: { start: 'node prod.js' } },
     });
     const prev = process.env.FORGEAX_NODE_ENV;
     process.env.FORGEAX_NODE_ENV = 'production';
     try {
-      const r = await scanAllLayers(ROOTS());
+      const r = await scanAllExtensionOrigins(ROOTS());
       expect(r.found.map((f) => f.manifest.id)).toEqual(['@forgeax-extension/wb-prod']);
       expect(r.errors.length).toBe(1);
       expect(r.errors[0].reason).toContain('devOnly');
@@ -185,14 +185,14 @@ describe('scanner + merger', () => {
   });
 
   it('accepts entry.standalone.devOnly:true outside production', async () => {
-    mkplugin('L0', '@forgeax-extension/wb-dev', {
+    mkplugin('builtin', '@forgeax-extension/wb-dev', {
       provides: { workbench: { id: 'dev' } },
       entry: { standalone: { start: 'bun --watch dev.ts', devOnly: true } },
     });
     const prev = process.env.FORGEAX_NODE_ENV;
     delete process.env.FORGEAX_NODE_ENV;
     try {
-      const r = await scanAllLayers(ROOTS());
+      const r = await scanAllExtensionOrigins(ROOTS());
       expect(r.errors).toEqual([]);
       expect(r.found.map((f) => f.manifest.id)).toEqual(['@forgeax-extension/wb-dev']);
     } finally {
@@ -200,15 +200,15 @@ describe('scanner + merger', () => {
     }
   });
 
-  it('FORGEAX_SAFE_BOOT unset still scans all three layers', async () => {
-    mkplugin('L0', '@forgeax-extension/wb-l0', { provides: { workbench: { id: 'l0' } } });
-    mkplugin('L1', '@forgeax-extension/wb-l1', { provides: { workbench: { id: 'l1' } } });
-    mkplugin('L2', '@forgeax-extension/wb-l2', { provides: { workbench: { id: 'l2' } } });
+  it('FORGEAX_SAFE_BOOT unset still scans all three origins', async () => {
+    mkplugin('builtin', '@forgeax-extension/wb-l0', { provides: { workbench: { id: 'l0' } } });
+    mkplugin('user', '@forgeax-extension/wb-l1', { provides: { workbench: { id: 'l1' } } });
+    mkplugin('project', '@forgeax-extension/wb-l2', { provides: { workbench: { id: 'l2' } } });
     const prev = process.env.FORGEAX_SAFE_BOOT;
     delete process.env.FORGEAX_SAFE_BOOT;
     try {
-      const r = await scanAllLayers(ROOTS());
-      expect(r.found.map((f) => f.layer).sort()).toEqual(['L0', 'L1', 'L2']);
+      const r = await scanAllExtensionOrigins(ROOTS());
+      expect(r.found.map((f) => f.origin).sort()).toEqual(['builtin', 'project', 'user']);
     } finally {
       if (prev !== undefined) process.env.FORGEAX_SAFE_BOOT = prev;
     }

@@ -27,7 +27,7 @@ export interface InstalledEntry {
   id: string;
   slug: string;
   version: string;
-  layer: 'L1' | 'L2';
+  origin: 'user' | 'project';
   source?: string;
   sha256?: string;
   ts: string;

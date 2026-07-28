@@ -3,7 +3,7 @@
  *  覆盖:
  *  - 取数往返:register → resolve 命中(snapshot 原样回);未知 reqId resolve→false。
  *  - 取数超时:无人 resolve → fail-soft 返回 { unavailable, reason:'timeout' }(不挂死)。
- *  - L1 缓冲:push → drain 一次拿全部 + 清空;超上限 FIFO 丢旧;空/无 sid 安全。
+ *  - 错误回灌缓冲:push → drain 一次拿全部 + 清空;超上限 FIFO 丢旧;空/无 sid 安全。
  */
 import { describe, expect, test } from 'bun:test';
 import {
@@ -35,7 +35,7 @@ describe('perception-registry · 取数往返', () => {
   });
 });
 
-describe('perception-registry · L1 回灌缓冲', () => {
+describe('perception-registry · 错误回灌缓冲', () => {
   test('push → drain 拿全部并清空', () => {
     pushPerceptionNote('sid-A', { level: 'error', text: 'boom', ts: 1 });
     pushPerceptionNote('sid-A', { level: 'warn', text: 'careful', ts: 2 });

@@ -81,7 +81,7 @@ function resolveAgent(
     ...(avatarParsed.rules ? { avatarRules: avatarParsed.rules } : {}),
   };
   return {
-    entry: { extensionId: m.id, layer: merged.layer, definition, personaPath },
+    entry: { extensionId: m.id, origin: merged.origin, definition, personaPath },
     issues,
   };
 }

@@ -1,4 +1,4 @@
-/** perception-registry —— 感知接地(R5/M8 L1)的两个进程内中枢。
+/** perception-registry —— 感知接地(R5/M8 运行期错误回灌)的两个进程内中枢。
  *
  *  1. 取数往返(host-forced verification, R5 §C.3):内核 turn 经 `query_world` /
  *     `capture_frame` 工具 → fxt MCP server HTTP 回打 `/:sid/perception-query`,
@@ -9,7 +9,7 @@
  *     boolean,且超时 fail-soft 返回 `{ unavailable, reason:'timeout' }`(取数失败
  *     不该让 turn 挂死——它只是少一份感知证据)。
  *
- *  2. L1 错误回灌(R5 §C.4 / M8):游戏运行期 `VAG_CONSOLE{error}` /
+ *  2. 运行期错误回灌(R5 §C.4 / M8):游戏运行期 `VAG_CONSOLE{error}` /
  *     `VAG_PREVIEW_ERROR` 由 interface POST `/:sid/perception` 进来,push 进 per-sid
  *     **环形缓冲**;下一轮 `composeTurnRequest` 把它 drain 进 `dynamicSuffix`(user
  *     后缀,不打碎 prompt-cache 前缀,守 contract §2.2.1)。
@@ -91,7 +91,7 @@ export function resolvePerception(reqId: string, snapshot: unknown, leaseId?: un
   return true;
 }
 
-// ─── L1 回灌:per-sid 错误环形缓冲 ──────────────────────────────────────────
+// ─── 运行期错误回灌:per-sid 错误环形缓冲 ───────────────────────────────────
 
 export interface PerceptionNote {
   level: 'error' | 'warn';

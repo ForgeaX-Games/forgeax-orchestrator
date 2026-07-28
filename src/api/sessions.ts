@@ -754,7 +754,7 @@ export function createSessionsRouter() {
     return c.json({ ok, ...(ok ? {} : { reason: 'no-pending' }) });
   });
 
-  // ── 感知接地(R5 §C / M8 L1)——————————————————————————————————————————
+  // ── 感知接地(R5 §C / M8 运行期错误回灌)——————————————————————————————
   // 取数往返(host-forced verification, "仅取数, 不当裁判"):内核 turn 调
   // query_world/capture_frame → fxt MCP server HTTP 回打这里 → 经 EventBus 把
   // perception:query 推给 interface → interface 向 preview iframe postMessage 取真值
@@ -860,7 +860,7 @@ export function createSessionsRouter() {
     return c.json(res, res.ok ? 200 : 403);
   });
 
-  // L1 错误回灌:游戏运行期 console error / preview error → per-sid 环形缓冲,
+  // 运行期错误回灌:游戏运行期 console error / preview error → per-sid 环形缓冲,
   // 下一轮 composeTurnRequest drain 进 dynamicSuffix(轮间 user 后缀注入)。
   r.post('/:sid/perception', async (c) => {
     const sid = c.req.param('sid');

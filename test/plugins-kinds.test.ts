@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import {
@@ -24,8 +24,8 @@ import { _resetEventBusForTests } from '../src/events/bus';
 
 const TMP = `/tmp/forgeax-kinds-${process.pid}`;
 
-function mkmanifest(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<string, unknown>): string {
-  const dir = join(TMP, layer, dirName);
+function mkmanifest(origin: 'builtin' | 'user' | 'project', dirName: string, body: Record<string, unknown>): string {
+  const dir = join(TMP, origin, dirName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),
@@ -36,13 +36,13 @@ function mkmanifest(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<str
 }
 
 const ROOTS = () => ({
-  L0: join(TMP, 'L0'),
-  L1: join(TMP, 'L1'),
-  L2: join(TMP, 'L2'),
+  builtin: join(TMP, 'builtin'),
+  user: join(TMP, 'user'),
+  project: join(TMP, 'project'),
 });
 
 async function reloadFromTmp() {
-  const scan = await scanAllLayers(ROOTS());
+  const scan = await scanAllExtensionOrigins(ROOTS());
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
   _setSnapshotForTests({
@@ -59,7 +59,7 @@ async function reloadFromTmp() {
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   _resetSnapshotForTests();
   _resetToolHandlerCacheForTests();
   _resetEventBusForTests();
@@ -74,21 +74,21 @@ afterEach(() => {
 
 describe('kind dispatcher', () => {
   it('normalizes legacy @forgeax-plugin/* id at scan (sanctioned compat exception)', async () => {
-    // User-forked L1/L2 extensions predate the Extension rename and keep the
+    // User-forked user/project extensions predate the Extension rename and keep the
     // old namespace on disk — the scanner's single read point rewrites it.
-    mkmanifest('L1', 'wb-legacy', {
+    mkmanifest('user', 'wb-legacy', {
       id: '@forgeax-plugin/wb-legacy',
       kind: 'workbench',
       displayName: { zh: 'legacy' },
       provides: { workbench: { id: 'legacy', position: 100 } },
     });
-    const scan = await scanAllLayers(ROOTS());
+    const scan = await scanAllExtensionOrigins(ROOTS());
     expect(scan.errors).toEqual([]);
     expect(scan.found.map((f) => f.manifest.id)).toEqual(['@forgeax-extension/wb-legacy']);
   });
 
   it('fans out workbench provides.agents[] into the agents registry (ADR 0025 M4)', async () => {
-    const dir = mkmanifest('L0', 'wb-bundle', {
+    const dir = mkmanifest('builtin', 'wb-bundle', {
       id: '@forgeax-extension/wb-bundle',
       kind: 'workbench',
       displayName: { zh: 'bundle' },
@@ -127,14 +127,14 @@ describe('kind dispatcher', () => {
   });
 
   it('extracts workbench entry with position/standalone/panelSize', async () => {
-    mkmanifest('L0', 'wb-test', {
+    mkmanifest('builtin', 'wb-test', {
       id: '@forgeax-extension/wb-test',
       kind: 'workbench',
       displayName: { zh: 'wb' },
       provides: { workbench: { id: 'test', position: 110, panelSize: 'lg' } },
       entry: { standalone: { port: 5173 } },
     });
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     expect(reg.workbench.length).toBe(1);
     expect(reg.workbench[0]).toMatchObject({
@@ -147,13 +147,13 @@ describe('kind dispatcher', () => {
   });
 
   it('normalizes shorthand skill (string entry + leading-slash trigger)', async () => {
-    mkmanifest('L0', 'skill-x', {
+    mkmanifest('builtin', 'skill-x', {
       id: '@forgeax-extension/skill-x',
       kind: 'skill',
       displayName: { zh: 'skill' },
       provides: { skills: [{ id: 'foo', entry: './SKILL.md', trigger: '/foo' }] },
     });
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     expect(reg.skills.length).toBe(1);
     expect(reg.skills[0].definition.entry).toEqual({ kind: 'prompt', file: './SKILL.md' });
@@ -161,7 +161,7 @@ describe('kind dispatcher', () => {
   });
 
   it('flags agent missing personaFile but still registers definition', async () => {
-    mkmanifest('L0', 'agent-x', {
+    mkmanifest('builtin', 'agent-x', {
       id: '@forgeax-extension/agent-x',
       kind: 'agent',
       displayName: { zh: 'agent' },
@@ -174,7 +174,7 @@ describe('kind dispatcher', () => {
         },
       },
     });
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     expect(reg.agents.length).toBe(1);
     expect(reg.agents[0].definition.id).toBe('iori');
@@ -182,7 +182,7 @@ describe('kind dispatcher', () => {
   });
 
   it('skill discovery works inside a workbench-kind plugin', async () => {
-    mkmanifest('L0', 'wb-with-skills', {
+    mkmanifest('builtin', 'wb-with-skills', {
       id: '@forgeax-extension/wb-with-skills',
       kind: 'workbench',
       displayName: { zh: 'wb' },
@@ -191,7 +191,7 @@ describe('kind dispatcher', () => {
         skills: [{ id: 'inner', entry: './SKILL.md' }],
       },
     });
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     expect(reg.workbench.length).toBe(1);
     expect(reg.skills.length).toBe(1);
@@ -199,19 +199,19 @@ describe('kind dispatcher', () => {
   });
 
   it('sorts workbench by position then id', async () => {
-    mkmanifest('L0', 'wb-late', {
+    mkmanifest('builtin', 'wb-late', {
       id: '@forgeax-extension/wb-late',
       kind: 'workbench',
       displayName: { zh: 'late' },
       provides: { workbench: { id: 'late', position: 200 } },
     });
-    mkmanifest('L0', 'wb-early', {
+    mkmanifest('builtin', 'wb-early', {
       id: '@forgeax-extension/wb-early',
       kind: 'workbench',
       displayName: { zh: 'early' },
       provides: { workbench: { id: 'early', position: 100 } },
     });
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     expect(reg.workbench.map((w) => w.workbenchId)).toEqual(['early', 'late']);
   });
@@ -220,7 +220,7 @@ describe('kind dispatcher', () => {
 // w3: AC-02 / AC-13 — requireConfirm three-value enum pass-through
 describe('loadTools requireConfirm enum pass-through (AC-02)', () => {
   it('passes requireConfirm:destructive from manifest through ToolEntry', async () => {
-    mkmanifest('L1', 'rc-destructive', {
+    mkmanifest('user', 'rc-destructive', {
       id: '@x/rc-destructive',
       kind: 'tool',
       displayName: { zh: 'd', en: 'd' },
@@ -236,7 +236,7 @@ describe('loadTools requireConfirm enum pass-through (AC-02)', () => {
   });
 
   it('passes requireConfirm:never through ToolEntry', async () => {
-    mkmanifest('L1', 'rc-never', {
+    mkmanifest('user', 'rc-never', {
       id: '@x/rc-never',
       kind: 'tool',
       displayName: { zh: 'n', en: 'n' },
@@ -249,7 +249,7 @@ describe('loadTools requireConfirm enum pass-through (AC-02)', () => {
   });
 
   it('passes requireConfirm:undefined (omitted) through ToolEntry', async () => {
-    mkmanifest('L1', 'rc-omit', {
+    mkmanifest('user', 'rc-omit', {
       id: '@x/rc-omit',
       kind: 'tool',
       displayName: { zh: 'o', en: 'o' },
@@ -266,7 +266,7 @@ describe('loadTools requireConfirm enum pass-through (AC-02)', () => {
 // w3: AC-13 — listTools() ToolDescriptor contains requireConfirm field
 describe('listTools ToolDescriptor requireConfirm (AC-13)', () => {
   it('ToolDescriptor.requireConfirm is destructive when manifest declares it', async () => {
-    mkmanifest('L1', 'desc-destructive', {
+    mkmanifest('user', 'desc-destructive', {
       id: '@x/desc-destructive',
       kind: 'tool',
       displayName: { zh: 'd', en: 'd' },
@@ -283,7 +283,7 @@ describe('listTools ToolDescriptor requireConfirm (AC-13)', () => {
   });
 
   it('ToolDescriptor.requireConfirm is undefined when manifest omits field', async () => {
-    mkmanifest('L1', 'desc-omit', {
+    mkmanifest('user', 'desc-omit', {
       id: '@x/desc-omit',
       kind: 'tool',
       displayName: { zh: 'o', en: 'o' },

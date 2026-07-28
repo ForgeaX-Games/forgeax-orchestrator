@@ -14,7 +14,7 @@ export function loadWorkbench(merged: MergedManifest): WorkbenchEntry | null {
   const wb = m.provides.workbench;
   return {
     extensionId: m.id,
-    layer: merged.layer,
+    origin: merged.origin,
     workbenchId: wb.id,
     position: wb.position ?? 999,
     panelSize: wb.panelSize ?? 'md',

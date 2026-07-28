@@ -10,18 +10,18 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { forkExtension, defaultForkId } from '../src/extensions/fork';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { _setSnapshotForTests, _resetSnapshotForTests } from '../src/extensions/registry';
 
 const TMP = `/tmp/forgeax-fork-${process.pid}`;
 
-async function reload(L1Root?: string, L2Root?: string): Promise<void> {
-  const scan = await scanAllLayers({
-    L0: join(TMP, 'L0'),
-    L1: L1Root ?? join(TMP, 'L1'),
-    L2: L2Root ?? join(TMP, 'L2'),
+async function reload(userRoot?: string, projectRoot?: string): Promise<void> {
+  const scan = await scanAllExtensionOrigins({
+    builtin: join(TMP, 'builtin'),
+    user: userRoot ?? join(TMP, 'user'),
+    project: projectRoot ?? join(TMP, 'project'),
   });
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
@@ -51,7 +51,7 @@ function writeSrc(root: string, dirName: string, body: Record<string, unknown>):
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   _resetSnapshotForTests();
 });
 
@@ -66,8 +66,8 @@ describe('plugin fork', () => {
     expect(defaultForkId('@x/foo-mine')).toBe('@x/foo-mine-2');
   });
 
-  it('happy path: copies tree to L2 and patches manifest id + displayName', async () => {
-    writeSrc(join(TMP, 'L0'), 'src', {
+  it('happy path: copies tree to project and patches manifest id + displayName', async () => {
+    writeSrc(join(TMP, 'builtin'), 'src', {
       id: '@me/src',
       kind: 'tool',
       displayName: { en: 'Src', zh: '原版' },
@@ -75,7 +75,7 @@ describe('plugin fork', () => {
       provides: { tools: [{ id: 's.t' }] },
     });
     await reload();
-    const r = await forkExtension({ srcId: '@me/src', newId: '@me/src-fork', destLayer: 'L2', projectRoot: TMP });
+    const r = await forkExtension({ srcId: '@me/src', newId: '@me/src-fork', destinationOrigin: 'project', projectRoot: TMP });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.id).toBe('@me/src-fork');
@@ -90,14 +90,14 @@ describe('plugin fork', () => {
   });
 
   it('refuses when newId already exists in snapshot', async () => {
-    writeSrc(join(TMP, 'L0'), 'a', {
+    writeSrc(join(TMP, 'builtin'), 'a', {
       id: '@me/a',
       kind: 'tool',
       displayName: { en: 'A' },
       entry: { backend: './h.ts' },
       provides: { tools: [{ id: 'a.t' }] },
     });
-    writeSrc(join(TMP, 'L0'), 'b', {
+    writeSrc(join(TMP, 'builtin'), 'b', {
       id: '@me/b',
       kind: 'tool',
       displayName: { en: 'B' },
@@ -105,14 +105,14 @@ describe('plugin fork', () => {
       provides: { tools: [{ id: 'b.t' }] },
     });
     await reload();
-    const r = await forkExtension({ srcId: '@me/a', newId: '@me/b', destLayer: 'L2', projectRoot: TMP });
+    const r = await forkExtension({ srcId: '@me/a', newId: '@me/b', destinationOrigin: 'project', projectRoot: TMP });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.code).toBe('exists');
   });
 
   it('refuses bad newId namespace', async () => {
-    writeSrc(join(TMP, 'L0'), 'src', {
+    writeSrc(join(TMP, 'builtin'), 'src', {
       id: '@me/src',
       kind: 'tool',
       displayName: { en: 'Src' },
@@ -120,7 +120,7 @@ describe('plugin fork', () => {
       provides: { tools: [{ id: 's.t' }] },
     });
     await reload();
-    const r = await forkExtension({ srcId: '@me/src', newId: 'no-scope', destLayer: 'L2', projectRoot: TMP });
+    const r = await forkExtension({ srcId: '@me/src', newId: 'no-scope', destinationOrigin: 'project', projectRoot: TMP });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.code).toBe('bad_input');
@@ -128,14 +128,14 @@ describe('plugin fork', () => {
 
   it('refuses unknown srcId', async () => {
     await reload();
-    const r = await forkExtension({ srcId: '@nope/nope', destLayer: 'L2', projectRoot: TMP });
+    const r = await forkExtension({ srcId: '@nope/nope', destinationOrigin: 'project', projectRoot: TMP });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.code).toBe('not_found');
   });
 
-  it('L2 requires projectRoot', async () => {
-    writeSrc(join(TMP, 'L0'), 'src', {
+  it('project requires projectRoot', async () => {
+    writeSrc(join(TMP, 'builtin'), 'src', {
       id: '@me/src',
       kind: 'tool',
       displayName: { en: 'Src' },
@@ -143,7 +143,7 @@ describe('plugin fork', () => {
       provides: { tools: [{ id: 's.t' }] },
     });
     await reload();
-    const r = await forkExtension({ srcId: '@me/src', destLayer: 'L2' });
+    const r = await forkExtension({ srcId: '@me/src', destinationOrigin: 'project' });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.code).toBe('bad_input');

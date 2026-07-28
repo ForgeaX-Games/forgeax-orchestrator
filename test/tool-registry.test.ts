@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import {
@@ -24,8 +24,8 @@ import { getEventBus, _resetEventBusForTests } from '../src/events/bus';
 
 const TMP = `/tmp/forgeax-tool-registry-${process.pid}`;
 
-function mkmanifest(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<string, unknown>): string {
-  const dir = join(TMP, layer, dirName);
+function mkmanifest(origin: 'builtin' | 'user' | 'project', dirName: string, body: Record<string, unknown>): string {
+  const dir = join(TMP, origin, dirName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),
@@ -36,13 +36,13 @@ function mkmanifest(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<str
 }
 
 const ROOTS = () => ({
-  L0: join(TMP, 'L0'),
-  L1: join(TMP, 'L1'),
-  L2: join(TMP, 'L2'),
+  builtin: join(TMP, 'builtin'),
+  user: join(TMP, 'user'),
+  project: join(TMP, 'project'),
 });
 
 async function reloadFromTmp() {
-  const scan = await scanAllLayers(ROOTS());
+  const scan = await scanAllExtensionOrigins(ROOTS());
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
   _setSnapshotForTests({
@@ -59,7 +59,7 @@ async function reloadFromTmp() {
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   _resetSnapshotForTests();
   _resetToolHandlerCacheForTests();
   _resetConfirmsForTests();
@@ -76,7 +76,7 @@ afterEach(() => {
 
 describe('Tool kind loader', () => {
   it('extracts tools from a kind=tool manifest', async () => {
-    mkmanifest('L1', 'demo-tool', {
+    mkmanifest('user', 'demo-tool', {
       id: '@x/demo-tool',
       kind: 'tool',
       displayName: { zh: 'demo-zh', en: 'demo' },
@@ -96,7 +96,7 @@ describe('Tool kind loader', () => {
   });
 
   it('extracts tools from a kind=workbench/agent/skill manifest too', async () => {
-    mkmanifest('L1', 'wb-x', {
+    mkmanifest('user', 'wb-x', {
       id: '@x/wb-x',
       kind: 'workbench',
       displayName: { zh: 'wb', en: 'wb' },
@@ -110,7 +110,7 @@ describe('Tool kind loader', () => {
   });
 
   it('flags duplicate tool ids inside the same plugin', async () => {
-    mkmanifest('L1', 'dup', {
+    mkmanifest('user', 'dup', {
       id: '@x/dup',
       kind: 'tool',
       displayName: { zh: 'd', en: 'd' },
@@ -122,7 +122,7 @@ describe('Tool kind loader', () => {
   });
 
   it('resolves entry.backend to an absolute path', async () => {
-    const dir = mkmanifest('L1', 'with-backend', {
+    const dir = mkmanifest('user', 'with-backend', {
       id: '@x/with-backend',
       kind: 'tool',
       displayName: { zh: 'b', en: 'b' },
@@ -142,7 +142,7 @@ describe('callTool dispatch', () => {
   });
 
   it('rejects ai caller when exposedToAI is false', async () => {
-    mkmanifest('L1', 'priv', {
+    mkmanifest('user', 'priv', {
       id: '@x/priv',
       kind: 'tool',
       displayName: { zh: 'p', en: 'p' },
@@ -158,7 +158,7 @@ describe('callTool dispatch', () => {
   });
 
   it('returns no_handler when manifest has no entry.backend', async () => {
-    mkmanifest('L1', 'no-bk', {
+    mkmanifest('user', 'no-bk', {
       id: '@x/no-bk',
       kind: 'tool',
       displayName: { zh: 'n', en: 'n' },
@@ -171,7 +171,7 @@ describe('callTool dispatch', () => {
   });
 
   it('dynamic-imports handler module and returns result', async () => {
-    const dir = mkmanifest('L1', 'dyn', {
+    const dir = mkmanifest('user', 'dyn', {
       id: '@x/dyn',
       kind: 'tool',
       displayName: { zh: 'd', en: 'd' },
@@ -193,7 +193,7 @@ describe('callTool dispatch', () => {
   });
 
   it('surfaces handler exception as invoke_error', async () => {
-    const dir = mkmanifest('L1', 'boom', {
+    const dir = mkmanifest('user', 'boom', {
       id: '@x/boom',
       kind: 'tool',
       displayName: { zh: 'b', en: 'b' },
@@ -211,7 +211,7 @@ describe('callTool dispatch', () => {
   });
 
   it('requireConfirm: AI caller waits for tool.confirm-acked (allow)', async () => {
-    const dir = mkmanifest('L1', 'cf-ok', {
+    const dir = mkmanifest('user', 'cf-ok', {
       id: '@x/cf-ok',
       kind: 'tool',
       displayName: { zh: 'c', en: 'c' },
@@ -245,7 +245,7 @@ describe('callTool dispatch', () => {
   });
 
   it('requireConfirm: deny short-circuits with user-rejected', async () => {
-    const dir = mkmanifest('L1', 'cf-deny', {
+    const dir = mkmanifest('user', 'cf-deny', {
       id: '@x/cf-deny',
       kind: 'tool',
       displayName: { zh: 'c', en: 'c' },
@@ -268,7 +268,7 @@ describe('callTool dispatch', () => {
   });
 
   it('requireConfirm: user caller bypasses the gate', async () => {
-    const dir = mkmanifest('L1', 'cf-user', {
+    const dir = mkmanifest('user', 'cf-user', {
       id: '@x/cf-user',
       kind: 'tool',
       displayName: { zh: 'c', en: 'c' },
@@ -289,7 +289,7 @@ describe('callTool dispatch', () => {
     process.env.FORGEAX_TEST_ALLOWED = 'allowed-value';
     process.env.FORGEAX_TEST_SECRET = 'must-not-leak';
     try {
-      const dir = mkmanifest('L1', 'envtool', {
+      const dir = mkmanifest('user', 'envtool', {
         id: '@x/envtool',
         kind: 'tool',
         displayName: { zh: 'e', en: 'e' },
@@ -317,7 +317,7 @@ describe('callTool dispatch', () => {
   });
 
   it('listTools surfaces hasHandler flag', async () => {
-    const dir = mkmanifest('L1', 'mix', {
+    const dir = mkmanifest('user', 'mix', {
       id: '@x/mix',
       kind: 'tool',
       displayName: { zh: 'm', en: 'm' },
@@ -325,7 +325,7 @@ describe('callTool dispatch', () => {
       provides: { tools: [{ id: 'm.go', exposedToAI: true }] },
     });
     writeFileSync(join(dir, 'h.mjs'), `export default { 'm.go': () => 1 };\n`, 'utf-8');
-    mkmanifest('L1', 'schemaonly', {
+    mkmanifest('user', 'schemaonly', {
       id: '@x/schemaonly',
       kind: 'tool',
       displayName: { zh: 's', en: 's' },
@@ -341,7 +341,7 @@ describe('callTool dispatch', () => {
 // w5: AC-03/AC-04/AC-11 — confirm gate emit tests (always/destructive + envelope shape)
 describe('confirm gate emit (w5)', () => {
   it('ai+always emits tool.confirm-required with token in payload (AC-03)', async () => {
-    const dir = mkmanifest('L1', 'w5-always', {
+    const dir = mkmanifest('user', 'w5-always', {
       id: '@x/w5-always',
       kind: 'tool',
       displayName: { zh: 'c', en: 'c' },
@@ -370,7 +370,7 @@ describe('confirm gate emit (w5)', () => {
   });
 
   it('ai+destructive emits tool.confirm-required with token in payload (AC-04)', async () => {
-    const dir = mkmanifest('L1', 'w5-destr', {
+    const dir = mkmanifest('user', 'w5-destr', {
       id: '@x/w5-destr',
       kind: 'tool',
       displayName: { zh: 'd', en: 'd' },
@@ -396,7 +396,7 @@ describe('confirm gate emit (w5)', () => {
 // w6: AC-05/AC-09 — bypass tests (never/omit + non-AI callers)
 describe('confirm gate bypass (w6)', () => {
   async function makeBypassTool(id: string, manifestId: string, requireConfirm?: string) {
-    const dir = mkmanifest('L1', manifestId, {
+    const dir = mkmanifest('user', manifestId, {
       id: `@x/${manifestId}`,
       kind: 'tool',
       displayName: { zh: 'b', en: 'b' },
@@ -485,7 +485,7 @@ describe('confirm gate bypass (w6)', () => {
 // w7: AC-06/AC-07/AC-08/D-4/D-5/R-1 — outcome tests (allow/deny/timeout/emit-failed + token idempotent)
 describe('confirm gate outcomes (w7)', () => {
   async function makeConfirmTool(toolId: string, dirName: string, requireConfirm: 'always' | 'destructive' = 'always') {
-    const dir = mkmanifest('L1', dirName, {
+    const dir = mkmanifest('user', dirName, {
       id: `@x/${dirName}`,
       kind: 'tool',
       displayName: { zh: 'c', en: 'c' },

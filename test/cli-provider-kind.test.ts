@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { loadDriverForEntry } from '../src/extensions/kinds/cli-provider';
@@ -19,8 +19,8 @@ import {
 
 const TMP = `/tmp/@forgeax/orchestrator-provider-kind-${process.pid}`;
 
-function mkmanifest(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<string, unknown>): string {
-  const dir = join(TMP, layer, dirName);
+function mkmanifest(origin: 'builtin' | 'user' | 'project', dirName: string, body: Record<string, unknown>): string {
+  const dir = join(TMP, origin, dirName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'forgeax-extension.json'),
@@ -31,15 +31,15 @@ function mkmanifest(layer: 'L0' | 'L1' | 'L2', dirName: string, body: Record<str
 }
 
 const ROOTS = () => ({
-  L0: join(TMP, 'L0'),
-  L1: join(TMP, 'L1'),
-  L2: join(TMP, 'L2'),
+  builtin: join(TMP, 'builtin'),
+  user: join(TMP, 'user'),
+  project: join(TMP, 'project'),
 });
 
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   _resetDriverRegistryForTests();
 });
 
@@ -65,7 +65,7 @@ function fakeDriver(id: string): Driver {
 
 describe('cli-provider kind loader', () => {
   it('extracts CliProviderEntry from manifest', async () => {
-    mkmanifest('L0', 'cp-x', {
+    mkmanifest('builtin', 'cp-x', {
       id: '@forgeax-extension/cp-x',
       kind: 'cli-provider',
       displayName: { zh: '某 CLI', en: 'Some CLI' },
@@ -78,7 +78,7 @@ describe('cli-provider kind loader', () => {
         },
       },
     });
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     expect(reg.cliProviders.length).toBe(1);
     expect(reg.cliProviders[0]).toMatchObject({
@@ -92,32 +92,32 @@ describe('cli-provider kind loader', () => {
   });
 
   it('falls back to manifest.displayName.zh when cliProvider.displayName missing', async () => {
-    mkmanifest('L0', 'cp-fb', {
+    mkmanifest('builtin', 'cp-fb', {
       id: '@forgeax-extension/cp-fb',
       kind: 'cli-provider',
       displayName: { zh: '中文名', en: 'EN' },
       provides: { cliProvider: { id: 'fb-cli' } },
     });
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     expect(reg.cliProviders[0].displayName).toBe('中文名');
   });
 
   it('records backendPath when entry.backend is set', async () => {
-    const dir = mkmanifest('L0', 'cp-bk', {
+    const dir = mkmanifest('builtin', 'cp-bk', {
       id: '@forgeax-extension/cp-bk',
       kind: 'cli-provider',
       displayName: { zh: 'bk' },
       entry: { backend: './driver.ts' },
       provides: { cliProvider: { id: 'bk-cli' } },
     });
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     expect(reg.cliProviders[0].backendPath).toBe(join(dir, 'driver.ts'));
   });
 
   it('loadDriverForEntry returns already-registered in-tree driver', async () => {
-    mkmanifest('L0', 'cp-native', {
+    mkmanifest('builtin', 'cp-native', {
       id: '@forgeax-extension/cp-native',
       kind: 'cli-provider',
       displayName: { zh: 'native' },
@@ -126,14 +126,14 @@ describe('cli-provider kind loader', () => {
     const native = fakeDriver('forgeax-native');
     registerDriver(native);
 
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     const r = await loadDriverForEntry(reg.cliProviders[0]);
     expect(r.driver).toBe(native);
   });
 
   it('loadDriverForEntry caches the resolved driver', async () => {
-    mkmanifest('L0', 'cp-cache', {
+    mkmanifest('builtin', 'cp-cache', {
       id: '@forgeax-extension/cp-cache',
       kind: 'cli-provider',
       displayName: { zh: 'c' },
@@ -141,7 +141,7 @@ describe('cli-provider kind loader', () => {
     });
     const d1 = fakeDriver('c-cli');
     registerDriver(d1);
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     const entry = reg.cliProviders[0];
     const a = await loadDriverForEntry(entry);
@@ -154,7 +154,7 @@ describe('cli-provider kind loader', () => {
   });
 
   it('loadDriverForEntry imports entry.backend when no in-tree driver', async () => {
-    const dir = mkmanifest('L0', 'cp-imp', {
+    const dir = mkmanifest('builtin', 'cp-imp', {
       id: '@forgeax-extension/cp-imp',
       kind: 'cli-provider',
       displayName: { zh: 'imp' },
@@ -177,20 +177,20 @@ describe('cli-provider kind loader', () => {
       };`,
       'utf-8',
     );
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     const r = await loadDriverForEntry(reg.cliProviders[0]);
     expect(r.driver?.id).toBe('imported-cli');
   });
 
   it('loadDriverForEntry returns reason when no backend + no in-tree', async () => {
-    mkmanifest('L0', 'cp-miss', {
+    mkmanifest('builtin', 'cp-miss', {
       id: '@forgeax-extension/cp-miss',
       kind: 'cli-provider',
       displayName: { zh: 'm' },
       provides: { cliProvider: { id: 'missing-cli' } },
     });
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     const r = await loadDriverForEntry(reg.cliProviders[0]);
     expect(r.driver).toBeNull();
@@ -198,7 +198,7 @@ describe('cli-provider kind loader', () => {
   });
 
   it('loadDriverForEntry rejects when imported driver.id mismatches manifest', async () => {
-    const dir = mkmanifest('L0', 'cp-mis', {
+    const dir = mkmanifest('builtin', 'cp-mis', {
       id: '@forgeax-extension/cp-mis',
       kind: 'cli-provider',
       displayName: { zh: 'mis' },
@@ -216,7 +216,7 @@ describe('cli-provider kind loader', () => {
       };`,
       'utf-8',
     );
-    const merged = mergeManifests((await scanAllLayers(ROOTS())).found);
+    const merged = mergeManifests((await scanAllExtensionOrigins(ROOTS())).found);
     const reg = buildKindRegistry(merged.manifests);
     const r = await loadDriverForEntry(reg.cliProviders[0]);
     expect(r.driver).toBeNull();

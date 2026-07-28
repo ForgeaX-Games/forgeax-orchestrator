@@ -3,7 +3,7 @@
  *
  * Mirrors the real marketplace plugin at
  *   packages/marketplace/extensions/skill-author-plugin/
- * into a /tmp scratch L1 root and verifies:
+ * into a /tmp scratch user root and verifies:
  *   1. The skill is registered with id `meta:author-plugin` and slash trigger
  *      `/author-plugin`.
  *   2. SkillRunner returns the SKILL.md text body verbatim (prompt-entry).
@@ -16,7 +16,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, copyFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { scanAllLayers } from '../src/extensions/scanner';
+import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { _setSnapshotForTests, _resetSnapshotForTests } from '../src/extensions/registry';
@@ -26,14 +26,14 @@ import { _resetEventBusForTests } from '../src/events/bus';
 
 const REPO_ROOT = resolve(import.meta.dir, '../../..');
 const TMP = `/tmp/forgeax-skill-author-${process.pid}`;
-const PLUGIN_DIR = join(TMP, 'L1', 'skill-author-plugin');
+const PLUGIN_DIR = join(TMP, 'user', 'skill-author-plugin');
 const SRC_DIR = resolve(REPO_ROOT, 'packages/marketplace/extensions/skill-author-plugin');
 
 async function reload() {
-  const scan = await scanAllLayers({
-    L0: join(TMP, 'L0'),
-    L1: join(TMP, 'L1'),
-    L2: join(TMP, 'L2'),
+  const scan = await scanAllExtensionOrigins({
+    builtin: join(TMP, 'builtin'),
+    user: join(TMP, 'user'),
+    project: join(TMP, 'project'),
   });
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
@@ -51,7 +51,7 @@ async function reload() {
 beforeEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
-  for (const l of ['L0', 'L1', 'L2'] as const) mkdirSync(join(TMP, l), { recursive: true });
+  for (const l of ['builtin', 'user', 'project'] as const) mkdirSync(join(TMP, l), { recursive: true });
   mkdirSync(PLUGIN_DIR, { recursive: true });
   copyFileSync(join(SRC_DIR, 'forgeax-extension.json'), join(PLUGIN_DIR, 'forgeax-extension.json'));
   copyFileSync(join(SRC_DIR, 'SKILL.md'), join(PLUGIN_DIR, 'SKILL.md'));

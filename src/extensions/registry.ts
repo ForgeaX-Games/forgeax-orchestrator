@@ -10,10 +10,10 @@
  * the older slot/tool registry from the bus runtime. They will merge in
  * a later Phase C/D PR — see 13-MIGRATION-ROADMAP.
  */
-import { scanAllLayers, type ScanError } from './scanner';
+import { scanAllExtensionOrigins, type ScanError } from './scanner';
 import { mergeManifests, type MergedManifest, type MergeIssue } from './merger';
 import { buildKindRegistry, type KindRegistry } from './kinds';
-import type { ExtensionLayer } from './scanner';
+import type { ExtensionOrigin } from './scanner';
 import { getEventBus, type EventBus } from '../events/bus';
 
 export interface ExtensionSnapshot {
@@ -27,7 +27,7 @@ export interface ExtensionSnapshot {
 }
 
 export interface ExtensionRegistryOpts {
-  roots?: Partial<Record<ExtensionLayer, string | null>>;
+  roots?: Partial<Record<ExtensionOrigin, string | null>>;
 }
 
 const EMPTY: ExtensionSnapshot = {
@@ -72,7 +72,7 @@ export function onExtensionsReloaded(fn: ExtensionsReloadedHook): void {
  *  not fatal — they're surfaced in `scanErrors` so the UI/CI can flag
  *  them while the rest of the snapshot still works. */
 export async function reloadExtensions(opts: ExtensionRegistryOpts = {}): Promise<ExtensionSnapshot> {
-  const scan = await scanAllLayers(opts.roots);
+  const scan = await scanAllExtensionOrigins(opts.roots);
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
   const next: ExtensionSnapshot = {

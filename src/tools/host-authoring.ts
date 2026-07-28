@@ -12,7 +12,7 @@
  *    - parseManifest 自验(fail fast,§Schema-as-Contract)
  *    - 双名字空间撞名查重(plugin snapshot + marketplace legacy) —— 否则新角色会
  *      **静默遮蔽**内建角色(resolvePersonaForAgent 是 plugin-first)
- *    - 调 platform-io 的纯 IO primitive writeAgentPack 落盘(L1/L2,目录存在即拒)
+ *    - 调 platform-io 的纯 IO primitive writeAgentPack 落盘(user/project,目录存在即拒)
  *  以及 reloadExtensions(让刚落盘的角色进 snapshot → 下一轮 roster 自动带上)。
  *
  *  这是**通用缝**:任何写插件的产品工具都需要它,不是 team-forge 的产品逻辑。
@@ -44,7 +44,7 @@ export interface AgentPackSpec {
   avatar?: string;
   /** #hex;缺省固定色。 */
   color?: string;
-  /** 'global'(L1,默认) | 'project'(L2)。 */
+  /** 'global'(user,默认) | 'project'(project)。 */
   scope?: AgentPackScope;
   /** 可选记忆种子 → memory/lessons.md。 */
   memorySeed?: string;
@@ -68,7 +68,7 @@ export interface RosterEntry {
 }
 
 export interface HostAuthoring {
-  /** 重扫插件层(L0/L1/L2),刷新 snapshot。让刚落盘的 agent-pack 生效。 */
+  /** 重扫插件层(builtin/user/project),刷新 snapshot。让刚落盘的 agent-pack 生效。 */
   reloadExtensions(): Promise<void>;
   /** 兼容 marketplace 插件工具(wb-team-forge tools.mjs 等)沿用的旧方法名,勿删。 */
   reloadPlugins(): Promise<void>;
