@@ -123,6 +123,11 @@ export interface ProductContext {
    *  behavior, e.g. wb-game-video syncing its component set into the game dir before
    *  a version is committed). game-host stays generic; app only passes it through. */
   gameHostBeforeVersion?: (args: { slug: string; gameDir: string; project: unknown }) => void | Promise<void>;
+  gameHostSeedProvider?: (args: { slug: string }) => Promise<{
+    project?: unknown;
+    blueprint: unknown;
+    assetsManifest: unknown;
+  }>;
 }
 
 export interface ForgeaxApp {
@@ -192,7 +197,10 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   // Per-game package persistence + git versioning (game-host). Reuses the
   // platform-io safe-path whitelist (.forgeax/games/<slug>). The optional
   // version-prepare hook is injected by the product shell (§ ProductContext).
-  app.route('/api/game-host', createGameHostRouter({ beforeVersion: ctx.gameHostBeforeVersion }));
+  app.route('/api/game-host', createGameHostRouter({
+    beforeVersion: ctx.gameHostBeforeVersion,
+    seedProvider: ctx.gameHostSeedProvider,
+  }));
   app.route('/api/projects', createProjectsRouter());
   app.route('/api/fs', createFsBrowserRouter());
   app.route('/api/workspaces', createWorkspacesRouter({
