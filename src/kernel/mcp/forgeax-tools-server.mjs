@@ -220,7 +220,7 @@ const TOOLS = {
   list_games: {
     spec: {
       name: 'list_games',
-      description: 'List the game projects in this forgeax workspace (under .forgeax/games/). Returns { count, games }.',
+      description: 'List the game projects in this ForgeaX instance (under .forgeax/games/). Returns { count, games }.',
       inputSchema: { type: 'object', properties: {} },
     },
     run: () => { const games = listGames(); return JSON.stringify({ count: games.length, games }); },

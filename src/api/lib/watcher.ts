@@ -69,18 +69,6 @@ export class FsWatcher {
     return () => this.listeners.delete(fn);
   }
 
-  /** Re-point the watcher at a new root (workspace hot-switch). Unlike
-   *  stop()+start(), this preserves registered listeners — the hub.broadcast
-   *  subscription wired at boot must survive the switch, otherwise file events
-   *  from the new workspace would never reach live tabs. No-op if root is
-   *  unchanged and a watcher is already running. */
-  async rebind(rootDir: string, paths: string[] = ['.forgeax/games']): Promise<void> {
-    if (this.watcher && this.rootDir === rootDir) return;
-    await this.watcher?.close();
-    this.watcher = undefined; // clears start()'s already-running guard; listeners survive
-    this.start(rootDir, paths);
-  }
-
   private emit(change: FileChangeEvent['change'], rawPath: string) {
     const norm = rawPath.split('\\').join('/');
     const ev: FileChangeEvent = { type: 'file-event', path: norm, change };

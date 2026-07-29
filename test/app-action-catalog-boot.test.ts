@@ -23,7 +23,7 @@ test('createForgeaxApp fails before filesystem boot when the headless registry i
 
   await expect(
     createForgeaxApp({
-      projectRoot,
+      instanceRoot: projectRoot,
       hostUiActions: [
         {
           actionId: 'outside.catalog',

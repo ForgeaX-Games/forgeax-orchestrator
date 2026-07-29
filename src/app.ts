@@ -12,9 +12,7 @@
 import { Hono } from 'hono';
 
 import { createFilesRouter } from '@forgeax/platform-io';
-import { createProjectsRouter } from '@forgeax/platform-io';
 import { createFsBrowserRouter } from '@forgeax/platform-io';
-import { createWorkspacesRouter } from './api/workspaces';
 import { createSettingsRouter } from './api/settings';
 import { createMemorySettingsRouter } from './api/memory-settings';
 import { createBootSplashRouter } from '@forgeax/platform-io';
@@ -65,8 +63,8 @@ import './llm/register-all';
 export interface ProductContext {
   /** Where read-only resources live (builtin assets, interface dist, marketplace). */
   resourceRoot?: string;
-  /** Where mutable user/project data lives (.forgeax/...). */
-  projectRoot: string;
+  /** Private runtime instance root (.forgeax/). User projects are games. */
+  instanceRoot: string;
   /** Port assignments for the product processes. */
   ports?: {
     server?: number;
@@ -77,28 +75,24 @@ export interface ProductContext {
   version?: string;
   /** Optional brand id override. */
   brand?: string;
-  /** Broadcast a message to connected WS clients (provided by the shell's WsHub). */
-  broadcast?: (msg: unknown) => void;
-  /** Rebind the filesystem watcher to a new root (provided by the shell). */
-  rebindWatcher?: (root: string) => void;
   /** How session state trees land + how sessions are enumerated, as a **factory**
-   *  keyed by project root. Injected by the product shell (studio = game-nested
+   *  keyed by instance root. Injected by the product shell (studio = game-nested
    *  `.forgeax/games/<slug>/sessions/<sid>`). A factory (not a single instance) so
-   *  a workspace/project-root switch can rebuild the layout for the new root —
-   *  re-initing the PathManager with a bare projectRoot would otherwise drop the
+   *  the runtime instance is selected at boot — re-initing the PathManager with
+   *  only a root would otherwise drop the
    *  layout back to the flat default and hide game-nested sessions. Omitted ⇒
    *  generic flat layout (`<userRoot>/sessions/<sid>`), i.e. @forgeax/orchestrator runs
    *  game-agnostic as a standalone CLI. */
-  sessionLayoutFactory?: (projectRoot: string) => SessionLayout;
+  sessionLayoutFactory?: (instanceRoot: string) => SessionLayout;
   /** Movable runtime-state root (cache / checkpoints / SM debug.log), as a
-   *  **factory** keyed by project root — same shape and reason as
-   *  `sessionLayoutFactory`: a workspace/project-root switch must rebuild it
-   *  for the new root; a boot-time string would stay pinned to the old
+   *  **factory** keyed by instance root — same shape and reason as
+   *  `sessionLayoutFactory`: each runtime instance must build it at boot; a
+   *  boot-time string remains tied to that instance
    *  project. (The SessionManager debug.log stream still binds its path at
    *  boot — it re-points on process restart, not on switch.) Omitted ⇒ state
    *  stays under the user root (`~/.forgeax`), i.e. standalone-CLI behavior.
    *  Keys / kits / settings never follow this root. */
-  stateRootFactory?: (projectRoot: string) => string;
+  stateRootFactory?: (instanceRoot: string) => string;
   /** Business routers injected by the shell, mounted after the static cli routers
    *  (order/path unchanged for the static set). Replaces the per-feature static
    *  mounts as business migrates out of cli (Stage A §3). Each entry mounts at
@@ -145,7 +139,7 @@ export interface ForgeaxApp {
  * shell. Stage1-B will fold the remaining boot/serve glue from main.ts in.
  */
 export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp> {
-  const { projectRoot } = ctx;
+  const { instanceRoot } = ctx;
 
   buildActionCatalog(undefined, {
     headlessHandlerActionIds: [
@@ -162,9 +156,9 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   }
 
   const pm = initPathManager({
-    projectRoot,
-    stateRoot: ctx.stateRootFactory?.(projectRoot),
-    layout: ctx.sessionLayoutFactory?.(projectRoot),
+    projectRoot: instanceRoot,
+    stateRoot: ctx.stateRootFactory?.(instanceRoot),
+    layout: ctx.sessionLayoutFactory?.(instanceRoot),
   });
   // Install shell-injected orchestration seams once at boot (same idiom as the
   // path/session managers above). Read-only on the hot path thereafter.
@@ -201,28 +195,15 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
     beforeVersion: ctx.gameHostBeforeVersion,
     seedProvider: ctx.gameHostSeedProvider,
   }));
-  app.route('/api/projects', createProjectsRouter());
   app.route('/api/fs', createFsBrowserRouter());
-  app.route('/api/workspaces', createWorkspacesRouter({
-    broadcast: ctx.broadcast,
-    rebindWatcher: ctx.rebindWatcher,
-    // Rebuild the session layout for the switched-to root so /api/sessions keeps
-    // enumerating game-nested sessions after a workspace change (else it drops to
-    // the flat default layout and the UI sees an empty list → loses history).
-    sessionLayoutFactory: ctx.sessionLayoutFactory,
-    // Same factory the boot init used — a workspace switch must re-derive the
-    // movable state root for the new root (terminal cache & checkpoint stores
-    // resolve lazily via getPathManager()).
-    stateRootFactory: ctx.stateRootFactory,
-  }));
   app.route('/api/settings', createSettingsRouter());
   app.route('/api/memory-settings', createMemorySettingsRouter());
   app.route('/api/boot-splash', createBootSplashRouter());
   app.route('/api/version', createVersionRouter());
   app.route('/api/changelog', createChangelogRouter());
   app.route('/api/sessions', createSessionsRouter());
-  app.route('/api/logs', createLogsRouter(projectRoot));
-  app.route('/api/prefs', createPrefsRouter(projectRoot));
+  app.route('/api/logs', createLogsRouter(instanceRoot));
+  app.route('/api/prefs', createPrefsRouter(instanceRoot));
   app.route('/api/commands', createCommandsApiRouter());
   app.route('/api/cli', createCliRouter());
   app.route('/api/brand', createBrandRouter());

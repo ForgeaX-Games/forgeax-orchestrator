@@ -1,7 +1,5 @@
-// Re-point engine-src/.forgeax → <workspaceRoot>/.forgeax. Used by workspace
-// hot-switch (POST /api/workspaces/activate). Idempotent. Engine vite uses
-// polling so the next watcher tick picks up the new game tree without a
-// process restart.
+// Re-point engine-src/.forgeax → <instanceRoot>/.forgeax. The link is a private
+// runtime mount for the active game store; it is not a user-facing project or
 //
 // Lifted out of the deleted src/orchestrator/spawn.ts (subprocess model is
 // gone; this stayed because it's pure fs work, not subprocess management).
@@ -17,13 +15,13 @@ function monorepoRoot(): string {
 const ROOT = monorepoRoot();
 const ENGINE_SRC_DIR = join(ROOT, 'packages', 'editor', 'packages', 'play-runtime');
 
-export function repointEngineForgeaXSymlink(workspaceRoot: string): string {
+export function repointEngineForgeaXSymlink(instanceRoot: string): string {
   if (!existsSync(ENGINE_SRC_DIR)) {
     throw new Error('engine-src dir missing — release artifact mode cannot hot-switch');
   }
-  const target = join(workspaceRoot, '.forgeax');
+  const target = join(instanceRoot, '.forgeax');
   const link = join(ENGINE_SRC_DIR, '.forgeax');
-  mkdirSync(join(workspaceRoot, '.forgeax', 'games'), { recursive: true });
+  mkdirSync(join(instanceRoot, '.forgeax', 'games'), { recursive: true });
   let existing: ReturnType<typeof lstatSync> | null = null;
   try { existing = lstatSync(link); } catch { /* not present */ }
   if (existing) {

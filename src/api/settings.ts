@@ -47,7 +47,7 @@ const SAFE_ENV_KEYS = new Set([
   // 直连 DeepSeek (deepseek-v4 provider; llm provider 读这俩 var).
   'DEEPSEEK_API_KEY',
   'DEEPSEEK_BASE_URL',
-  // Workspace → GitHub upload (see src/upload). All three are drawer-editable.
+  // Runtime-instance → GitHub upload (see src/upload). All three are drawer-editable.
   // Decision 2026-07-09: FORGEAX_UPLOAD_REPO is user-configurable (default =
   // DEFAULT_UPLOAD_REPO shared org repo) — users may upload to any repo their own
   // token can write. Residual risk of a network-repointable destination is
@@ -58,18 +58,13 @@ const SAFE_ENV_KEYS = new Set([
 ]);
 
 /**
- * The .env credentials file is INSTALL-GLOBAL, not per-workspace.
+ * The .env credentials file is INSTALL-GLOBAL, not per-game.
  *
  * The server loads $ROOT/.env once at boot (run.ts) into process.env; those
- * credentials + FORGEAX_MODEL are process-global and survive a workspace
- * hot-switch (POST /api/workspaces/activate only remaps FORGEAX_PROJECT_ROOT).
- * If Settings read/wrote `<defaultProjectRoot()>/.env` it would follow the
- * MUTABLE active workspace root — so activating a fresh workspace made the
- * drawer read that new root's (empty) .env: keys vanished, FORGEAX_MODEL reset
- * to the fallback, and the "connect a model" gate fired even though the running
- * server still had valid creds in process.env. Anchor to the file the server
- * actually loaded (FORGEAX_ENV_FILE, exported by run.ts) so credentials are
- * stable across workspaces. Fallback keeps the packaged app / tests unchanged.
+ * credentials + FORGEAX_MODEL are process-global and independent of the active
+ * game. Anchor to the file the server actually loaded (FORGEAX_ENV_FILE,
+ * exported by run.ts) so credentials remain stable while games are switched.
+ * Fallback keeps the packaged app / tests unchanged.
  */
 function envFilePath(): string {
   const explicit = process.env.FORGEAX_ENV_FILE;
