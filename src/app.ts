@@ -10,6 +10,11 @@
 // 自己只负责 Bun.serve + 静态 SPA + engine/interface 进程 spawn + vite 代理。
 
 import { Hono } from 'hono';
+import { createHonoWorkbenchRouter } from '@forgeax/workbench-host/http/hono';
+import {
+  configureWorkbenchAgentTools,
+  type WorkbenchAgentHost,
+} from './workbench/agent-tools';
 
 import { createFilesRouter } from '@forgeax/platform-io';
 import { createFsBrowserRouter } from '@forgeax/platform-io';
@@ -122,11 +127,23 @@ export interface ProductContext {
     blueprint: unknown;
     assetsManifest: unknown;
   }>;
+  /** One product-owned Workbench Host; orchestrator only mounts its shared HTTP projection. */
+  workbenchHost?: Parameters<typeof createHonoWorkbenchRouter>[0] & WorkbenchAgentHost;
 }
 
 export interface ForgeaxApp {
   /** The mounted Hono application (caller wires it into Bun.serve). */
   app: Hono;
+}
+
+export function mountWorkbenchHost(
+  app: Hono,
+  host: Parameters<typeof createHonoWorkbenchRouter>[0],
+): void {
+  app.route(
+    '/__workbench__/v1',
+    createHonoWorkbenchRouter(host, { prefix: '/__workbench__/v1' }),
+  );
 }
 
 /**
@@ -168,6 +185,9 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
     hostUiActions: ctx.hostUiActions,
     assetPathPolicy: ctx.assetPathPolicy,
   });
+  if (ctx.workbenchHost) {
+    await configureWorkbenchAgentTools(ctx.workbenchHost);
+  }
   await ensureUserDirDefaults(pm);
   const sm = initSessionManager(pm);
   const restored = await sm.bootAutoStart();
@@ -180,6 +200,7 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   await bootCliProviders();
 
   const app = new Hono();
+  if (ctx.workbenchHost) mountWorkbenchHost(app, ctx.workbenchHost);
 
   // 给每个 /api/* 请求建立 ALS session 作用域(从 query/path/JSON body 解析 sid),
   // 让 handler(含 streamSSE 流体)里的 console.* 经 logger bridge 落对应 session

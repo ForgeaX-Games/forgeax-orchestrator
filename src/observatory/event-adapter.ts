@@ -154,11 +154,7 @@ export function adapt(stored: StoredEvent, state: AdapterState): AgentEventOut[]
       cacheReadTokens: usage.cacheReadTokens ?? 0,
       cacheCreationTokens: usage.cacheCreationTokens ?? 0,
       // 缓存命中率(还原老 studio 的 cachedRatio,迁移遗失,这里补回 surface)。
-      cachedRatio: formatCacheHitRatio(
-        usage.inputTokens ?? 0,
-        usage.cacheReadTokens ?? 0,
-        usage.cacheCreationTokens ?? 0,
-      ),
+      cachedRatio: formatCacheHitRatio(usage.inputTokens ?? 0, usage.cacheReadTokens ?? 0),
     } : undefined;
     const aborted = !!stored.payload?.aborted;
     const stopReason = aborted ? 'cancelled' : 'end_turn';

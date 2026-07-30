@@ -62,15 +62,48 @@ describe('codex-appserver mapNotification', () => {
     expect(out[1]).toEqual({ kind: 'tool.result', callId: 'f1', ok: false, error: 'failed' });
   });
 
-  test('tokenUsage then turn/completed → turn.usage(with tokens) before turn.done(stop)', async () => {
+  test('tokenUsage uses current last usage, never cumulative thread total', async () => {
     const st = createCodexNotifState();
     const q = new KernelEventQueue();
-    mapCodexNotification('thread/tokenUsage/updated', { tokenUsage: { total: { inputTokens: 7, outputTokens: 9, cachedInputTokens: 2 } } }, st, q);
+    mapCodexNotification('thread/tokenUsage/updated', {
+      tokenUsage: {
+        total: {
+          inputTokens: 1_316_946,
+          outputTokens: 12_000,
+          cachedInputTokens: 900_000,
+        },
+        last: {
+          inputTokens: 70_000,
+          outputTokens: 456,
+          cachedInputTokens: 18_176,
+        },
+      },
+    }, st, q);
     mapCodexNotification('turn/completed', {}, st, q);
     const out = await collect(q); // turn/completed calls q.end()
-    expect(out[0]).toEqual({ kind: 'turn.usage', inputTokens: 7, outputTokens: 9, cacheRead: 2 });
+    expect(out[0]).toEqual({
+      kind: 'turn.usage',
+      inputTokens: 70_000,
+      outputTokens: 456,
+      cacheRead: 18_176,
+    });
     expect(out[1]).toEqual({ kind: 'turn.done', reason: 'stop' });
     expect(st.ended).toBe(true);
+  });
+
+  test('cumulative-only token update is not misreported as current turn usage', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('thread/tokenUsage/updated', {
+      tokenUsage: {
+        total: { inputTokens: 99_999, outputTokens: 888 },
+      },
+    }, st, q);
+    mapCodexNotification('turn/completed', {}, st, q);
+    expect(await collect(q)).toEqual([
+      { kind: 'turn.usage' },
+      { kind: 'turn.done', reason: 'stop' },
+    ]);
   });
 
   test('error notification → turn.usage, error, turn.done(error)', async () => {
@@ -81,6 +114,18 @@ describe('codex-appserver mapNotification', () => {
     expect(out.map((e) => e.kind)).toEqual(['turn.usage', 'error', 'turn.done']);
     expect((out[1] as any).error.message).toBe('boom');
     expect((out[2] as any).reason).toBe('error');
+  });
+
+  test('new nested ErrorNotification shape preserves the real message', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('error', {
+      error: { message: 'model gpt-test is not supported' },
+    }, st, q);
+    const out = await collect(q);
+    expect((out[1] as any).error.message).toBe(
+      'model gpt-test is not supported',
+    );
   });
 
   test('unknown notification tolerated (no events)', async () => {

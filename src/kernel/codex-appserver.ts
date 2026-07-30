@@ -180,7 +180,11 @@ export function mapCodexNotification(
       return;
     }
     case 'thread/tokenUsage/updated': {
-      const t = params?.tokenUsage?.total;
+      // `total` 是 Codex thread 从创建至今的累计消耗，若把它写成 turn.usage，
+      // ContextRing / auto_compaction 会在每轮重复累计历史。`last` 才是当前最新
+      // 模型请求的完整 input + output；其中 cachedInputTokens 已包含在 inputTokens
+      // 内，只作为 cacheRead 明细透传，不能再次相加。
+      const t = params?.tokenUsage?.last;
       if (t) state.lastUsage = { inputTokens: t.inputTokens, outputTokens: t.outputTokens, cacheRead: t.cachedInputTokens };
       return;
     }
@@ -192,7 +196,18 @@ export function mapCodexNotification(
       return;
     case 'error':
       queue.push(usageEvent(state));
-      queue.push({ kind: 'error', error: { code: 'protocol', message: String(params?.message ?? 'codex error') } });
+      queue.push({
+        kind: 'error',
+        error: {
+          code: 'protocol',
+          message:
+            typeof params?.error?.message === 'string'
+              ? params.error.message
+              : typeof params?.message === 'string'
+                ? params.message
+                : 'codex error',
+        },
+      });
       queue.push({ kind: 'turn.done', reason: 'error' });
       state.ended = true;
       queue.end();

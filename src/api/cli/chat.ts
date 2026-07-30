@@ -271,11 +271,7 @@ export function createCliRouter() {
                       output: u.outputTokens,
                       cacheRead: u.cacheReadTokens,
                       cacheCreation: u.cacheCreationTokens,
-                      cachedRatio: formatCacheHitRatio(
-                        u.inputTokens ?? 0,
-                        u.cacheReadTokens ?? 0,
-                        u.cacheCreationTokens ?? 0,
-                      ),
+                      cachedRatio: formatCacheHitRatio(u.inputTokens ?? 0, u.cacheReadTokens ?? 0),
                     });
                   }
                   break;

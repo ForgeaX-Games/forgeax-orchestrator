@@ -63,7 +63,9 @@ module.exports = {
       from: { path: '^src/' },
       to: {
         path: '^@forgeax/',
-        pathNot: '^@forgeax/(agent-runtime|types|platform-io)(/|$)',
+        pathNot:
+          '(^@forgeax/(agent-runtime|types|platform-io)(/|$)|' +
+          '^@forgeax/workbench-host/(contracts|http/hono)$)',
       },
     },
     {

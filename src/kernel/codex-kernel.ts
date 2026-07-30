@@ -35,6 +35,7 @@ import { ensureSidecar } from './sidecar-singleton';
 import { sidecarEnabled } from './kernel-mode';
 import { resolveBinary } from '../cli-providers/shared/resolve-binary';
 import {
+  buildCodexAppServerGlobalArgs,
   buildCodexArgs,
   CODEX_DRIVER_LABEL,
   CODEX_FALLBACK_MODELS,
@@ -141,6 +142,7 @@ export class CodexKernel implements AgentKernel {
     const client = new CodexAppServerClient({
       binary: await this.binary(),
       cwd: defaultProjectRoot(),
+      globalArgs: buildCodexAppServerGlobalArgs(),
       onServerRequest: () => ({}),
       onNotification: () => { /* 目录探测不消费通知 */ },
     });
@@ -261,10 +263,7 @@ export class CodexKernel implements AgentKernel {
     }
     if (runtime) Object.assign(env, runtime.env);
     const mcpOverrides = runtime ? buildCodexMcpOverrides(runtime) : [];
-    const globalArgs = [
-      ...(hooksActive ? ['--dangerously-bypass-hook-trust'] : []),
-      ...mcpOverrides,
-    ];
+    const globalArgs = buildCodexAppServerGlobalArgs(hooksActive, mcpOverrides);
 
     // 稳定隔离 CODEX_HOME + keyed mutex(plan §8):同一逻辑 session 跨 turn 复用目录
     // (thread resume 不丢),同 home 串行(防 SQLite lock / session 损坏)。
@@ -324,9 +323,9 @@ export class CodexKernel implements AgentKernel {
       binary,
       cwd: projectRoot,
       env,
-      // globalArgs 注入在 `app-server` 子命令之前:hooksActive → --dangerously-bypass-hook-trust;
-      // 有工具轮 → `-c mcp_servers.fxt.*` 注册本轮 fxt MCP server(plan §6.1)。
-      ...(globalArgs.length ? { globalArgs } : {}),
+      // globalArgs 注入在 `app-server` 子命令之前：默认关闭 Codex 原生多 Agent；
+      // hooksActive → --dangerously-bypass-hook-trust；有工具轮 → 注册本轮 fxt MCP。
+      globalArgs,
       onNotification: (m, params) => mapCodexNotification(m, params, notifState, queue),
       onServerRequest: handleServerRequest,
       onExit: (code, tail) => {

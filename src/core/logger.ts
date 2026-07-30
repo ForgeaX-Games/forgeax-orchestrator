@@ -409,10 +409,13 @@ export class Logger {
   }
 
   async flush(): Promise<void> {
-    return new Promise((resolve) => {
-      if (!this.debugStream.writableNeedDrain) resolve();
-      else this.debugStream.once("drain", resolve);
-    });
+    // `writableNeedDrain === false` only means the user-space high-water mark
+    // was not exceeded; it does not prove preceding writes reached the fd.
+    // An empty write's callback is ordered after all earlier writes.
+    await Promise.all([
+      flushStream(this.debugStream),
+      this.latestStream ? flushStream(this.latestStream) : Promise.resolve(),
+    ]);
   }
 
   async close(): Promise<void> {
@@ -436,4 +439,14 @@ export class Logger {
         : Promise.resolve(),
     ]);
   }
+}
+
+function flushStream(stream: WriteStream): Promise<void> {
+  if (stream.destroyed) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    stream.write("", (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
 }

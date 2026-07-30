@@ -10,6 +10,8 @@
  * 锁在这里的 Codex-isms:
  *  - {@link buildCodexArgs}  `codex exec [--json] / exec resume <tid> / --skip-git-repo-check /
  *                             -c approval_policy / -s|-c sandbox_mode / -m <model>` + prompt 组装
+ *  - {@link buildCodexSingleAgentArgs} Codex 原生多 Agent 工具的进程级关闭参数
+ *  - {@link buildCodexAppServerGlobalArgs} app-server 全局参数组装
  *  - {@link CODEX_APPROVAL_POLICY} / {@link CODEX_SANDBOX_MODE} 放行模式常量
  *  - JSONL→KernelEvent 映射:re-export 自 codex-mapper.ts(本身已是隔离的 codex-ism)
  *
@@ -55,6 +57,41 @@ export {
 export const CODEX_APPROVAL_POLICY = 'never' as const;
 /** headless sandbox:工作区可写(首轮 `-s`,resume 经 `-c sandbox_mode=`)。 */
 export const CODEX_SANDBOX_MODE = 'workspace-write' as const;
+
+/**
+ * ForgeaX 已经用 agent-tree（`AgentTree` + `Scheduler`）和 `delegate_to_subagent`
+ * 工具做统一的 sub-agent 编排，Codex 在这里只是 AgentKernel，不应再向模型暴露
+ * 第二套原生 spawn/send/wait 工具。
+ *
+ * 三个覆盖缺一不可：
+ * - `multi_agent=false` 关闭当前稳定的 V1 collaboration tools；
+ * - `multi_agent_v2=false` 防止 V2 优先级覆盖 `agents.enabled`；
+ * - `agents.enabled=false` 防止 model metadata 重新选择 multi-agent backend。
+ *
+ * 返回新数组，避免调用方拼接本轮 MCP 参数时修改共享常量。
+ */
+export function buildCodexSingleAgentArgs(): string[] {
+  return [
+    '--disable',
+    'multi_agent',
+    '--disable',
+    'multi_agent_v2',
+    '-c',
+    'agents.enabled=false',
+  ];
+}
+
+/** `codex app-server` 子命令之前的全部 adapter-owned 全局参数。 */
+export function buildCodexAppServerGlobalArgs(
+  hooksActive = false,
+  mcpOverrides: string[] = [],
+): string[] {
+  return [
+    ...buildCodexSingleAgentArgs(),
+    ...(hooksActive ? ['--dangerously-bypass-hook-trust'] : []),
+    ...mcpOverrides,
+  ];
+}
 
 // ─── settings.permissions 拦截面(046 楔子3) ─────────────────────────
 // codex 无 per-invocation hooks flag → 在 `<workspace>/.codex/hooks.json` 写**静态**
@@ -140,6 +177,8 @@ export function buildCodexArgs(
   const common = [
     '--json',
     '--skip-git-repo-check',
+    // Codex 只作为单 Agent Kernel；ForgeaX agent-tree 是唯一编排面。
+    ...buildCodexSingleAgentArgs(),
     ...(hooksActive ? ['--dangerously-bypass-hook-trust'] : []),
     '-c',
     `approval_policy="${CODEX_APPROVAL_POLICY}"`,
