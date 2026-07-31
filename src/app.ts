@@ -205,7 +205,10 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   // Per-game package persistence + git versioning (game-host). Reuses the
   // platform-io safe-path whitelist (.forgeax/games/<slug>). The optional
   // version-prepare hook is injected by the product shell (§ ProductContext).
-  app.route('/api/game-host', createGameHostRouter({ beforeVersion: ctx.gameHostBeforeVersion }));
+  app.route('/api/game-host', createGameHostRouter({
+    beforeVersion: ctx.gameHostBeforeVersion,
+    seedProvider: ctx.gameHostSeedProvider,
+  }));
   app.route('/api/fs', createFsBrowserRouter());
   app.route('/api/settings', createSettingsRouter());
   app.route('/api/memory-settings', createMemorySettingsRouter());
