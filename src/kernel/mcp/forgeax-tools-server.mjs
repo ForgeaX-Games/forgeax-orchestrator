@@ -26,8 +26,14 @@
  *  安全边界:本进程只有「查询/调用」两类工具;ui-lease / ui-manifest 写端点
  *  (权限闸的信任锚)**刻意不在** MCP 面上,外部 client 无法改写权限声明。
  */
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createMcpDispatcher, serveStdio } from '../../mcp/protocol.mjs';
+import {
+  classifyAndWrite,
+  searchMemory,
+  soulMemoryRoot,
+} from '../../soul/layered-memory-runtime.mjs';
 
 const DEBUG = process.env.FORGEAX_CC_MCP_DEBUG;
 const dbg = (m) => { if (DEBUG) { try { appendFileSync('/tmp/forgeax-cc-mcp.log', `${new Date().toISOString()} [tools] ${m}\n`); } catch {} } };
@@ -106,30 +112,9 @@ async function perceptionQuery(kind, query) {
   }
 }
 
-// ── R6 数字生命:memory_search 的真实后端 ──────────────────────────────
-// 这是独立 node 子进程(CC 经 --mcp-config spawn),无打包器 → 无法 import 服务端 TS。
-// 故在此**镜像** `src/soul/layered-memory.ts` 的检索逻辑(纯 FS · 朴素关键词 · 无 RAG)。
-// 改检索口径时两处需同步。
-function soulMemoryRoot() {
-  const safe = SLUG_RE.test(SOUL_AGENT) ? SOUL_AGENT : 'default';
-  return join(PROJECT_ROOT, '.forgeax/souls', safe, 'memory');
-}
-function readLayerFiles(root, tier, game) {
-  const dir = tier === 'episodes' && game ? join(root, 'episodes', game) : join(root, tier);
-  if (tier === 'episodes' && !game) return [];
-  const out = [];
-  let names = [];
-  try { names = readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.md') && f.toLowerCase() !== 'memory.md').sort(); } catch { return []; }
-  for (const f of names) {
-    let body = '';
-    try { body = readFileSync(join(dir, f), 'utf-8').trim(); } catch { continue; }
-    if (!body) continue;
-    const rel = tier === 'episodes' && game ? `episodes/${game}/${f}` : `${tier}/${f}`;
-    out.push({ tier, game: tier === 'episodes' ? game : undefined, file: rel, body });
-  }
-  return out;
-}
-// ── R6 数字生命:remember 写入(模型驱动成长)—— 镜像 layered-memory.ts 的写时分类 + 索引 ──
+// ── R6 数字生命:memory_search / remember ──────────────────────────────
+// Plain-Node runtime SSOT is shared with `src/soul/layered-memory.ts`; this
+// copied MCP asset imports it directly instead of mirroring FS/search logic.
 function activeGame() {
   try {
     const p = join(PROJECT_ROOT, '.forgeax/active-game.json');
@@ -138,58 +123,26 @@ function activeGame() {
     return typeof slug === 'string' && SLUG_RE.test(slug) ? slug : undefined;
   } catch { return undefined; }
 }
-function slugify(s) {
-  return (String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48)) || 'entry';
-}
-function rebuildIndex(root) {
-  const lines = [];
-  const add = (sections) => { for (const m of sections) {
-    const first = m.body.split(/\r?\n/).find((l) => l.trim()) ?? '';
-    const tag = m.game ? `${m.tier}:${m.game}` : m.tier;
-    lines.push(`- [${tag}] ${m.file} — ${first.replace(/^#+\s*/, '').slice(0, 120)}`);
-  } };
-  add(readLayerFiles(root, 'identity')); add(readLayerFiles(root, 'traits'));
-  try { for (const g of readdirSync(join(root, 'episodes')).sort()) if (SLUG_RE.test(g)) add(readLayerFiles(root, 'episodes', g)); } catch {}
-  mkdirSync(root, { recursive: true });
-  writeFileSync(join(root, 'MEMORY.md'), `# MEMORY index\n\n> 常驻索引:每条一行。模型据此挑文件 Read 召回(纯 FS,无 RAG)。\n\n${lines.join('\n')}\n`);
-}
 /** 写一条记忆:general→traits;game→episodes/<当前game>;无 kind+有 game→episodes,否则 traits。 */
 function rememberMemory(args) {
   const text = String(args?.text ?? '').trim();
   if (!text) return { ok: false, error: 'remember: empty text' };
   const kind = args?.kind === 'general' || args?.kind === 'game' ? args.kind : undefined;
   const game = activeGame();
-  const toTraits = kind === 'general' || (kind !== 'game' && !game);
-  const tier = toTraits ? 'traits' : 'episodes';
-  if (tier === 'episodes' && !game) return { ok: false, error: 'remember: game-bound memory needs an active game' };
-  const root = soulMemoryRoot();
-  const dir = tier === 'episodes' ? join(root, 'episodes', game) : join(root, tier);
-  mkdirSync(dir, { recursive: true });
-  const base = slugify(args?.title ?? text);
-  let name = `${base}.md`, n = 2;
-  while (existsSync(join(dir, name))) name = `${base}-${n++}.md`;
-  writeFileSync(join(dir, name), `${args?.title ? `# ${args.title}\n\n` : ''}${text}\n`);
-  rebuildIndex(root);
-  const rel = tier === 'episodes' ? `episodes/${game}/${name}` : `${tier}/${name}`;
-  return { ok: true, tier, ...(tier === 'episodes' ? { game } : {}), file: rel };
+  if (kind === 'game' && !game) {
+    return { ok: false, error: 'remember: game-bound memory needs an active game' };
+  }
+  const ref = { root: soulMemoryRoot(PROJECT_ROOT, SOUL_AGENT), ...(game ? { game } : {}) };
+  const title = typeof args?.title === 'string' && args.title.trim() ? args.title.trim() : undefined;
+  const written = classifyAndWrite(ref, [{ text, ...(kind ? { kind } : {}), ...(title ? { title } : {}) }]);
+  if (!written.length) return { ok: false, error: 'remember: nothing written (no active game for game-bound memory)' };
+  return { ok: true, ...written[0] };
 }
 
-function searchMemory(query, limit = 5) {
-  const root = soulMemoryRoot();
-  const all = [...readLayerFiles(root, 'identity'), ...readLayerFiles(root, 'traits')];
-  try { for (const g of readdirSync(join(root, 'episodes'))) if (SLUG_RE.test(g)) all.push(...readLayerFiles(root, 'episodes', g)); } catch {}
-  const q = String(query || '').toLowerCase().trim();
-  const tokens = q.split(/\s+/).filter((t) => t.length >= 2);
-  const scored = all.map((m) => {
-    const hay = m.body.toLowerCase();
-    let score = hay.includes(q) ? 5 : 0;
-    for (const t of tokens) if (hay.includes(t)) score += 1;
-    return { m, score };
-  }).filter((x) => x.score > 0).sort((a, b) => b.score - a.score).slice(0, limit);
-  return {
-    query: String(query || ''),
-    matches: scored.map(({ m }) => ({ tier: m.tier, ...(m.game ? { game: m.game } : {}), file: m.file, text: m.body.length > 400 ? `${m.body.slice(0, 400)}…` : m.body })),
-  };
+function searchLayeredMemory(query) {
+  const game = activeGame();
+  const ref = { root: soulMemoryRoot(PROJECT_ROOT, SOUL_AGENT), ...(game ? { game } : {}) };
+  return searchMemory(ref, String(query ?? ''));
 }
 
 /** 列出工作区里的游戏(`.forgeax/games/` + 兼容旧 `games/`),过滤 _template / 隐藏。 */
@@ -233,7 +186,7 @@ const TOOLS = {
       description: "Search your long-term layered memory (identity / traits / episodes, including past-life worlds) for relevant entries. Returns { query, matches:[{tier, game?, file, text}] }.",
       inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
     },
-    run: (args) => JSON.stringify(searchMemory(args?.query ?? '')),
+    run: (args) => JSON.stringify(searchLayeredMemory(args?.query)),
   },
   // 数字生命(R6)成长通道 —— 模型驱动写入:agent 自己决定记什么。general→traits(可移植),
   // game→episodes/<当前game>;写时分类 + 维护 MEMORY.md 索引。真实后端 = soul 分层记忆库。
@@ -399,54 +352,28 @@ function activeToolNames(bridgedByName = BRIDGED_BY_NAME) {
   return [...names].sort();
 }
 
-let buf = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (d) => {
-  buf += d;
-  let i;
-  while ((i = buf.indexOf('\n')) >= 0) {
-    const line = buf.slice(0, i); buf = buf.slice(i + 1);
-    if (line.trim()) { let m; try { m = JSON.parse(line); } catch { continue; } handle(m); }
-  }
-});
-
-function send(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
-
 /** Structured MCP `not_found` for an unknown / unexposed / undeclared tool call.
  *  Returned as an `isError` tool result (not a JSON-RPC error) so the model sees
  *  a clean "tool not found" instead of the call silently succeeding or hanging.
  *  Carries a machine-readable `structuredContent.code:'not_found'` for callers
  *  that parse it, plus a `not_found:` text prefix for humans/tests. */
-function sendNotFound(id, name, why, bridgedByName = BRIDGED_BY_NAME) {
-  const activeTools = activeToolNames(bridgedByName);
+function notFound(name, tools) {
+  const activeTools = tools.map((tool) => tool.name).sort();
   const hint = activeTools.length > 0
     ? `Active tools this turn: ${activeTools.join(', ')}. If the tool you need is listed, call it directly; otherwise stop retrying this name and choose an available tool.`
     : 'No active tools are exposed this turn; stop retrying this name.';
-  send({
-    jsonrpc: '2.0',
-    id,
-    result: {
-      isError: true,
-      content: [{ type: 'text', text: `not_found: tool "${name ?? ''}" ${why}. ${hint}` }],
-      structuredContent: { code: 'not_found', tool: name ?? null, activeTools, hint },
-    },
-  });
+  const why = isExposed(name) ? 'unknown tool' : 'not exposed this turn';
+  return {
+    isError: true,
+    content: [{ type: 'text', text: `not_found: tool "${name ?? ''}" ${why}. ${hint}` }],
+    structuredContent: { code: 'not_found', tool: name ?? null, activeTools, hint },
+  };
 }
 
-function handle(msg) {
-  const { id, method, params } = msg;
-  if (method === 'initialize') {
-    send({ jsonrpc: '2.0', id, result: {
-      protocolVersion: params?.protocolVersion || '2024-11-05',
-      capabilities: { tools: {} },
-      serverInfo: { name: 'fxt', version: '0.1.0' },
-    } });
-  } else if (method === 'notifications/initialized') {
-    /* no response */
-  } else if (method === 'tools/list') {
+function currentTools() {
     const bridgedByName = refreshBridgedByName();
     // 下发面 allowlist:内置工具(已按 EXPOSE 裁过)+ 桥接工具(去内置重名 + EXPOSE 过滤)。
-    const builtin = Object.values(TOOLS).map((t) => t.spec);
+    const builtin = Object.values(TOOLS).map((tool) => ({ ...tool.spec, run: tool.run }));
     const bridged = [];
     for (const t of bridgedByName.values()) {
       if (!isExposed(t.name)) continue;
@@ -454,43 +381,28 @@ function handle(msg) {
         name: t.name,
         description: t.description ?? '',
         inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
+        async run(args) {
+          const result = await bridgeCall(t.name, args);
+          return {
+            ...(result.isError ? { isError: true } : {}),
+            content: [{ type: 'text', text: result.text }],
+          };
+        },
       });
     }
-    send({ jsonrpc: '2.0', id, result: { tools: [...builtin, ...bridged] } });
-  } else if (method === 'tools/call') {
-    const name = params?.name;
-    const args = params?.arguments ?? {};
-    dbg(`call ${name} ${JSON.stringify(args)}`);
-    const bridgedByName = refreshBridgedByName();
-    // 执行面 allowlist(纵深第二道):未曝光 / 未知 / 未声明的工具一律结构化 not_found,
-    // **绝不**把任意 tool name 直接桥到宿主(§5.2 rule 5)。
-    if (!isExposed(name)) return sendNotFound(id, name, 'not exposed this turn', bridgedByName);
-    const tool = TOOLS[name];
-    if (tool) {
-      // 内置工具:本地执行(支持 sync 或 async run —— query_world/capture_frame 走 HTTP 取数)。
-      // run 返回 { content: [...] } → 原样作 MCP result(ui_screenshot 回 image block);
-      // 其余返回值按文本包一层(既有工具零回归)。
-      Promise.resolve()
-        .then(() => tool.run(args))
-        .then((out) => {
-          const result = out && typeof out === 'object' && Array.isArray(out.content)
-            ? { content: out.content }
-            : { content: [{ type: 'text', text: String(out) }] };
-          send({ jsonrpc: '2.0', id, result });
-        })
-        .catch((e) => {
-          send({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: `error: ${e?.message ?? e}` }] } });
-        });
-      return;
-    }
-    // host-tool:必须在本轮 specs 里声明过(BRIDGED_BY_NAME)才桥回宿主执行(异步;fail-closed)。
-    if (!bridgedByName.has(name)) return sendNotFound(id, name, 'unknown tool', bridgedByName);
-    bridgeCall(name, args).then((r) => {
-      send({ jsonrpc: '2.0', id, result: { ...(r.isError ? { isError: true } : {}), content: [{ type: 'text', text: r.text }] } });
-    });
-  } else if (id != null) {
-    send({ jsonrpc: '2.0', id, error: { code: -32601, message: 'method not found' } });
-  }
+    return [...builtin, ...bridged];
 }
+
+const dispatch = createMcpDispatcher({
+  serverInfo: { name: 'fxt', version: '0.1.0' },
+  tools: currentTools,
+  onUnknownTool: notFound,
+});
+await serveStdio(async (message) => {
+  if (message?.method === 'tools/call') {
+    dbg(`call ${message.params?.name} ${JSON.stringify(message.params?.arguments ?? {})}`);
+  }
+  return dispatch(message);
+});
 
 dbg('mcp forgeax-tools server up');

@@ -19,6 +19,7 @@
  */
 
 import { appendFileSync } from 'node:fs';
+import { createMcpDispatcher, serveStdio } from '../../mcp/protocol.mjs';
 
 const SERVER_URL = (process.env.FORGEAX_SERVER_URL || 'http://127.0.0.1:18900').replace(/\/$/, '');
 const SID = process.env.FORGEAX_SID || '';
@@ -56,37 +57,13 @@ async function askForgeax(toolName, input) {
   }
 }
 
-let buf = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (d) => {
-  buf += d;
-  let i;
-  while ((i = buf.indexOf('\n')) >= 0) {
-    const line = buf.slice(0, i); buf = buf.slice(i + 1);
-    if (line.trim()) { let m; try { m = JSON.parse(line); } catch { continue; } handle(m); }
-  }
-});
-
-function send(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
-
-async function handle(msg) {
-  const { id, method, params } = msg;
-  if (method === 'initialize') {
-    send({ jsonrpc: '2.0', id, result: {
-      protocolVersion: params?.protocolVersion || '2024-11-05',
-      capabilities: { tools: {} },
-      serverInfo: { name: 'forgeax', version: '0.1.0' },
-    } });
-  } else if (method === 'notifications/initialized') {
-    /* no response */
-  } else if (method === 'tools/list') {
-    send({ jsonrpc: '2.0', id, result: { tools: [{
+const dispatch = createMcpDispatcher({
+  serverInfo: { name: 'forgeax', version: '0.1.0' },
+  tools: [{
       name: 'approve',
       description: 'forgeax permission prompt: routes a tool-permission request to the Studio UI for the user to approve or deny.',
       inputSchema: { type: 'object', properties: { tool_name: { type: 'string' }, input: { type: 'object' } }, additionalProperties: true },
-    }] } });
-  } else if (method === 'tools/call') {
-    const args = params?.arguments ?? {};
+      async run(args) {
     const toolName = args.tool_name ?? 'tool';
     const input = args.input ?? {};
     dbg(`approve req tool=${toolName} ${describe(toolName, input)}`);
@@ -101,10 +78,11 @@ async function handle(msg) {
     } else {
       decision = { behavior: 'allow', updatedInput: input };
     }
-    send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(decision) }] } });
-  } else if (id != null) {
-    send({ jsonrpc: '2.0', id, error: { code: -32601, message: 'method not found' } });
-  }
-}
+        return JSON.stringify(decision);
+      },
+    }],
+});
+
+await serveStdio(dispatch);
 
 dbg(`mcp permission server up · url=${SERVER_URL} sid=${SID}`);

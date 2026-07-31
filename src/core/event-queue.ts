@@ -8,9 +8,12 @@
  *    steer      — 高优中断；入队 + 触发 onSteer 监听器立即打断 LLM stream
  *
  *  排序：priority asc + ts asc（priority 0 最优先）。
- *  容量上限：MAX_EVENTS=50，溢出时 FIFO 丢老的（避免事件爆栈）。 */
+ *  容量上限：MAX_EVENTS=50，溢出时 FIFO 丢老的（避免事件爆栈）——但 "required"
+ *  事件（如 delegate_to_subagent 完成回调）豁免：淘汰只挑最旧的 best-effort
+ *  事件；若队列已被 required 占满，拒绝的是新来的这一条，而不是淘汰任何已排队
+ *  的 required 事件。 */
 
-import type { Event, EventHandoff, EventQueueAPI } from "./types";
+import type { Event, EventDurability, EventHandoff, EventQueueAPI } from "./types";
 
 const MAX_EVENTS = 50;
 
@@ -19,6 +22,10 @@ const eventComparator = (a: Event, b: Event): number =>
 
 function resolveEventHandoff(event: Event): EventHandoff {
   return event.handoff ?? "turn";
+}
+
+function resolveEventDurability(event: Event): EventDurability {
+  return event.durability ?? "best-effort";
 }
 
 export class EventQueue implements EventQueueAPI {
@@ -40,7 +47,15 @@ export class EventQueue implements EventQueueAPI {
     }
     this.queue.push(event);
     if (this.queue.length > MAX_EVENTS) {
-      this.queue.shift();
+      const newIndex = this.queue.length - 1;
+      const victimIndex = this.queue.findIndex((e) => resolveEventDurability(e) !== "required");
+      if (victimIndex < 0 || victimIndex === newIndex) {
+        // Queue is saturated with required events — drop the incoming event
+        // itself rather than evicting any of them.
+        this.queue.pop();
+        return;
+      }
+      this.queue.splice(victimIndex, 1);
     }
     if (handoff === "steer") {
       for (const cb of this.steerListeners) {

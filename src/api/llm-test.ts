@@ -16,9 +16,20 @@
 // timing, not handle a network failure. Real failures (router not mounted, JSON
 // parse) still get the standard Hono error path.
 
-import { Hono } from 'hono';
+import { Hono, type MiddlewareHandler } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { complete, type ChatMessage } from '../lib/llm-gateway';
+
+export type LlmTestRequestSource = 'studio-ui' | 'game-runtime';
+
+export interface LlmTestRouterOptions {
+  /**
+   * Host-owned request provenance. The product shell must derive this from its
+   * trusted routing context, not from a client-supplied Origin or custom header.
+   * Omission preserves standalone Model Lab consumers as studio UI requests.
+   */
+  resolveRequestSource?: (request: Request) => LlmTestRequestSource;
+}
 
 interface TestRequestBody {
   model?: string;
@@ -29,8 +40,24 @@ interface TestRequestBody {
   maxTokens?: number;
 }
 
-export function createLlmTestRouter() {
+export function createLlmTestRouter(options: LlmTestRouterOptions = {}) {
   const app = new Hono();
+  const rejectGameRuntime: MiddlewareHandler = async (c, next) => {
+    const source = options.resolveRequestSource?.(c.req.raw) ?? 'studio-ui';
+    if (source === 'game-runtime') {
+      return c.json(
+        {
+          ok: false,
+          error: 'game runtime requests must use the NPC Brain API instead of Model Lab',
+        },
+        403,
+      );
+    }
+    return next();
+  };
+
+  app.use('/test', rejectGameRuntime);
+  app.use('/test-stream', rejectGameRuntime);
 
   app.post('/test', async (c) => {
     let body: TestRequestBody;

@@ -15,7 +15,7 @@
  *      gpt-* / codex-* / o[1-9]-*       → openai-responses   + OPENAI_*
  *      gemini-3*                        → google-gemini-3    + GEMINI_API_KEY
  *      gemini-*                         → google-gemini-2    + GEMINI_API_KEY
- *      deepseek-*                       → deepseek-v4        + DEEPSEEK_*
+ *      deepseek-*                       → Anthropic-compatible fallback
  *
  *    nothing matches → throws a single, actionable error: "set
  *    LITELLM_PROXY_KEY + LITELLM_PROXY_BASE_URL in .env, or add a vendor key
@@ -53,14 +53,6 @@ const RE_GEMINI = /^gemini-/i;
 const RE_DEEPSEEK = /^deepseek-/i;
 
 export function resolveModelAdapter(model: string, env: NodeJS.ProcessEnv): ResolvedAdapter {
-  // Direct-route exceptions: 用户显式配了 DEEPSEEK_API_KEY 等直连 key 的情况下,
-  // 即便 LITELLM_PROXY 也配着, 也优先走直连. 理由: 自家 LiteLLM proxy 不一定上架
-  // 所有 vendor model id (e.g. deepseek-v4-flash), 强制走代理会 401/404. 直连
-  // key 是"我要绕过代理用这个模型"的明确意图, 应当尊重.
-  if (RE_DEEPSEEK.test(model) && env.DEEPSEEK_API_KEY) {
-    return { api: "deepseek-v4", apiKey: env.DEEPSEEK_API_KEY, apiBase: env.DEEPSEEK_BASE_URL || undefined };
-  }
-
   if (proxyConfigured(env)) {
     const proxyKey = env.LITELLM_PROXY_KEY!;
     const proxyBase = normalizeProxyBase(env.LITELLM_PROXY_BASE_URL!);
@@ -94,9 +86,14 @@ export function resolveModelAdapter(model: string, env: NodeJS.ProcessEnv): Reso
     return { api: "google-gemini-2", apiKey, apiBase: undefined };
   }
   if (RE_DEEPSEEK.test(model)) {
-    const apiKey = env.DEEPSEEK_API_KEY ?? "";
-    if (!apiKey) throw new Error(`No API key for '${model}': set DEEPSEEK_API_KEY (or LITELLM_PROXY_KEY+LITELLM_PROXY_BASE_URL) in .env`);
-    return { api: "deepseek-v4", apiKey, apiBase: env.DEEPSEEK_BASE_URL || undefined };
+    // Digital-life hosts may only have the Anthropic-compatible credential pair.
+    // Keep the configured model id for audit/transport visibility and use the
+    // host's compatible messages endpoint as the final provider fallback.
+    const anthropicKey = env.ANTHROPIC_API_KEY ?? "";
+    if (anthropicKey) {
+      return { api: "anthropic-messages", apiKey: anthropicKey, apiBase: env.ANTHROPIC_BASE_URL || undefined };
+    }
+    throw new Error(`No compatible provider for '${model}': set ANTHROPIC_API_KEY or LITELLM_PROXY_KEY+LITELLM_PROXY_BASE_URL in .env`);
   }
 
   throw new Error(

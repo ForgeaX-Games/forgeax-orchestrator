@@ -102,7 +102,7 @@ describe('POST /:sid/permission-request 的规则前置', () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ toolName: 'Bash', command: 'rm -rf /tmp/x' }),
     });
-    const json = await res.json();
+    const json = await res.json() as { allow: boolean };
     expect(json.allow).toBe(false);
   });
 });

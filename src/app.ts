@@ -33,7 +33,12 @@ import { createExtensionsRouter } from './api/extensions';
 import { reloadExtensions, onExtensionsReloaded } from './extensions/registry';
 import { syncEventTriggerBindings } from './skills/event-bridge';
 import { createThreadsRouter } from './api/threads';
-import { createLlmTestRouter } from './api/llm-test';
+import {
+  createLlmTestRouter,
+  type LlmTestRequestSource,
+} from './api/llm-test';
+import { createNpcRouter } from './api/npc';
+import { NpcRuntime } from './npc-brain/runtime';
 import { createUsageRouter } from './api/usage';
 import { createToolsRouter } from './api/tools';
 import { createEventsRouter } from './api/events';
@@ -129,11 +134,19 @@ export interface ProductContext {
   }>;
   /** One product-owned Workbench Host; orchestrator only mounts its shared HTTP projection. */
   workbenchHost?: Parameters<typeof createHonoWorkbenchRouter>[0] & WorkbenchAgentHost;
+  /**
+   * Host-owned provenance for Model Lab requests. The shell derives this from
+   * trusted routing context so game code cannot opt itself into `studio-ui` by
+   * forging browser-controlled headers. Omitted for standalone UI-only hosts.
+   */
+  resolveLlmTestRequestSource?: (request: Request) => LlmTestRequestSource;
 }
 
 export interface ForgeaxApp {
   /** The mounted Hono application (caller wires it into Bun.serve). */
   app: Hono;
+  /** Play-time NPC runtime shared by HTTP and the shell-owned WS upgrade path. */
+  npcRuntime: import('./npc-brain/runtime').NpcRuntime;
 }
 
 export function mountWorkbenchHost(
@@ -201,6 +214,7 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
 
   const app = new Hono();
   if (ctx.workbenchHost) mountWorkbenchHost(app, ctx.workbenchHost);
+  const npcRuntime = new NpcRuntime({ projectRoot: instanceRoot });
 
   // 给每个 /api/* 请求建立 ALS session 作用域(从 query/path/JSON body 解析 sid),
   // 让 handler(含 streamSSE 流体)里的 console.* 经 logger bridge 落对应 session
@@ -212,10 +226,7 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   // Per-game package persistence + git versioning (game-host). Reuses the
   // platform-io safe-path whitelist (.forgeax/games/<slug>). The optional
   // version-prepare hook is injected by the product shell (§ ProductContext).
-  app.route('/api/game-host', createGameHostRouter({
-    beforeVersion: ctx.gameHostBeforeVersion,
-    seedProvider: ctx.gameHostSeedProvider,
-  }));
+  app.route('/api/game-host', createGameHostRouter({ beforeVersion: ctx.gameHostBeforeVersion }));
   app.route('/api/fs', createFsBrowserRouter());
   app.route('/api/settings', createSettingsRouter());
   app.route('/api/memory-settings', createMemorySettingsRouter());
@@ -231,7 +242,10 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   app.route('/api/bus', createBusRouter());
   app.route('/api/extensions', createExtensionsRouter());
   app.route('/api/threads', createThreadsRouter());
-  app.route('/api/llm', createLlmTestRouter());
+  app.route('/api/llm', createLlmTestRouter({
+    resolveRequestSource: ctx.resolveLlmTestRequestSource,
+  }));
+  app.route('/api/npc', createNpcRouter({ projectRoot: instanceRoot, runtime: npcRuntime }));
   app.route('/api/usage', createUsageRouter());
   app.route('/api/tools', createToolsRouter());
   app.route('/api/events', createEventsRouter());
@@ -254,5 +268,5 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
     app.route(r.path, r.router);
   }
 
-  return { app };
+  return { app, npcRuntime };
 }

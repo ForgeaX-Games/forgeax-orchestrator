@@ -12,12 +12,23 @@ export interface ChatMessage {
   content: string;
 }
 
+export interface JsonSchemaResponseFormat {
+  /** Provider-visible schema name. OpenAI-compatible APIs require this wrapper. */
+  name: string;
+  /** JSON Schema accepted by the selected transport. */
+  schema: Record<string, unknown>;
+  /** Reject provider fields that the schema does not describe. */
+  strict?: boolean;
+}
+
 export interface CompleteRequest {
   model: string;
   messages: ChatMessage[];
   temperature?: number;
   topP?: number;
   maxTokens?: number;
+  /** Ask compatible transports for a schema-constrained JSON response. */
+  responseFormat?: JsonSchemaResponseFormat;
   /** Caller can name a registered transport explicitly; default = auto-route by model prefix. */
   transport?: string;
   /** Per-call abort (timeout etc). Gateway also enforces an internal default timeout. */

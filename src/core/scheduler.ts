@@ -255,6 +255,24 @@ export class Scheduler implements SchedulerAPI {
     }
   }
 
+  /** `interruptAgents` + 确定性等排空:abort 后 await 每个目标 agent 的
+   *  `settled`(当前 turn 若有,完整收尾才 resolve;空闲则已 resolve),取代
+   *  调用方猜时间的 sleep。5s 兜底超时防止某个 agent 卡死拖垮 rewind(§9
+   *  graceful degradation);超时只打日志,不视为错误。 */
+  async interruptAndDrain(agentPath?: string): Promise<void> {
+    const targets = agentPath
+      ? [this.agents.get(agentPath)].filter((a): a is BaseAgent => a != null)
+      : [...this.agents.values()];
+    for (const agent of targets) agent.stop();
+    if (targets.length === 0) return;
+    const timeout = new Promise<void>((resolve) => setTimeout(resolve, 5_000));
+    const drained = Promise.all(targets.map((a) => a.settled)).then(() => true as const);
+    const ok = await Promise.race([drained, timeout.then(() => false as const)]);
+    if (!ok) {
+      console.warn(`[scheduler] interruptAndDrain timed out waiting for ${targets.length} agent(s) to settle`);
+    }
+  }
+
   async controlAgent(action: AgentControlAction, agentPath: string): Promise<string> {
     return this.inSession(() => {
       switch (action) {
@@ -393,6 +411,7 @@ export class Scheduler implements SchedulerAPI {
           // 这个实例时才删 —— 否则可能误删 doRestart 之后顶上来的新实例。
           void this.lifecycleLock.acquire(agentPath, async () => {
             if (this.agents.get(agentPath) !== agent) return;
+            await this.fireDetached(agentPath);
             await agent.shutdown();
             this.agents.delete(agentPath);
           }).catch(() => {});

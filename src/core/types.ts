@@ -158,6 +158,10 @@ export interface SessionConfig {
 
 export type EventHandoff = "silent" | "passive" | "turn" | "innerLoop" | "steer";
 
+/** "required" events are never evicted by EventQueue's overflow trimming;
+ *  only "best-effort" events (the default) are eligible for FIFO eviction. */
+export type EventDurability = "required" | "best-effort";
+
 export interface EventPayload {
   /** Display / log content. NOT directly fed to LLM. */
   content?: EventContent;
@@ -178,6 +182,10 @@ export interface EventBase {
   ts: number;
   /** 0 = immediate, 1 = normal (default), 2 = low. */
   priority?: number;
+  /** Default "best-effort" — eligible for FIFO eviction when EventQueue
+   *  overflows MAX_EVENTS. "required" events are protected from eviction
+   *  (e.g. delegate_to_subagent completion callbacks). */
+  durability?: EventDurability;
   /** Per-session monotonic sequence — stamped by EventBus.publish (multi-tab sync). */
   seq?: number;
   /** Session generation id — seq is only comparable within the same sgen. */

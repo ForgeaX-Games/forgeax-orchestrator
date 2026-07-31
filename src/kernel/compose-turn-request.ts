@@ -1,13 +1,13 @@
 /**
- * composeTurnRequest — 编排层把一次 chat 组装成中立 `TurnRequest`(喂内核)。
+ * composeTurnRequest npc_text npc_text chat npc_text `TurnRequest`(npc_text)npc_text
  *
- * M2:**编排层真正拥有"组装一轮"**——systemPrompt(charter + persona)在此拼装,
- * 内核只执行。charter/environment/note 来自注入的产品壳 composer(阶段A §3.2),编排层
- * 自身不含游戏宪章内容,故业务无关。
- *   - charter:产品壳宪章 + 当前激活 scope note(稳定缓存前缀)
- *   - persona:marketplace agent 的人格(default/root 无)
- *   - model:优先 body.model,否则读 agent.json::models.model(ModelPicker 不回归)
- *   - tools:M2 仍空(CC 自带工具);MCP 工具下发在 M3。
+ * M2:**npc_text"npc_text"**npc_textsystemPrompt(charter + persona)npc_text,
+ * npc_textcharter/environment/note npc_text composer(npc_textA npc_text3.2),npc_text
+ * npc_text,npc_text
+ *   - charter:npc_text + npc_text scope note(npc_text)
+ *   - persona:marketplace agent npc_text(default/root npc_text)
+ *   - model:npc_text body.model,npc_text agent.json::models.model(ModelPicker npc_text)
+ *   - tools:M2 npc_text(CC npc_text);MCP npc_text M3npc_text
  */
 import type { AgentKernel, TurnRequest, TurnMessage } from '@forgeax/agent-runtime';
 import { existsSync } from 'node:fs';
@@ -32,17 +32,18 @@ import { drainPerceptionNotes } from '../api/lib/perception-registry';
 import { firstClassUiToolSpecs } from '../api/lib/ui-manifest-registry';
 import type { SkillRefLite } from '../soul/types';
 import uiBridgeContract from './ui-bridge-contract.json';
+import { NPC_TOOL_CONTRACTS } from '@forgeax/types/npc-tools';
 
-/** P3(B 路径):core 有 builtin 实现的「安全类」工具集。own trustTier 下这些标
- *  `delivery:'local'`(forgeax-core 内核本进程直跑)。name 与 core builtin 对齐,且
- *  @forgeax/orchestrator `builtin/kits/workspace/tools/` 同名。危险类(bash/出网/删/凭据)与 host
- *  专属工具(list_games/query_world…)不入此集 → 仍走 host 桥把闸。 */
+/** P3(B npc_text):core npc_text builtin npc_textown trustTier npc_text
+ *  `delivery:'local'`(forgeax-core npc_text)npc_textname npc_text core builtin npc_text,npc_text
+ *  @forgeax/orchestrator `builtin/kits/workspace/tools/` npc_text(bash/npc_text/npc_text/npc_text)npc_text host
+ *  npc_text(list_games/query_worldnpc_text)npc_text npc_text npc_text host npc_text */
 const LOCAL_CAPABLE_TOOLS = new Set<string>(['read_file', 'write_file', 'edit_file', 'grep', 'glob']);
 
-/** 编排层声明的基础工具(中立 ToolSpec)。内核据此挂 MCP server + `--allowedTools` 放行。
- *  `memory_search`/`remember` = 数字生命(R6)通道,真实后端 = soul 分层记忆库。
- *  游戏语义工具(list_games/query_world/capture_frame)**不再硬编码于此**——由产品壳
- *  经 HostToolSpec seam 注入(阶段A §3 设计意图,P1-7 落地),cli 层保持业务无关。 */
+/** npc_text(npc_text ToolSpec)npc_text MCP server + `--allowedTools` npc_text
+ *  `memory_search`/`remember`/`soul_create` = npc_text(R6)npc_text,npc_text = soul npc_text/npc_text soul-packnpc_text
+ *  npc_text(list_games/query_world/capture_frame)**npc_text**npc_text
+ *  npc_text HostToolSpec seam npc_text(npc_textA npc_text3 npc_text,P1-7 npc_text),cli npc_text */
 const FORGEAX_TOOLS = [
   {
     name: 'memory_search',
@@ -53,16 +54,26 @@ const FORGEAX_TOOLS = [
   {
     name: 'remember',
     description:
-      "Persist a durable memory about the user or this game into your long-term layered memory so you recall it in future sessions (数字生命成长). kind:'general' = portable fact about the user (carries across games); kind:'game' = bound to the current game world.",
+      "Persist a durable memory about the user or this game into your long-term layered memory so you recall it in future sessions (npc_text). kind:'general' = portable fact about the user (carries across games); kind:'game' = bound to the current game world.",
     inputSchema: {
       type: 'object',
       properties: { text: { type: 'string' }, kind: { type: 'string', enum: ['general', 'game'] }, title: { type: 'string' } },
       required: ['text'],
     },
   },
-  // UI 语义操作层(产品 AI 化 P0):ui_snapshot / ui_invoke。契约 SSOT =
-  // ui-bridge-contract.json(与 .mjs MCP server 共读同一文件 → 各内核看到字节一致的
-  // 工具说明)。宿主侧实现在 forgeax-builtin-tools.ts,权限见 trust-gate 的 per-action 特判。
+  {
+    name: 'soul_create',
+    description: NPC_TOOL_CONTRACTS.soul_create.description,
+    inputSchema: NPC_TOOL_CONTRACTS.soul_create.inputSchema,
+  },
+  {
+    name: 'npc_wire',
+    description: NPC_TOOL_CONTRACTS.npc_wire.description,
+    inputSchema: NPC_TOOL_CONTRACTS.npc_wire.inputSchema,
+  },
+  // UI npc_text(npc_text AI npc_text P0):ui_snapshot / ui_invokenpc_text SSOT =
+  // ui-bridge-contract.json(npc_text .mjs MCP server npc_text npc_text npc_text
+  // npc_text)npc_text forgeax-builtin-tools.ts,npc_text trust-gate npc_text per-action npc_text
   ...uiBridgeContract.tools,
 ];
 
@@ -82,26 +93,26 @@ export interface ComposeInput {
   /** Stable identities of inbound messages already persisted for this turn.
    *  Excluded from host-owned history because they are also `input.text`. */
   historyExcludeEvents?: readonly EventIdentity[];
-  /** UI 直传的模型覆盖(优先);否则从 agent.json 解析。 */
+  /** UI npc_text(npc_text);npc_text agent.json npc_text */
   model?: string;
-  /** 该 agent 的 host-tools(kits/toolRegistry)→ 经 MCP 桥下发内核(T-A)。 */
+  /** npc_text agent npc_text host-tools(kits/toolRegistry)npc_text npc_text MCP npc_text(T-A)npc_text */
   extraTools?: TurnRequest['tools'];
-  /** 多模态附件。形状开放(contract `InputMessage.attachments`):
-   *  `{ kind:'image'|'document', mediaType, data?(base64) | path?(host 文件) }` 透传进
-   *  `TurnRequest.input.attachments`,由原生内核 facade 组 image/document block;
-   *  `{ kind:'file', name, mediaType, data }` 在本层落盘 uploads/ 换成路径注记
-   *  (见 materializeFileAttachments),对全部内核生效。 */
+  /** npc_text(contract `InputMessage.attachments`):
+   *  `{ kind:'image'|'document', mediaType, data?(base64) | path?(host npc_text) }` npc_text
+   *  `TurnRequest.input.attachments`,npc_text facade npc_text image/document block;
+   *  `{ kind:'file', name, mediaType, data }` npc_text uploads/ npc_text
+   *  (npc_text materializeFileAttachments),npc_text */
   attachments?: TurnRequest['input']['attachments'];
-  /** 全链路 trace:上游(浏览器 ui.request)的 W3C traceparent;透传进 TurnRequest,
-   *  内核 facade 把 kernel.turn 挂成它的 child。缺省 ⇒ kernel.turn 自建 root。 */
+  /** npc_text trace:npc_text(npc_text ui.request)npc_text W3C traceparent;npc_text TurnRequest,
+   *  npc_text facade npc_text kernel.turn npc_text childnpc_text npc_text kernel.turn npc_text rootnpc_text */
   traceparent?: string;
-  /** 本轮期望的回复语言(UI 结算:跟随输入 / 快捷开关)。注入进 `dynamicSuffix`
-   *  (轮间 user 后缀,不进 persona/charter,不 bust 缓存前缀),让 agent 用该语言
-   *  回复。缺省 ⇒ 不注入(agent 自行判断)。 */
+  /** npc_text(UI npc_text:npc_text / npc_text)npc_text `dynamicSuffix`
+   *  (npc_text user npc_text,npc_text persona/charter,npc_text bust npc_text),npc_text agent npc_text
+   *  npc_text npc_text npc_text(agent npc_text)npc_text */
   replyLanguage?: 'en' | 'zh';
 }
 
-/** 一行回复语言指令(英文中立,注入 dynamicSuffix)。 */
+/** npc_text(npc_text,npc_text dynamicSuffix)npc_text */
 function replyLanguageDirective(lang: 'en' | 'zh'): string {
   const name = lang === 'zh' ? 'Simplified Chinese' : 'English';
   return `# Reply language\nWrite your reply to the user in ${name}. Keep code, identifiers, file paths and technical terms unchanged.`;
@@ -109,14 +120,14 @@ function replyLanguageDirective(lang: 'en' | 'zh'): string {
 
 export async function composeTurnRequest(input: ComposeInput): Promise<TurnRequest> {
   const projectRoot = defaultProjectRoot();
-  // charter / environment / note 由注入的产品壳 composer 提供(阶段A §3.2)——编排层不再
-  // 硬编码游戏宪章。无注入(standalone game-agnostic cli)⇒ composer 缺省 ⇒ 三段皆空。
+  // charter / environment / note npc_text composer npc_text(npc_textA npc_text3.2)npc_text
+  // npc_text(standalone game-agnostic cli)npc_text composer npc_text npc_text npc_text
   const composer = getSystemPromptComposer();
   const scopeSlug = sessionScopeSlug(input.sessionId ?? input.threadId) ?? getPathManager().resolveScope();
   const note = composer?.activeGameNote(scopeSlug) ?? '';
-  // environment(Paths / 当前游戏 / Workbench 插件 / Skills 目录)。Working directory =
-  //   projectRoot:core 文件工具相对 process.cwd()(serve.ts 即 projectRoot)解析,与 charter
-  //   「starts at project root」一致。best-effort:composer 未就绪/异常 → 跳过 environment,不挡本轮。
+  // environment(Paths / npc_text / Workbench npc_text / Skills npc_text)npc_textWorking directory =
+  //   projectRoot:core npc_text process.cwd()(serve.ts npc_text projectRoot)npc_text,npc_text charter
+  //   npc_textstarts at project rootnpc_textbest-effort:composer npc_text/npc_text npc_text npc_text environment,npc_text
   let environment = '';
   try {
     environment = composer?.environment({ cwd: projectRoot, projectRoot, slug: scopeSlug ?? null }) ?? '';
@@ -125,15 +136,15 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   }
   const charter = [composer?.charter() ?? '', environment, note].filter((s) => s && s.trim()).join('\n\n');
 
-  // R6 数字生命:把 agentId「重生」成 AgentRecord(persona + 分层记忆 + 信任档)。
-  //  - persona(stable 前缀)= soul persona + identity/traits + MEMORY.md 索引
-  //  - dynamicSuffix(user 后缀,不busts cache)= 当前 game 的 episodes 召回
-  //  - trustTier 权威 = 加载路径(pass-through 给宿主 enforcement)
+  // R6 npc_text:npc_text agentIdnpc_text AgentRecord(persona + npc_text + npc_text)npc_text
+  //  - persona(stable npc_text)= soul persona + identity/traits + MEMORY.md npc_text
+  //  - dynamicSuffix(user npc_text,npc_textbusts cache)= npc_text game npc_text episodes npc_text
+  //  - trustTier npc_text = npc_text(pass-through npc_text enforcement)
   const record = await loadAgentRecord(input.agentId, { projectRoot, game: scopeSlug });
   const stableMem = composeStableMemory(record.memory);
   const persona = [record.persona, stableMem].filter((s) => s && s.trim()).join('\n\n---\n\n');
-  // dynamicSuffix(不 bust 缓存)= 今世 episodes 召回,或(有前世首进新世界)转世唤醒。
-  // 两者互斥:转世通知要求今世 episodes=0,episodic 召回要求 ≥1。
+  // dynamicSuffix(npc_text bust npc_text)= npc_text episodes npc_text,npc_text(npc_text)npc_text
+  // npc_text:npc_text episodes=0,episodic npc_text npc_text1npc_text
   const episodic = composeEpisodicRecall(record.memory);
   const rebirth = composeReincarnationNotice(record.memory);
   if (rebirth && scopeSlug) {
@@ -143,24 +154,24 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   // 让 agent 看见自己写的代码在引擎里真实报的错(轮间注入,不进 system prompt)。
   const notes = drainPerceptionNotes(input.sessionId);
   const runtimeFeedback = notes.length
-    ? `# Runtime feedback from the game preview (console — newest last)\n${notes
+    ? `# Runtime feedback from the game preview (console npc_text newest last)\n${notes
         .map((n) => `- [${n.level}] ${n.text}`)
         .join('\n')}\n\nIf these indicate a problem with code you wrote, fix it; otherwise acknowledge and continue.`
     : '';
   const replyLang = input.replyLanguage ? replyLanguageDirective(input.replyLanguage) : '';
   const dynamicSuffix = [rebirth, episodic, runtimeFeedback, replyLang].filter((s) => s && s.trim()).join('\n\n---\n\n');
 
-  // 模型 + 级联回退:UI 覆盖(input.model)只给主模型无回退;否则从 agent.json::models.model
-  // 解析——数组形态 = [主模型, ...fallback](--fallback-model 链),单串 = 无回退。
+  // npc_text + npc_text:UI npc_text(input.model)npc_text;npc_text agent.json::models.model
+  // npc_text = [npc_text, ...fallback](--fallback-model npc_text),npc_text = npc_text
   const resolvedModels = input.model ? { model: input.model } : await resolveAgentModels(input.sessionId, input.agentId);
   const model = resolvedModels.model;
   const fallbackModels = resolvedModels.fallbackModels;
 
-  // 合并工具(去重,名字冲突时先到先得)→ 经 MCP 桥下发内核。
-  // 优先级:FORGEAX_TOOLS(内置真值)> seam hostTools(产品壳注入,如 list_games/
-  //   query_world/capture_frame)> first-class UI action(catalog 派生)> extraTools
-  //   (agent host-tools/kits)> record.tools(soul-pack tools/*.json)> skill-derived。
-  //   内置/host 工具在冲突时获胜,soul-pack 不能覆盖宿主真值工具。
+  // npc_text(npc_text,npc_text)npc_text npc_text MCP npc_text
+  // npc_text:FORGEAX_TOOLS(npc_text)> seam hostTools(npc_text,npc_text list_games/
+  //   query_world/capture_frame)> first-class UI action(catalog npc_text)> extraTools
+  //   (agent host-tools/kits)> record.tools(soul-pack tools/*.json)> skill-derivednpc_text
+  //   npc_text/host npc_text,soul-pack npc_text
   const seen = new Set(FORGEAX_TOOLS.map((t) => t.name));
   const tools: TurnRequest['tools'] = [...FORGEAX_TOOLS];
   type ToolEntry = NonNullable<TurnRequest['tools']>[number];
@@ -172,25 +183,25 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
       }
     }
   };
-  // seam hostTools:只出墙可序列化三元组(run 是宿主侧执行体,永不过 wire)。
+  // seam hostTools:npc_text(run npc_text,npc_text wire)npc_text
   pushDeduped(getHostTools().map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })));
-  // P1-9 一等工具化:server catalog 里标 firstClass 的 UI action 派生独立 ToolSpec
-  //   (ui_act_*)。模型原生看到 schema、免一次 snapshot 发现往返;执行/权限在两个
-  //   host 工具执行口被反解回 ui_invoke(actionId)走同一 per-action 闸与往返。
+  // P1-9 npc_text:server catalog npc_text firstClass npc_text UI action npc_text ToolSpec
+  //   (ui_act_*)npc_text schemanpc_text snapshot npc_text;npc_text/npc_text
+  //   host npc_text ui_invoke(actionId)npc_text per-action npc_text
   pushDeduped(firstClassUiToolSpecs(input.sessionId));
   pushDeduped(input.extraTools ?? []);
-  // R2/C1:把 soul-pack「重生」时带来的 tools(已是 ToolSpec[])注入本轮。
+  // R2/C1:npc_text soul-packnpc_text tools(npc_text ToolSpec[])npc_text
   pushDeduped(record.tools ?? []);
-  // skills(SkillRefLite,非 ToolSpec)→ 派生最小 invocation ToolSpec,让内核能放行 +
-  //   agent 自知其技能。kind/description 透传到 description;暂用 `args` 自由文本入参,
-  //   结构化 skill schema 待 SkillRunner 接线(follow-up)。
+  // skills(SkillRefLite,npc_text ToolSpec)npc_text npc_text invocation ToolSpec,npc_text +
+  //   agent npc_textkind/description npc_text description;npc_text `args` npc_text,
+  //   npc_text skill schema npc_text SkillRunner npc_text(follow-up)npc_text
   pushDeduped(skillsToToolSpecs(record.skills ?? []));
 
-  // P3(B 路径):给每个工具标 `delivery`——own 的「安全类且 core 有 builtin 实现」的工具
-  //   标 'local'(forgeax-core 内核本进程直跑,经 NodeSandboxFs,满速+crash 隔离);危险类
-  //   (bash/出网/删/凭据)、host 专属(list_games/query_world…)、imported 一律 'host'(缺省,
-  //   回宿主走 host-tool-bridge→checkKernelTool 把闸)。claude-code/codex 等租用内核忽略此字段。
-  //   fail-closed:trustTier 非 'own' 或不在 allowlist → 'host'。
+  // P3(B npc_text):npc_text `delivery`npc_textown npc_text core npc_text builtin npc_text
+  //   npc_text 'local'(forgeax-core npc_text,npc_text NodeSandboxFs,npc_text+crash npc_text);npc_text
+  //   (bash/npc_text/npc_text/npc_text)npc_texthost npc_text(list_games/query_worldnpc_text)npc_textimported npc_text 'host'(npc_text,
+  //   npc_text host-tool-bridgenpc_textcheckKernelTool npc_text)npc_textclaude-code/codex npc_text
+  //   fail-closed:trustTier npc_text 'own' npc_text allowlist npc_text 'host'npc_text
   const deliveredTools = tools.map((t) => ({
     ...t,
     delivery: (record.trustTier === 'own' && t.name != null && LOCAL_CAPABLE_TOOLS.has(t.name)
@@ -213,7 +224,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   let uploadBase = projectRoot;
   try {
     if (input.sessionId) uploadBase = getPathManager().session(input.sessionId).root();
-  } catch { /* layout 未就绪 → 落 projectRoot */ }
+  } catch { /* layout npc_text npc_text npc_text projectRoot */ }
   const uploads = materializeFileAttachments(
     input.attachments,
     resolvePath(uploadBase, 'uploads'),
@@ -237,8 +248,8 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
       text: messageText,
       ...(uploads.attachments && uploads.attachments.length ? { attachments: uploads.attachments } : {}),
     },
-    // pack 经 manifest.json 声明的策略(promptMode/toolPolicy)透传给内核 profile。
-    // own/builtin(forge)无 manifest ⇒ 缺省 append + 无 toolPolicy(零回归)。
+    // pack npc_text manifest.json npc_text(promptMode/toolPolicy)npc_text profilenpc_text
+    // own/builtin(forge)npc_text manifest npc_text npc_text append + npc_text toolPolicy(npc_text)npc_text
     systemPrompt: {
       charter,
       persona,
@@ -247,10 +258,10 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     },
     tools: deliveredTools,
     ...(record.toolPolicy ? { toolPolicy: record.toolPolicy } : {}),
-    // pack 经 manifest.json 可声明预算硬闸(maxTurns/maxBudgetUsd → --max-turns/--max-budget-usd)。
+    // pack npc_text manifest.json npc_text(maxTurns/maxBudgetUsd npc_text --max-turns/--max-budget-usd)npc_text
     budget: record.budget ?? {},
-    // 编排层(数字生命引擎)拥有记忆成长 → 内核**不得自主**跑 auto-memory(防双写/双成本/两套SSOT)。
-    // 内核的 fork-extract 机制仍可被编排层驱动;forgeax-core 本无自主记忆=no-op,rented(cc)据此关闭其自带提取。
+    // npc_text(npc_text)npc_text npc_text npc_text**npc_text**npc_text auto-memory(npc_text/npc_text/npc_textSSOT)npc_text
+    // npc_text fork-extract npc_text;forgeax-core npc_text=no-op,rented(cc)npc_text
     memoryAutonomy: false,
     trustTier: record.trustTier,
     ...(input.sessionId ? { hostSessionId: input.sessionId } : {}),
@@ -270,8 +281,12 @@ async function materializeNativeHistory(
   if (!sessionId) return undefined;
   try {
     const session = getSessionManager().peek(sessionId);
-    const ledger = session?.ledgers.get(agentId) ?? session?.ledgers.get('forge');
-    if (!session || !ledger) return undefined;
+    if (!session) return undefined;
+    // The in-memory ledger map is only a cache. After a session refresh/open it
+    // can be empty even though the per-agent WAL is present on disk. Always
+    // hydrate the exact requested agent key; falling back to `forge` crosses
+    // conversation ownership boundaries and makes custom roles lose history.
+    const ledger = session.getOrCreateLedger(agentId);
     // Capture the narrowed reader before async closures (TS does not preserve
     // optional-chain narrowing through those closure boundaries).
     const historySource = ledger;
@@ -293,13 +308,13 @@ async function materializeNativeHistory(
     const msgs = await cw.buildPrompt();
     return llmMessagesToTurnHistory(msgs);
   } catch {
-    return undefined; // 契约 fallback:无 history ⇒ 内核自续
+    return undefined; // npc_text fallback:npc_text history npc_text npc_text
   }
 }
 
-/** 把 soul-pack 的 skills(SkillRefLite,非 ToolSpec)派生成最小 invocation ToolSpec。
- *  每个技能 → 一个 `skill_<skillId>` 工具,供内核放行 + agent 自知。结构化 skill
- *  schema(参数/返回)待 SkillRunner 接线,暂用自由文本 `args` 入参(follow-up)。 */
+/** npc_text soul-pack npc_text skills(SkillRefLite,npc_text ToolSpec)npc_text invocation ToolSpecnpc_text
+ *  npc_text npc_text npc_text `skill_<skillId>` npc_text,npc_text + agent npc_text skill
+ *  schema(npc_text/npc_text)npc_text SkillRunner npc_text,npc_text `args` npc_text(follow-up)npc_text */
 function skillsToToolSpecs(skills: ReadonlyArray<SkillRefLite>): TurnRequest['tools'] {
   const sanitize = (id: string) => id.toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
   return skills
@@ -311,7 +326,7 @@ function skillsToToolSpecs(skills: ReadonlyArray<SkillRefLite>): TurnRequest['to
     }));
 }
 
-/** 当前 chat tab 绑定的游戏 slug(peek-only,不 hydrate);'default'/不存在 → undefined。 */
+/** npc_text chat tab npc_text slug(peek-only,npc_text hydrate);'default'/npc_text npc_text undefinednpc_text */
 function sessionScopeSlug(sid?: string): string | undefined {
   if (!sid) return undefined;
   try {
@@ -324,9 +339,9 @@ function sessionScopeSlug(sid?: string): string | undefined {
   }
 }
 
-/** best-effort 读 `<sid>/agents/<agentId>/agent.json::models.model`。
- *  数组形态 = [主模型, ...fallback]:首个有效串作 model,其余作 fallbackModels(--fallback-model)。
- *  单串 = 仅主模型、无回退。读不到 → 空。 */
+/** best-effort npc_text `<sid>/agents/<agentId>/agent.json::models.model`npc_text
+ *  npc_text = [npc_text, ...fallback]:npc_text model,npc_text fallbackModels(--fallback-model)npc_text
+ *  npc_text = npc_text npc_text npc_text */
 async function resolveAgentModels(
   sessionId?: string,
   agentId?: string,

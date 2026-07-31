@@ -73,6 +73,11 @@ export abstract class BaseAgent {
   protected abortController = new AbortController();
   protected shuttingDown = false;
 
+  /** 空闲(无进行中 turn)时恒为已 resolve；子类在真正干活的区间内换成新 pending
+   *  promise，干完(含 catch/finally 收尾)才 resolve。给 `stop()` 之后想确定性
+   *  等排空的调用方(如 checkpoint rewind)用，取代猜时间的 sleep。 */
+  protected turnSettled: Promise<void> = Promise.resolve();
+
   protected readonly blackboard: BlackboardAPI;
   protected readonly tree: AgentTreeAPI;
   protected readonly eventBus: EventBus;
@@ -210,6 +215,20 @@ export abstract class BaseAgent {
   /** Abort current iteration; shutdown() 才是完整释放。 */
   stop(): void {
     this.abortController.abort();
+  }
+
+  /** Resolve 时机 = 当前进行中 turn(若有)已完整收尾(含 catch/finally)；空闲时
+   *  恒已 resolve。`stop()` 之后 await 这个即为确定性排空,取代猜时间的 sleep。 */
+  get settled(): Promise<void> {
+    return this.turnSettled;
+  }
+
+  /** 子类在真正干活的区间前调用:换上新 pending `turnSettled`,返回收尾时要调的
+   *  resolver(放 finally 里调,确保 abort/异常路径也会 resolve)。 */
+  protected beginTurnSettle(): () => void {
+    let resolve!: () => void;
+    this.turnSettled = new Promise<void>((res) => { resolve = res; });
+    return resolve;
   }
 
   /** Full shutdown：abort + 注销 queue + 清空 registries。FSWatcher 反注册延后到

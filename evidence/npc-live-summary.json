@@ -1,0 +1,49 @@
+{
+  "schema": "forgeax.npc.live-summary",
+  "version": 1,
+  "candidate": {
+    "endpoint": "http://127.0.0.1:18930/api/npc",
+    "game": "paopaotang",
+    "npcId": "pudding",
+    "expectedModel": "deepseek-v4-flash-openai",
+    "candidateSha": "e0baa4bb73dd28bd56d1b3c52666fe814a3197a3"
+  },
+  "attempts": 29,
+  "successes": 20,
+  "failures": 9,
+  "counts": {
+    "success": 20,
+    "timeout": 7,
+    "provider-error": 0,
+    "invalid": 0,
+    "fallback": 2,
+    "thinking": 0
+  },
+  "p50Ms": 2158.392291000011,
+  "p95Ms": 4569.906999999999,
+  "prdGate": {
+    "minimumSuccesses": 20,
+    "p50LimitMs": 2500,
+    "p95LimitMs": 6000,
+    "passed": true
+  },
+  "runId": "npc-live-2026-07-30T02:09:51.688Z",
+  "measuredAt": "2026-07-30T02:11:31.911Z",
+  "requiredSuccesses": 20,
+  "maxAttempts": 60,
+  "loaded": [
+    {
+      "npcId": "pudding",
+      "soulId": "paopaotang.pudding",
+      "trustTier": "own"
+    }
+  ],
+  "observedModels": [
+    "deepseek-v4-flash-openai"
+  ],
+  "observedTransports": [
+    "litellm"
+  ],
+  "ledgerPath": "/Users/you/extensions/github/forgeax-studio/.worktrees/feat-20260727-digital-life-npc-completion/packages/orchestrator/evidence/npc-live-attempts.jsonl",
+  "auditFile": "/tmp/forgeax-npc-live-data/.forgeax/npc-brain/paopaotang/decisions-20260730.jsonl"
+}

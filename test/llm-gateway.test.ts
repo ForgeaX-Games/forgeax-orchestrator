@@ -20,6 +20,7 @@ import {
 } from "../src/lib/llm-gateway";
 import { litellmTransport } from "../src/lib/llm-gateway/transports/litellm";
 import type { LlmTransport } from "../src/lib/llm-gateway/types";
+import { resolveModelAdapter } from "../src/llm/auto-resolver";
 
 let realFetch: typeof fetch;
 let prevBaseUrl: string | undefined;
@@ -83,7 +84,7 @@ describe("resolveTransport / registerModelMapping", () => {
   });
 });
 
-describe("complete() via litellm transport", () => {
+describe.serial("complete() via litellm transport", () => {
   test("happy path: builds correct request, parses response, tracks usage + latency", async () => {
     let captured: { url?: string; body?: Record<string, unknown>; auth?: string } = {};
 
@@ -141,9 +142,21 @@ describe("complete() via litellm transport", () => {
   });
 
   test("missing env → throws helpful error", async () => {
+    const previousBase = process.env.LITELLM_PROXY_BASE_URL;
+    const previousAnthropicBase = process.env.ANTHROPIC_BASE_URL;
+    const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
     delete process.env.LITELLM_PROXY_KEY;
+    delete process.env.LITELLM_PROXY_BASE_URL;
+    delete process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_API_KEY;
     await expect(complete({ model: "gpt-5.5", messages: [{ role: "user", content: "x" }] }))
-      .rejects.toThrow(/LITELLM_PROXY_KEY not set/);
+      .rejects.toThrow(/generic LLM transport/);
+    if (previousBase === undefined) delete process.env.LITELLM_PROXY_BASE_URL;
+    else process.env.LITELLM_PROXY_BASE_URL = previousBase;
+    if (previousAnthropicBase === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = previousAnthropicBase;
+    if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
   });
 
   test("non-JSON response → throws with status + snippet", async () => {
@@ -199,7 +212,18 @@ describe("complete() via litellm transport", () => {
   });
 });
 
-describe("litellm transport direct invocation", () => {
+describe.serial("litellm transport direct invocation", () => {
+  test("routes a deepseek NPC model through Anthropic credentials as the final fallback", () => {
+    expect(resolveModelAdapter("deepseek-v4-flash-openai", {
+      ANTHROPIC_API_KEY: "anthropic-test",
+      ANTHROPIC_BASE_URL: "https://anthropic-compatible.invalid",
+    })).toEqual({
+      api: "anthropic-messages",
+      apiKey: "anthropic-test",
+      apiBase: "https://anthropic-compatible.invalid",
+    });
+  });
+
   test("omits undefined sampler params from body", async () => {
     let body: Record<string, unknown> | undefined;
     const mockFetcher = (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -221,5 +245,78 @@ describe("litellm transport direct invocation", () => {
     expect("temperature" in body!).toBe(false);
     expect("top_p" in body!).toBe(false);
     expect("max_tokens" in body!).toBe(false);
+  });
+
+  test("forwards a strict JSON Schema response format", async () => {
+    let body: Record<string, unknown> | undefined;
+    const mockFetcher = (async (_url: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(init?.body as string);
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"action":"idle"}' } }],
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    await litellmTransport.complete(
+      {
+        model: "deepseek-v4-pro",
+        messages: [{ role: "user", content: "decide" }],
+        responseFormat: {
+          name: "npc_decision",
+          schema: {
+            type: "object",
+            properties: { action: { type: "string" } },
+            required: ["action"],
+            additionalProperties: false,
+          },
+        },
+      },
+      { fetcher: mockFetcher },
+    );
+
+    expect(body!.response_format).toEqual({
+      type: "json_schema",
+      json_schema: {
+        name: "npc_decision",
+        schema: {
+          type: "object",
+          properties: { action: { type: "string" } },
+          required: ["action"],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+    });
+    expect(body!.thinking).toEqual({ type: "disabled" });
+    expect(body!.reasoning_effort).toBeUndefined();
+  });
+
+  test("does not force reasoning controls on non-NPC structured callers", async () => {
+    let body: Record<string, unknown> | undefined;
+    const mockFetcher = (async (_url: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(init?.body as string);
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"ok":true}' } }],
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    await litellmTransport.complete(
+      {
+        model: "deepseek-v4-flash-openai",
+        messages: [{ role: "user", content: "probe" }],
+        responseFormat: {
+          name: "plugin_probe",
+          schema: {
+            type: "object",
+            properties: { ok: { type: "boolean" } },
+            required: ["ok"],
+            additionalProperties: false,
+          },
+        },
+      },
+      { fetcher: mockFetcher },
+    );
+
+    expect(body!.thinking).toBeUndefined();
+    expect(body!.reasoning_effort).toBeUndefined();
   });
 });

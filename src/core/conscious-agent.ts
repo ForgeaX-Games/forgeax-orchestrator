@@ -446,6 +446,7 @@ export class ConsciousAgent extends BaseAgent {
       while (this.commandQueue.length > 0 && !turnSignal.aborted) {
         const cmd = this.commandQueue.shift()!;
         this.currentTurn++;
+        const settleDone = this.beginTurnSettle();
         try {
           await runWithAgentTurn(this.agentPath, this.currentTurn, async () => {
             await this.executeCommand(cmd.toolName, cmd.args, cmd.reason, turnSignal);
@@ -454,6 +455,8 @@ export class ConsciousAgent extends BaseAgent {
           if (!turnSignal.aborted) {
             withModelFeedback(() => console.error(`command failed: ${err?.message ?? err}`));
           }
+        } finally {
+          settleDone();
         }
       }
       if (turnSignal.aborted) continue;
@@ -465,24 +468,26 @@ export class ConsciousAgent extends BaseAgent {
         continue;
       }
 
-      if (this.queue.hasHandoff("steer")) {
-        // Skip coalesce for steer events — process immediately
-      } else if ((trigger.priority ?? 1) > 0 && this.coalesceMs > 0) {
-        await sleep(this.coalesceMs, turnSignal);
-      }
-
-      const events = this.queue.drain().filter((e) => eventToSessionMessage(e) !== null);
-      if (events.length === 0) continue;
-
-      this.currentTurn++;
-
-      const steerWatcher = this.queue.onSteer(() => {
-        this.abortController.abort();
-      });
-
-      console.log(`▶ process [${events.length} events]`);
-
+      const settleDone = this.beginTurnSettle();
+      let steerWatcher: { dispose(): void } | undefined;
       try {
+        if (this.queue.hasHandoff("steer")) {
+          // Skip coalesce for steer events — process immediately
+        } else if ((trigger.priority ?? 1) > 0 && this.coalesceMs > 0) {
+          await sleep(this.coalesceMs, turnSignal);
+        }
+
+        const events = this.queue.drain().filter((e) => eventToSessionMessage(e) !== null);
+        if (events.length === 0) continue;
+
+        this.currentTurn++;
+
+        steerWatcher = this.queue.onSteer(() => {
+          this.abortController.abort();
+        });
+
+        console.log(`▶ process [${events.length} events]`);
+
         await runWithAgentTurn(this.agentPath, this.currentTurn, async () => {
           await this.process(events, turnSignal);
         });
@@ -493,7 +498,8 @@ export class ConsciousAgent extends BaseAgent {
           withModelFeedback(() => console.error(`process failed: ${err?.message ?? err}`));
         }
       } finally {
-        steerWatcher.dispose();
+        settleDone();
+        steerWatcher?.dispose();
       }
     }
   }

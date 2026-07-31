@@ -181,7 +181,40 @@ export class Session {
       logger: this.logger,
       onAgentFreed: init.onAgentFreed ?? ((agentPath) => this.freeAgentState(agentPath)),
       onAgentAttached: (agent) => this.kitReloadCoordinator?.registerAgent(agent),
-      onAgentDetached: (agentPath) => this.kitReloadCoordinator?.unregisterAgent(agentPath),
+      onAgentDetached: (agentPath) => {
+        this.kitReloadCoordinator?.unregisterAgent(agentPath);
+        // Target of a pending delegation is going away (shutdown/restart/remove/
+        // crash) — `hook:turnEnd` will never fire for it, so without this the
+        // `delegations` entry leaks forever and permanently blocks future
+        // delegations to this path via `delegationGuard`'s target-busy check.
+        this._resolveDelegation(agentPath, { aborted: true });
+        // Same "hook:turnEnd will never fire" gap also strands the TARGET's own
+        // UI: the front-end's cancel button / "thinking" indicator only clear on
+        // `hook:turnEnd` (session-stream.ts's `setStreaming(sid, emitter, false)`),
+        // so a sub-agent that's forcibly terminated mid-turn stays visually
+        // "running" forever even though its delegator was already notified.
+        // Synthesize the same shape `ledger-recovery.ts` uses for unsealed turns
+        // (`aborted: true, synthesized: true`) and `publish` (not `emit`) it so
+        // `_bindLedgerPersistence` seals the ledger and the WS hub relays it to
+        // every tab watching this agentPath — no queue routing needed, this is a
+        // status broadcast, not a message. Gated on `liveTurns.has()` so we never
+        // double-fire if the real turnEnd already made it out.
+        if (this.liveTurns.has(agentPath)) {
+          this.eventBus.publish(
+            {
+              source: `agent:${agentPath}`,
+              type: "hook:turnEnd",
+              payload: {
+                aborted: true,
+                error: "agent detached before its turn ended",
+                synthesized: true,
+              },
+              ts: Date.now(),
+            },
+            agentPath,
+          );
+        }
+      },
     });
 
     this.kitReloadCoordinator = new AgentKitReloadCoordinator(
@@ -291,40 +324,61 @@ export class Session {
       }
 
       if (event.type !== "hook:turnEnd") return;
-      const info = this.delegations.get(emitterId);
-      if (!info) return;
-      this.delegations.delete(emitterId);
       const payload = (event.payload ?? {}) as { aborted?: boolean; error?: string; stopReason?: string };
-      const status = payload.aborted ? "取消" : payload.error ? "失败" : "完成";
-      const detail = payload.error ? `（错误：${String(payload.error).slice(0, 120)}）` : "";
-      // Relay the teammate's actual final output so the delegator can act on it
-      // directly (e.g. apply tsumugi's verify report) instead of stalling to
-      // ask the user to paste it back. Trim to keep the delegator's context
-      // bounded; the full transcript still lives in the teammate's ledger.
-      const result = payload.aborted ? "" : (this.latestAssistantText.get(emitterId) ?? "");
-      this.latestAssistantText.delete(emitterId);
-      const MAX = 8000;
-      const resultBlock = result
-        ? `\n\n--- ${emitterId} 的产出 ---\n${result.length > MAX ? result.slice(0, MAX) + "\n…（已截断，完整内容见该 agent 的对话）" : result}`
-        : "";
-      // emit (not publish) — `to` routes the event into the delegator's
-      // per-agent queue. Without queue routing the delegator's run-loop
-      // (waitForEvent → drainQueue) never wakes and the message is lost.
-      this.eventBus.emit(
-        {
-          source: "agent",
-          type: "message",
-          payload: {
-            content: `✓ ${emitterId} ${status}了你交办的任务${detail}：${info.brief}${resultBlock}`,
-            fromAgent: emitterId,
-          },
-          to: info.delegator,
-          handoff: "turn",
-          ts: Date.now(),
-        },
-        emitterId,
-      );
+      this._resolveDelegation(emitterId, { aborted: payload.aborted, error: payload.error });
     });
+  }
+
+  /** Resolve (and remove) a pending delegation targeting `targetAgentPath`,
+   *  relaying a completion/abort message back to the delegator. Two call
+   *  sites: `_bindDelegationCallback`'s `hook:turnEnd` observer (normal
+   *  completion) and the Scheduler's `onAgentDetached` hook (target shut
+   *  down / restarted / removed / crashed while a delegation was still
+   *  pending for it). Without the second call site `hook:turnEnd` never
+   *  fires for a target that's gone, so the `delegations` entry leaks
+   *  forever and permanently blocks future delegations to that path via
+   *  `delegationGuard`'s target-busy check. */
+  private _resolveDelegation(
+    targetAgentPath: string,
+    outcome: { aborted?: boolean; error?: unknown },
+  ): void {
+    const info = this.delegations.get(targetAgentPath);
+    if (!info) return;
+    this.delegations.delete(targetAgentPath);
+    const status = outcome.aborted ? "取消" : outcome.error ? "失败" : "完成";
+    const detail = outcome.error ? `（错误：${String(outcome.error).slice(0, 120)}）` : "";
+    // Relay the teammate's actual final output so the delegator can act on it
+    // directly (e.g. apply tsumugi's verify report) instead of stalling to
+    // ask the user to paste it back. Trim to keep the delegator's context
+    // bounded; the full transcript still lives in the teammate's ledger.
+    const result = outcome.aborted ? "" : (this.latestAssistantText.get(targetAgentPath) ?? "");
+    this.latestAssistantText.delete(targetAgentPath);
+    const MAX = 8000;
+    const resultBlock = result
+      ? `\n\n--- ${targetAgentPath} 的产出 ---\n${result.length > MAX ? result.slice(0, MAX) + "\n…（已截断，完整内容见该 agent 的对话）" : result}`
+      : "";
+    // emit (not publish) — `to` routes the event into the delegator's
+    // per-agent queue. Without queue routing the delegator's run-loop
+    // (waitForEvent → drainQueue) never wakes and the message is lost.
+    // durability: "required" — the delegator's queue can independently fill
+    // up with ordinary UI/tool messages; this callback must not be FIFO-
+    // evicted along with them, or the delegator never learns the teammate
+    // finished (see EventQueue's MAX_EVENTS overflow eviction).
+    this.eventBus.emit(
+      {
+        source: "agent",
+        type: "message",
+        payload: {
+          content: `✓ ${targetAgentPath} ${status}了你交办的任务${detail}：${info.brief}${resultBlock}`,
+          fromAgent: targetAgentPath,
+        },
+        to: info.delegator,
+        handoff: "turn",
+        durability: "required",
+        ts: Date.now(),
+      },
+      targetAgentPath,
+    );
   }
 
   // ─── EventBus → agent_command routing ────────────────────────────────────

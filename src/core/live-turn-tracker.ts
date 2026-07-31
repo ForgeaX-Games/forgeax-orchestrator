@@ -119,6 +119,14 @@ export class LiveTurnTracker {
     }));
   }
 
+  /** `emitterId` 当前是否有未封口的在途 turn(已收到 turnStart,还没收到匹配的
+   *  turnEnd)。供 caller 判断「target 被强制终止时,是否需要补一条合成
+   *  turnEnd」——若这里已经是 false,说明真实 turnEnd 已经跑过,不必再补,
+   *  避免重复广播。 */
+  has(agentPath: string): boolean {
+    return this.turns.has(agentPath);
+  }
+
   /** 仅 thinking / 等首 token 的 emitter。正文或工具活动都可恢复,不得 abort。 */
   thinkingOnlyEmitterIds(): string[] {
     const out: string[] = [];

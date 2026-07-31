@@ -14,6 +14,10 @@
     "./kernel/forgeax-core-kernel": {
       "types": "./dist/kernel/forgeax-core-kernel.d.ts",
       "import": "./dist/kernel/forgeax-core-kernel.js"
+    },
+    "./npc-brain/standalone": {
+      "types": "./src/npc-brain/standalone.ts",
+      "import": "./src/npc-brain/standalone.ts"
     }
   },
   "files": [
@@ -24,6 +28,10 @@
     "pack:tgz": "npm pack",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "npc-brain": "bun src/npc-brain/standalone.ts",
+    "eval:npc-bots": "bun scripts/run-npc-bot-eval.ts ../.. 100",
+    "measure:npc-transport": "bun scripts/measure-npc-transport.ts ../.. 100",
+    "measure:npc-live": "bun scripts/measure-npc-live.ts ../..",
     "test:codex-tools-e2e": "bun test/codex-tools-e2e.ts",
     "test:codex-tools-golden": "CODEX_TOOLS_E2E_REQUIRE_LIVE=1 bun test/codex-tools-e2e.ts",
     "lint:boundaries": "depcruise --config .dependency-cruiser.cjs src",

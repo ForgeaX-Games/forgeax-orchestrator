@@ -231,7 +231,7 @@ export function buildCbcMcpArgs(req: TurnRequest, permSid: string): string[] {
   };
 
   // host-tool 桥:非内置工具经 MCP→HTTP 回调宿主执行(内置工具在 mcp server 内本地处理)。
-  const BUILTIN_FXT = new Set(['echo', 'list_games', 'memory_search', 'remember', 'query_world', 'capture_frame']);
+  const BUILTIN_FXT = new Set(['echo', 'list_games', 'memory_search', 'remember', 'soul_create', 'npc_wire', 'query_world', 'capture_frame']);
   const bridged = tools.filter((t) => !BUILTIN_FXT.has(t.name));
   if (bridged.length > 0) {
     try {

@@ -28,13 +28,13 @@ beforeAll(() => {
     fetch: async (req) => {
       const m = new URL(req.url).pathname.match(/^\/api\/sessions\/([^/]+)\/hook-gate$/);
       if (!m) return new Response('nf', { status: 404 });
-      const body = await req.json();
+      const body = await req.json() as { toolName: string };
       received.push({ sid: decodeURIComponent(m[1]), body });
       const hit = canned[body.toolName] ?? { decision: 'none' };
       return Response.json(hit);
     },
   });
-  port = server.port;
+  port = server.port!;
 });
 
 afterAll(() => {

@@ -31,6 +31,7 @@ import {
 import { KeyedMutex, codexHomeKey } from '../src/kernel/codex-session-home';
 
 const SERVER = resolvePath(import.meta.dir, '../src/kernel/mcp/forgeax-tools-server.mjs');
+const PERMISSION_SERVER = resolvePath(import.meta.dir, '../src/cli-providers/mcp/permission-server.mjs');
 
 function req(over: Partial<TurnRequest> = {}): TurnRequest {
   return {
@@ -283,8 +284,8 @@ describe('codex-session-home — keyed mutex', () => {
 // ─── process-level double allowlist ──────────────────────────────────
 
 /** Drive forgeax-tools-server.mjs over stdio; resolve responses by id. */
-function spawnServer(env: Record<string, string>) {
-  const child = spawn(process.execPath, [SERVER], {
+function spawnServer(env: Record<string, string>, server = SERVER) {
+  const child = spawn(process.execPath, [server], {
     env: { ...process.env, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -318,6 +319,37 @@ function spawnServer(env: Record<string, string>) {
 }
 
 describe('forgeax-tools-server — double allowlist (process-level)', () => {
+  test('remember + memory_search use the shared layered-memory runtime', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const projectRoot = mkdtempSync(join(tmpdir(), 'fxt-memory-runtime-'));
+    const srv = spawnServer({
+      FORGEAX_PROJECT_ROOT: projectRoot,
+      FORGEAX_SOUL_AGENT: 'forge',
+      FORGEAX_FXT_EXPOSE: 'remember,memory_search',
+    });
+    try {
+      await srv.rpc('initialize', { protocolVersion: '2024-11-05' });
+      const remembered = await srv.rpc('tools/call', {
+        name: 'remember',
+        arguments: { kind: 'general', text: 'protocol convergence marker' },
+      });
+      expect(remembered.result.isError).toBeFalsy();
+      expect(remembered.result.content[0].text).toContain('"tier":"traits"');
+
+      const searched = await srv.rpc('tools/call', {
+        name: 'memory_search',
+        arguments: { query: 'convergence marker' },
+      });
+      expect(searched.result.isError).toBeFalsy();
+      expect(searched.result.content[0].text).toContain('protocol convergence marker');
+    } finally {
+      srv.close();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   test('EXPOSE=echo: list shows only echo; call echo ok; others not_found', async () => {
     const srv = spawnServer({
       FORGEAX_FXT_EXPOSE: 'echo',
@@ -444,6 +476,30 @@ describe('forgeax-tools-server — double allowlist (process-level)', () => {
       expect(nf.result.structuredContent?.activeTools).toContain('my_host_tool');
       expect(nf.result.structuredContent?.hint).toContain('Active tools this turn');
       expect(nf.result.content?.[0]?.text).toContain('stop retrying this name');
+    } finally {
+      srv.close();
+    }
+  });
+});
+
+describe('permission-server — shared MCP protocol (process-level)', () => {
+  test('initialize/list/call stay fail-closed without a session id', async () => {
+    const srv = spawnServer({ FORGEAX_SID: '' }, PERMISSION_SERVER);
+    try {
+      const initialized = await srv.rpc('initialize', { protocolVersion: '2024-11-05' });
+      expect(initialized.result.serverInfo.name).toBe('forgeax');
+
+      const listed = await srv.rpc('tools/list');
+      expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual(['approve']);
+
+      const called = await srv.rpc('tools/call', {
+        name: 'approve',
+        arguments: { tool_name: 'Bash', input: { command: 'echo no' } },
+      });
+      expect(JSON.parse(called.result.content[0].text)).toEqual({
+        behavior: 'deny',
+        message: '用户在 forgeax Studio 里拒绝了这个命令',
+      });
     } finally {
       srv.close();
     }

@@ -16,10 +16,13 @@ let realFetch: typeof fetch;
 let prevBaseUrl: string | undefined;
 let prevKey: string | undefined;
 
-function makeApp() {
+function makeApp(
+  source: "studio-ui" | "game-runtime" = "studio-ui",
+) {
   // Mount the router at root for testing — production mounts at /api/llm.
-  // We hit /test (relative to the router) below.
-  return createLlmTestRouter();
+  // Request provenance is injected by the host; it is deliberately independent
+  // of browser-controlled headers such as Origin.
+  return createLlmTestRouter({ resolveRequestSource: () => source });
 }
 
 interface CapturedRequest {
@@ -70,7 +73,51 @@ afterEach(() => {
   _resetGateway();
 });
 
+describe("Model Lab request-source policy", () => {
+  for (const path of ["/test", "/test-stream"]) {
+    test(`rejects a host-classified game runtime at ${path}`, async () => {
+      const captured = mockProxy(() => ({
+        status: 200,
+        body: { choices: [{ message: { content: "must not run" } }] },
+      }));
+      const app = makeApp("game-runtime");
+      const resp = await app.request(path, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "http://localhost:18920",
+          "x-forgeax-request-source": "studio-ui",
+        },
+        body: "{not-json",
+      });
+
+      expect(resp.status).toBe(403);
+      expect(resp.headers.get("content-type")).toContain("application/json");
+      expect(await resp.json()).toEqual({
+        ok: false,
+        error: "game runtime requests must use the NPC Brain API instead of Model Lab",
+      });
+      expect(captured).toHaveLength(0);
+    });
+  }
+});
+
 describe("/api/llm/test", () => {
+  test("allows normal Model Lab UI requests", async () => {
+    mockProxy(() => ({
+      status: 200,
+      body: { choices: [{ message: { content: "model lab ok" } }] },
+    }));
+    const app = makeApp("studio-ui");
+    const resp = await app.request("/test", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.5", prompt: "smoke test" }),
+    });
+
+    expect(resp.status).toBe(200);
+    expect(await resp.json()).toMatchObject({ ok: true, text: "model lab ok" });
+  });
   test("rejects body without model", async () => {
     const app = makeApp();
     const resp = await app.request("/test", {
@@ -229,5 +276,27 @@ describe("/api/llm/test", () => {
     const json = (await resp.json()) as { ok: boolean; error: string };
     expect(json.ok).toBe(false);
     expect(json.error).toContain("LITELLM_PROXY_KEY");
+  });
+});
+
+describe("/api/llm/test-stream", () => {
+  test("allows normal Model Lab UI streaming requests", async () => {
+    globalThis.fetch = (async () => new Response(
+      'data: {"model":"gpt-5.5","choices":[{"delta":{"content":"ok"}}]}\n\n' +
+        "data: [DONE]\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )) as unknown as typeof fetch;
+    const app = makeApp("studio-ui");
+    const resp = await app.request("/test-stream", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.5", prompt: "smoke test" }),
+    });
+
+    expect(resp.status).toBe(200);
+    const text = await resp.text();
+    expect(text).toContain("event: chunk");
+    expect(text).toContain('"delta":"ok"');
+    expect(text).toContain("event: done");
   });
 });

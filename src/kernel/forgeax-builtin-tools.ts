@@ -2,24 +2,19 @@
  * forgeax-builtin-tools —— forgeax-core 原生内核路径下「编排层声明的内置 forgeax 工具」
  * 的宿主侧执行实现。
  *
- * 背景(本模块要补的洞):`compose-turn-request.ts` 的 `FORGEAX_TOOLS`
- * (`list_games` / `memory_search` / `remember` / `query_world` / `capture_frame`,外加
- * `echo` demo)把工具 **schema 出墙给模型**;但它们的**执行实现**此前只活在
- * cc/cbc/codex 用的 MCP stdio server `forgeax-tools-server.mjs` 里。forgeax-core 内核
- * (现为默认内核)不经那层 MCP——它把所有 host 工具经 `hostTool` 桥回宿主 →
- * `executeTool` 查 agent 的 kit 注册表,而这些内置工具不在 kit 注册表里 →
- * 返回 `{ error: "Unknown tool: remember" }`(模型以为记住了,实际没落盘)。
+ * `compose-turn-request.ts` 把内置工具 schema 暴露给模型；forgeax-core 不经过
+ * cc/cbc/codex 使用的 MCP stdio server，因此需要在宿主侧提供同一批执行实现。
  *
- * 本模块在宿主侧补上同一批工具的实现,**与 .mjs 同构**:memory 直接复用
- * `soul/layered-memory.ts` 这份 TS SSOT(不再镜像检索/写盘逻辑),感知接地复用
- * `perception-registry` 的取数往返。`host-tool-bridge` 与 `:sid/kernel-tool` 两个
- * host 工具执行口都在「信任闸放行后、executeTool 前」先问本模块。
+ * memory 与 MCP asset 共同复用 `soul/layered-memory-runtime.mjs` 这份 plain-Node
+ * SSOT，感知接地复用 `perception-registry`。`host-tool-bridge` 与
+ * `:sid/kernel-tool` 两个 host 工具执行口都在信任闸放行后、executeTool 前调用本模块。
  *
- * 注:cc/cbc/codex 内核仍在 `.mjs` 里本地执行这批工具(从不桥回 `:sid/kernel-tool`),
- * 故本模块只对 forgeax-core 路径生效,不改其它内核行为。改检索/写盘口径时,
- * `layered-memory.ts`(TS SSOT,本模块用)与 `forgeax-tools-server.mjs`(.mjs 镜像)两处需同步。
+ * cc/cbc/codex 内核仍在 `.mjs` 中本地执行这些工具，不会桥回 `:sid/kernel-tool`；
+ * 本模块只对 forgeax-core 路径生效。工具 schema 仍须与 MCP server 同步。
  */
 import { randomUUID } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 import type { Event } from '../core/types';
 import type { LayeredMemoryRef } from '../soul/types';
 import { soulMemoryRoot, searchMemory, classifyAndWrite } from '../soul';
@@ -31,28 +26,30 @@ import {
   isFirstClassUiToolName,
   resolveFirstClassUiTool,
 } from '../api/lib/ui-manifest-registry';
-import { getHostUiAction, type HostToolRunCtx } from '../orchestration-seams';
+import { getHostTool, getHostUiAction, type HostToolRunCtx } from '../orchestration-seams';
 import { catalogGet } from './action-catalog';
 import { getBuiltinHeadlessUiAction } from './ui-headless-actions';
+import { NPC_TOOL_CONTRACTS } from '@forgeax/types/npc-tools';
 
-/** 仅需 publish 的最小事件发布口(`EventBus` 类 / 绑定 bus / 测试桩皆满足)。 */
+/** 仅需 publish 的最小事件发布口（EventBus、绑定 bus、测试桩均可满足）。 */
 export interface EventPublisher {
   publish(event: Event, emitterId?: string): void;
 }
 
-/** 内置 forgeax 工具名集合(与 compose-turn-request 的 FORGEAX_TOOLS + .mjs TOOLS 对齐)。
- *  游戏语义工具(list_games/query_world/capture_frame)已迁产品壳经 HostToolSpec seam
- *  注入(P1-7),不再是编排层内置——执行口对 seam 工具走 `HostToolSpec.run`。 */
+/** 内置 forgeax 工具名集合，与 compose-turn-request 和 MCP server 的声明对齐。
+ * 游戏语义工具已迁至产品壳，经 HostToolSpec seam 注入。 */
 const BUILTIN_NAMES: ReadonlySet<string> = new Set([
   'echo',
   'memory_search',
   'remember',
+  'soul_create',
+  'npc_wire',
   'ui_snapshot',
   'ui_invoke',
   'ui_screenshot',
 ]);
 
-/** 该工具是否为内置 forgeax 工具(宿主侧有实现,不查 agent kit 注册表)。 */
+/** 该工具是否由宿主侧内置实现，不需要查询 agent kit。 */
 export function isForgeaxBuiltinTool(name: string): boolean {
   return BUILTIN_NAMES.has(name);
 }
@@ -107,37 +104,34 @@ export function preflightUiToolDispatch(
   return { name, args };
 }
 
-/** 感知/UI 往返的 query kind(闭合 union:server 端点与本模块共守)。 */
+/** 感知/UI 往返的 query kind。 */
 export type PerceptionKind = 'world' | 'frame' | 'ui_snapshot' | 'ui_invoke' | 'ui_screenshot';
 
-/** 内置工具执行上下文(显式声明的输入,Pipeline Isolation)。 */
+/** 内置工具执行上下文（显式输入，保持 Pipeline Isolation）。 */
 export interface BuiltinToolCtx {
-  /** 工作区根(.forgeax/games · souls 解析基准)。 */
+  /** 工作区根目录（游戏与 soul 的解析基准）。 */
   projectRoot: string;
-  /** soul 记忆库归属 agent(= 本轮 agentPath);决定 `.forgeax/souls/<agentId>/memory`。 */
+  /** soul 记忆库所属 agent；决定 `.forgeax/souls/<agentId>/memory`。 */
   agentId: string;
-  /** 本会话绑定 / 当前激活的游戏 slug。`remember kind:'game'` 与 episodes 召回按此隔离;
-   *  缺省 = 通用上下文(game-bound 记忆将拒写)。 */
+  /** 当前游戏 slug；game-bound 记忆按此隔离。 */
   game?: string;
-  /** 感知接地工具(query_world/capture_frame/ui_*)的会话总线;缺省则降级为 unavailable。 */
+  /** 感知工具使用的会话总线；缺省时 fail-soft 为 unavailable。 */
   eventBus?: EventPublisher;
-  /** 会话 id —— ui_* 往返的 lease/runtime binding 与 catalog projection 查询键。 */
+  /** 会话 id，用于 UI lease、runtime binding 与 catalog projection。 */
   sid?: string;
 }
 
 const PERCEPTION_TIMEOUT_MS = 8_000;
-/** ui_invoke 通道默认超时(略宽于取数:invoke 要等 action 执行/受理)。 */
+/** ui_invoke 默认超时。 */
 const UI_INVOKE_TIMEOUT_MS = 10_000;
-/** ui_screenshot 通道超时(DOM 序列化 + 栅格化比取数慢,再宽一档)。 */
+/** ui_screenshot 涉及 DOM 序列化与栅格化，使用更宽的超时。 */
 const UI_SCREENSHOT_TIMEOUT_MS = 15_000;
 
 function memoryRef(ctx: BuiltinToolCtx): LayeredMemoryRef {
   return { root: soulMemoryRoot(ctx.projectRoot, ctx.agentId), ...(ctx.game ? { game: ctx.game } : {}) };
 }
 
-/** 把内置工具执行上下文适配成 seam 工具的 `HostToolRunCtx`(两个执行口对
- *  `HostToolSpec.run` 调用时用)。`perception` 绑定本会话总线 —— shell 注入的感知类
- *  工具(query_world/capture_frame)经它走编排层通用往返;UI 未连 fail-soft。 */
+/** 将内置工具上下文适配为 seam 工具使用的 HostToolRunCtx。 */
 export function hostToolRunCtx(ctx: BuiltinToolCtx): HostToolRunCtx {
   return {
     ...(ctx.sid ? { sid: ctx.sid } : {}),
@@ -148,8 +142,163 @@ export function hostToolRunCtx(ctx: BuiltinToolCtx): HostToolRunCtx {
   };
 }
 
-/** 写一条记忆(模型驱动成长):general→traits(可移植);game→episodes/<当前game>;
- *  无 kind 时有 game→episodes、否则→traits。失败返回 `{ ok:false, error }`(由调用方翻成 isError)。 */
+function isPathInside(root: string, candidate: string): boolean {
+  const rel = relative(resolve(root), resolve(candidate));
+  return rel === '' || (!rel.startsWith('..') && !rel.startsWith('/'));
+}
+
+function readJsonObject(path: string): Record<string, unknown> {
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseModelPreference(value: unknown): string | string[] | undefined {
+  if (typeof value === 'string') {
+    const model = value.trim();
+    return model || undefined;
+  }
+  if (!Array.isArray(value)) return undefined;
+  const models = value
+    .filter((entry): entry is string => typeof entry === 'string')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return models.length ? models : undefined;
+}
+
+/** Create or update only the managed files in a project-owned native soul pack. */
+function soulCreate(ctx: BuiltinToolCtx, args: Record<string, unknown> | undefined): unknown {
+  const parsed = NPC_TOOL_CONTRACTS.soul_create.input.safeParse(args ?? {});
+  if (!parsed.success) return { ok: false, error: `soul_create: invalid input: ${parsed.error.message}` };
+  const { soulId, name, identity } = parsed.data;
+
+  const soulRoot = resolve(ctx.projectRoot, '.forgeax', 'souls-builtin');
+  const dir = resolve(soulRoot, soulId);
+  if (!isPathInside(soulRoot, dir)) return { ok: false, error: 'soul_create: soul path escapes project root' };
+
+  const identityPath = join(dir, 'persona', 'identity.md');
+  const manifestPath = join(dir, 'manifest.json');
+  const agentPath = join(dir, 'agent.json');
+  const existed = existsSync(dir);
+  mkdirSync(join(dir, 'persona'), { recursive: true });
+
+  const manifest = readJsonObject(manifestPath);
+  const agent = readJsonObject(agentPath);
+  const requestedModel = parseModelPreference(parsed.data.models ?? parsed.data.model);
+  const existingModels = agent.models && typeof agent.models === 'object' && !Array.isArray(agent.models)
+    ? agent.models as Record<string, unknown>
+    : {};
+  const models = requestedModel === undefined && Object.keys(existingModels).length === 0
+    ? undefined
+    : requestedModel === undefined
+      ? existingModels
+      : { ...existingModels, model: requestedModel };
+
+  writeFileSync(identityPath, `# ${name}\n\n${identity}\n`);
+  writeFileSync(manifestPath, `${JSON.stringify({ ...manifest, id: soulId, name, version: 1 }, null, 2)}\n`);
+  const managedAgent = {
+    ...agent,
+    id: soulId,
+    name,
+    personaFile: './persona/identity.md',
+    ...(models ? { models } : {}),
+  };
+  writeFileSync(agentPath, `${JSON.stringify(managedAgent, null, 2)}\n`);
+
+  return {
+    ok: true,
+    created: !existed,
+    soulId,
+    path: `.forgeax/souls-builtin/${soulId}`,
+    changedPaths: [
+      `.forgeax/souls-builtin/${soulId}/persona/identity.md`,
+      `.forgeax/souls-builtin/${soulId}/manifest.json`,
+      `.forgeax/souls-builtin/${soulId}/agent.json`,
+    ],
+  };
+}
+
+function appendAdoptionLedger(
+  ctx: BuiltinToolCtx,
+  stage: 'validation' | 'execution',
+  status: 'success' | 'failure',
+  detail: Record<string, unknown>,
+): void {
+  try {
+    const path = resolve(ctx.projectRoot, '.forgeax', 'adoption-ledger.jsonl');
+    mkdirSync(join(ctx.projectRoot, '.forgeax'), { recursive: true });
+    appendFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), tool: detail.tool ?? 'npc_wire', stage, status, ...detail })}\n`);
+  } catch {
+    // Adoption diagnostics must never make the tool itself fail.
+  }
+}
+
+function npcWire(ctx: BuiltinToolCtx, args: Record<string, unknown> | undefined): unknown {
+  const parsed = NPC_TOOL_CONTRACTS.npc_wire.input.safeParse(args ?? {});
+  if (!parsed.success) {
+    const result = {
+      ok: false,
+      code: 'invalid_input',
+      hint: 'Provide game, npcId, soulId, and at least one canonical affordance.',
+      expected: 'NpcWireInput',
+      actual: parsed.error.issues,
+    };
+    appendAdoptionLedger(ctx, 'validation', 'failure', { tool: 'npc_wire', error: result });
+    return result;
+  }
+  const hostTool = getHostTool('npc_wire');
+  if (!hostTool?.run) {
+    const result = {
+      ok: false,
+      code: 'host_unavailable',
+      hint: 'Start the Studio host and retry npc_wire.',
+      expected: 'npc_wire host tool seam',
+    };
+    appendAdoptionLedger(ctx, 'execution', 'failure', { tool: 'npc_wire', error: result });
+    return result;
+  }
+  try {
+    const result = hostTool.run(parsed.data, hostToolRunCtx(ctx));
+    const value = result instanceof Promise ? undefined : result;
+    if (value && typeof value === 'object' && (value as { ok?: unknown }).ok === false) {
+      const raw = value as { error?: unknown };
+      const failure = {
+        ok: false,
+        code: 'wire_failed',
+        hint: typeof raw.error === 'string' ? raw.error : 'Host rejected npc_wire.',
+        expected: 'writable game NPC adapter',
+        actual: value,
+      };
+      appendAdoptionLedger(ctx, 'execution', 'failure', { tool: 'npc_wire', error: failure });
+      return failure;
+    }
+    if (result instanceof Promise) {
+      return result.then((resolved) => {
+        const ok = !(resolved && typeof resolved === 'object' && (resolved as { ok?: unknown }).ok === false);
+        appendAdoptionLedger(ctx, 'execution', ok ? 'success' : 'failure', { tool: 'npc_wire', result: resolved });
+        return resolved;
+      });
+    }
+    appendAdoptionLedger(ctx, 'execution', 'success', { tool: 'npc_wire', result });
+    return result;
+  } catch (error) {
+    const failure = {
+      ok: false,
+      code: 'wire_failed',
+      hint: error instanceof Error ? error.message : String(error),
+      expected: 'writable game NPC adapter',
+    };
+    appendAdoptionLedger(ctx, 'execution', 'failure', { tool: 'npc_wire', error: failure });
+    return failure;
+  }
+}
+
 function remember(ctx: BuiltinToolCtx, args: Record<string, unknown> | undefined): unknown {
   const text = String(args?.text ?? '').trim();
   if (!text) return { ok: false, error: 'remember: empty text' };
@@ -162,11 +311,8 @@ function remember(ctx: BuiltinToolCtx, args: Record<string, unknown> | undefined
   return { ok: true, tier: w.tier, ...(w.game ? { game: w.game } : {}), file: w.file };
 }
 
-/** 感知接地取数往返:发 perception:query 给前端(经 EventBus)→ 注册阻塞 Promise →
- *  前端取真值(game iframe 或 ActionRegistry)后 POST /perception-reply 解开;超时
- *  fail-soft 返回 unavailable。镜像 `:sid/perception-query` 路由,在 forgeax-core
- *  in-process 路径里复用同一 registry。ui_* 类查询的回灌被 lease 把关(声明与执行方
- *  同源,见 ui-manifest-registry)。 */
+/** 感知取数往返：发布 perception:query，由前端回传真实值并解开 Promise；
+ * 超时 fail-soft 为 unavailable。UI 回灌额外受 lease 约束。 */
 async function perceptionQuery(
   ctx: BuiltinToolCtx,
   kind: PerceptionKind,
@@ -194,8 +340,7 @@ async function perceptionQuery(
   }
 }
 
-/** 执行一个内置 forgeax 工具。调用方须先确认 `isForgeaxBuiltinTool(name)` 且信任闸已放行。
- *  返回值与工具 schema 描述一致(对象;调用方负责审计 + 把 `{error}` 翻成 isError)。 */
+/** 执行内置 forgeax 工具；调用方负责信任闸、审计与错误映射。 */
 export async function runForgeaxBuiltinTool(
   name: string,
   args: Record<string, unknown> | undefined,
@@ -208,15 +353,15 @@ export async function runForgeaxBuiltinTool(
       return searchMemory(memoryRef(ctx), String(args?.query ?? ''));
     case 'remember':
       return remember(ctx, args);
-    // UI 语义操作层(产品 AI 化 P0):与 seam 感知工具同构的往返,应答方是 interface
-    // 的 ActionRegistry。契约(schema/description)SSOT = ui-bridge-contract.json。
+    case 'soul_create':
+      return soulCreate(ctx, args);
+    case 'npc_wire':
+      return npcWire(ctx, args);
+    // UI 语义操作层：与 seam 感知工具同构，应答方是 interface 的 ActionRegistry。
     case 'ui_snapshot':
       return perceptionQuery(ctx, 'ui_snapshot', args ?? {});
     case 'ui_screenshot': {
-      // P3:兜底证据通道。UI 侧成功回 { dataUrl, width, height, ... } → 转 ContentPart
-      // 数组([image, text meta]),原生内核路径经 createToolResultMessage 变成真正的
-      // image content block(模型看得到像素);unavailable / captured:false 原样透传
-      // (JSON 文本,模型按契约 description 处理,勿重试)。
+      // 成功截图转换为模型可见的 image ContentPart；失败结果按 JSON 原样透传。
       const out = await perceptionQuery(ctx, 'ui_screenshot', args ?? {}, UI_SCREENSHOT_TIMEOUT_MS);
       if (out && typeof out === 'object' && typeof (out as { dataUrl?: unknown }).dataUrl === 'string') {
         const { dataUrl, ...meta } = out as { dataUrl: string } & Record<string, unknown>;
@@ -235,8 +380,7 @@ export async function runForgeaxBuiltinTool(
       const actionId = typeof args?.actionId === 'string' ? args.actionId : '';
       const rejection = uiActionCatalogRejection(actionId);
       if (rejection) return rejection;
-      // 超时按 catalog 里 action 声明的 timeoutMs 放宽(clamp [1s,30s]);慢 action 的
-      // 正道是 UI 侧快速回 accepted(受理即答),不是拉长超时硬等——见契约 description。
+      // catalog 已校验 action 存在；UI 侧按声明的 timeoutMs 执行。
       // A live lease + accepted manifest row is only an executor binding. With no binding,
       // cold-start dispatch must not wait for a UI timeout before trying the server surface.
       const out = isUiActionRuntimeAvailable(ctx.sid, actionId)
@@ -247,10 +391,7 @@ export async function runForgeaxBuiltinTool(
             uiInvokeTimeoutMs(ctx.sid, actionId, UI_INVOKE_TIMEOUT_MS),
           )
         : { unavailable: true, reason: `no live UI executor binding for action ${JSON.stringify(actionId)}` };
-      // P1-8 headless 回落(方案 §5):UI 不在线(unavailable)且该 action 声明了
-      // surface 'server'|'both' → 走宿主侧等价 handler(seam 注入优先,cli 内置次之;
-      // handler 必须调与 UI run() 相同的内部实现,server 是行为 SSOT)。声明 'ui' 或
-      // 无 handler → 保持 unavailable 原样返回(模型据契约 description 自行跳过)。
+      // UI 不可用时，surface 为 server/both 的 action 可降级到 headless handler。
       if (out && typeof out === 'object' && (out as { unavailable?: unknown }).unavailable === true && actionId) {
         const decl = getUiAction(ctx.sid, actionId);
         if (decl && (decl.surface === 'server' || decl.surface === 'both')) {
@@ -268,7 +409,7 @@ export async function runForgeaxBuiltinTool(
       return out;
     }
     default:
-      // 防御:isForgeaxBuiltinTool 已挡;落到这里说明集合与 switch 失同步。
+      // 防御分支：调用方原则上已通过 isForgeaxBuiltinTool 校验。
       return { error: `not a forgeax builtin tool: ${name}` };
   }
 }

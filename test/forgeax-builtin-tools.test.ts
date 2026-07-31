@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { initOrchestrationSeams, resetOrchestrationSeams } from '../src/orchestration-seams';
 import { isForgeaxBuiltinTool, runForgeaxBuiltinTool } from '../src/kernel/forgeax-builtin-tools';
 import { buildActionCatalog } from '../src/kernel/action-catalog';
 import { soulMemoryRoot } from '../src/soul';
@@ -18,6 +19,7 @@ beforeAll(() => {
 });
 afterAll(() => {
   if (TMP) rmSync(TMP, { recursive: true, force: true });
+  resetOrchestrationSeams();
 });
 
 describe('isForgeaxBuiltinTool', () => {
@@ -29,6 +31,53 @@ describe('isForgeaxBuiltinTool', () => {
     for (const n of ['list_games', 'query_world', 'capture_frame', 'read_file', 'bash', 'delegate_to_subagent', 'totally_unknown']) {
       expect(isForgeaxBuiltinTool(n)).toBe(false);
     }
+  });
+
+  test('recognizes npc_wire as a first-class adoption builtin', () => {
+    expect(isForgeaxBuiltinTool('npc_wire')).toBe(true);
+  });
+});
+
+describe('npc_wire adoption dispatch', () => {
+  test('records structured validation failure before host execution', async () => {
+    const projectRoot = join(TMP, 'p-wire-invalid');
+    const out = await runForgeaxBuiltinTool('npc_wire', { game: 'village' }, { projectRoot, agentId: 'forge' }) as {
+      ok: boolean;
+      code: string;
+      hint: string;
+      expected: string;
+    };
+    expect(out).toMatchObject({ ok: false, code: 'invalid_input', expected: 'NpcWireInput' });
+    const ledger = readFileSync(join(projectRoot, '.forgeax', 'adoption-ledger.jsonl'), 'utf8');
+    expect(ledger).toContain('"stage":"validation"');
+    expect(ledger).toContain('"status":"failure"');
+  });
+
+  test('dispatches valid wiring to the injected host and records success', async () => {
+    const projectRoot = join(TMP, 'p-wire-valid');
+    let calls = 0;
+    initOrchestrationSeams({
+      hostTools: [{
+        name: 'npc_wire',
+        description: 'wire',
+        inputSchema: {},
+        run: (_args, ctx) => {
+          calls += 1;
+          expect(ctx.projectRoot).toBe(projectRoot);
+          return { ok: true, changedPaths: ['src/npcs/guide/index.ts'] };
+        },
+      }],
+    });
+    const out = await runForgeaxBuiltinTool('npc_wire', {
+      game: 'village',
+      npcId: 'guide',
+      soulId: 'village.guide',
+      affordances: [{ action: 'goto', params: { target: { type: 'enum', source: 'waypoint' } } }],
+    }, { projectRoot, agentId: 'forge' }) as { ok: boolean };
+    expect(out.ok).toBe(true);
+    expect(calls).toBe(1);
+    expect(readFileSync(join(projectRoot, '.forgeax', 'adoption-ledger.jsonl'), 'utf8')).toContain('"status":"success"');
+    resetOrchestrationSeams();
   });
 });
 

@@ -85,4 +85,14 @@ export interface MemoryFact {
 export type LifeEvent =
   | { kind: 'soul.loaded'; agentId: string; source: SoulSource; trustTier: TrustTier; at: number }
   | { kind: 'rebirth.projected'; agentId: string; into: string; at: number }
-  | { kind: 'memory.written'; agentId: string; tier: MemoryTier; game?: string; file: string; at: number };
+  | { kind: 'memory.written'; agentId: string; tier: MemoryTier; game?: string; file: string; at: number }
+  | {
+      kind: 'npc.decision';
+      agentId: string;
+      game: string;
+      eventId: string;
+      seq?: number;
+      outcome: 'decision' | 'fallback' | 'budget_skip';
+      fallback: boolean;
+      at: number;
+    };

@@ -290,9 +290,9 @@ export class CheckpointManager {
       // 旧 pending 前捕获。
       const wasPending = sc.pending != null;
 
-      // 1. 停掉进行中的 turn;给事件 flush 留一拍,避免半截 turn 落在 boundary 后
-      session.scheduler.interruptAgents();
-      await sleep(120);
+      // 1. 停掉进行中的 turn,确定性等它排空(而非猜时间的 sleep):await 到
+      // agent.settled resolve,保证半截 turn 的事件已经 flush 完才拍 boundary。
+      await session.scheduler.interruptAndDrain();
 
       // 1.5 挂起态再回退:单活跃 boundary 模型 —— 旧 boundary 作废(cancel),
       // 新 boundary 接管;恢复锚点继承第一次回退前的状态,Redo 永远回到「回退前最新」。
@@ -517,10 +517,6 @@ export class CheckpointManager {
       /* UI 通知失败不影响状态 */
     }
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 let _instance: CheckpointManager | null = null;

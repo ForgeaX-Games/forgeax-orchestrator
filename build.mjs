@@ -33,7 +33,11 @@ const externalizeNonForgeax = {
 };
 
 const res = await build({
-  entrypoints: ['./src/kernel/forgeax-core-kernel.ts', './src/index.ts'],
+  entrypoints: [
+    './src/kernel/forgeax-core-kernel.ts',
+    './src/index.ts',
+    './src/npc-brain/standalone.ts',
+  ],
   outdir: './dist',
   root: './src',
   target: 'node',

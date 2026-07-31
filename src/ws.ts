@@ -5,6 +5,8 @@ import type { Event } from './core/types';
 
 export interface WsClientData {
   id: string;
+  /** Play-time NPC channel; handled by the dedicated NPC WS handler. */
+  npc?: { sessionId: string; token: string };
   /** Optional session subscription —— 升级时通过 ?sid= 携带。 */
   sid?: string;
   /** 断线续传(多 tab 同步 §3.3)—— 升级时通过 ?since=<seq>&sgen= 携带。 */
