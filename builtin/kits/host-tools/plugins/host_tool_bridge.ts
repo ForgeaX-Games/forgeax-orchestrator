@@ -34,12 +34,6 @@ import {
   type ToolDescriptor,
 } from "../../../../src/tools/registry";
 import { markHostToolDefinition } from "../../../../src/kernel/host-tool-confirmation";
-import { basename } from "node:path";
-import {
-  callWorkbenchAgentTool,
-  hasWorkbenchAgentTool,
-  listWorkbenchAgentTools,
-} from "../../../../src/workbench/agent-tools";
 
 /** 迁移护栏：这些前缀的 Host 工具仍由各自的 legacy builtin kit 提供（bare 名），
  *  默认 deny 以免“桥接版 + kit 版”双份列给 LLM 造成混淆。等对应 kit 退役后，
@@ -108,16 +102,6 @@ function bridgeTool(d: ToolDescriptor, ctx: AgentContext): ToolDefinition {
     description: d.description ?? d.id,
     input_schema: toInputSchema(d.argsSchema),
     async execute(args) {
-      if (hasWorkbenchAgentTool(d.id)) {
-        const result = await callWorkbenchAgentTool({
-          gameId: basename(ctx.cwd),
-          toolId: d.id,
-          args,
-        });
-        return typeof result === "string"
-          ? result
-          : JSON.stringify(result, null, 2);
-      }
       const res = await callTool({
         toolId: d.id,
         args,
@@ -165,22 +149,11 @@ export default function hostToolBridge(ctx: AgentContext): PluginSource {
       process.stderr.write(
         `[host_tool_bridge] listTools failed: ${(err as Error)?.message ?? err}\n`,
       );
-      descriptors = [];
+      return [];
     }
-    const legacy = descriptors.filter(
+    return descriptors.filter(
       (d) => d.exposedToAI && d.hasHandler && matchesAny(d.id, allow) && !matchesAny(d.id, deny),
     );
-    const shared = listWorkbenchAgentTools()
-      .filter((d) => matchesAny(d.id, allow) && !matchesAny(d.id, deny))
-      .map((d): ToolDescriptor => ({
-        id: d.id,
-        extensionId: "@forgeax/workbench-host",
-        description: d.description,
-        exposedToAI: true,
-        hasHandler: true,
-        argsSchema: d.inputSchema,
-      }));
-    return [...legacy, ...shared];
   }
 
   /** 幂等对齐：目标集 vs 已注册集做增量 diff —— 补注缺失的、释放已消失的。

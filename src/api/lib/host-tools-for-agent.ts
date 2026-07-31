@@ -15,9 +15,8 @@
  * `<sid>/agents/<agentId>/agent.json`。LLM 可见名同样把 `:`/`.` → `_`。
  */
 import { readFileSync } from 'node:fs';
-import { listTools, type ToolDescriptor } from '../../tools/registry';
+import { listTools } from '../../tools/registry';
 import { getPathManager } from '../../fs/path-manager';
-import { listWorkbenchAgentTools } from '../../workbench/agent-tools';
 
 export interface HostToolSpec {
   name: string;
@@ -77,13 +76,13 @@ export function hostToolSpecsForAgent(sid: string | undefined, agentId: string):
   if (allow.length === 0) return [];
   const allowRes = allow.map(globToRegExp);
   const denyRes = deny.map(globToRegExp);
-  let descriptors: ToolDescriptor[];
+  let descriptors;
   try {
     descriptors = listTools();
   } catch {
-    descriptors = [];
+    return [];
   }
-  const legacy = descriptors
+  return descriptors
     .filter(
       (d) =>
         d.exposedToAI &&
@@ -96,16 +95,4 @@ export function hostToolSpecsForAgent(sid: string | undefined, agentId: string):
       description: d.description ?? d.id,
       inputSchema: toInputSchema(d.argsSchema),
     }));
-  const shared = listWorkbenchAgentTools()
-    .filter(
-      (d) =>
-        allowRes.some((re) => re.test(d.id))
-        && !denyRes.some((re) => re.test(d.id)),
-    )
-    .map((d) => ({
-      name: d.id.replace(/[^a-zA-Z0-9_-]/g, '_'),
-      description: d.description ?? d.id,
-      inputSchema: d.inputSchema,
-    }));
-  return [...legacy, ...shared];
 }

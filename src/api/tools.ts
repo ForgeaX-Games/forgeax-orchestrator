@@ -12,12 +12,6 @@ import { z } from 'zod';
 import { ToolCallSchema } from '@forgeax/types';
 import { callTool, listTools } from '../tools/registry';
 import { getEventBus } from '../events/bus';
-import { getPathManager } from '../fs/path-manager';
-import {
-  callWorkbenchTool,
-  hasWorkbenchAgentTool,
-  listWorkbenchAgentTools,
-} from '../workbench/agent-tools';
 
 /** D-8: body schema for POST /api/tools/confirm */
 const ConfirmBodySchema = z.object({
@@ -29,19 +23,7 @@ const ConfirmBodySchema = z.object({
 export function createToolsRouter() {
   const r = new Hono();
 
-  r.get('/', (c) => c.json({
-    tools: [
-      ...listTools(),
-      ...listWorkbenchAgentTools().map((tool) => ({
-        id: tool.id,
-        extensionId: '@forgeax/workbench-host',
-        description: tool.description,
-        exposedToAI: true,
-        hasHandler: true,
-        argsSchema: tool.inputSchema,
-      })),
-    ],
-  }));
+  r.get('/', (c) => c.json({ tools: listTools() }));
 
   r.post('/call', async (c) => {
     const body = await c.req.json().catch(() => null);
@@ -59,25 +41,6 @@ export function createToolsRouter() {
         { ok: false, error: parsed.error.issues.map((i) => i.message).join('; '), code: 'bad_request' },
         400,
       );
-    }
-    if (hasWorkbenchAgentTool(parsed.data.toolId)) {
-      try {
-        const gameId = getPathManager().resolveScope();
-        if (!gameId) throw new Error('No active game is available');
-        const result = await callWorkbenchTool({
-          caller: parsed.data.caller.kind === 'ai' ? 'ai' : 'ui',
-          gameId,
-          toolId: parsed.data.toolId,
-          args: parsed.data.args,
-        });
-        return c.json({ ok: true, result });
-      } catch (error) {
-        return c.json({
-          ok: false,
-          error: (error as Error).message,
-          code: 'invoke_error',
-        });
-      }
     }
     const result = await callTool(parsed.data);
     return c.json(result);
