@@ -161,6 +161,7 @@ export function ensureCursorHooksConfig(projectRoot: string): boolean {
 export function buildCursorArgs(
   req: TurnRequest,
   cursorChatId: string | undefined,
+  workspace?: { root: string; projectRoot: string },
 ): { args: string[]; message: string } {
   const isFirstTurn = !cursorChatId;
 
@@ -197,6 +198,10 @@ export function buildCursorArgs(
     '--approve-mcps',
     ...(selectedModel ? ['--model', selectedModel] : []),
     ...(cursorChatId ? ['--resume', cursorChatId] : []),
+    // Cursor has no `--mcp-config`. For a tools turn the kernel supplies a
+    // short-lived workspace whose `.cursor/mcp.json` declares fxt, while the
+    // real Studio project stays visible as an additional workspace root.
+    ...(workspace ? ['--workspace', workspace.root, '--add-dir', workspace.projectRoot] : []),
   ];
   return { args, message };
 }

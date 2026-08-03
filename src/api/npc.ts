@@ -2,9 +2,7 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { NpcRuntime, NpcSession } from '../npc-brain/runtime';
 import { NpcRuntime as DefaultNpcRuntime } from '../npc-brain/runtime';
-import { resumeRequestSchema } from '../npc-brain/protocol';
-
-const NPC_DECIDE_DEADLINE_MS = 12_000;
+import { perceptionSnapshotSchema, resumeRequestSchema } from '../npc-brain/protocol';
 
 export interface NpcRouterOptions {
   projectRoot: string;
@@ -23,6 +21,7 @@ export function createNpcRouter(options: NpcRouterOptions) {
       const loaded = session ? [...session.soulBindings.values()].map((binding) => ({
         npcId: binding.npcId,
         soulId: binding.soulId,
+        decisionTimeoutMs: binding.decisionTimeoutMs,
         ...(binding.trustTier ? { trustTier: binding.trustTier } : {}),
       })) : [];
       return c.json({ ok: true, ...grant, loaded, wsUrl: '/api/npc/ws' });
@@ -38,11 +37,12 @@ export function createNpcRouter(options: NpcRouterOptions) {
     // Pass a RELATIVE deadline so the Brain anchors it to its own clock (single
     // clock source): mixing Date.now() here with the service's injectable now()
     // breaks the abort timer under clock-injecting (form-C) deployments.
-    const wallDeadlineAt = Date.now() + NPC_DECIDE_DEADLINE_MS;
     try {
-      const decision = await runtime.decide(session, await readJson(c, null), {
+      const snapshot = perceptionSnapshotSchema.parse(await readJson(c, null));
+      const decisionTimeoutMs = runtime.decisionTimeoutMs(session, snapshot.npcId);
+      const wallDeadlineAt = Date.now() + decisionTimeoutMs;
+      const decision = await runtime.decide(session, snapshot, {
         signal: c.req.raw.signal,
-        deadlineMs: NPC_DECIDE_DEADLINE_MS,
       });
       if (!decision) {
         return c.json({

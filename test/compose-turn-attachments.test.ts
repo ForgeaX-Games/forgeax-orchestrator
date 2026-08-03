@@ -11,6 +11,10 @@ import { getSessionManager, initSessionManager, resetSessionManager } from '../s
 import { transcribeKernelTurn } from '../src/kernel/transcribe-turn';
 import { prepareUserAttachmentPayload } from '../src/message/materialize-user-attachments';
 import { eventToSessionMessage } from '../src/message/message-ingress';
+import { buildKindRegistry } from '../src/extensions/kinds';
+import { _resetSnapshotForTests, _setSnapshotForTests } from '../src/extensions/registry';
+import type { MergedManifest } from '../src/extensions/merger';
+import { buildCapabilitySnapshot } from '../src/capabilities/catalog';
 
 const capabilities: KernelCapabilities = {
   streaming: true, thinking: true, toolCalls: true, midTurnInject: false, forkExtract: false,
@@ -34,6 +38,7 @@ beforeEach(async () => {
   initSessionManager(initPathManager({ userRoot: root }));
 });
 afterEach(async () => {
+  _resetSnapshotForTests();
   await resetSessionManager();
   resetPathManager();
   rmSync(root, { recursive: true, force: true });
@@ -120,5 +125,58 @@ describe('composeTurnRequest selected-kernel policy', () => {
     const historyJson = JSON.stringify(subsequent.history ?? []);
     expect(historyJson.split(priorPath).length).toBeGreaterThanOrEqual(2);
     expect(historyJson.split(currentPath).length).toBeGreaterThanOrEqual(2);
+  });
+
+  test('projects a manifest skill into every kernel turn with catalog identity', async () => {
+    const manifest = {
+      schemaVersion: 1 as const,
+      id: '@example/shared-skill',
+      version: '1.0.0',
+      kind: 'skill' as const,
+      displayName: { en: 'Shared skill' },
+      provides: { skills: [{ id: 'hello', entry: './SKILL.md', trigger: '/hello' }] },
+    };
+    const merged: MergedManifest = {
+      manifest,
+      origin: 'user',
+      originPath: join(root, 'shared-skill', 'forgeax-extension.json'),
+      shadowedBy: [],
+    };
+    const kinds = buildKindRegistry([merged]);
+    _setSnapshotForTests({
+      generation: 7,
+      loadedAt: Date.now(),
+      manifests: [merged],
+      kinds,
+      scanErrors: [],
+      mergeIssues: [],
+      capabilities: buildCapabilitySnapshot({
+        generation: 7,
+        loadedAt: Date.now(),
+        manifests: [merged],
+        kinds,
+        scanErrors: [],
+        mergeIssues: [],
+      }),
+    });
+
+    for (const [name, profile] of [
+      ['native', NATIVE_KERNEL_PROFILE],
+      ['rented', RENTED_KERNEL_PROFILE],
+    ] as const) {
+      const session = await getSessionManager().create({ displayName: name });
+      const req = await composeTurnRequest({
+        message: 'use the shared skill',
+        agentId: 'forge',
+        sessionId: session.sid,
+        kernel: kernel(`skill-${name}`, profile),
+      });
+      expect(req.tools).toContainEqual(expect.objectContaining({
+        name: 'skill_hello',
+        capabilityId: '@example/shared-skill#skill:hello',
+        capabilityGeneration: 7,
+        delivery: 'host',
+      }));
+    }
   });
 });

@@ -117,6 +117,8 @@ export async function materializeForgeaxToolsRuntime(
   // the MCP server dedupes names it already implements as builtins. Written 0600.
   const specs = (req.tools ?? []).map((t) => ({
     name: t.name,
+    ...(t.capabilityId ? { capabilityId: t.capabilityId } : {}),
+    ...(t.capabilityGeneration !== undefined ? { capabilityGeneration: t.capabilityGeneration } : {}),
     description: t.description ?? '',
     inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
   }));
@@ -149,6 +151,9 @@ export async function materializeForgeaxToolsRuntime(
     FORGEAX_TOOL_SPECS_FILE: specsFile,
     // Double-allowlist client side: the server filters BOTH list and call.
     FORGEAX_FXT_EXPOSE: enabledTools.join(','),
+    ...(req.capabilityGeneration !== undefined
+      ? { FORGEAX_CAPABILITY_GENERATION: String(req.capabilityGeneration) }
+      : {}),
   };
   if (options.disablePerception) env.FORGEAX_DISABLE_PERCEPTION = '1';
   if (options.disableUiBridge) env.FORGEAX_DISABLE_UI_BRIDGE = '1';

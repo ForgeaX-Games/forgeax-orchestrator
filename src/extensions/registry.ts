@@ -15,6 +15,11 @@ import { mergeManifests, type MergedManifest, type MergeIssue } from './merger';
 import { buildKindRegistry, type KindRegistry } from './kinds';
 import type { ExtensionOrigin } from './scanner';
 import { getEventBus, type EventBus } from '../events/bus';
+import {
+  buildCapabilitySnapshot,
+  type CapabilityRegistryInput,
+} from '../capabilities/catalog';
+import type { CapabilitySnapshot } from '@forgeax/types';
 
 export interface ExtensionSnapshot {
   /** Surrogate timestamp; bumps on every successful replaceFromManifests. */
@@ -24,6 +29,8 @@ export interface ExtensionSnapshot {
   kinds: KindRegistry;
   scanErrors: ScanError[];
   mergeIssues: MergeIssue[];
+  /** Optional for hand-built legacy snapshots; real reloads always populate it. */
+  capabilities?: CapabilitySnapshot;
 }
 
 export interface ExtensionRegistryOpts {
@@ -45,6 +52,12 @@ const EMPTY: ExtensionSnapshot = {
   },
   scanErrors: [],
   mergeIssues: [],
+  capabilities: {
+    generation: 0,
+    loadedAt: 0,
+    capabilities: [],
+    issues: [],
+  },
 };
 
 let _current: ExtensionSnapshot = EMPTY;
@@ -75,13 +88,23 @@ export async function reloadExtensions(opts: ExtensionRegistryOpts = {}): Promis
   const scan = await scanAllExtensionOrigins(opts.roots);
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
+  const generation = _current.generation + 1;
+  const loadedAt = Date.now();
   const next: ExtensionSnapshot = {
-    generation: _current.generation + 1,
-    loadedAt: Date.now(),
+    generation,
+    loadedAt,
     manifests: merge.manifests,
     kinds,
     scanErrors: scan.errors,
     mergeIssues: merge.issues,
+    capabilities: buildCapabilitySnapshot({
+      generation,
+      loadedAt,
+      manifests: merge.manifests,
+      kinds,
+      scanErrors: scan.errors,
+      mergeIssues: merge.issues,
+    } satisfies CapabilityRegistryInput),
   };
   _current = next;
   // Doc 04 §triggers — rewire `{kind:'event'}` skill triggers against the

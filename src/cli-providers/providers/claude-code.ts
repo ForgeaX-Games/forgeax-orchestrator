@@ -104,6 +104,25 @@ const CAPABILITIES: ProviderCapabilities = {
 };
 
 const DEFAULT_BINARY = 'claude';
+const MIN_HEALTH_TIMEOUT_MS = 3_000;
+
+/**
+ * the reference agent CLI owns several credential stores (including its interactive login),
+ * so checking only this server's environment is not a valid availability test.
+ * Keep the parser deliberately narrow: an unsuccessful command or malformed
+ * output must never turn a provider green.
+ */
+export function claudeAuthStatusIsLoggedIn(stdout: string, code: number | null): boolean {
+  if (code !== 0) return false;
+  try {
+    const status: unknown = JSON.parse(stdout);
+    return typeof status === 'object'
+      && status !== null
+      && (status as { loggedIn?: unknown }).loggedIn === true;
+  } catch {
+    return false;
+  }
+}
 
 export class ClaudeCodeProvider implements CliProvider {
   readonly id = 'claude-code' as const;
@@ -149,9 +168,10 @@ export class ClaudeCodeProvider implements CliProvider {
   }
 
   async health(timeoutMs = 1500): Promise<ProviderHealth> {
-    // Check (a) binary executes (b) an auth credential is present somewhere.
-    // Both checks run regardless of either's outcome so missing-binary +
-    // missing-key are reported together rather than serially.
+    // Check (a) the binary executes and (b) either the server has an explicit
+    // credential or the reference agent CLI itself reports an active login. The latter is
+    // essential for an interactive `claude auth login`: its credential store is
+    // intentionally outside this process environment.
     //
     // Credential can arrive two ways: ANTHROPIC_API_KEY (x-api-key, e.g. a
     // litellm proxy key) OR ANTHROPIC_AUTH_TOKEN (Bearer, the OpenRouter
@@ -163,10 +183,16 @@ export class ClaudeCodeProvider implements CliProvider {
       this.envOverride.ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_API_KEY ?? '';
     // Redact $HOME prefix via shared friendlyPath helper (see shared/).
     const friendlyBin = friendlyPath(this.binary);
+    const healthTimeoutMs = Math.max(timeoutMs, MIN_HEALTH_TIMEOUT_MS);
     let binaryDetail: string | null = null;
     let binaryOk = false;
+    let cliLoginOk = false;
     try {
-      const { stdout, code } = await runCapture(this.binary, ['--version'], { timeoutMs, captureStderr: true });
+      const [version, authStatus] = await Promise.all([
+        runCapture(this.binary, ['--version'], { timeoutMs: healthTimeoutMs, captureStderr: true }),
+        runCapture(this.binary, ['auth', 'status', '--json'], { timeoutMs: healthTimeoutMs, captureStderr: true }),
+      ]);
+      const { stdout, code } = version;
       const out = stdout.trim();
       // Take first line only — a future `claude --version` that prints a
       // banner + version line would otherwise inject a newline into the
@@ -175,12 +201,13 @@ export class ClaudeCodeProvider implements CliProvider {
       if (code === 0 && firstLine) { binaryOk = true; binaryDetail = `${friendlyBin} → ${firstLine}`; }
       else if (code === 0) binaryDetail = `${friendlyBin} ran but printed no --version output`;
       else binaryDetail = `binary ${friendlyBin} exited ${code}`;
+      cliLoginOk = claudeAuthStatusIsLoggedIn(authStatus.stdout, authStatus.code);
     } catch (e) {
       binaryDetail = `cannot exec ${friendlyBin}: ${(e as Error).message}`;
     }
     const missing: string[] = [];
     if (!binaryOk) missing.push(binaryDetail!);
-    if (!apiKey) missing.push('no API credential (set ANTHROPIC_AUTH_TOKEN for OpenRouter, ANTHROPIC_API_KEY, or OAuth via keychain)');
+    if (!apiKey && !cliLoginOk) missing.push('no usable credential (set ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, or run `claude auth login`)');
     if (missing.length === 0) return { ok: true, detail: binaryDetail ?? undefined };
     return { ok: false, detail: missing.join(' · ') };
   }

@@ -11,6 +11,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { getPathManager } from "../fs/path-manager";
+import { defaultProjectRoot } from "@forgeax/platform-io";
 import type {
   CallContext,
   CommandModule,
@@ -22,7 +23,7 @@ import type {
 // `require.cache` access for bun ESM —— see comment on `importModule` below.
 const _localRequire = createRequire(import.meta.url);
 
-const LAYERS = ["builtin"] as const;
+const LAYERS = ["builtin", "user", "project"] as const;
 type Layer = (typeof LAYERS)[number];
 
 /** Resolve layer dir。builtin → `pm.builtin().resourceDir("commands")`（与
@@ -34,6 +35,8 @@ function dirOf(layer: Layer): string {
     if (process.env.FORGEAX_COMMANDS_DIR) return process.env.FORGEAX_COMMANDS_DIR;
     return getPathManager().builtin().resourceDir("commands");
   }
+  if (layer === "user") return getPathManager().user().resourceDir("commands");
+  if (layer === "project") return join(defaultProjectRoot(), ".forgeax", "commands");
   throw new Error(`commands runner: unknown layer ${layer}`);
 }
 

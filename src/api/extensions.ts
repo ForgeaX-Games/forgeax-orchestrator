@@ -17,6 +17,13 @@ import { recordAsSkill, distillRecordedSkill } from '../skills/record-as-skill';
 import { complete as llmComplete } from '../lib/llm-gateway';
 import { listExtensionFiles, readExtensionFile, writeExtensionFile } from '../extensions/files';
 import { loadExtensionList } from '../extensions/slim-list';
+import { emptyCapabilitySnapshot } from '@forgeax/types';
+import { getSessionManager } from '../core/session-manager';
+import { getPathManager } from '../fs/path-manager';
+import { listAllCommands } from '../commands/runner';
+import { commandCapabilities } from '../capabilities/adapters';
+import { commonCapabilityRoots } from '../capabilities/common-roots';
+import { listCommonMcpServers } from '../capabilities/mcp-catalog';
 
 export function createExtensionsRouter(): Hono {
   const router = new Hono();
@@ -32,6 +39,37 @@ export function createExtensionsRouter(): Hono {
   router.get('/manifests', (c) => {
     const snap = getExtensionSnapshot();
     return c.json(serialize(snap));
+  });
+
+  router.get('/capabilities', async (c) => {
+    const snap = getExtensionSnapshot();
+    const capabilitySnapshot = snap.capabilities ?? emptyCapabilitySnapshot();
+    const commandSpecs = await listAllCommands({
+      sm: getSessionManager(),
+      paths: getPathManager(),
+    });
+    const commandEntries = commandCapabilities(commandSpecs, capabilitySnapshot.generation);
+    const kind = c.req.query('kind');
+    const allCapabilities = [...capabilitySnapshot.capabilities, ...commandEntries];
+    const capabilities = kind
+      ? allCapabilities.filter((capability) => capability.kind === kind)
+      : allCapabilities;
+    return c.json({
+      generation: capabilitySnapshot.generation,
+      loadedAt: capabilitySnapshot.loadedAt,
+      capabilities,
+      issues: capabilitySnapshot.issues,
+    });
+  });
+
+  /** Shared capability management view: canonical paths plus user/project MCP. */
+  router.get('/shared', (c) => {
+    const roots = commonCapabilityRoots();
+    return c.json({
+      roots,
+      mcp: listCommonMcpServers(),
+      commands: { user: roots.user.commands, project: roots.project.commands },
+    });
   });
 
   router.post('/reload', async (c) => {
@@ -217,6 +255,7 @@ function codeToHttp(code: string): 400 | 403 | 404 | 409 | 413 | 500 {
 }
 
 function serialize(snap: ReturnType<typeof getExtensionSnapshot>) {
+  const capabilitySnapshot = snap.capabilities ?? emptyCapabilitySnapshot();
   return {
     generation: snap.generation,
     loadedAt: snap.loadedAt,
@@ -260,5 +299,6 @@ function serialize(snap: ReturnType<typeof getExtensionSnapshot>) {
       ...snap.mergeIssues.map((i) => ({ phase: 'merge' as const, ...i })),
       ...snap.kinds.issues.map((i) => ({ phase: 'kind' as const, ...i })),
     ],
+    capabilities: capabilitySnapshot,
   };
 }

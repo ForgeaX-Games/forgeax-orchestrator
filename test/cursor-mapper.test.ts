@@ -82,6 +82,31 @@ describe('cursor-mapper', () => {
     expect(out).toEqual([{ kind: 'tool.result', callId: 'tc2', ok: false, error: 'denied' }]);
   });
 
+  test('current MCP envelope preserves provider/tool name and content-array result', () => {
+    const { out } = run([
+      {
+        type: 'tool_call',
+        subtype: 'started',
+        call_id: 'mcp1',
+        tool_call: { mcpToolCall: { args: { providerIdentifier: 'fxt', toolName: 'echo', text: 'ignored' } } },
+      },
+      {
+        type: 'tool_call',
+        subtype: 'completed',
+        call_id: 'mcp1',
+        tool_call: {
+          mcpToolCall: {
+            result: { success: { content: [{ text: { text: '[forgeax_echo] CURSOR_OK' } }] } },
+          },
+        },
+      },
+    ] as CursorRawEvent[]);
+    expect(out).toEqual([
+      { kind: 'tool.call', callId: 'mcp1', name: 'mcp__fxt__echo', args: { providerIdentifier: 'fxt', toolName: 'echo', text: 'ignored' } },
+      { kind: 'tool.result', callId: 'mcp1', ok: true, result: '[forgeax_echo] CURSOR_OK' },
+    ]);
+  });
+
   test('result success → turn.usage BEFORE turn.done(stop), with token usage', () => {
     const { out, state } = run([
       // normal case: text already streamed → result must NOT re-emit it as a fallback delta.

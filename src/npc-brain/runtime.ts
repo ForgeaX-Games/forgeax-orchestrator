@@ -13,6 +13,7 @@ import {
   npcSessionReadyFrameSchema,
   parseNpcWireEnvelope,
   perceptionSnapshotSchema,
+  resolveNpcDecisionDeadlineMs,
   type NpcDecisionWire,
   type NpcSessionRequest,
   type NpcSoulBinding,
@@ -22,8 +23,6 @@ import {
 import type { TrustTier } from '../soul';
 import { findSoulPack } from '../soul/soul-pack-loader';
 import { NpcBatchCollector } from './batch-collector';
-
-const NPC_DECIDE_DEADLINE_MS = 12_000;
 
 export interface NpcSessionGrant {
   sessionId: string;
@@ -35,6 +34,7 @@ export interface NpcSessionGrant {
 export interface ResolvedNpcSoulBinding {
   npcId: string;
   soulId: string;
+  decisionTimeoutMs: number;
   trustTier?: TrustTier;
   /** Internal marker: an explicit producer declaration must resolve to a physical pack. */
   requiresPack?: boolean;
@@ -143,7 +143,11 @@ export class NpcRuntime {
     }
     const decision = await this.brain.decide(
       { ...snapshot, playerId: session.playerId },
-      { ...options, soulId: binding.soulId },
+      {
+        ...options,
+        deadlineMs: options.deadlineMs ?? binding.decisionTimeoutMs,
+        soulId: binding.soulId,
+      },
     );
     if (!decision) return undefined;
     session.lastSeq.set(decision.npcId, decision.seq);
@@ -176,7 +180,11 @@ export class NpcRuntime {
       group.map((snapshot) => ({ ...snapshot, playerId: session.playerId })),
       (snapshot) => {
         const binding = session.soulBindings.get(snapshot.npcId)!;
-        return { ...options, soulId: binding.soulId };
+        return {
+          ...options,
+          deadlineMs: options.deadlineMs ?? binding.decisionTimeoutMs,
+          soulId: binding.soulId,
+        };
       },
     )))).flat();
     for (const decision of decisions) {
@@ -195,6 +203,7 @@ export class NpcRuntime {
     const resolved: ResolvedNpcSoulBinding = {
       npcId: binding.npcId,
       soulId: binding.soulId ?? `${session.game}.${binding.npcId}`,
+      decisionTimeoutMs: resolveNpcDecisionDeadlineMs(binding.decisionDeadline),
       requiresPack: binding.soulId !== undefined,
     };
     this.#assertDeclaredPack(resolved);
@@ -212,6 +221,12 @@ export class NpcRuntime {
     session.replay.delete(npcId);
     this.brain.detach(session.game, npcId);
     return session.soulBindings.delete(npcId);
+  }
+
+  decisionTimeoutMs(session: NpcSession, npcId: string): number {
+    const binding = session.soulBindings.get(npcId);
+    if (!binding) throw new Error('NPC outside session capability');
+    return binding.decisionTimeoutMs;
   }
 
   resume(session: NpcSession, epoch: number | undefined, request: ResumeRequest) {
@@ -253,11 +268,18 @@ export class NpcRuntime {
     npcs: NpcSessionRequest['npcs'],
   ): Map<string, ResolvedNpcSoulBinding> {
     const bindings = new Map<string, ResolvedNpcSoulBinding>();
-    for (const npcId of npcIds ?? []) bindings.set(npcId, { npcId, soulId: `${game}.${npcId}` });
+    for (const npcId of npcIds ?? []) {
+      bindings.set(npcId, {
+        npcId,
+        soulId: `${game}.${npcId}`,
+        decisionTimeoutMs: resolveNpcDecisionDeadlineMs(),
+      });
+    }
     for (const item of npcs ?? []) {
       bindings.set(item.npcId, {
         npcId: item.npcId,
         soulId: item.soulId ?? `${game}.${item.npcId}`,
+        decisionTimeoutMs: resolveNpcDecisionDeadlineMs(item.decisionDeadline),
         requiresPack: item.soulId !== undefined,
       });
     }
@@ -303,9 +325,7 @@ export function createNpcWebSocketHandler(runtime: NpcRuntime): WebSocketHandler
       collectors.set(ws, new NpcBatchCollector({
         windowMs: 100,
         flush: async (snapshots) => {
-          const decisions = await runtime.decideBatch(session, [...snapshots], {
-            deadlineMs: NPC_DECIDE_DEADLINE_MS,
-          });
+          const decisions = await runtime.decideBatch(session, [...snapshots]);
           const eventId = `batch-${Date.now()}`;
           sendDecisions(ws, session, eventId, decisions);
           sendBudget(ws, session, eventId);
@@ -327,9 +347,7 @@ export function createNpcWebSocketHandler(runtime: NpcRuntime): WebSocketHandler
           };
         });
         if (snapshots.length === 0) return;
-        void runtime.decideBatch(session, snapshots, {
-          deadlineMs: NPC_DECIDE_DEADLINE_MS,
-        }).then((decisions) => {
+        void runtime.decideBatch(session, snapshots).then((decisions) => {
           const eventId = `server-heartbeat-${Date.now()}`;
           sendDecisions(ws, session, eventId, decisions);
           sendBudget(ws, session, eventId);
@@ -373,9 +391,7 @@ export function createNpcWebSocketHandler(runtime: NpcRuntime): WebSocketHandler
           await collectors.get(ws)?.add(envelope.snapshot);
         } else if (envelope.type === 'snapshots') {
           for (const snapshot of envelope.snapshots) latestSpotlight.get(ws)?.set(snapshot.npcId, snapshot);
-          const decisions = await runtime.decideBatch(session, envelope.snapshots, {
-            deadlineMs: NPC_DECIDE_DEADLINE_MS,
-          });
+          const decisions = await runtime.decideBatch(session, envelope.snapshots);
           if (decisions.length > 0) {
             const frame = npcDecisionsFrameSchema.parse({
               ...header(ws, envelope.eventId, session),

@@ -29,6 +29,7 @@ import { getPathManager } from '../fs/path-manager';
 import { tt } from '../lib/turn-trace';
 import { appendToolAudit } from './tool-audit';
 import { shouldDelegateHostToolConfirmation } from './host-tool-confirmation';
+import { runSkillKernelTool } from '../skills/kernel-tool-bridge';
 
 /** 与原生内核约定的 host 工具执行签名(结构化,不 import 内核包的类型)。
  *  `agentId` = 本轮真实发起工具的 agent(委派轮里即被委派方,如 mochi);缺省回落 defaultAgentPath。
@@ -152,6 +153,12 @@ export function makeInProcessExecuteTool(
         ? await runForgeaxBuiltinTool(name, (args ?? {}) as Record<string, unknown>, builtinCtx)
         : seamTool?.run
           ? await seamTool.run((args ?? {}) as Record<string, unknown>, hostToolRunCtx(builtinCtx))
+          : name.startsWith('skill_')
+            ? await runSkillKernelTool(name, args, {
+                kind: 'ai',
+                sessionId: sid,
+                agentId: agentPath,
+              })
           : await _executeTool(
               name,
               (args ?? {}) as Record<string, unknown>,

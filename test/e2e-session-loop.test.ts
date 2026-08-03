@@ -184,10 +184,11 @@ describe("Session E2E — bus → ledger → reopen → replay", () => {
   });
 
   test("kits 热更新 polling 路径（flushReloads）：attach 前就已存在 → 改内容 → registry 看到新版本", async () => {
-    // 对齐 ref 设计：flushReloads 的 prev=undefined 只设 baseline 不触发，
-    // 真正承载 ADD 路径的是 fs.watch（下一个 test）。polling 的本职是兜
-    // **MODIFY** —— 当 fs.watch 在 O_TRUNC+write+close 之类模式上漏 event
-    // 时让 ConsciousAgent 在 tool batch 之后能可靠拉到新内容。
+    // 对齐 ref 设计：flushReloads 的 prev=undefined 只在「这个 kit 目录本身第
+    // 一次被扫到」时只设 baseline 不触发（避免把 initKits 已同步装载过的文件
+    // 误判成 reload）。ADD/DELETE 平时靠 fs.watch，但 polling 同样要兜住它们
+    // ——见下面两个 test；当 fs.watch 在 O_TRUNC+write+close 之类模式上漏 event
+    // 时，让 ConsciousAgent 在 tool batch 之后能可靠拉到新增/修改/删除。
     //
     // 因此先把 tool 文件落盘，再 attach（让 initKits 时直接走 _loadInternal
     // 把 v1 装进 registry），之后改内容再 flushReloads 验证 polling 出新版本。
@@ -234,6 +235,85 @@ describe("Session E2E — bus → ledger → reopen → replay", () => {
     expect(v2!.description).toBe("v2");
 
     expect(await session.kitReloadCoordinator.flushReloads()).toBe(false);
+
+    await sm.close(session.sid);
+  });
+
+  test("kits 热更新 polling 路径（flushReloads）：baseline 建立后新增文件（ADD）必须触发 reload", async () => {
+    // ADD 平时靠 fs.watch，但 fs.watch 对 O_TRUNC+write+close 写法一样会丢事件
+    // （见 reload-coordinator.ts 文件头注释），所以 polling 也要兜住 ADD —— 只要
+    // kit 目录已经过至少一轮基线扫描，之后新出现的文件名必须触发对应 kind 的
+    // reload，而不是被当成「首次遇到」静默吞掉。
+    const pm = (await import("../src/fs/path-manager")).getPathManager();
+    const sm = initSessionManager(pm);
+    const session = await createSessionWithRoot(sm, { displayName: "hotadd" });
+
+    const rootLayer = pm.session(session.sid).agent("root");
+    const kitToolsDir = join(rootLayer.resourceDir("kits"), "hot", "tools");
+    mkdirSync(kitToolsDir, { recursive: true });
+    writeFileSync(
+      join(kitToolsDir, "ping.ts"),
+      `export default {
+        description: "ping",
+        input_schema: { type: "object", properties: {} },
+        async execute() { return "pong"; },
+      };\n`,
+      "utf-8",
+    );
+
+    await session.scheduler.attachAgent("root");
+    const agent = session.scheduler.getAgent("root")!;
+
+    // 第一轮只建基线（对齐上一个 test 锁的行为）。
+    expect(await session.kitReloadCoordinator.flushReloads()).toBe(false);
+
+    // 运行期新增一个 tool 文件，不改动已存在的 ping.ts。
+    writeFileSync(
+      join(kitToolsDir, "pong.ts"),
+      `export default {
+        description: "pong",
+        input_schema: { type: "object", properties: {} },
+        async execute() { return "ping"; },
+      };\n`,
+      "utf-8",
+    );
+
+    const triggered = await session.kitReloadCoordinator.flushReloads();
+    expect(triggered).toBe(true);
+    expect(agent.agentContext.tools.list().find((t) => t.name === "hot/tools/pong")).toBeDefined();
+
+    await sm.close(session.sid);
+  });
+
+  test("kits 热更新 polling 路径（flushReloads）：删除文件（DELETE）必须触发 reload 并从 registry 摘除", async () => {
+    const pm = (await import("../src/fs/path-manager")).getPathManager();
+    const sm = initSessionManager(pm);
+    const session = await createSessionWithRoot(sm, { displayName: "hotdel" });
+
+    const rootLayer = pm.session(session.sid).agent("root");
+    const kitToolsDir = join(rootLayer.resourceDir("kits"), "hot", "tools");
+    mkdirSync(kitToolsDir, { recursive: true });
+    const toolPath = join(kitToolsDir, "ping.ts");
+    writeFileSync(
+      toolPath,
+      `export default {
+        description: "ping",
+        input_schema: { type: "object", properties: {} },
+        async execute() { return "pong"; },
+      };\n`,
+      "utf-8",
+    );
+
+    await session.scheduler.attachAgent("root");
+    const agent = session.scheduler.getAgent("root")!;
+    expect(agent.agentContext.tools.list().find((t) => t.name === "hot/tools/ping")).toBeDefined();
+
+    expect(await session.kitReloadCoordinator.flushReloads()).toBe(false);
+
+    rmSync(toolPath);
+    const triggered = await session.kitReloadCoordinator.flushReloads();
+    expect(triggered).toBe(true);
+    expect(agent.agentContext.tools.list().find((t) => t.name === "hot/tools/ping")).toBeUndefined();
 
     await sm.close(session.sid);
   });

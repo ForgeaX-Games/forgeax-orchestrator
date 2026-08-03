@@ -10,11 +10,10 @@
  * + `resolveKernel` + `runTurn`,再把 KernelEvent 映射成 bus 事件。**不持密钥、
  * 不碰内核内部**。`Hook.TurnStart/TurnEnd` 仍由调用方 `process()` 包。
  *
- * 历史连续性:交给内核会话 —— `threadId = uuidv5(sid::agentPath)`(确定性 UUID,
+ * 历史连续性:交给内核会话 —— `threadId = deriveThreadId(sid, agentPath)`(确定性 UUID,
  * 满足 CC resume 的 UUID 门槛),首轮新建、之后 `--resume` 续接该 agent 的会话;
  * **不**经 ContextWindow 把 ledger 喂模型(ledger 仅供 UI 显示)。
  */
-import { createHash } from 'node:crypto';
 import { Hook } from '../hooks/types';
 import { normalizeContent } from '../message/modality';
 import type { EventBusAPI } from './types';
@@ -23,18 +22,7 @@ import { resolveKernel } from '../kernel/resolve-kernel';
 import { tt } from '../lib/turn-trace';
 import { hostTelemetryEnabled } from '../kernel/host-telemetry';
 import { startCliKernelTurn, type CliKernelTurnTrace } from '../kernel/cli-kernel-trace';
-
-/** 确定性 UUIDv5(RFC 4122,sha1)——稳定 key → 稳定 UUID(CC resume 要求 UUID)。 */
-function uuidv5(name: string): string {
-  const NS = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'; // 标准 DNS 命名空间
-  const nsBytes = Buffer.from(NS.replace(/-/g, ''), 'hex');
-  const h = createHash('sha1').update(nsBytes).update(Buffer.from(name, 'utf8')).digest();
-  const b = Buffer.from(h.subarray(0, 16));
-  b[6] = (b[6] & 0x0f) | 0x50; // version 5
-  b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
-  const hex = b.toString('hex');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
+import { deriveThreadId } from '../lib/thread-id';
 
 /** `turn.done.reason === 'error'` 但上游没发过显式 error 事件时,合成可读错误——
  *  否则 error 保持 undefined,UI 会把失败渲染成「空响应」占位而非错误卡
@@ -78,7 +66,7 @@ export interface KernelTurnOpts {
 /** 跑一轮内核 turn,把流式/工具/终态映射成 bus 事件。返回 {aborted,error}。 */
 export async function runKernelTurn(opts: KernelTurnOpts): Promise<{ aborted: boolean; error?: string }> {
   const { agentId, eventBus, signal, turn } = opts;
-  const threadId = uuidv5(`${opts.sessionId ?? 'nosid'}::${agentId}`);
+  const threadId = deriveThreadId(opts.sessionId, agentId);
 
   let finalText = '';
   let thinkingText = '';

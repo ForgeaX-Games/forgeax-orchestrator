@@ -9,6 +9,7 @@
  */
 import { CursorKernel } from '../src/kernel/cursor-kernel';
 import type { TurnRequest, KernelEvent } from '@forgeax/agent-runtime';
+import { randomUUID } from 'node:crypto';
 
 const MARKER = 'ZX9Q7';
 const FAV = 'forty-two (42)';
@@ -92,6 +93,32 @@ async function main(): Promise<void> {
   check('turn 2 completed (stop)', r2.done === 'stop', { done: r2.done });
   check('turn 2 RESUMED context (recalls "42" from turn 1)', /42|forty-two/i.test(r2.text), {
     reply: r2.text.slice(0, 80),
+  });
+
+  console.log('\n— TOOL TURN (dynamic fxt MCP workspace) —');
+  const token = `CURTOK-${randomUUID().slice(0, 8)}`;
+  const toolEvents: KernelEvent[] = [];
+  let toolText = '';
+  const toolReq: TurnRequest = {
+    session: { threadId: `e2e-cursor-tools-${Date.now()}`, agentId: 'forge' },
+    callId: `e2e-cursor-tools-${Date.now()}`,
+    input: { text: `Call the echo tool with text set to "${token}". Then reply with exactly the tool result.` },
+    systemPrompt: { charter: 'You are a terse test agent. You must call the requested tool before replying.', persona: '', mode: 'replace' },
+    tools: [{ name: 'echo', description: 'Echo back the given text.', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } }],
+    budget: { maxTurns: 4 },
+    trustTier: 'imported',
+  };
+  for await (const event of kernel.runTurn(toolReq, new AbortController().signal)) {
+    toolEvents.push(event);
+    if (event.kind === 'message.delta') toolText += event.text;
+  }
+  const toolCall = toolEvents.find((event): event is Extract<KernelEvent, { kind: 'tool.call' }> => event.kind === 'tool.call' && event.name.includes('echo'));
+  const toolResult = toolEvents.find((event): event is Extract<KernelEvent, { kind: 'tool.result' }> =>
+    event.kind === 'tool.result' && event.ok && JSON.stringify(event.result ?? '').includes(`[forgeax_echo] ${token}`),
+  );
+  const toolError = toolEvents.find((event) => event.kind === 'error');
+  check('tool turn delivered → invoked → executed (fxt MCP round-trip)', Boolean(toolCall) && Boolean(toolResult) && !toolError, {
+    call: Boolean(toolCall), result: Boolean(toolResult), error: toolError ?? null, text: toolText.slice(0, 240), token,
   });
 
   console.log(`\n— timing —\n  turn1=${r1.ms}ms  turn2=${r2.ms}ms`);

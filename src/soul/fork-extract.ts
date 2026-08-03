@@ -14,6 +14,7 @@
 import type { ForkExtractRequest, ForkExtractResult } from '@forgeax/agent-runtime';
 import { resolveKernel } from '../kernel/resolve-kernel';
 import { composeTurnRequest } from '../kernel/compose-turn-request';
+import { deriveThreadId } from '../lib/thread-id';
 
 /** 追加给 fork 的唯一一条 user 指令(英文,分层 taxonomy 经 remember 工具)。 */
 export const SOUL_EXTRACT_INSTRUCTION = [
@@ -50,13 +51,16 @@ export async function tryKernelForkExtract(input: SoulForkExtractInput): Promise
   if (!kernel.capabilities?.forkExtract || typeof kernel.forkExtract !== 'function') return false;
 
   // 复用上一轮的 systemPrompt+tools+history(同一 composeTurnRequest 构建器 → 缓存对齐)。
+  // threadId 必须与正常轮次(kernel-turn.ts)同一派生公式 —— 否则内核侧缓存前缀 key 对不上,
+  // fork 这次调用就白丢一次本该有的 cache-warm(bug:此前直接传 raw sid,与正常轮次的
+  // deriveThreadId(sid, agentPath) 不一致)。
   let composed;
   try {
     composed = await composeTurnRequest({
       message: SOUL_EXTRACT_INSTRUCTION,
       agentId: input.agentPath,
       kernel,
-      threadId: input.sid,
+      threadId: deriveThreadId(input.sid, input.agentPath),
       sessionId: input.sid,
     });
   } catch {

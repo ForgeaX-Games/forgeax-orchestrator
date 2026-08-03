@@ -47,6 +47,12 @@ export class AgentKitReloadCoordinator {
   private watchRegs: WatchRegistration[] = [];
   /** Snapshot map for poll-based scan: file abs path → combined hash. */
   private flushSnapshots = new Map<string, string>();
+  /** Poll-scan directory listings for ADD/DELETE diffing —— 键是
+   *  `<kitDir>/<pkg>/<kind>` scope，值是该 scope 上一轮看到的文件名集合。 */
+  private flushDirListings = new Map<string, Set<string>>();
+  /** Poll-scan package listings，键是 kitDir，值是上一轮看到的 kit 包名集合 ——
+   *  用于探测整包被删除（此时其下每个 kind 子目录都不会再被枚举到）。 */
+  private flushPkgListings = new Map<string, Set<string>>();
   /** Shared-dir 3 watch 是否已起 —— lazy 触发，避免纯容器 Session 也烧
    *  3 个 fs.watch slot。Ref 把这一步放在 scheduler.start() 一次性起；
    *  forgeax coordinator 属于 Session，registerAgent 自然是 attachAgent
@@ -134,6 +140,8 @@ export class AgentKitReloadCoordinator {
     }
     this.agents.clear();
     this.flushSnapshots.clear();
+    this.flushDirListings.clear();
+    this.flushPkgListings.clear();
     this._sharedWatching = false;
   }
 
@@ -227,8 +235,13 @@ export class AgentKitReloadCoordinator {
 
   // ─── Proactive flush（after each tool batch） ─────────────────────────────
 
-  /** 扫所有 kit dir + 所有 agent src/index.ts。任何 combined hash 变化触发
-   *  对应 kind 的 reload + scriptSrcChanged hook。返回是否触发过 reload。 */
+  /** 扫所有 kit dir + 所有 agent src/index.ts。文件新增（ADD）、内容变化
+   *  （MODIFY）、消失（DELETE，含整包被删）都记为对应 kind 的 reload 触发 +
+   *  scriptSrcChanged hook —— ADD/DELETE 平时靠 fs.watch，但 fs.watch 在某些
+   *  文件系统上对 O_TRUNC+write+close 写法（见文件头注释）一样会丢事件，这里
+   *  补上 polling 安全网，而不是只兜 MODIFY。首次遇到某个 kitDir 仍只建基线不
+   *  触发（避免把 initKits 已同步装载过的文件误判成 reload），之后每一轮才把
+   *  新出现/消失的文件名当真。返回是否触发过 reload。 */
   async flushReloads(): Promise<boolean> {
     const allPaths = [...this.agents.keys()];
     const dirs: Array<[string, string[]]> = [
@@ -245,26 +258,71 @@ export class AgentKitReloadCoordinator {
     ];
 
     const toReload = new Map<string, Set<KitKind>>();
+    const markReload = (agentPaths: string[], kind: KitKind): void => {
+      for (const path of agentPaths) {
+        let set = toReload.get(path);
+        if (!set) { set = new Set(); toReload.set(path, set); }
+        set.add(kind);
+      }
+    };
+
     for (const [kitDir, agentPaths] of dirs) {
       let pkgs: import("node:fs").Dirent[];
       try {
         pkgs = await readdir(kitDir, { withFileTypes: true });
       } catch {
-        continue;
+        pkgs = [];
       }
-      for (const pkg of pkgs) {
-        if (!pkg.isDirectory()) continue;
+      const currentPkgNames = new Set(pkgs.filter((p) => p.isDirectory()).map((p) => p.name));
+      const prevPkgNames = this.flushPkgListings.get(kitDir);
+      if (prevPkgNames) {
+        for (const pkgName of prevPkgNames) {
+          if (currentPkgNames.has(pkgName)) continue;
+          // 整包被删 —— 它名下每个 kind 子目录都不会再被枚举到，逐个清基线 + 触发。
+          for (const kind of VALID_KINDS) {
+            const scopeKey = join(kitDir, pkgName, kind);
+            const prevFiles = this.flushDirListings.get(scopeKey);
+            if (prevFiles && prevFiles.size > 0) {
+              for (const f of prevFiles) this.flushSnapshots.delete(join(scopeKey, f));
+              markReload(agentPaths, kind);
+            }
+            // 留一个空集合（而非整条删除）：若该包名之后重新出现，文件枚举按
+            // ADD 处理触发 reload，而不是被误判成「本 scope 从未见过」的静默基线。
+            this.flushDirListings.set(scopeKey, new Set());
+          }
+        }
+      }
+      this.flushPkgListings.set(kitDir, currentPkgNames);
+
+      for (const pkgName of currentPkgNames) {
         for (const kind of VALID_KINDS) {
+          const scopeKey = join(kitDir, pkgName, kind);
           let files: string[];
           try {
-            files = (await readdir(join(kitDir, pkg.name, kind))).filter((f) =>
-              f.endsWith(".ts"),
-            );
+            files = (await readdir(scopeKey)).filter((f) => f.endsWith(".ts"));
           } catch {
-            continue;
+            files = [];
           }
+          const currentFiles = new Set(files);
+          // 这个 scope（pkg/kind）本身可能是本轮才第一次出现（新装的 kit 包）——
+          // 但只要 kitDir 整体不是本轮第一次扫到（`prevPkgNames` 已存在），就不能
+          // 把它的文件当成「从未见过」而只建基线：那样会让新装 kit 的第一批文件
+          // 永远等不到 reload 触发。退化成空集合即可，交给下面的 ADD 判定处理。
+          const prevFiles = this.flushDirListings.has(scopeKey)
+            ? this.flushDirListings.get(scopeKey)!
+            : prevPkgNames !== undefined ? new Set<string>() : undefined;
+          if (prevFiles) {
+            for (const f of prevFiles) {
+              if (currentFiles.has(f)) continue;
+              // 文件被删 —— 清基线，触发所属 kind 的 reload。
+              this.flushSnapshots.delete(join(scopeKey, f));
+              markReload(agentPaths, kind);
+            }
+          }
+          this.flushDirListings.set(scopeKey, currentFiles);
+
           for (const f of files) {
-            const p = join(kitDir, pkg.name, kind, f);
+            const p = join(scopeKey, f);
             invalidateHash(p);
             const eh = computeFileHash(p);
 
@@ -279,22 +337,21 @@ export class AgentKitReloadCoordinator {
                 .map((d) => { invalidateHash(d); return computeFileHash(d); });
               combined = shortHash(eh + depHashes.join(""));
             }
-            const condPath = join(kitDir, pkg.name, "condition.ts");
+            const condPath = join(kitDir, pkgName, "condition.ts");
             invalidateHash(condPath);
             const condHash = computeFileHash(condPath);
             if (condHash !== "0") combined = shortHash(combined + condHash);
 
             const prev = this.flushSnapshots.get(p);
             if (prev === undefined) {
-              // First encounter — establish baseline, no reload trigger.
               this.flushSnapshots.set(p, combined);
+              // `prevFiles` 为 undefined 说明这个 scope 本轮是第一次扫到（比如
+              // agent 刚 register）——只建基线，不触发；`prevFiles` 已存在但没
+              // 这个文件名，说明是运行期新增（ADD），必须触发。
+              if (prevFiles !== undefined) markReload(agentPaths, kind);
             } else if (prev !== combined) {
               this.flushSnapshots.set(p, combined);
-              for (const path of agentPaths) {
-                let set = toReload.get(path);
-                if (!set) { set = new Set(); toReload.set(path, set); }
-                set.add(kind);
-              }
+              markReload(agentPaths, kind);
             }
           }
         }

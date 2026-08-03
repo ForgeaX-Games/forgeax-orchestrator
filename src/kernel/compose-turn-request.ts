@@ -30,6 +30,9 @@ import {
 } from '../soul';
 import { drainPerceptionNotes } from '../api/lib/perception-registry';
 import { firstClassUiToolSpecs } from '../api/lib/ui-manifest-registry';
+import { getExtensionSnapshot } from '../extensions/registry';
+import { projectToolSpecs } from '../capabilities/projection';
+import { skillToolSpecs } from '../skills/tool-specs';
 import type { SkillRefLite } from '../soul/types';
 import uiBridgeContract from './ui-bridge-contract.json';
 import { NPC_TOOL_CONTRACTS } from '@forgeax/types/npc-tools';
@@ -167,11 +170,12 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   const model = resolvedModels.model;
   const fallbackModels = resolvedModels.fallbackModels;
 
-  // npc_text(npc_text,npc_text)npc_text npc_text MCP npc_text
-  // npc_text:FORGEAX_TOOLS(npc_text)> seam hostTools(npc_text,npc_text list_games/
-  //   query_world/capture_frame)> first-class UI action(catalog npc_text)> extraTools
-  //   (agent host-tools/kits)> record.tools(soul-pack tools/*.json)> skill-derivednpc_text
-  //   npc_text/host npc_text,soul-pack npc_text
+  // 合并工具(去重,名字冲突时先到先得)→ 经 MCP 桥下发内核。
+  // 优先级:FORGEAX_TOOLS(内置真值)> seam hostTools(产品壳注入,如 list_games/
+  //   query_world/capture_frame)> first-class UI action(catalog 派生)> extraTools
+  //   (agent host-tools/kits)> record.tools(soul-pack tools/*.json)> extension skills>
+  //   soul-pack skills。
+  //   内置/host 工具在冲突时获胜,soul-pack 不能覆盖宿主真值工具。
   const seen = new Set(FORGEAX_TOOLS.map((t) => t.name));
   const tools: TurnRequest['tools'] = [...FORGEAX_TOOLS];
   type ToolEntry = NonNullable<TurnRequest['tools']>[number];
@@ -192,9 +196,13 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   pushDeduped(input.extraTools ?? []);
   // R2/C1:npc_text soul-packnpc_text tools(npc_text ToolSpec[])npc_text
   pushDeduped(record.tools ?? []);
-  // skills(SkillRefLite,npc_text ToolSpec)npc_text npc_text invocation ToolSpec,npc_text +
-  //   agent npc_textkind/description npc_text description;npc_text `args` npc_text,
-  //   npc_text skill schema npc_text SkillRunner npc_text(follow-up)npc_text
+  // Extension skills are runnable through the host bridge. Add only this
+  // executable catalog kind: command/MCP/memory entries remain discovery data
+  // until each has a concrete runtime dispatcher.
+  pushDeduped(skillToolSpecs());
+  // skills(SkillRefLite,非 ToolSpec)→ 派生最小 invocation ToolSpec,让内核能放行 +
+  //   agent 自知其技能。kind/description 透传到 description;暂用 `args` 自由文本入参,
+  //   结构化 skill schema 待 SkillRunner 接线(follow-up)。
   pushDeduped(skillsToToolSpecs(record.skills ?? []));
 
   // P3(B npc_text):npc_text `delivery`npc_textown npc_text core npc_text builtin npc_text
@@ -202,12 +210,18 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   //   (bash/npc_text/npc_text/npc_text)npc_texthost npc_text(list_games/query_worldnpc_text)npc_textimported npc_text 'host'(npc_text,
   //   npc_text host-tool-bridgenpc_textcheckKernelTool npc_text)npc_textclaude-code/codex npc_text
   //   fail-closed:trustTier npc_text 'own' npc_text allowlist npc_text 'host'npc_text
-  const deliveredTools = tools.map((t) => ({
-    ...t,
-    delivery: (record.trustTier === 'own' && t.name != null && LOCAL_CAPABLE_TOOLS.has(t.name)
-      ? 'local'
-      : 'host') as 'local' | 'host',
-  }));
+  const capabilitySnapshot = getExtensionSnapshot().capabilities;
+  const projectedTools = capabilitySnapshot
+    ? projectToolSpecs(tools, capabilitySnapshot, 'rented')
+    : tools;
+  const deliveredTools = projectedTools.map((t) => {
+    return {
+      ...t,
+      delivery: (record.trustTier === 'own' && t.name != null && LOCAL_CAPABLE_TOOLS.has(t.name)
+        ? 'local'
+        : 'host') as 'local' | 'host',
+    };
+  });
 
   const profile = orchestrationProfileOf(input.kernel);
   // Host-owned history is a kernel-owned capability, not an environment/kernel-id guess.
@@ -257,6 +271,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
       ...(record.promptMode ? { mode: record.promptMode } : {}),
     },
     tools: deliveredTools,
+    ...(capabilitySnapshot ? { capabilityGeneration: capabilitySnapshot.generation } : {}),
     ...(record.toolPolicy ? { toolPolicy: record.toolPolicy } : {}),
     // pack npc_text manifest.json npc_text(maxTurns/maxBudgetUsd npc_text --max-turns/--max-budget-usd)npc_text
     budget: record.budget ?? {},

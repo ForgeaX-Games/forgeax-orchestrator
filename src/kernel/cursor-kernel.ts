@@ -52,6 +52,8 @@ import {
   type CursorRawEvent,
 } from './cursor-profile';
 import { buildCursorHomeWithoutUserMcp, disposeCursorHome } from './cursor-home';
+import { materializeForgeaxToolsRuntime, type ForgeaxToolsRuntime } from './mcp/forgeax-tools-runtime';
+import { materializeCursorToolsWorkspace, type CursorToolsWorkspace } from './cursor-tools-workspace';
 
 export class CursorKernel implements AgentKernel {
   // id MUST match the UI's providerOverride for cursor (interface uses
@@ -105,15 +107,28 @@ export class CursorKernel implements AgentKernel {
     // 全局 `~/.cursor/mcp.json`(那些远程 MCP server 每轮握手 ~5s,与游戏开发无关)。默认/失败/
     // Windows 返回 undefined → 退回真实 HOME(原有逻辑不变)。turn 结束 finally 清理。
     let isoHome: string | undefined;
+    let toolsRuntime: ForgeaxToolsRuntime | undefined;
+    let toolsWorkspace: CursorToolsWorkspace | undefined;
     try {
       const binary = await this.binary();
       const projectRoot = defaultProjectRoot();
+      // Cursor reads MCP servers only from `<workspace>/.cursor/mcp.json` and
+      // cannot receive a dynamic config flag. Materialize an isolated workspace
+      // for this exact turn instead of rewriting the user's project config.
+      if ((req.tools?.length ?? 0) > 0) {
+        toolsRuntime = await materializeForgeaxToolsRuntime(req, {
+          runtimeId: req.callId || req.hostSessionId || tid || 'cursor',
+        });
+        if (!toolsRuntime) throw new Error('cursor tools turn did not materialize fxt runtime');
+        toolsWorkspace = await materializeCursorToolsWorkspace(toolsRuntime);
+      }
+      const executionRoot = toolsWorkspace?.root ?? projectRoot;
       isoHome = buildCursorHomeWithoutUserMcp();
 
       // settings.permissions 拦截面(046 楔子3 = task 2e):工作区静态 .cursor/hooks.json
       // (beforeShellExecution/beforeMCPExecution → forgeax /:sid/hook-gate)。上下文经
       // per-turn spawn env 注入;用户自跑 cursor 无 FORGEAX env → hook 零干预。
-      const hooksActive = ensureCursorHooksConfig(projectRoot);
+      const hooksActive = ensureCursorHooksConfig(executionRoot);
       const forgeaxHookEnv: Record<string, string> = hooksActive
         ? {
             FORGEAX_SERVER_URL: `http://127.0.0.1:${process.env.FORGEAX_SERVER_PORT ?? '18900'}`,
@@ -143,12 +158,16 @@ export class CursorKernel implements AgentKernel {
       // prompt 走 stdin(不进 argv):cursor `-p` 无位置参数时从 stdin 读 prompt。
       // 这样首轮的超长 charter+persona+task 不再撑爆 Windows cmd.exe 的 ~8191 命令
       // 行上限(否则 GBK「命令行太长。」+ exit 1)。stdin 是管道、不受长度限制,全平台一致。
-      const { args, message } = buildCursorArgs(req, cursorChatId);
+      const { args, message } = buildCursorArgs(
+        req,
+        cursorChatId,
+        toolsWorkspace ? { root: toolsWorkspace.root, projectRoot } : undefined,
+      );
       const { lines, exit } = spawnJsonl<CursorRawEvent>({
         cmd: binary,
         args,
         env,
-        cwd: projectRoot,
+        cwd: executionRoot,
         signal: ac.signal,
         stdin: message,
         ...(envOverride ? { envOverride } : {}),
@@ -195,6 +214,8 @@ export class CursorKernel implements AgentKernel {
       }
       // 清理镜像 HOME(只删 symlink,绝不动真实 target)。
       disposeCursorHome(isoHome);
+      await toolsWorkspace?.cleanup();
+      await toolsRuntime?.cleanup();
       if (req.callId) CursorKernel.inflight.delete(req.callId);
     }
   }

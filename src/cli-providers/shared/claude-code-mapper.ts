@@ -154,10 +154,16 @@ export function createClaudeMapperState(): ClaudeMapperState {
 function captureUsage(state: ClaudeMapperState, raw: RawUsage | undefined): void {
   if (!raw) return;
   const cur: MappedUsage = state.lastUsage ?? {};
-  if (typeof raw.input_tokens === 'number') cur.inputTokens = raw.input_tokens;
-  if (typeof raw.output_tokens === 'number') cur.outputTokens = raw.output_tokens;
   if (typeof raw.cache_read_input_tokens === 'number') cur.cacheReadTokens = raw.cache_read_input_tokens;
   if (typeof raw.cache_creation_input_tokens === 'number') cur.cacheCreationTokens = raw.cache_creation_input_tokens;
+  // Anthropic 原始 input_tokens 是「裸输入」,不含缓存;框架统一口径是 inputTokens
+  // **含**缓存(OpenAI/Codex 原生语义,src/llm/anthropic.ts 的直连 provider 同款
+  // 算法:nakedInput + cacheRead + cacheCreate)。在这里(唯一适配层入口)换算,
+  // 下游(auto_compaction/summary-compaction/observatory)不需要再感知 provider。
+  if (typeof raw.input_tokens === 'number') {
+    cur.inputTokens = raw.input_tokens + (cur.cacheReadTokens ?? 0) + (cur.cacheCreationTokens ?? 0);
+  }
+  if (typeof raw.output_tokens === 'number') cur.outputTokens = raw.output_tokens;
   state.lastUsage = cur;
 }
 

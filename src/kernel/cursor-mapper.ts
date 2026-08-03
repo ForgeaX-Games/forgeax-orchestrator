@@ -110,6 +110,25 @@ function toolDisplayName(keyed: string): string {
   }
 }
 
+/** Cursor's current MCP envelope carries the real provider/tool name inside
+ * `mcpToolCall.args`; preserve the cross-kernel wire spelling so consumers can
+ * distinguish `fxt/echo` from Cursor's preparatory `getMcpToolsToolCall`. */
+function cursorToolName(keyed: string, body: Record<string, unknown>): string {
+  if (keyed !== 'mcpToolCall') return toolDisplayName(keyed);
+  const args = body.args && typeof body.args === 'object' ? body.args as Record<string, unknown> : {};
+  const provider = typeof args.providerIdentifier === 'string'
+    ? args.providerIdentifier
+    : typeof args.serverIdentifier === 'string'
+      ? args.serverIdentifier
+      : 'mcp';
+  const tool = typeof args.toolName === 'string'
+    ? args.toolName
+    : typeof args.name === 'string'
+      ? args.name
+      : 'tool';
+  return `mcp__${provider}__${tool}`;
+}
+
 /** tool_call 对象上第一个形如 "<x>ToolCall" 的 envelope key。 */
 function keyedToolEnvelope(
   tc: Record<string, unknown> | undefined,
@@ -130,8 +149,25 @@ function flattenToolResult(result: unknown): { ok: boolean; text: string } {
   const r = result as Record<string, any>;
   if (r.success && typeof r.success === 'object') {
     const s = r.success;
+    const contentText = Array.isArray(s.content)
+      ? s.content
+          .map((part: unknown) => {
+            if (!part || typeof part !== 'object') return '';
+            const text = (part as { text?: unknown }).text;
+            if (typeof text === 'string') return text;
+            if (text && typeof text === 'object' && typeof (text as { text?: unknown }).text === 'string') {
+              return (text as { text: string }).text;
+            }
+            return '';
+          })
+          .filter(Boolean)
+          .join('\n')
+      : typeof s.content === 'string' ? s.content : '';
     const text =
-      (typeof s.stdout === 'string' && s.stdout) || (typeof s.message === 'string' && s.message) || '';
+      (typeof s.stdout === 'string' && s.stdout) ||
+      (typeof s.message === 'string' && s.message) ||
+      contentText ||
+      '';
     return { ok: true, text };
   }
   if (r.rejected && typeof r.rejected === 'object') {
@@ -186,7 +222,7 @@ export function mapCursorEvent(raw: CursorRawEvent, state: CursorMapperState): K
       if (!env || !callId) return out;
       if (raw.subtype === 'started') {
         const args = (env.body.args as unknown) ?? {};
-        out.push({ kind: 'tool.call', callId, name: toolDisplayName(env.keyed), args });
+        out.push({ kind: 'tool.call', callId, name: cursorToolName(env.keyed, env.body), args });
       } else if (raw.subtype === 'completed') {
         const { ok, text } = flattenToolResult(env.body.result);
         out.push(

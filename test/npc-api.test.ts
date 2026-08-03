@@ -64,6 +64,69 @@ async function openSession(app: ReturnType<typeof makeRouter>['app'], body: unkn
 }
 
 describe('createNpcRouter (M0 HTTP path)', () => {
+  test('resolves per-NPC deadline presets, custom values, and the balanced default', async () => {
+    const { app, runtime } = makeRouter(root(), goodDecision);
+    const session = await openSession(app, {
+      game: 'demo',
+      npcs: [
+        { npcId: 'fast', decisionDeadline: { preset: 'fast' } },
+        { npcId: 'default' },
+        { npcId: 'patient', decisionDeadline: { preset: 'patient' } },
+        { npcId: 'custom', decisionDeadline: { preset: 'custom', timeoutMs: 15_000 } },
+      ],
+    });
+
+    expect(session.status).toBe(200);
+    expect(Object.fromEntries(session.body.loaded.map((item: any) => [item.npcId, item.decisionTimeoutMs])))
+      .toEqual({ fast: 3_000, default: 6_000, patient: 12_000, custom: 15_000 });
+    const authorized = runtime.authorize(session.body.sessionId, session.body.token)!;
+    expect(runtime.decisionTimeoutMs(authorized, 'default')).toBe(6_000);
+    expect(runtime.decisionTimeoutMs(authorized, 'custom')).toBe(15_000);
+  });
+
+  test('rejects an invalid custom decision deadline at session creation', async () => {
+    const { app } = makeRouter(root(), goodDecision);
+    const session = await openSession(app, {
+      game: 'demo',
+      npcs: [{ npcId: 'guide', decisionDeadline: { preset: 'custom', timeoutMs: 30_001 } }],
+    });
+    expect(session.status).toBe(400);
+    expect(session.body.ok).toBe(false);
+  });
+
+  test('applies each NPC deadline to single and batch Brain decisions', async () => {
+    const seen: number[] = [];
+    const brain = {
+      decide: async (_snapshot: unknown, options: { deadlineMs?: number }) => {
+        seen.push(options.deadlineMs ?? -1);
+        return undefined;
+      },
+      decideBatch: async (
+        snapshots: Array<{ npcId: string }>,
+        optionsFor: (snapshot: { npcId: string }) => { deadlineMs?: number },
+      ) => {
+        for (const item of snapshots) seen.push(optionsFor(item).deadlineMs ?? -1);
+        return [];
+      },
+    } as unknown as NpcBrainService;
+    const runtime = new NpcRuntime({ projectRoot: root(), brain });
+    const grant = runtime.createSession({
+      game: 'demo',
+      npcs: [
+        { npcId: 'fast', decisionDeadline: { preset: 'fast' } },
+        { npcId: 'custom', decisionDeadline: { preset: 'custom', timeoutMs: 15_000 } },
+      ],
+    });
+    const session = runtime.authorize(grant.sessionId, grant.token)!;
+
+    await runtime.decide(session, snapshot({ npcId: 'fast' }));
+    await runtime.decideBatch(session, [
+      snapshot({ npcId: 'fast', eventId: 'fast-batch' }),
+      snapshot({ npcId: 'custom', eventId: 'custom-batch' }),
+    ]);
+    expect(seen).toEqual([3_000, 3_000, 15_000]);
+  });
+
   test('rejects a session when an explicitly declared Soul pack is missing', async () => {
     const projectRoot = root();
     const runtime = new NpcRuntime({ projectRoot });

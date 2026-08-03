@@ -48,6 +48,13 @@ import { kernelEnabled } from "../../kernel/kernel-mode";
 import { transcribeKernelTurn } from "../../kernel/transcribe-turn";
 import { tt, ttEnabled } from "../../lib/turn-trace";
 import { formatCacheHitRatio } from "../../lib/cache-ratio";
+import { getExtensionSnapshot } from "../../extensions/registry";
+import { emptyCapabilitySnapshot } from "@forgeax/types";
+import { listAllCommands } from "../../commands/runner";
+import { commandCapabilities } from "../../capabilities/adapters";
+import { getSessionManager as getCapabilitySessionManager } from "../../core/session-manager";
+import { commonCapabilityRoots } from "../../capabilities/common-roots";
+import { listCommonMcpServers } from "../../capabilities/mcp-catalog";
 
 interface ChatBody {
   message?: string;
@@ -131,6 +138,35 @@ export function createCliRouter() {
       return c.json({ ok: false, providers: [], detail: "no cli-provider registered" }, 503);
     }
     return c.json({ ok: overallOk, providers: snaps });
+  });
+
+  /** Kernel picker discovery: shared catalog + kernel-native catalog. */
+  r.get("/capabilities", async (c) => {
+    const kernelId = c.req.query("kernel")?.trim();
+    if (!kernelId) return c.json({ ok: false, error: "missing kernel query" }, 400);
+    try {
+      const kernel = resolveKernel("", kernelId);
+      const snapshot = getExtensionSnapshot().capabilities ?? emptyCapabilitySnapshot();
+      const commands = await listAllCommands({
+        sm: getCapabilitySessionManager(),
+        paths: getPathManager(),
+      });
+      const native = kernel.listCapabilities
+        ? await kernel.listCapabilities()
+        : { kernelId: kernel.id, capabilities: [] };
+      return c.json({
+        kernelId: kernel.id,
+        shared: {
+          generation: snapshot.generation,
+          capabilities: [...snapshot.capabilities, ...commandCapabilities(commands, snapshot.generation)],
+          mcp: listCommonMcpServers(),
+          roots: commonCapabilityRoots(),
+        },
+        native,
+      });
+    } catch (error) {
+      return c.json({ ok: false, error: (error as Error).message }, 404);
+    }
   });
 
   r.post("/chat", async (c) => {
