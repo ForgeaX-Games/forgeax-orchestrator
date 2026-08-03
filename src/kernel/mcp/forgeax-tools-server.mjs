@@ -27,6 +27,7 @@
  *  (权限闸的信任锚)**刻意不在** MCP 面上,外部 client 无法改写权限声明。
  */
 import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { createMcpDispatcher, serveStdio } from '../../mcp/protocol.mjs';
 import {
@@ -344,6 +345,127 @@ function refreshBridgedByName() {
   return BRIDGED_BY_NAME;
 }
 
+// Project MCP servers are proxied here for kernels whose native MCP surface
+// cannot receive a per-turn project config (notably Codex and forgeax-core's
+// fxt path). The process is itself per-turn, so keeping one client per server
+// avoids a second initialize/list handshake for every tool call.
+function readProjectMcpServers() {
+  for (const path of [join(PROJECT_ROOT, '.forgeax/mcp.json'), join(PROJECT_ROOT, '.mcp.json'), join(PROJECT_ROOT, 'mcp.json')]) {
+    if (!existsSync(path)) continue;
+    try {
+      const raw = JSON.parse(readFileSync(path, 'utf8'));
+      const entries = raw?.mcpServers;
+      if (!entries || typeof entries !== 'object' || Array.isArray(entries)) return [];
+      return Object.entries(entries).flatMap(([name, cfg]) => {
+        if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg) || (cfg.type && cfg.type !== 'stdio') || typeof cfg.command !== 'string') return [];
+        return [{ name, cfg: {
+          command: cfg.command,
+          args: Array.isArray(cfg.args) ? cfg.args.map(String) : [],
+          env: cfg.env && typeof cfg.env === 'object' && !Array.isArray(cfg.env) ? cfg.env : {},
+        } }];
+      });
+    } catch { return []; }
+  }
+  return [];
+}
+
+class ProjectMcpClient {
+  constructor(server) {
+    this.server = server;
+    this.child = spawn(server.cfg.command, server.cfg.args, {
+      cwd: PROJECT_ROOT,
+      env: { ...process.env, ...server.cfg.env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    this.buffer = '';
+    this.nextId = 1;
+    this.pending = new Map();
+    this.initialized = false;
+    this.child.stdout.setEncoding('utf8');
+    this.child.stdout.on('data', (chunk) => this.accept(chunk));
+    this.child.on('error', (error) => this.rejectAll(error));
+    this.child.on('exit', (code, signal) => this.rejectAll(new Error(`MCP server ${server.name} exited (${code ?? signal ?? 'unknown'})`)));
+  }
+  accept(chunk) {
+    this.buffer += chunk;
+    for (;;) {
+      const i = this.buffer.indexOf('\n');
+      if (i < 0) return;
+      const line = this.buffer.slice(0, i).trim();
+      this.buffer = this.buffer.slice(i + 1);
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (typeof msg.id !== 'number') continue;
+        const pending = this.pending.get(msg.id);
+        if (!pending) continue;
+        this.pending.delete(msg.id);
+        if (msg.error) pending.reject(new Error(msg.error.message || 'MCP error')); else pending.resolve(msg);
+      } catch {}
+    }
+  }
+  rejectAll(error) {
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+  }
+  request(method, params = {}) {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`MCP ${this.server.name} ${method} timeout`)); }, 8000);
+      this.pending.set(id, {
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
+      try { this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`); }
+      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
+    });
+  }
+  async listTools() {
+    if (!this.initialized) {
+      await this.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'forgeax-fxt', version: '0.1.0' } });
+      this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })}\n`);
+      this.initialized = true;
+    }
+    const response = await this.request('tools/list');
+    return Array.isArray(response?.result?.tools) ? response.result.tools : [];
+  }
+  async callTool(name, args) {
+    if (!this.initialized) await this.listTools();
+    const response = await this.request('tools/call', { name, arguments: args || {} });
+    return response?.result || {};
+  }
+  close() { try { this.child.kill(); } catch {} }
+}
+
+let PROJECT_MCP_PROMISE;
+function loadProjectMcp() {
+  return (PROJECT_MCP_PROMISE ??= (async () => {
+  const byName = new Map();
+  const clients = [];
+  for (const server of readProjectMcpServers()) {
+    const prefix = `mcp__${normalizeMcpName(server.name)}__`;
+    if (EXPOSE_SET && ![...EXPOSE_SET].some((name) => name.startsWith(prefix))) continue;
+    const client = new ProjectMcpClient(server);
+    try {
+      const listed = await client.listTools();
+      clients.push(client);
+      for (const tool of listed) {
+        if (typeof tool?.name !== 'string' || !tool.name.trim()) continue;
+        const name = `mcp__${normalizeMcpName(server.name)}__${normalizeMcpName(tool.name)}`;
+        byName.set(name, { client, remoteName: tool.name, spec: {
+          name,
+          description: typeof tool.description === 'string' ? tool.description : '',
+          inputSchema: tool.inputSchema || { type: 'object', properties: {} },
+        } });
+      }
+    } catch { client.close(); }
+  }
+  return { byName, clients };
+  })());
+}
+
+function normalizeMcpName(value) { return String(value).replace(/[^a-zA-Z0-9_-]/g, '_'); }
+
 function activeToolNames(bridgedByName = BRIDGED_BY_NAME) {
   const names = new Set(Object.keys(TOOLS));
   for (const t of bridgedByName.values()) {
@@ -370,13 +492,22 @@ function notFound(name, tools) {
   };
 }
 
-function currentTools() {
+async function currentTools() {
     const bridgedByName = refreshBridgedByName();
+    const projectMcp = await loadProjectMcp();
     // 下发面 allowlist:内置工具(已按 EXPOSE 裁过)+ 桥接工具(去内置重名 + EXPOSE 过滤)。
     const builtin = Object.values(TOOLS).map((tool) => ({ ...tool.spec, run: tool.run }));
+    const project = [...projectMcp.byName.values()]
+      .filter((entry) => isExposed(entry.spec.name))
+      .map((entry) => ({
+        ...entry.spec,
+        async run(args) { return entry.client.callTool(entry.remoteName, args); },
+      }));
+    const projectNames = new Set(projectMcp.byName.keys());
     const bridged = [];
     for (const t of bridgedByName.values()) {
       if (!isExposed(t.name)) continue;
+      if (projectNames.has(t.name)) continue;
       bridged.push({
         name: t.name,
         description: t.description ?? '',
@@ -390,7 +521,7 @@ function currentTools() {
         },
       });
     }
-    return [...builtin, ...bridged];
+    return [...builtin, ...project, ...bridged];
 }
 
 const dispatch = createMcpDispatcher({

@@ -97,6 +97,13 @@ function serveReuseEnabled(): boolean {
   return (process.env.FORGEAX_CORE_SERVE_REUSE ?? '').trim() !== 'off';
 }
 
+/** forgeax-core serve 冷启动窗口。Node + Docker 首次加载完整 CLI bundle 可能明显
+ *  超过旧的 8s；与 agent-host 冷启动窗口保持同一默认值，且允许部署侧按机器性能覆盖。 */
+export function coreServeSpawnTimeoutMs(): number {
+  const value = Number(process.env.FORGEAX_CORE_SERVE_SPAWN_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 30_000;
+}
+
 export interface CreateForgeaxCoreKernelOpts {
   /** host-tool 桥定位的默认 agentPath(主对话恒 'forge')。 */
   defaultAgentPath?: string;
@@ -126,7 +133,11 @@ function deriveSock(sessionId: string): string {
 }
 
 /** 连 serve endpoint;serve 刚 spawn 需片刻才 listen → 重试到 deadline。 */
-async function connectWithRetry(sock: string, signal: AbortSignal, deadlineMs = 8000): Promise<RpcConnection> {
+async function connectWithRetry(
+  sock: string,
+  signal: AbortSignal,
+  deadlineMs = coreServeSpawnTimeoutMs(),
+): Promise<RpcConnection> {
   const end = Date.now() + deadlineMs;
   for (;;) {
     if (signal.aborted) throw new Error('aborted before forgeax-core serve ready');
@@ -426,7 +437,15 @@ class ForgeaxCoreServeKernel implements AgentKernel {
       },
     });
 
-    const conn = await connectWithRetry(grant.endpoint ?? endpoint, signal);
+    let conn: RpcConnection;
+    try {
+      conn = await connectWithRetry(grant.endpoint ?? endpoint, signal);
+    } catch (error) {
+      // 启动失败必须回收 sidecar session；否则子进程稍后才 listen 时会成为孤儿，
+      // 下一轮还可能复用一个宿主已判失败的进程。
+      await sidecar.shutdownSession(sessionId).catch(() => {});
+      throw error;
+    }
     const capabilities = await readServeCapabilities(conn);
     const s: ServeSession = {
       sessionId,
@@ -567,7 +586,13 @@ class ForgeaxCoreServeKernel implements AgentKernel {
         cwd: projectRoot, env: stripModelKeys(materializeEnv()),
       },
     });
-    const conn = await connectWithRetry(grant.endpoint ?? endpoint, signal);
+    let conn: RpcConnection;
+    try {
+      conn = await connectWithRetry(grant.endpoint ?? endpoint, signal);
+    } catch (error) {
+      await sidecar.shutdownSession(sessionId).catch(() => {});
+      throw error;
+    }
     const capabilities = await readServeCapabilities(conn);
     if (req.liveHostContext && (!this.hostTurnSnapshot || !capabilities.has('hostTurnSnapshot.v1'))) {
       conn.close();

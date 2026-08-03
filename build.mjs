@@ -69,6 +69,7 @@ writeFileSync(
     '// Minimal type shim (loosely typed on purpose — the consumer casts).',
     'export declare function registerForgeaxCoreKernel(opts: { hostBridge: unknown; hostTurnSnapshot?: unknown }): void;',
     'export declare function getKernel(name: string): unknown;',
+    'export declare function coreServeSpawnTimeoutMs(): number;',
     '',
   ].join('\n'),
 );

@@ -366,6 +366,7 @@ export class ConsciousAgent extends BaseAgent {
   private readonly runToolBatchFn: ToolBatchRunner;
   private readonly getToolsFn: () => ToolDefinition[];
   private readonly refreshToolsFn?: () => Promise<void>;
+  private readonly historyLedger: LedgerReader;
 
   get isTurnActive(): boolean {
     return !this.abortController.signal.aborted;
@@ -376,6 +377,7 @@ export class ConsciousAgent extends BaseAgent {
   constructor(config: ConsciousAgentInitConfig) {
     super(config);
     this.sid = config.sid;
+    this.historyLedger = config.ledger;
     this.modelRoutingHints = new ModelRoutingHints(this.agentPath);
     this.sessionDefaultModels = config.sessionDefaultModels ?? {};
 
@@ -593,6 +595,8 @@ export class ConsciousAgent extends BaseAgent {
               ? [{ sgen: event.sgen, seq: event.seq }]
               : [],
           ),
+          historyLedger: this.historyLedger,
+          historyBlackboard: this.blackboard,
           eventBus: this.boundEventBus,
           signal,
           turn: this.currentTurn,

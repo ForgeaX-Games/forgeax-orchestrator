@@ -30,6 +30,7 @@ import { tt } from '../lib/turn-trace';
 import { appendToolAudit } from './tool-audit';
 import { shouldDelegateHostToolConfirmation } from './host-tool-confirmation';
 import { runSkillKernelTool } from '../skills/kernel-tool-bridge';
+import { createProjectMcpBridge } from './project-mcp';
 
 /** 与原生内核约定的 host 工具执行签名(结构化,不 import 内核包的类型)。
  *  `agentId` = 本轮真实发起工具的 agent(委派轮里即被委派方,如 mochi);缺省回落 defaultAgentPath。
@@ -68,6 +69,7 @@ export function makeInProcessExecuteTool(
     deps.shouldDelegateHostToolConfirmation ?? shouldDelegateHostToolConfirmation;
   const _requestToolApproval = deps.requestToolApproval ?? requestToolApproval;
   const _executeTool = deps.executeTool ?? executeTool;
+  const projectMcp = createProjectMcpBridge(defaultProjectRoot());
   return async (name: string, args: unknown, sid?: string, agentId?: string): Promise<unknown> => {
     if (!sid) throw new Error('forgeax-core kernel: missing hostSessionId for host-tool bridge');
     // Normalize catalog-derived ui_act_* and reject missing declarations before trust policy.
@@ -158,7 +160,14 @@ export function makeInProcessExecuteTool(
                 kind: 'ai',
                 sessionId: sid,
                 agentId: agentPath,
-              })
+            })
+            : name.startsWith('mcp__')
+              ? await (async () => {
+                  const projectResult = await projectMcp.callIfKnown(name, args);
+                  return projectResult === undefined
+                    ? await _executeTool(name, (args ?? {}) as Record<string, unknown>, agent.agentContext.tools.list(), agent.agentContext)
+                    : projectResult;
+                })()
           : await _executeTool(
               name,
               (args ?? {}) as Record<string, unknown>,

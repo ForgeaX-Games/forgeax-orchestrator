@@ -18,6 +18,8 @@ import { Hook } from '../hooks/types';
 import { normalizeContent } from '../message/modality';
 import type { EventBusAPI } from './types';
 import { composeTurnRequest, type EventIdentity } from '../kernel/compose-turn-request';
+import type { LedgerReader } from '../context-window/context-window';
+import type { BlackboardAPI } from './types';
 import { resolveKernel } from '../kernel/resolve-kernel';
 import { tt } from '../lib/turn-trace';
 import { hostTelemetryEnabled } from '../kernel/host-telemetry';
@@ -46,6 +48,9 @@ export interface KernelTurnOpts {
   userText: string;
   /** Stable identities of this turn's already-persisted inbound messages. */
   historyExcludeEvents?: readonly EventIdentity[];
+  /** Exact live agent state used to materialize durable host-owned history. */
+  historyLedger?: LedgerReader;
+  historyBlackboard?: BlackboardAPI;
   /** = this.boundEventBus(emitterId 自动带 agentPath)。 */
   eventBus: EventBusAPI;
   signal: AbortSignal;
@@ -88,6 +93,8 @@ export async function runKernelTurn(opts: KernelTurnOpts): Promise<{ aborted: bo
       ...(opts.historyExcludeEvents?.length
         ? { historyExcludeEvents: opts.historyExcludeEvents }
         : {}),
+      ...(opts.historyLedger ? { historyLedger: opts.historyLedger } : {}),
+      ...(opts.historyBlackboard ? { historyBlackboard: opts.historyBlackboard } : {}),
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.tools ? { extraTools: opts.tools } : {}),
       ...(opts.attachments && opts.attachments.length ? { attachments: opts.attachments } : {}),

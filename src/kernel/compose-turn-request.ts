@@ -18,7 +18,8 @@ import { getSessionManager } from '../core/session-registry';
 import { getPathManager } from '../fs/path-manager';
 import { materializeFileAttachments } from './materialize-file-attachments';
 import { orchestrationProfileOf } from './kernel-profile';
-import { ContextWindow } from '../context-window/context-window';
+import { ContextWindow, type LedgerReader } from '../context-window/context-window';
+import type { BlackboardAPI } from '../core/types';
 import { llmMessagesToTurnHistory } from './llm-history';
 import { getSystemPromptComposer, getHostTools } from '../orchestration-seams';
 import {
@@ -33,6 +34,7 @@ import { firstClassUiToolSpecs } from '../api/lib/ui-manifest-registry';
 import { getExtensionSnapshot } from '../extensions/registry';
 import { projectToolSpecs } from '../capabilities/projection';
 import { skillToolSpecs } from '../skills/tool-specs';
+import { discoverProjectMcpTools } from './project-mcp';
 import type { SkillRefLite } from '../soul/types';
 import uiBridgeContract from './ui-bridge-contract.json';
 import { NPC_TOOL_CONTRACTS } from '@forgeax/types/npc-tools';
@@ -96,7 +98,11 @@ export interface ComposeInput {
   /** Stable identities of inbound messages already persisted for this turn.
    *  Excluded from host-owned history because they are also `input.text`. */
   historyExcludeEvents?: readonly EventIdentity[];
-  /** UI npc_text(npc_text);npc_text agent.json npc_text */
+  /** Live agent-owned history dependencies. Passing these avoids rediscovering
+   *  the same ledger through a process singleton at the package boundary. */
+  historyLedger?: LedgerReader;
+  historyBlackboard?: BlackboardAPI;
+  /** UI 直传的模型覆盖(优先);否则从 agent.json 解析。 */
   model?: string;
   /** npc_text agent npc_text host-tools(kits/toolRegistry)npc_text npc_text MCP npc_text(T-A)npc_text */
   extraTools?: TurnRequest['tools'];
@@ -194,6 +200,10 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   //   host npc_text ui_invoke(actionId)npc_text per-action npc_text
   pushDeduped(firstClassUiToolSpecs(input.sessionId));
   pushDeduped(input.extraTools ?? []);
+  // Project MCP is discovered once at the turn boundary so every kernel gets
+  // the same canonical names and schemas. Provider-specific adapters then
+  // decide whether to mount the server natively or use the fxt bridge.
+  pushDeduped(await discoverProjectMcpTools(projectRoot));
   // R2/C1:npc_text soul-packnpc_text tools(npc_text ToolSpec[])npc_text
   pushDeduped(record.tools ?? []);
   // Extension skills are runnable through the host bridge. Add only this
@@ -230,6 +240,8 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
         input.sessionId,
         input.agentId,
         input.historyExcludeEvents,
+        input.historyLedger,
+        input.historyBlackboard,
       )
     : undefined;
 
@@ -292,16 +304,22 @@ async function materializeNativeHistory(
   sessionId: string | undefined,
   agentId: string,
   excludeEvents?: readonly EventIdentity[],
+  injectedLedger?: LedgerReader,
+  injectedBlackboard?: BlackboardAPI,
 ): Promise<TurnMessage[] | undefined> {
   if (!sessionId) return undefined;
   try {
-    const session = getSessionManager().peek(sessionId);
-    if (!session) return undefined;
+    // The live agent already owns the exact ledger and blackboard. Prefer
+    // those dependencies: package subpath builds can otherwise hold a
+    // different SessionManager registry instance and silently lose history.
+    const session = injectedLedger ? undefined : getSessionManager().peek(sessionId);
+    if (!session && !injectedLedger) return undefined;
     // The in-memory ledger map is only a cache. After a session refresh/open it
     // can be empty even though the per-agent WAL is present on disk. Always
     // hydrate the exact requested agent key; falling back to `forge` crosses
     // conversation ownership boundaries and makes custom roles lose history.
-    const ledger = session.getOrCreateLedger(agentId);
+    const ledger = injectedLedger ?? session?.getOrCreateLedger(agentId);
+    if (!ledger) return undefined;
     // Capture the narrowed reader before async closures (TS does not preserve
     // optional-chain narrowing through those closure boundaries).
     const historySource = ledger;
@@ -319,7 +337,7 @@ async function materializeNativeHistory(
           readFromTail: async (_isEnough: (events: Awaited<ReturnType<typeof historySource.readAllEvents>>) => boolean) =>
             (await historySource.readAllEvents()).filter(keep),
         };
-    const cw = new ContextWindow(agentId, historyLedger, session.blackboard);
+    const cw = new ContextWindow(agentId, historyLedger, injectedBlackboard ?? session?.blackboard);
     const msgs = await cw.buildPrompt();
     return llmMessagesToTurnHistory(msgs);
   } catch {

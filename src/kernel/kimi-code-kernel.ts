@@ -29,6 +29,7 @@ import {
   materializeForgeaxToolsRuntime,
   type ForgeaxToolsRuntime,
 } from './mcp/forgeax-tools-runtime';
+import { readProjectMcpServers } from './project-mcp';
 
 export const KIMI_CODE_DRIVER_LABEL = 'kimi-code · subscription runtime · no local cost';
 export const KIMI_CODE_FALLBACK_MODELS = [
@@ -68,6 +69,22 @@ function toMcpServer(runtime: ForgeaxToolsRuntime): McpServer {
     args: runtime.args,
     env: Object.entries(runtime.env).map(([name, value]) => ({ name, value })),
   };
+}
+
+function toProjectMcpServers(projectRoot: string, requestedTools: readonly string[]): McpServer[] {
+  const requestedServers = new Set(
+    requestedTools
+      .filter((name) => name.startsWith('mcp__'))
+      .map((name) => name.slice('mcp__'.length).split('__', 1)[0]),
+  );
+  return readProjectMcpServers(projectRoot)
+    .filter(({ name }) => requestedServers.has(name.replace(/[^a-zA-Z0-9_-]/g, '_')))
+    .map(({ name, config }) => ({
+    name,
+    command: config.command,
+    args: config.args,
+    env: Object.entries(config.env ?? {}).map(([envName, value]) => ({ name: envName, value })),
+    }));
 }
 
 export class KimiCodeKernel implements AgentKernel {
@@ -213,7 +230,14 @@ export class KimiCodeKernel implements AgentKernel {
     else signal.addEventListener('abort', onAbort, { once: true });
 
     try {
-      const mcpServers = runtime ? [toMcpServer(runtime)] : [];
+      // Keep fxt for the host bridge and mount project-local stdio servers as
+      // native ACP MCP servers as well. Kimi's ACP implementation does not
+      // reliably surface tools proxied behind another MCP server in its tool
+      // catalog, so the project server must be visible at the ACP boundary.
+      const mcpServers = [
+        ...(runtime ? [toMcpServer(runtime)] : []),
+        ...toProjectMcpServers(projectRoot, (req.tools ?? []).map(({ name }) => name)),
+      ];
       let setup;
       try {
         setup = previousSessionId

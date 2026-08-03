@@ -83,6 +83,65 @@ describe('composeTurnRequest selected-kernel policy', () => {
     unregisterKernel('explicit-native');
   });
 
+  test('native history hydrates the durable agent ledger after session restart', async () => {
+    const manager = getSessionManager();
+    const session = await manager.create({ displayName: 'restart-history' });
+    transcribeKernelTurn(session, 'forge', {
+      message: 'add the guide ability',
+      asstText: 'I can add that next',
+      thinkingText: '',
+      stopReason: 'end_turn',
+      toolEvents: [],
+    });
+    await manager.close(session.sid);
+
+    const reopened = await manager.open(session.sid);
+    expect(reopened.ledgers.size).toBe(0);
+
+    const req = await composeTurnRequest({
+      message: 'do it',
+      agentId: 'forge',
+      sessionId: reopened.sid,
+      kernel: kernel('restart-native', NATIVE_KERNEL_PROFILE),
+    });
+
+    expect(req.history).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'user', content: 'add the guide ability' }),
+      expect.objectContaining({ role: 'assistant', content: 'I can add that next' }),
+    ]));
+    expect(reopened.ledgers.has('forge')).toBe(true);
+  });
+
+  test('native history uses the live agent ledger without rediscovering its session singleton', async () => {
+    const manager = getSessionManager();
+    const session = await manager.create({ displayName: 'injected-history' });
+    transcribeKernelTurn(session, 'forge', {
+      message: 'remember the restart token',
+      asstText: 'token remembered',
+      thinkingText: '',
+      stopReason: 'end_turn',
+      toolEvents: [],
+    });
+    const historyLedger = session.getOrCreateLedger('forge');
+    const historyBlackboard = session.blackboard;
+    await manager.close(session.sid);
+    expect(manager.peek(session.sid)).toBeNull();
+
+    const req = await composeTurnRequest({
+      message: 'what was it?',
+      agentId: 'forge',
+      sessionId: session.sid,
+      kernel: kernel('injected-native', NATIVE_KERNEL_PROFILE),
+      historyLedger,
+      historyBlackboard,
+    });
+
+    expect(req.history).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'user', content: 'remember the restart token' }),
+      expect.objectContaining({ role: 'assistant', content: 'token remembered' }),
+    ]));
+  });
+
   test('stable identity excludes only current inbound when timestamps collide', async () => {
     const session = await getSessionManager().create({ displayName: 'current-cutoff' });
     const selected = kernel('native-cutoff', NATIVE_KERNEL_PROFILE);

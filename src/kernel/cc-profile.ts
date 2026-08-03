@@ -31,6 +31,7 @@ import { homedir, tmpdir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
 import type { ChatEvent } from '../cli-providers/types';
 import { defaultProjectRoot } from '@forgeax/platform-io';
+import { readProjectMcpServers } from './project-mcp';
 
 const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
 
@@ -304,8 +305,14 @@ function buildFallbackArgs(models: TurnRequest['fallbackModels']): string[] {
  * own/builtin(forge)**npc_text**(npc_text + npc_text operator npc_text)npc_text npc_textenv-scrub + cred-proxy
  * npc_text,npc_text**npc_text**,npc_text imported npc_text`--setting-sources ''` npc_text = npc_text
  */
-function buildHermeticArgs(trustTier: TurnRequest['trustTier']): string[] {
-  return trustTier === 'imported' ? ['--strict-mcp-config', '--setting-sources', ''] : [];
+function buildHermeticArgs(
+  trustTier: TurnRequest['trustTier'],
+  hasProjectMcp: boolean,
+): string[] {
+  if (trustTier === 'imported') return ['--strict-mcp-config', '--setting-sources', ''];
+  // Project MCP is mounted explicitly for this turn. Do not let Claude merge
+  // unrelated operator MCP configuration into the same tool namespace.
+  return hasProjectMcp ? ['--strict-mcp-config'] : [];
 }
 
 /**
@@ -359,7 +366,7 @@ export function buildCcArgs(
 
   // MCP:npc_text(permission-prompt npc_text forgeax MCP)+ npc_text(fxt server)npc_text
   const tid = req.session.threadId?.trim();
-  const mcpArgs = buildMcpArgs(req, tid || '');
+  const mcpArgs = buildMcpArgs(req, tid || '', projectRoot);
 
   // npc_text(--tools/--disallowedTools)npc_text mcpArgs npc_textsystemPromptArgs npc_text
   // systemPromptArgs npc_text `--*-system-prompt*` flag npc_text,npc_text `--disallowedTools`,
@@ -367,7 +374,7 @@ export function buildCcArgs(
   const toolPolicyArgs = buildToolPolicyArgs(req.toolPolicy);
 
   // hermetic npc_text(npc_text imported)+ npc_text + npc_text
-  const hermeticArgs = buildHermeticArgs(req.trustTier);
+  const hermeticArgs = buildHermeticArgs(req.trustTier, req.tools.some((tool) => tool.name.startsWith('mcp__')));
   const budgetArgs = buildBudgetArgs(req.budget);
   const fallbackArgs = buildFallbackArgs(req.fallbackModels);
 
@@ -422,7 +429,7 @@ export function ccSessionExists(cwd: string, tid: string): boolean {
  *   - permission server `forgeax`(npc_text sid npc_text)npc_text `--permission-prompt-tool mcp__forgeax__approve`
  *   - npc_text server `fxt`(npc_text)npc_text `--allowedTools mcp__fxt__<tool>...`(npc_text)
  *  npc_text server npc_text npc_text(npc_text permission-mode npc_text)npc_text */
-export function buildMcpArgs(req: TurnRequest, permSid: string): string[] {
+export function buildMcpArgs(req: TurnRequest, permSid: string, projectRoot = defaultProjectRoot()): string[] {
   const mcpServers: Record<string, unknown> = {};
   const flags: string[] = [];
 
@@ -454,6 +461,7 @@ export function buildMcpArgs(req: TurnRequest, permSid: string): string[] {
       FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
       FORGEAX_SID: req.hostSessionId?.trim() || permSid,
       FORGEAX_AGENT: req.session.agentId?.trim() || 'forge',
+      FORGEAX_FXT_EXPOSE: req.tools.map((tool) => tool.name).join(','),
     };
 
     // T-A host-tool npc_text:npc_text MCPnpc_textHTTP npc_text
@@ -476,9 +484,34 @@ export function buildMcpArgs(req: TurnRequest, permSid: string): string[] {
       args: [resolvePath(import.meta.dirname, 'mcp/forgeax-tools-server.mjs')],
       env,
     };
+    const requestedProjectServers = new Set(
+      req.tools
+        .map((tool) => tool.name)
+        .filter((name) => name.startsWith('mcp__'))
+        .map((name) => name.slice('mcp__'.length).split('__', 1)[0]),
+    );
+    const projectServerKeys = new Map<string, string>();
+    for (const server of readProjectMcpServers(projectRoot)) {
+      const normalizedServer = server.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+      if (!requestedProjectServers.has(normalizedServer) || mcpServers[server.name]) continue;
+      mcpServers[server.name] = {
+        command: server.config.command,
+        args: server.config.args,
+        ...(server.config.env ? { env: server.config.env } : {}),
+      };
+      projectServerKeys.set(normalizedServer, server.name);
+    }
     // npc_text npc_text headless npc_text(= npc_text)npc_text
     // `--allowedTools <tools...>` npc_text:npc_text argv npc_text
-    flags.push('--allowedTools', ...req.tools.map((t) => `mcp__fxt__${t.name}`));
+    const allowedTools = req.tools.flatMap((tool) => {
+      const fxtName = `mcp__fxt__${tool.name}`;
+      if (!tool.name.startsWith('mcp__')) return [fxtName];
+      const separator = tool.name.indexOf('__', 'mcp__'.length);
+      const serverName = separator >= 0 ? tool.name.slice('mcp__'.length, separator) : '';
+      const configName = projectServerKeys.get(serverName) ?? serverName;
+      return serverName && mcpServers[configName] ? [fxtName, tool.name] : [fxtName];
+    });
+    flags.push('--allowedTools', ...allowedTools);
   }
 
   if (Object.keys(mcpServers).length === 0) return [];

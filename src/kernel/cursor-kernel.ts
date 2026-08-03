@@ -120,7 +120,11 @@ export class CursorKernel implements AgentKernel {
           runtimeId: req.callId || req.hostSessionId || tid || 'cursor',
         });
         if (!toolsRuntime) throw new Error('cursor tools turn did not materialize fxt runtime');
-        toolsWorkspace = await materializeCursorToolsWorkspace(toolsRuntime);
+        toolsWorkspace = await materializeCursorToolsWorkspace(
+          toolsRuntime,
+          projectRoot,
+          (req.tools ?? []).map(({ name }) => name),
+        );
       }
       const executionRoot = toolsWorkspace?.root ?? projectRoot;
       isoHome = buildCursorHomeWithoutUserMcp();

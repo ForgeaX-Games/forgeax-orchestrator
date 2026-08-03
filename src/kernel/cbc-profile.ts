@@ -29,6 +29,7 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
 import { defaultProjectRoot } from '@forgeax/platform-io';
+import { readProjectMcpServers } from './project-mcp';
 // 复用 cc-profile 的稳定件(cbc 与 cc 完全一致):线事件→KernelEvent 映射、
 // permission-mode 枚举翻译、跨进程权限闸 registry。单一来源,避免 drift。
 import {
@@ -211,7 +212,7 @@ function buildCbcHermeticArgs(trustTier: TurnRequest['trustTier']): string[] {
  * `--permission-mode` + 下方 `--allowedTools`(host-tool 显式放行)。
  * 仅当编排层声明了工具时,下发 fxt 工具 server + `--allowedTools`。
  */
-export function buildCbcMcpArgs(req: TurnRequest, permSid: string): string[] {
+export function buildCbcMcpArgs(req: TurnRequest, permSid: string, projectRoot = defaultProjectRoot()): string[] {
   // 关掉 cbc 的感知工具(query_world / capture_frame):cbc 基线上下文 ~56k(cc 仅 ~2.8k)
   // 且 MCP 工具被 ToolSearch 延迟加载,agent 反射式调 query_world 再等不可用的预览,会把
   // 多次 model 往返叠成 60-90s「卡死」感。cbc 去掉感知后单轮闲聊 ~1-2 次往返即收尾;
@@ -226,6 +227,7 @@ export function buildCbcMcpArgs(req: TurnRequest, permSid: string): string[] {
     FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
     FORGEAX_SID: req.hostSessionId?.trim() || permSid,
     FORGEAX_AGENT: req.session.agentId?.trim() || 'forge',
+    FORGEAX_FXT_EXPOSE: tools.map((tool) => tool.name).join(','),
     // 让 fxt server 也从 tools/list 里剔除感知工具(双保险:模型既看不到也调不动)。
     FORGEAX_DISABLE_PERCEPTION: '1',
   };
@@ -243,19 +245,47 @@ export function buildCbcMcpArgs(req: TurnRequest, permSid: string): string[] {
     }
   }
 
-  const mcpServers = {
+  const mcpServers: Record<string, unknown> = {
     fxt: {
       command: process.execPath,
       args: [resolvePath(import.meta.dirname, 'mcp/forgeax-tools-server.mjs')],
       env,
     },
   };
+  // a peer agent CLI's ToolSearch does not reliably surface nested fxt names. Mount
+  // requested project stdio servers natively so their canonical MCP names are
+  // available without a second discovery round-trip.
+  const requestedProjectServers = new Set(
+    tools
+      .map((tool) => tool.name)
+      .filter((name) => name.startsWith('mcp__'))
+      .map((name) => name.slice('mcp__'.length).split('__', 1)[0]),
+  );
+  const projectServerKeys = new Map<string, string>();
+  for (const server of readProjectMcpServers(projectRoot)) {
+    const normalizedServer = server.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    if (!requestedProjectServers.has(normalizedServer) || mcpServers[server.name]) continue;
+    mcpServers[server.name] = {
+      command: server.config.command,
+      args: server.config.args,
+      ...(server.config.env ? { env: server.config.env } : {}),
+    };
+    projectServerKeys.set(normalizedServer, server.name);
+  }
 
   try {
     const cfgPath = resolvePath(tmpdir(), `forgeax-cbc-mcp-${permSid || req.session.agentId || 'x'}.json`);
     writeFileSync(cfgPath, JSON.stringify({ mcpServers }));
     // 编排层显式放行声明的工具 → headless 不卡审批(= 权限归编排层)。感知工具已剔除。
-    return ['--mcp-config', cfgPath, '--allowedTools', ...tools.map((t) => `mcp__fxt__${t.name}`)];
+    const allowedTools = tools.flatMap((tool) => {
+      const fxtName = `mcp__fxt__${tool.name}`;
+      if (!tool.name.startsWith('mcp__')) return [fxtName];
+      const separator = tool.name.indexOf('__', 'mcp__'.length);
+      const serverName = separator >= 0 ? tool.name.slice('mcp__'.length, separator) : '';
+      const configName = projectServerKeys.get(serverName) ?? serverName;
+      return serverName && mcpServers[configName] ? [fxtName, tool.name] : [fxtName];
+    });
+    return ['--mcp-config', cfgPath, '--allowedTools', ...allowedTools];
   } catch {
     return [];
   }
@@ -277,12 +307,20 @@ export function buildCbcArgs(
     : sp.charter;
 
   const tid = req.session.threadId?.trim();
-  const mcpArgs = buildCbcMcpArgs(req, tid || '');
+  const mcpArgs = buildCbcMcpArgs(req, tid || '', _projectRoot);
   const toolPolicyArgs = buildCbcToolPolicyArgs(req.toolPolicy);
   // 始终 --strict-mcp-config(忽略用户全局 ~/.codebuddy MCP,防 30s 流超时卡死);imported 再叠 --setting-sources ''。
   const hermeticArgs = buildCbcHermeticArgs(req.trustTier);
   const budgetArgs = buildCbcBudgetArgs(req.budget);
   const fallbackArgs = buildCbcFallbackArgs(req.fallbackModels);
+  // a peer agent CLI treats native project MCP calls as DeferExecuteTool. In its
+  // non-interactive stream mode `acceptEdits` still waits for an approval that
+  // Studio cannot answer mid-turn; the project MCP is already turn-scoped and
+  // explicitly allowlisted above, so use the headless bypass only for turns
+  // that actually carry a project MCP capability.
+  const effectivePermissionMode = req.tools.some((tool) => tool.name.startsWith('mcp__'))
+    ? 'bypassPermissions'
+    : permissionMode;
 
   const spKey = req.hostSessionId?.trim() || tid || req.session.agentId?.trim() || 'x';
   const systemPromptArgs = buildCbcSystemPromptArgs(systemPrompt, sp.mode ?? 'append', spKey);
@@ -296,7 +334,7 @@ export function buildCbcArgs(
     '--output-format=stream-json',
     '--include-partial-messages',
     '--verbose',
-    '--permission-mode', permissionMode,
+    '--permission-mode', effectivePermissionMode,
     ...hermeticArgs,
     ...mcpArgs,
     ...toolPolicyArgs,
