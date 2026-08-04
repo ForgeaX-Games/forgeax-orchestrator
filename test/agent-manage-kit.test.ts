@@ -10,13 +10,18 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { initPathManager, resetPathManager, getPathManager } from "../src/fs/path-manager";
 import { initSessionManager, resetSessionManager } from "../src/core/session-manager";
 import type { Session } from "../src/core/session";
 import type { Event, AgentContext } from "../src/core/types";
+import {
+  _resetSnapshotForTests,
+  _setSnapshotForTests,
+  getExtensionSnapshot,
+} from "../src/extensions/registry";
 
 import delegateTool from "../builtin/kits/agent_manage/tools/delegate_to_subagent";
 import listTool from "../builtin/kits/agent_manage/tools/list_subagents";
@@ -29,11 +34,13 @@ beforeEach(async () => {
   resetPathManager();
   await resetSessionManager();
   initPathManager({ userRoot });
+  _resetSnapshotForTests();
 });
 
 afterEach(async () => {
   await resetSessionManager();
   resetPathManager();
+  _resetSnapshotForTests();
   rmSync(userRoot, { recursive: true, force: true });
 });
 
@@ -137,6 +144,43 @@ describe("agent_manage kit — delegate_to_subagent", () => {
     } finally {
       unsub();
     }
+  });
+
+  test("newly scaffolded teammate inherits the delegator's selected model", async () => {
+    const personaPath = join(userRoot, "mochi-persona.md");
+    writeFileSync(personaPath, "# Mochi\n", "utf-8");
+    const current = getExtensionSnapshot();
+    _setSnapshotForTests({
+      ...current,
+      kinds: {
+        ...current.kinds,
+        agents: [{
+          extensionId: "@test/mochi",
+          origin: "user",
+          definition: {
+            id: "mochi",
+            role: "tester",
+            card: { name: { en: "Mochi" }, color: "#fff", avatar: "M" },
+            personaFile: "./mochi-persona.md",
+            defaultLang: "en",
+            multiInstance: false,
+          },
+          personaPath,
+        }],
+      },
+    });
+
+    const session = await createSessionWithRootAndTeammate("delegate-model", "dg-model");
+    const rootLayer = getPathManager().session(session.sid).agent("root");
+    writeFileSync(rootLayer.agentJson(), JSON.stringify({ models: { model: ["fable-5"] } }), "utf-8");
+    const ctx = await getRootCtx(session);
+
+    const out = await delegateTool.execute({ agent: "mochi", message: "test inheritance" }, ctx);
+    expect(String(out)).toMatch(/Delegated to mochi/);
+    const teammateConfig = JSON.parse(
+      readFileSync(getPathManager().session(session.sid).agent("mochi").agentJson(), "utf-8"),
+    ) as { models?: { model?: string[] } };
+    expect(teammateConfig.models?.model).toEqual(["fable-5"]);
   });
 });
 

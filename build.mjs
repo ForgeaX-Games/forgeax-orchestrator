@@ -15,6 +15,7 @@ import { build } from 'bun';
 import { rmSync, mkdirSync, copyFileSync, writeFileSync } from 'node:fs';
 import { Glob } from 'bun';
 import { dirname, join } from 'node:path';
+import { buildPlatformOptions } from './build-platform.mjs';
 
 rmSync('./dist', { recursive: true, force: true });
 
@@ -43,7 +44,7 @@ const res = await build({
   target: 'node',
   format: 'esm',
   splitting: false,
-  sourcemap: 'linked',
+  ...buildPlatformOptions(process.platform),
   plugins: [externalizeNonForgeax],
 });
 

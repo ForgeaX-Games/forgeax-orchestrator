@@ -16,7 +16,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { appendFile, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { getPathManager } from "../fs/path-manager";
 import type {
   TerminalManagerAPI,
@@ -31,6 +31,47 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_STDOUT_CAPTURE = 512_000;
 const MAX_MARKER_BUF = 64_000;
 const STATE_DIR = ".shell_state";
+
+interface ShellResolutionOptions {
+  platform: NodeJS.Platform;
+  env: Record<string, string | undefined>;
+  exists: (path: string) => boolean;
+  findOnPath: () => string | undefined;
+}
+
+export function resolveHostShellPath(options: ShellResolutionOptions): string {
+  const configured = options.env.FORGEAX_BASH_PATH;
+  const windowsCandidates = options.platform === "win32" ? [
+    configured,
+    options.env.ProgramFiles ? win32.join(options.env.ProgramFiles, "Git", "bin", "bash.exe") : undefined,
+    options.env.ProgramFiles ? win32.join(options.env.ProgramFiles, "Git", "usr", "bin", "bash.exe") : undefined,
+    options.env["ProgramFiles(x86)"] ? win32.join(options.env["ProgramFiles(x86)"], "Git", "bin", "bash.exe") : undefined,
+  ] : [];
+  const candidates = [
+    ...windowsCandidates,
+    configured,
+    "/usr/bin/bash",
+    "/bin/bash",
+    options.env.SHELL,
+  ].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) if (options.exists(candidate)) return candidate;
+  return options.findOnPath() ?? "bash";
+}
+
+export function shellNoRcFlags(shellPath: string): string[] {
+  const base = (shellPath.split(/[\\/]/).pop() ?? shellPath).replace(/\.exe$/i, "").toLowerCase();
+  if (base === "zsh") return ["-f"];
+  if (base === "bash" || base === "sh") return ["--norc", "--noprofile"];
+  return [];
+}
+
+export async function waitForChildSpawn(child: Pick<ChildProcess, "pid" | "once">): Promise<void> {
+  if (child.pid != null) return;
+  await new Promise<void>((resolve) => {
+    child.once("spawn", resolve);
+    child.once("error", resolve);
+  });
+}
 
 let terminalManagerInstance: TerminalManager | null = null;
 
@@ -151,17 +192,19 @@ export class TerminalManager implements TerminalManagerAPI {
     // the literal; no `--norc`) make those commands fail with spurious exit 1
     // and `no matches found`. So $SHELL is only a last-resort fallback when no
     // bash is on disk; noRcFlags still picks correct flags for it if so.
-    const candidates = [
-      "/usr/bin/bash",
-      "/bin/bash",
-      "bash",
-      process.env.SHELL,
-    ].filter((v): v is string => Boolean(v));
-    for (const c of candidates) {
-      if (!c.includes("/")) return c;
-      if (existsSync(c)) return c;
-    }
-    return "bash";
+    return resolveHostShellPath({
+      platform: process.platform,
+      env: process.env,
+      exists: existsSync,
+      findOnPath: () => {
+        const lookup = spawnSync(process.platform === "win32" ? "where.exe" : "which", ["bash"], {
+          encoding: "utf-8", windowsHide: true,
+        });
+        return lookup.status === 0
+          ? lookup.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean)
+          : undefined;
+      },
+    });
   }
 
   private resolveSessionCwd(initialCwd?: string): string {
@@ -178,10 +221,7 @@ export class TerminalManager implements TerminalManagerAPI {
    *  RESOLVED shell — not assuming bash — is what stops every command failing
    *  with `zsh: no such option: norc` on macOS where $SHELL defaults to zsh. */
   private noRcFlags(shellPath: string): string[] {
-    const base = shellPath.replace(/.*\//, "");
-    if (base === "zsh") return ["-f"];
-    if (base === "bash" || base === "sh") return ["--norc", "--noprofile"];
-    return [];
+    return shellNoRcFlags(shellPath);
   }
 
   private spawnShellProcess(shellPath: string, sessionCwd: string): ChildProcess {
@@ -261,6 +301,11 @@ export class TerminalManager implements TerminalManagerAPI {
     };
 
     this.attachSessionObservers(poolKey, session);
+
+    await waitForChildSpawn(child);
+    if (session.spawnError || child.pid == null) {
+      throw session.spawnError ?? new Error(`shell failed to spawn: ${shellPath}`);
+    }
 
     if (initScript) {
       try { session.process.stdin?.write(initScript + "\n"); } catch { /* ignore */ }

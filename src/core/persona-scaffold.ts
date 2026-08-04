@@ -30,6 +30,7 @@ export type PersonaScaffoldResult =
 export async function ensurePersonaScaffold(
   session: Session,
   agentId: string,
+  opts: { model?: string | string[] } = {},
 ): Promise<PersonaScaffoldResult> {
   if (session.tree.get(agentId)) return { ok: true, alreadyPresent: true };
 
@@ -49,6 +50,9 @@ export async function ensurePersonaScaffold(
       agentType: "conscious",
       overrides: {
         personaFile: persona.personaPath,
+        ...(opts.model
+          ? { models: { model: Array.isArray(opts.model) ? [...opts.model] : [opts.model] } }
+          : {}),
         ...(persona.memoryDir ? { memoryDir: persona.memoryDir } : {}),
         ...(persona.tools && persona.tools.length > 0
           ? { kits: { config: { "host-tools": { allow: persona.tools } } } }

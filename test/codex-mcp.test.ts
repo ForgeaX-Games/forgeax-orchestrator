@@ -28,7 +28,12 @@ import {
   materializeForgeaxToolsRuntime,
   type ForgeaxToolsRuntime,
 } from '../src/kernel/mcp/forgeax-tools-runtime';
-import { KeyedMutex, codexHomeKey } from '../src/kernel/codex-session-home';
+import {
+  KeyedMutex,
+  codexHomeKey,
+  codexProjectTrustHeader,
+  hasProjectTrust,
+} from '../src/kernel/codex-session-home';
 
 const SERVER = resolvePath(import.meta.dir, '../src/kernel/mcp/forgeax-tools-server.mjs');
 const PERMISSION_SERVER = resolvePath(import.meta.dir, '../src/cli-providers/mcp/permission-server.mjs');
@@ -243,6 +248,13 @@ describe('forgeax-tools-runtime — materialize', () => {
 // ─── keyed mutex + home key ──────────────────────────────────────────
 
 describe('codex-session-home — keyed mutex', () => {
+  test('Windows project trust headers escape backslashes and match case-insensitively', () => {
+    const root = 'E:\\LightBox_Develop\\tmp\\forgeax-studio';
+    expect(codexProjectTrustHeader(root)).toBe('[projects."E:\\\\LightBox_Develop\\\\tmp\\\\forgeax-studio"]');
+    expect(hasProjectTrust(`[projects.'e:\\lightbox_develop\\tmp\\forgeax-studio']\ntrust_level = "trusted"`, root)).toBe(true);
+    expect(hasProjectTrust('[projects."E:\\\\other"]', root)).toBe(false);
+  });
+
   test('same key serializes; different keys run in parallel', async () => {
     const m = new KeyedMutex();
     const order: string[] = [];

@@ -125,7 +125,10 @@ export default {
       if (!session) {
         return `Error: session ${sid} is no longer open — cannot delegate.`;
       }
-      const res = await ensurePersonaScaffold(session, agentId);
+      const selectedModel = ctx.getAgentJson().models?.model;
+      const res = await ensurePersonaScaffold(session, agentId, {
+        ...(selectedModel ? { model: selectedModel } : {}),
+      });
       if (!res.ok) {
         if (res.code === "persona_not_found") {
           return (

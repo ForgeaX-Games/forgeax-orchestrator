@@ -90,9 +90,28 @@ export function sanitizeCodexConfig(raw: string): string {
   return out.join('\n');
 }
 
+function normalizedProjectPath(value: string): string {
+  return value.replace(/\//g, '\\').toLowerCase();
+}
+
+/** Render a TOML table header with a safely quoted path key. */
+export function codexProjectTrustHeader(projectRoot: string): string {
+  return `[projects.${JSON.stringify(projectRoot)}]`;
+}
+
 /** Does the sanitized config already trust `projectRoot`? */
-function hasProjectTrust(cfg: string, projectRoot: string): boolean {
-  return cfg.includes(`[projects."${projectRoot}"]`);
+export function hasProjectTrust(cfg: string, projectRoot: string): boolean {
+  const wanted = normalizedProjectPath(projectRoot);
+  for (const match of cfg.matchAll(/^\s*\[projects\.(.+)\]\s*$/gm)) {
+    const rawKey = match[1]?.trim() ?? '';
+    let decoded: string | undefined;
+    if (rawKey.startsWith("'") && rawKey.endsWith("'")) decoded = rawKey.slice(1, -1);
+    else if (rawKey.startsWith('"') && rawKey.endsWith('"')) {
+      try { decoded = JSON.parse(rawKey) as string; } catch { /* malformed */ }
+    }
+    if (decoded !== undefined && normalizedProjectPath(decoded) === wanted) return true;
+  }
+  return false;
 }
 
 /**
@@ -133,7 +152,7 @@ export async function ensureCodexSessionHome(key: string): Promise<string> {
     cfg = '';
   }
   if (!hasProjectTrust(cfg, projectRoot)) {
-    cfg = `${cfg}\n\n[projects."${projectRoot}"]\ntrust_level = "trusted"\n`;
+    cfg = `${cfg}\n\n${codexProjectTrustHeader(projectRoot)}\ntrust_level = "trusted"\n`;
   }
   try {
     writeFileSync(join(dir, 'config.toml'), cfg, { mode: 0o600 });
