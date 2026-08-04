@@ -9,6 +9,7 @@
 import { readFileSync } from 'node:fs';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { getSessionManager } from '../../core/session-manager';
+import { getPathManager } from '../../fs/path-manager';
 import type { AgentJson, ModelsConfig } from '../../core/types';
 import { ensureAgentScaffold, isValidAgentName } from '../../core/agent-scaffold';
 import { resolvePersonaForAgent } from '../../agents/loader';
@@ -42,22 +43,25 @@ export interface CreateSessionBody {
   autoStart?: boolean;
   /** undefined = 解析 manifest 默认 agent;"<name>" 指定;false/''/null = 不 bootstrap。 */
   bootstrapAgent?: string | false | null;
+  /** Explicit immutable scope for products whose SessionLayout supports one. */
+  scope?: string;
 }
 
-/** 建 session(永久绑当前 active game,PR2)+ bootstrap 入口 agent。
+/** 建 session（永久绑定显式 scope，未提供时绑定当前 scope）+ bootstrap 入口 agent。
  *  与历史 `POST /api/sessions` 路由逐行同义(注释随迁)。 */
 export async function createSessionWithBootstrap(
   body: CreateSessionBody,
 ): Promise<{ sid: string; bootstrappedAgent: string | null }> {
   const sm = getSessionManager();
-  // Permanent binding (plan B PR2): the new session is bound to the current
-  // active game by the injected SessionLayout (paths.allocate) — its home
-  // becomes <games>/<activeSlug>/sessions/<sid>/. No defaultDir is passed/stored.
+  // Permanent binding (plan B PR2): the injected SessionLayout binds either
+  // the explicit scope supplied by the product or its current scope. The path
+  // is the authority; no duplicate defaultDir field is persisted.
   const session = await sm.create({
     displayName: body.displayName,
     defaultModels: body.defaultModels,
     timezone: body.timezone,
     autoStart: body.autoStart,
+    scope: body.scope,
   });
   // **先** scheduler.start() 让它先订阅 tree.onChange,**再** scaffold root
   // —— scaffold 写盘后 FSWatcher 派发 rename → tree.onChange("added") →
@@ -107,4 +111,31 @@ export async function createSessionWithBootstrap(
   }
 
   return { sid: session.sid, bootstrappedAgent };
+}
+
+const pendingEnsureByScope = new Map<
+  string,
+  Promise<{ sid: string; bootstrappedAgent: string | null; created: boolean }>
+>();
+
+/** Ensure one session exists for a scope without letting concurrent pages race
+ *  into duplicate default sessions. The binding itself still has one writer:
+ *  SessionLayout.allocate. */
+export async function ensureSessionWithBootstrap(
+  body: CreateSessionBody,
+): Promise<{ sid: string; bootstrappedAgent: string | null; created: boolean }> {
+  const sm = getSessionManager();
+  const scope = body.scope ?? getPathManager().resolveScope();
+  const key = scope ?? '__global__';
+  const pending = pendingEnsureByScope.get(key);
+  if (pending) return pending;
+
+  const existing = sm.list(scope ? { game: scope } : {})[0];
+  if (existing) return { sid: existing.sid, bootstrappedAgent: null, created: false };
+
+  const promise = createSessionWithBootstrap({ ...body, scope })
+    .then((created) => ({ ...created, created: true }))
+    .finally(() => pendingEnsureByScope.delete(key));
+  pendingEnsureByScope.set(key, promise);
+  return promise;
 }

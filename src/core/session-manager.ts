@@ -61,6 +61,9 @@ export interface CreateSessionOpts {
   timezone?: string;
   /** 缺省 true；显式 false 才跳过 boot autoStart。 */
   autoStart?: boolean;
+  /** Optional product-provided immutable scope for the new session. Generic
+   *  layouts ignore it; scoped layouts validate and bind it at allocation. */
+  scope?: string;
 }
 
 export interface SessionListEntry {
@@ -215,7 +218,7 @@ export class SessionManager {
     // Establish the session's home + game binding (studio = current active game).
     // allocate is the single writer + creates the dir; path is the SSOT of the
     // binding afterward (no defaultDir persisted).
-    const { workDir } = this.paths.allocate(sid);
+    const { workDir } = this.paths.allocate(sid, opts.scope);
     const layer = this.paths.session(sid);
 
     // 1) session.json —— **不**持久化 defaultDir(绑定由路径派生);只存稳定字段。

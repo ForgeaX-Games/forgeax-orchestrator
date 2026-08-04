@@ -25,7 +25,11 @@ import { randomUUID } from 'node:crypto';
 import { registerPermission, resolvePermission } from '../core/permission-registry';
 import { registerPerception, resolvePerception, pushPerceptionNote } from './lib/perception-registry';
 import { acquireUiLease, setUiManifest, uiInvokeTimeoutMs } from './lib/ui-manifest-registry';
-import { createSessionWithBootstrap } from './lib/session-create';
+import {
+  createSessionWithBootstrap,
+  ensureSessionWithBootstrap,
+  type CreateSessionBody,
+} from './lib/session-create';
 import { getHostTool } from '../orchestration-seams';
 import type { PerceptionKind } from '../kernel/forgeax-builtin-tools';
 import { executeTool } from '../kits/tool/tool-executor';
@@ -62,6 +66,16 @@ function resolveAgentPath(session: Session, to: string): string {
   return to;
 }
 
+function sessionCreateBody(raw: unknown): CreateSessionBody | null {
+  if (raw == null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const body = raw as Record<string, unknown>;
+  if (body.scope !== undefined && (typeof body.scope !== 'string' || body.scope.length === 0)) {
+    return null;
+  }
+  return body as CreateSessionBody;
+}
+
 export function createSessionsRouter() {
   const r = new Hono();
 
@@ -82,10 +96,18 @@ export function createSessionsRouter() {
   });
 
   r.post('/', async (c) => {
-    const body = await c.req.json().catch(() => ({}));
+    const body = sessionCreateBody(await c.req.json().catch(() => ({})));
+    if (!body) return c.json({ error: 'scope must be a non-empty string when provided' }, 400);
     // 「建 session + bootstrap 入口 agent」的实现抽在 lib/session-create.ts(SSOT):
     // headless 的 `session.create` UI action(ui-headless-actions)与本路由共用同一份。
     const out = await createSessionWithBootstrap(body);
+    return c.json(out);
+  });
+
+  r.post('/ensure', async (c) => {
+    const body = sessionCreateBody(await c.req.json().catch(() => ({})));
+    if (!body) return c.json({ error: 'scope must be a non-empty string when provided' }, 400);
+    const out = await ensureSessionWithBootstrap(body);
     return c.json(out);
   });
 

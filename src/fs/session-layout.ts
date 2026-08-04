@@ -26,11 +26,12 @@ import { safeSegment } from "./safe-segment.js";
 
 export interface SessionLayout {
   /** Establish a brand-new session's home and return its roots. The single
-   *  writer: it decides the binding (studio = current active game), creates the
+   *  writer: it decides the binding (studio = explicit scope when supplied,
+   *  otherwise current active game), creates the
    *  directory, and from then on the binding is recoverable from the path alone.
    *  `sessionRoot`/`sessionWorkDir` for that sid are only meaningful after this
    *  (or for a session already present on disk). */
-  allocate(sid: string): { sessionRoot: string; workDir: string };
+  allocate(sid: string, scope?: string): { sessionRoot: string; workDir: string };
   /** Absolute root of a session's state tree (WAL / logs / checkpoints.jsonl
    *  all live under it). The `sid` is treated as a single path segment and
    *  guarded against traversal by the implementation. */
@@ -94,7 +95,7 @@ export class FlatSessionLayout implements SessionLayout {
   /** @param sessionsRoot parent dir of all `<sid>/` state trees.
    *  @param workDir agent working directory (generic = projectRoot). */
   constructor(private readonly sessionsRoot: string, private readonly workDir: string) {}
-  allocate(sid: string): { sessionRoot: string; workDir: string } {
+  allocate(sid: string, _scope?: string): { sessionRoot: string; workDir: string } {
     const root = this.sessionRoot(sid);
     mkdirSync(root, { recursive: true });
     return { sessionRoot: root, workDir: this.workDir };

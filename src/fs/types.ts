@@ -108,9 +108,9 @@ export interface PathManagerAPI {
   user(): UserLayerAPI;
   session(sid: string): SessionLayerAPI;
   /** Establish a new session's home (binding + dir) via the active SessionLayout
-   *  (studio = bind to current active game). Returns its state-tree root + the
+   *  (studio = explicit scope or current active game). Returns its state-tree root + the
    *  agent working directory. The single writer; call before session(sid). */
-  allocate(sid: string): { sessionRoot: string; workDir: string };
+  allocate(sid: string, scope?: string): { sessionRoot: string; workDir: string };
   /** Agent working directory for a session (studio = its bound game dir;
    *  generic = projectRoot). */
   sessionWorkDir(sid: string): string;

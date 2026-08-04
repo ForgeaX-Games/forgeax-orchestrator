@@ -182,9 +182,9 @@ class PathManager implements PathManagerAPI {
   session(sid: string): SessionLayerAPI {
     return new SessionLayer(sid, this._layout.sessionRoot(sid));
   }
-  /** Establish a new session's home (binding + dir) via the active layout. */
-  allocate(sid: string): { sessionRoot: string; workDir: string } {
-    return this._layout.allocate(sid);
+  /** Establish a new session's home + optional product scope via the active layout. */
+  allocate(sid: string, scope?: string): { sessionRoot: string; workDir: string } {
+    return this._layout.allocate(sid, scope);
   }
   /** The agent working directory for a session (studio = its bound game dir). */
   sessionWorkDir(sid: string): string {

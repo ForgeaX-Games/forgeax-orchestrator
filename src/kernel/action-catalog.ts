@@ -275,7 +275,7 @@ const ACTION_CATALOG_DECLARATIONS = [
   {
     id: 'game.switch',
     title: '切换游戏',
-    description: 'Switch the pinned game (project) to the given slug. Sessions and preview re-scope to it.',
+    description: 'Select the active game (project) by slug. Every open Studio page follows the server authority.',
     schema: { type: 'object', properties: { slug: { type: 'string' } }, required: ['slug'] },
     capability: 'write',
     firstClass: true,
