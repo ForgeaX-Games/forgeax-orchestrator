@@ -246,13 +246,15 @@ export class CursorKernel implements AgentKernel {
   async probe(): Promise<KernelHealth> {
     try {
       const binary = await this.binary();
-      const { stdout, code } = await runCapture(binary, ['--version']);
+      // `cursor-agent --version` can spend several seconds bootstrapping the
+      // CLI; `-h` is the bounded, non-interactive readiness command.
+      const { stdout, code } = await runCapture(binary, ['-h'], { timeoutMs: 10000 });
       const out = stdout.trim().split('\n')[0] ?? '';
       // cursor 支持 `cursor-agent login`(无需 API key)→ 缺 CURSOR_API_KEY 非致命,
       // 只要 binary 在即 ok(与 codex login 流程一致)。
       return code === 0
         ? { ok: true, kernelId: this.id, detail: out || 'cursor-agent ready' }
-        : { ok: false, kernelId: this.id, detail: `cursor-agent --version exit ${code}` };
+        : { ok: false, kernelId: this.id, detail: `cursor-agent -h exit ${code}` };
     } catch (e) {
       const msg = (e as Error).message;
       return {

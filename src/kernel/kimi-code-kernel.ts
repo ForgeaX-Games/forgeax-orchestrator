@@ -326,8 +326,10 @@ export class KimiCodeKernel implements AgentKernel {
 
   async probe(): Promise<KernelHealth> {
     const binary = await this.binary();
-    const { stdout, stderr, code } = await runCapture(binary, ['--version'], {
-      timeoutMs: 5000,
+    // Kimi's `--version` enters its interactive bootstrap on the installed
+    // 0.31 CLI; `-h` is the supported bounded command for readiness.
+    const { stdout, stderr, code, timedOut } = await runCapture(binary, ['-h'], {
+      timeoutMs: 10000,
       captureStderr: true,
     });
     const detail = (stdout || stderr).trim().split('\n')[0] ?? '';
@@ -336,8 +338,10 @@ export class KimiCodeKernel implements AgentKernel {
       ok: false,
       kernelId: this.id,
       detail: code == null
-        ? 'kimi binary not on PATH (install: https://www.kimi.com/code/docs/kimi-code-cli/guides/getting-started.html)'
-        : `kimi --version exit ${code}${detail ? `: ${detail}` : ''}`,
+        ? timedOut
+          ? 'kimi probe timed out after 10000ms'
+          : 'kimi binary not on PATH (install: https://www.kimi.com/code/docs/kimi-code-cli/guides/getting-started.html)'
+        : `kimi -h exit ${code}${detail ? `: ${detail}` : ''}`,
     };
   }
 }

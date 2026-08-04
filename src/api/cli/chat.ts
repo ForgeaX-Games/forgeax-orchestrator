@@ -91,6 +91,23 @@ const DEPRECATION_NOTICE = deprecation({
 export function createCliRouter() {
   const r = new Hono();
 
+  const boundedProbe = async <T extends { ok: boolean; detail?: string }>(
+    probe: () => Promise<T>,
+    timeoutMs = 6000,
+  ): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        probe(),
+        new Promise<T>((resolve) => {
+          timer = setTimeout(() => resolve({ ok: false, detail: `probe timed out after ${timeoutMs}ms` } as T), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
   // 所有 /api/cli/* 端点统一带 Deprecation header。
   r.use("*", DEPRECATION_NOTICE);
 
@@ -98,7 +115,7 @@ export function createCliRouter() {
   r.get("/health", async (c) => {
     const providers = listProviders();
     const snaps = await Promise.all(providers.map(async (p) => {
-      const h = await p.health(1500);
+      const h = await boundedProbe(() => p.health(1500));
       return { id: p.id, ok: h.ok, detail: h.detail, capabilities: p.capabilities };
     }));
     // 总体 ok 以 cli-provider(默认对话路径)为准 —— 第三方内核(codex/cursor)未装/
@@ -109,20 +126,23 @@ export function createCliRouter() {
     // 列表(按 id 去重,claude-code 已由 cli-provider 覆盖则跳过),与能跑的集合一致。
     if (kernelEnabled()) {
       const seen = new Set(snaps.map((s) => s.id));
-      for (const k of listAvailableKernels()) {
-        if (seen.has(k.id)) continue;
+      const kernels = listAvailableKernels().filter((k) => !seen.has(k.id));
+      const kernelSnaps = await Promise.all(kernels.map(async (k) => {
         let h: { ok: boolean; detail?: string };
         try {
-          h = await k.probe();
+          // Some installed CLIs (notably Kimi and Cursor) perform a short
+          // first-run bootstrap even for their non-interactive help probe.
+          // The kernel owns a 10s child timeout; do not let the health route's
+          // old 6s wrapper report a healthy binary as unavailable.
+          h = await boundedProbe(() => k.probe(), 15000);
         } catch (e) {
           h = { ok: false, detail: (e as Error).message };
         }
-        seen.add(k.id);
         // 把 KernelCapabilities 映射成 picker 期望的 ProviderCapabilities 形:
         // 内核经 threadId resume(sessions=true);子 agent 走编排层 handoff 而非内核内
         // (subAgents=false,保守);无 JSONL 回放语义。
         const cap = k.capabilities;
-        snaps.push({
+        return {
           id: k.id,
           ok: h.ok,
           detail: h.detail,
@@ -134,8 +154,9 @@ export function createCliRouter() {
             sessions: true,
             jsonlReplay: false,
           },
-        });
-      }
+        };
+      }));
+      snaps.push(...kernelSnaps);
     }
     if (snaps.length === 0) {
       return c.json({ ok: false, providers: [], detail: "no cli-provider registered" }, 503);

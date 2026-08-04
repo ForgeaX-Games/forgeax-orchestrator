@@ -35,6 +35,8 @@ export interface RunCaptureResult {
   code: number | null;
   stdout: string;
   stderr: string;
+  /** true when the configured timeout, rather than the child, ended the run. */
+  timedOut?: boolean;
 }
 
 /**
@@ -58,6 +60,7 @@ export function runCapture(cmd: string, args: string[], opts: RunCaptureOpts = {
         env: opts.env,
         stdio: ['ignore', 'pipe', opts.captureStderr ? 'pipe' : 'ignore'],
         shell: needsShell(cmd),
+        detached: !IS_WINDOWS,
         windowsHide: true,
       });
     } catch {
@@ -67,13 +70,49 @@ export function runCapture(cmd: string, args: string[], opts: RunCaptureOpts = {
     let stdout = '';
     let stderr = '';
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+    const killTree = (): void => {
+      const pid = child.pid;
+      if (typeof pid === 'number' && pid > 0) {
+        if (IS_WINDOWS) {
+          try {
+            const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
+              stdio: 'ignore',
+              windowsHide: true,
+            });
+            killer.once('error', () => { /* fall through to direct kill */ });
+          } catch {
+            /* fall through to direct kill */
+          }
+        } else {
+          try {
+            process.kill(-pid, 'SIGKILL');
+            return;
+          } catch {
+            /* fall through to direct kill */
+          }
+        }
+      }
+      try { child.kill('SIGKILL'); } catch { /* already dead */ }
+    };
+    const settle = (result: RunCaptureResult): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolveP(result);
+    };
     if (opts.timeoutMs && opts.timeoutMs > 0) {
-      timer = setTimeout(() => { try { child.kill(); } catch { /* ignore */ } }, opts.timeoutMs);
+      timer = setTimeout(() => {
+        // Launchers can leave descendants holding stdout/stderr. The child is
+        // a detached process-group leader on POSIX; Windows uses taskkill /T.
+        killTree();
+        settle({ code: null, stdout, stderr, timedOut: true });
+      }, opts.timeoutMs);
     }
     child.stdout?.on('data', (d: Buffer) => { stdout += d.toString(); });
     child.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
-    child.once('error', () => { if (timer) clearTimeout(timer); resolveP({ code: null, stdout, stderr }); });
-    child.once('close', (code) => { if (timer) clearTimeout(timer); resolveP({ code, stdout, stderr }); });
+    child.once('error', () => { settle({ code: null, stdout, stderr }); });
+    child.once('close', (code) => { settle({ code, stdout, stderr }); });
   });
 }
 

@@ -221,7 +221,7 @@ export class ClaudeCodeKernel implements AgentKernel {
   async probe(): Promise<KernelHealth> {
     try {
       const binary = await this.binary();
-      const { stdout, code } = await runCapture(binary, ['--version']);
+      const { stdout, code } = await runCapture(binary, ['--version'], { timeoutMs: 5000 });
       const out = stdout.trim().split('\n')[0] ?? '';
       const hasKey = Boolean(process.env.ANTHROPIC_API_KEY) || existsSync(resolvePath(homedir(), '.claude.json'));
       return code === 0 && hasKey

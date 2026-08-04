@@ -30,7 +30,7 @@ import { RENTED_KERNEL_PROFILE } from './kernel-profile';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
-import { runCapture } from '../lib/node-spawn';
+import { runCapture, which } from '../lib/node-spawn';
 import { spawnJsonl, scrubbedSecretEnv } from '../cli-providers/shared/subprocess-jsonl';
 import { resolveBinary } from '../cli-providers/shared/resolve-binary';
 import {
@@ -179,15 +179,21 @@ export class CbcKernel implements AgentKernel {
   async probe(): Promise<KernelHealth> {
     try {
       const binary = await this.binary();
-      const { stdout, code } = await runCapture(binary, ['--version']);
-      const out = stdout.trim().split('\n')[0] ?? '';
       // cbc 自管登录:凭据落 ~/.codebuddy(.credentials.json / ~/.codebuddy.json)。
       const loggedIn =
         existsSync(resolvePath(homedir(), '.codebuddy', '.credentials.json')) ||
         existsSync(resolvePath(homedir(), '.codebuddy.json'));
-      return code === 0 && loggedIn
-        ? { ok: true, kernelId: this.id, detail: out || 'codebuddy ready' }
-        : { ok: false, kernelId: this.id, detail: !loggedIn ? 'codebuddy login missing (run `codebuddy`)' : `codebuddy --version exit ${code}` };
+      const resolvedBinary = which(binary);
+      const installed = resolvedBinary !== null;
+      return installed && loggedIn
+        ? { ok: true, kernelId: this.id, detail: `${resolvedBinary} ready (version command unsupported)` }
+        : {
+          ok: false,
+          kernelId: this.id,
+          detail: !installed
+            ? 'codebuddy binary not on PATH (install a peer agent CLI)'
+            : 'codebuddy login missing (run `codebuddy`)',
+        };
     } catch (e) {
       return { ok: false, kernelId: this.id, detail: (e as Error).message };
     }

@@ -100,6 +100,13 @@ export { HistoryService } from './history/service';
 export { cloneHistoryBundle, createHistoryBundle, verifyHistoryBundle } from './history/bundle';
 export { authorizeHistory, type HistoryCapability, type HistoryPrincipal } from './history/authorizer';
 export { redactHistoryEntries } from './history/redactor';
+export {
+  getExtensionCapabilityControl,
+  type ExtensionCapabilityControl,
+  type ExtensionCapabilityInvocationContext,
+  type ExtensionCapabilityInvocationOptions,
+  type ExtensionCapabilityProvider,
+} from './tools/extension-capabilities';
 
 // WS + watcher primitives the shell wires into Bun.serve.
 export { WsHub, createWsHandler, type WsClientData } from './ws';

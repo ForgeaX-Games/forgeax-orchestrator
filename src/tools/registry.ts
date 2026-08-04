@@ -32,6 +32,10 @@ import { defaultProjectRoot } from '@forgeax/platform-io';
 import { getSessionManager } from '../core/session-manager';
 import { getPathManager } from '../fs/path-manager';
 import { getHostAuthoring, type HostAuthoring } from './host-authoring';
+import {
+  createScopedExtensionCapabilities,
+  type ScopedExtensionCapabilities,
+} from './extension-capabilities';
 
 export type ToolHandler = (
   args: unknown,
@@ -59,6 +63,8 @@ export type ToolHandler = (
      *  `@forgeax/*`(ESM 裸说明符),所以「写插件 / reload」这类需要宿主编排层
      *  能力的 authoring 操作只能经此注入。见 tools/host-authoring.ts。 */
     host: HostAuthoring;
+    /** 宿主注册的版本化能力。调用时自动绑定当前 tool/game/project 上下文。 */
+    capabilities: ScopedExtensionCapabilities;
   },
 ) => Promise<unknown> | unknown;
 
@@ -326,15 +332,25 @@ export async function callTool(req: ToolCall): Promise<ToolResult> {
   try {
     const filteredEnv: Record<string, string | undefined> = {};
     for (const k of entry.requestedEnv) filteredEnv[k] = process.env[k];
+    const projectRoot = defaultProjectRoot();
+    const capabilityContext = {
+      caller: req.caller,
+      toolId: req.toolId,
+      env: filteredEnv,
+      cwd: entry.extensionDir,
+      projectRoot,
+      ...(sessionGame ? { game: sessionGame } : {}),
+    };
     const result = await handler(req.args, {
       caller: req.caller,
       toolId: req.toolId,
       env: filteredEnv,
       cwd: entry.extensionDir,
-      projectRoot: defaultProjectRoot(),
+      projectRoot,
       ...(sessionGame ? { game: sessionGame } : {}),
       imageGen: createImageGen(filteredEnv),
       host: getHostAuthoring(),
+      capabilities: createScopedExtensionCapabilities(capabilityContext),
     });
     bus.emit(
       'tool.completed',

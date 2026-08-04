@@ -68,13 +68,19 @@ const IMAGE_POLICY: ImagePreflightPolicy = {
   supportedMimeTypes: ANTHROPIC_SUPPORTED_IMAGE_MIME_TYPES,
 };
 
-function toolDefsToAnthropic(tools?: ToolDefinition[]) {
+export function toolDefsToAnthropic(tools?: ToolDefinition[]) {
   if (!tools?.length) return undefined;
-  return tools.map((t) => ({
-    name: t.name,
-    description: t.description,
-    input_schema: t.input_schema,
-  }));
+  return tools.map((t) => {
+    const inputSchema: Record<string, unknown> = t.input_schema && typeof t.input_schema === "object"
+      ? { ...t.input_schema }
+      : {};
+    if (typeof inputSchema.type !== "string") inputSchema.type = "object";
+    return {
+      name: t.name,
+      description: t.description,
+      input_schema: inputSchema,
+    };
+  });
 }
 
 async function contentToAnthropic(content: ContentPart[]): Promise<any[]> {
