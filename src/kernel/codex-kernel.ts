@@ -76,6 +76,12 @@ function* codexMcpFailure(message: string): Generator<KernelEvent> {
   yield { kind: 'turn.done', reason: 'error' };
 }
 
+function* historyResumeFailure(message: string): Generator<KernelEvent> {
+  yield { kind: 'turn.usage' };
+  yield { kind: 'error', error: { code: 'protocol', message } };
+  yield { kind: 'turn.done', reason: 'error' };
+}
+
 export type CodexTurnTransport = 'app-server' | 'exec';
 
 export interface CodexKernelOptions {
@@ -112,6 +118,10 @@ export class CodexKernel implements AgentKernel {
       envVarName: 'CODEX_CLI_PATH',
       defaultBinary: 'codex',
     }));
+  }
+
+  hasNativeHistoryResume(threadId: string): boolean {
+    return this.threadIdMap.has(threadId) || this.appThreadIdMap.has(threadId);
   }
 
   /** Cached `codex --version` line (for the MCP capability gate). Empty on error
@@ -211,6 +221,17 @@ export class CodexKernel implements AgentKernel {
         return;
       } catch (e) {
         if (!(e instanceof AppServerUnavailable)) throw e;
+        const tid = req.session.threadId?.trim();
+        // App-server and exec keep different native thread identifiers. A
+        // delta prepared for an app-server thread must never be sent through a
+        // fresh exec chat; clear the stale resume reference and require the
+        // caller to retry, which composes a snapshot.
+        const historyMode = (req as TurnRequest & { historyPlan?: { mode?: string } }).historyPlan?.mode;
+        if (historyMode === 'delta' && tid && !this.threadIdMap.has(tid)) {
+          this.appThreadIdMap.delete(tid);
+          yield* historyResumeFailure('codex native session is unavailable; retry to synchronize a fresh history snapshot');
+          return;
+        }
         // app-server transport 起不来 → 回退 exec。fallback **必须携带同一套 MCP 工具**
         // (exec 路径会重新 materialize runtime),禁止退化成「无工具继续回答」(plan §6.2)。
         // eslint-disable-next-line no-console
@@ -391,7 +412,9 @@ export class CodexKernel implements AgentKernel {
         try {
           await client.request('thread/resume', { threadId: codexThreadId });
         } catch {
-          codexThreadId = await startFresh();
+          if (tid) this.appThreadIdMap.delete(tid);
+          yield* historyResumeFailure('codex native session resume failed; retry to synchronize a fresh history snapshot');
+          return;
         }
       } else {
         codexThreadId = await startFresh();

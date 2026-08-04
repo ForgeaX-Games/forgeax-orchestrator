@@ -118,6 +118,10 @@ export class KimiCodeKernel implements AgentKernel {
     })());
   }
 
+  hasNativeHistoryResume(threadId: string): boolean {
+    return this.threadToSession.has(threadId);
+  }
+
   private createClient(options: ConstructorParameters<typeof KimiAcpClient>[0]): KimiAcpClient {
     return this.options.createClient?.(options) ?? new KimiAcpClient(options);
   }
@@ -244,11 +248,12 @@ export class KimiCodeKernel implements AgentKernel {
           ? await client.resumeSession(previousSessionId, mcpServers)
           : await client.newSession(mcpServers);
       } catch (error) {
-        if (previousSessionId && !signal.aborted && !/auth|login/i.test((error as Error).message)) {
-          setup = await client.newSession(mcpServers);
-        } else {
-          throw error;
+        if (previousSessionId && threadId) this.threadToSession.delete(threadId);
+        if (previousSessionId && !signal.aborted) {
+          yield* failure(`kimi native session resume failed; retry to synchronize a fresh history snapshot: ${(error as Error).message}`);
+          return;
         }
+        throw error;
       }
       if (threadId) this.threadToSession.set(threadId, setup.sessionId);
       if (req.model?.trim()) await client.setModel(req.model.trim());

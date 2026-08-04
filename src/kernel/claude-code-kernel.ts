@@ -46,6 +46,7 @@ import {
   buildCcArgs,
   buildSessionArgs,
   chatEventToKernel,
+  ccSessionExists,
   CLAUDE_CODE_DRIVER_LABEL,
   CLAUDE_CODE_FALLBACK_MODELS,
   probeStreamJsonModels,
@@ -88,6 +89,10 @@ export class ClaudeCodeKernel implements AgentKernel {
       envVarName: 'ANTHROPIC_CLI_PATH',
       defaultBinary: 'claude',
     }));
+  }
+
+  hasNativeHistoryResume(threadId: string): boolean {
+    return this.startedThreadIds.has(threadId) || ccSessionExists(defaultProjectRoot(), threadId);
   }
 
   async *runTurn(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {

@@ -14,8 +14,8 @@ import { readdir, readFile } from 'node:fs/promises';
 import { renameSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { parseManifest } from '@forgeax/types';
-import type { ExtensionManifest } from '@forgeax/types';
+import { normalizeManifest, parseAnyManifest } from '@forgeax/types';
+import type { ExtensionManifest, ExtensionManifestV2 } from '@forgeax/types';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { assetRoot } from '@forgeax/platform-io';
 
@@ -25,6 +25,8 @@ export interface ScannedManifest {
   origin: ExtensionOrigin;
   originPath: string;
   manifest: ExtensionManifest;
+  /** Canonical capability-shaped projection consumed by new hosts. */
+  normalizedManifest?: ExtensionManifestV2;
 }
 
 export interface ScanError {
@@ -143,7 +145,7 @@ async function scanExtensionOrigin(origin: ExtensionOrigin, root: string): Promi
     }
     try {
       const json = JSON.parse(raw);
-      const parsed = parseManifest(json);
+      const parsed = parseAnyManifest(json);
       if (!parsed.ok || !parsed.manifest) {
         const reason = parsed.error
           ? parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
@@ -175,12 +177,63 @@ async function scanExtensionOrigin(origin: ExtensionOrigin, root: string): Promi
         });
         continue;
       }
-      out.found.push({ origin, originPath: manifestPath, manifest: parsed.manifest });
+      const normalizedManifest = normalizeManifest(parsed.manifest);
+      // Existing kind loaders are being retired independently. Until then they
+      // receive a lossless-enough compatibility projection while every new UI
+      // consumer reads normalizedManifest. The compatibility object is never
+      // persisted and is created only at this scanner boundary.
+      const manifest = parsed.manifest.schemaVersion === 1
+        ? parsed.manifest
+        : legacyProjection(normalizedManifest);
+      out.found.push({ origin, originPath: manifestPath, manifest, normalizedManifest });
     } catch (e) {
       out.errors.push({ origin, originPath: manifestPath, reason: (e as Error).message });
     }
   }
   return out;
+}
+
+function legacyProjection(manifest: ExtensionManifestV2): ExtensionManifest {
+  const firstPage = manifest.contributes.pages?.[0];
+  const firstAgent = manifest.contributes.agents?.[0];
+  const firstSkill = manifest.contributes.skills?.[0];
+  const firstTool = manifest.contributes.tools?.[0];
+  const common = {
+    ...manifest,
+    schemaVersion: 1 as const,
+    entry: manifest.entry,
+  };
+  delete (common as { contributes?: unknown }).contributes;
+  delete (common as { categories?: unknown }).categories;
+  if (firstPage) {
+    return {
+      ...common,
+      kind: 'workbench',
+      provides: {
+        workbench: { id: firstPage.id, hidden: !manifest.contributes.activities?.length },
+        agents: manifest.contributes.agents,
+        skills: manifest.contributes.skills,
+        tools: manifest.contributes.tools,
+        events: manifest.contributes.events,
+        surfaces: manifest.contributes.surfaces,
+        commands: manifest.contributes.commands,
+        mcp: manifest.contributes.mcp,
+        memory: manifest.contributes.memory,
+      },
+    } as ExtensionManifest;
+  }
+  if (firstAgent) return { ...common, kind: 'agent', provides: { agent: firstAgent } } as ExtensionManifest;
+  if (firstSkill) return { ...common, kind: 'skill', provides: { skills: [firstSkill] } } as ExtensionManifest;
+  if (firstTool) return { ...common, kind: 'tool', provides: { tools: [firstTool] } } as ExtensionManifest;
+  const provider = manifest.contributes.cliProviders?.[0];
+  if (provider) return { ...common, kind: 'cli-provider', provides: { cliProvider: provider } } as ExtensionManifest;
+  const binding = manifest.contributes.modelBindings?.[0];
+  if (binding) return { ...common, kind: 'model-binding', provides: { modelBinding: binding } } as ExtensionManifest;
+  return {
+    ...common,
+    kind: 'workbench',
+    provides: { workbench: { id: 'extension', hidden: true } },
+  } as ExtensionManifest;
 }
 
 /** Doc 14 §4 spike — Safe Boot: when `FORGEAX_SAFE_BOOT=1`, skip user+project

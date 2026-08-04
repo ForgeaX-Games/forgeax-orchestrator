@@ -12,7 +12,7 @@
  *  线程模型：单进程内部使用，append 同步写盘；rotate 内部 _rotating flag 防重入。
  *  Caller（Session.ledgers map 持有者）需在 dispose 时停止使用，本类不主动 close。 */
 
-import { mkdirSync, statSync, appendFileSync, readdirSync, existsSync } from "node:fs";
+import { mkdirSync, statSync, appendFileSync, readdirSync, existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Event } from "../core/types";
@@ -20,6 +20,19 @@ import type { PathManagerAPI } from "../fs/types";
 import { parseEvents } from "./event-store";
 import { walkAndExternalize } from "./event-blob";
 import type { StoredEvent } from "./types";
+import { randomUUID } from "node:crypto";
+
+export interface LedgerCursor {
+  shard: number;
+  line: number;
+  eventId: string;
+}
+
+export interface LedgerHistoryMeta {
+  eventId?: string;
+  turnId?: string;
+  origin?: { kernelId: string; laneId: string; epoch: number };
+}
 
 const MAX_SHARD_BYTES = 5 * 1024 * 1024;
 const SIZE_CHECK_INTERVAL = 20;
@@ -36,6 +49,7 @@ export class EventLedger {
   // it on every event — that's a stat-class syscall on every WS event.
   // Keep the safety net but skip it after the first successful append.
   private _dirEnsured = false;
+  private _currentLine = 0;
 
   constructor(
     public readonly sid: string,
@@ -85,7 +99,8 @@ export class EventLedger {
   /** 持久化一条 bus Event 到当前 shard。
    *  emitterId 由 EventBus 在 emit 时捕获，原样落盘。
    *  payload 在外置前 deep-clone，确保 in-memory observer 看到的对象不被改写。 */
-  append(event: Event, emitterId?: string): void {
+  append(event: Event, emitterId?: string, history?: LedgerHistoryMeta): LedgerCursor {
+    const eventId = history?.eventId ?? randomUUID();
     const stored: StoredEvent = {
       type: event.type,
       ts: event.ts,
@@ -98,6 +113,11 @@ export class EventLedger {
       payload: event.payload && typeof event.payload === "object"
         ? structuredClone(event.payload as Record<string, unknown>)
         : event.payload,
+      history: {
+        eventId,
+        ...(history?.turnId ? { turnId: history.turnId } : {}),
+        ...(history?.origin ? { origin: history.origin } : {}),
+      },
     };
     if (stored.payload && typeof stored.payload === "object") {
       walkAndExternalize(stored.payload, this.blobsDir);
@@ -107,12 +127,34 @@ export class EventLedger {
       this._dirEnsured = true;
     }
     appendFileSync(this._currentShardPath(), JSON.stringify(stored) + "\n", "utf-8");
+    const cursor = { shard: this._currentShard, line: ++this._currentLine, eventId };
 
     this._appendCount++;
     if (this._appendCount >= SIZE_CHECK_INTERVAL) {
       this._appendCount = 0;
       this._maybeRotate();
     }
+    return cursor;
+  }
+
+  async readAllWithCursors(): Promise<Array<{ event: StoredEvent; cursor: LedgerCursor }>> {
+    const out: Array<{ event: StoredEvent; cursor: LedgerCursor }> = [];
+    for (const path of this._listShardPaths()) {
+      const shardMatch = /events-(\d+)\.jsonl$/.exec(path);
+      const shard = shardMatch ? Number(shardMatch[1]) : 1;
+      let raw: string;
+      try { raw = await readFile(path, "utf-8"); } catch { continue; }
+      const lines = raw.split("\n").filter(Boolean);
+      const parsed = parseEvents(raw, this.blobsDir);
+      for (let i = 0; i < parsed.length; i++) {
+        const event = parsed[i];
+        const legacyId = `legacy:${shard}:${i + 1}`;
+        const eventId = event.history?.eventId ?? legacyId;
+        out.push({ event, cursor: { shard, line: i + 1, eventId } });
+      }
+      void lines;
+    }
+    return out;
   }
 
   async readAllEvents(): Promise<StoredEvent[]> {
@@ -166,6 +208,10 @@ export class EventLedger {
       }
     } catch { /* empty dir */ }
     this._currentShard = max > 0 ? max : 1;
+    try {
+      const raw = readFileSync(this._currentShardPath(), "utf-8");
+      this._currentLine = raw.split("\n").filter(Boolean).length;
+    } catch { this._currentLine = 0; }
   }
 
   private _maybeRotate(): void {

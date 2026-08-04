@@ -43,6 +43,7 @@ import { defaultProjectRoot } from '@forgeax/platform-io';
 import {
   buildCbcArgs,
   buildCbcSessionArgs,
+  cbcSessionExists,
   chatEventToKernel,
   CODEBUDDY_DRIVER_LABEL,
   CODEBUDDY_FALLBACK_MODELS,
@@ -85,6 +86,10 @@ export class CbcKernel implements AgentKernel {
       envVarName: 'CODEBUDDY_CLI_PATH',
       defaultBinary: 'codebuddy',
     }));
+  }
+
+  hasNativeHistoryResume(threadId: string): boolean {
+    return this.startedThreadIds.has(threadId) || cbcSessionExists(defaultProjectRoot(), threadId);
   }
 
   async *runTurn(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {

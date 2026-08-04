@@ -19,6 +19,8 @@
  */
 import type { Event } from "../core/types";
 import type { Session } from "../core/session";
+import type { PreparedHistory } from "@forgeax/agent-runtime";
+import { randomUUID } from "node:crypto";
 
 export interface KernelTurnRecord {
   /** 本轮用户输入文本(渲染 user 气泡)。 */
@@ -37,6 +39,7 @@ export interface KernelTurnRecord {
   stopReason: "end_turn" | "tool_use" | "max_tokens" | "cancelled";
   usage?: unknown;
   model?: string;
+  historyPlan?: PreparedHistory;
   toolEvents: Array<
     | { kind: "call"; callId: string; name: string; args: unknown }
     | { kind: "result"; callId: string; ok: boolean; result?: unknown; error?: string }
@@ -55,6 +58,11 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
   const ev = (o: Record<string, unknown>) => o as unknown as Event;
 
   const pid = rec.providerId;
+  const turnId = randomUUID();
+  const historyMeta = pid && rec.historyPlan?.laneId && typeof rec.historyPlan.epoch === 'number'
+    ? { turnId, origin: { kernelId: pid, laneId: rec.historyPlan.laneId, epoch: rec.historyPlan.epoch } }
+    : { turnId };
+  const append = (event: Event, emitterId?: string) => led.append(event, emitterId, historyMeta);
   // `content` is the UI projection; `llmMessage` is canonical model context.
   // Attachment base64 is never persisted: compose has replaced it with durable paths.
   // Keep path-only `attachments` so refresh can re-render image chips.
@@ -86,7 +94,7 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
       });
     }
   }
-  led.append(ev({
+  append(ev({
     type: "user_input",
     ts: t0,
     source: "user",
@@ -98,11 +106,11 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
       ...(durableAtts.length ? { attachments: durableAtts } : {}),
     },
   }));
-  led.append(ev({ type: "hook:turnStart", ts: t0, source: `agent:${ap}`, payload: { turn: 1, ...(pid ? { providerId: pid } : {}) } }), ap);
+  append(ev({ type: "hook:turnStart", ts: t0, source: `agent:${ap}`, payload: { turn: 1, turnId, ...(pid ? { providerId: pid } : {}) } }), ap);
 
   for (const t of rec.toolEvents) {
     if (t.kind === "call") {
-      led.append(
+      append(
         ev({
           type: "hook:toolCall",
           ts: Date.now(),
@@ -112,7 +120,7 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
         ap,
       );
     } else {
-      led.append(
+      append(
         ev({
           type: "hook:toolResult",
           ts: Date.now(),
@@ -132,7 +140,7 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
   }
 
   if (rec.asstText.trim() || rec.thinkingText.trim()) {
-    led.append(
+    append(
       ev({
         type: "hook:assistantMessage",
         ts: Date.now(),
@@ -153,5 +161,14 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
     );
   }
 
-  led.append(ev({ type: "hook:turnEnd", ts: Date.now(), source: `agent:${ap}`, payload: { turn: 1, reason: rec.stopReason } }), ap);
+  const endCursor = append(ev({ type: "hook:turnEnd", ts: Date.now(), source: `agent:${ap}`, payload: { turn: 1, turnId, reason: rec.stopReason } }), ap);
+  if (rec.historyPlan?.laneId && rec.providerId && typeof rec.historyPlan.epoch === 'number') {
+    led.append(ev({
+      type: 'kernel_history_applied', ts: Date.now(), source: 'history-coordinator',
+      payload: {
+        laneId: rec.historyPlan.laneId, kernelId: rec.providerId, epoch: rec.historyPlan.epoch,
+        knownThrough: endCursor, patchId: rec.historyPlan.patchId,
+      },
+    }));
+  }
 }

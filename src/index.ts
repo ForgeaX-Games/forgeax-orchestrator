@@ -94,6 +94,12 @@ export { projectToolSpecs } from './capabilities/projection';
 export { loadBrand, createBrandRouter } from './brand';
 export { getVersion } from '@forgeax/platform-io';
 export { listAllCommands } from './commands/runner';
+export { HistoryCoordinator, type HistorySource, type LaneStore, type PrepareOptions } from './history/coordinator';
+export type { HistoryEntry, HistoryCursor, KernelLane, PreparedHistory } from './history/types';
+export { HistoryService } from './history/service';
+export { cloneHistoryBundle, createHistoryBundle, verifyHistoryBundle } from './history/bundle';
+export { authorizeHistory, type HistoryCapability, type HistoryPrincipal } from './history/authorizer';
+export { redactHistoryEntries } from './history/redactor';
 
 // WS + watcher primitives the shell wires into Bun.serve.
 export { WsHub, createWsHandler, type WsClientData } from './ws';

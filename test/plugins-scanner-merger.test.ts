@@ -44,6 +44,31 @@ const ROOTS = () => ({
 });
 
 describe('scanner + merger', () => {
+  it('accepts manifest v2 and publishes the normalized contribution catalog', async () => {
+    const dir = join(TMP, 'builtin', 'page-v2');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'forgeax-extension.json'), JSON.stringify({
+      schemaVersion: 2,
+      id: '@forgeax-extension/page-v2',
+      version: '1.0.0',
+      displayName: 'Page v2',
+      categories: ['workbench'],
+      contributes: {
+        panelTypes: [{ id: 'content', runtime: 'iframe', entry: './index.html' }],
+        pages: [{
+          id: 'main', title: 'Main', cardinality: 'singleton',
+          layout: './main.page.json', layoutVersion: 1,
+          panels: [{ id: 'content', panelType: { extension: 'self', id: 'content' } }],
+        }],
+        activities: [{ id: 'launcher', title: 'Page v2', pageType: { extension: 'self', id: 'main' } }],
+      },
+    }), 'utf-8');
+    const result = await scanAllExtensionOrigins(ROOTS());
+    expect(result.errors).toEqual([]);
+    expect(result.found[0]?.normalizedManifest?.contributes.pages?.[0]?.id).toBe('main');
+    expect(result.found[0]?.manifest.kind).toBe('workbench');
+  });
+
   it('finds manifests in each origin', async () => {
     mkplugin('builtin', '@forgeax-extension/wb-a', { provides: { workbench: { id: 'a' } } });
     mkplugin('user', '@forgeax-extension/wb-b', { provides: { workbench: { id: 'b' } } });

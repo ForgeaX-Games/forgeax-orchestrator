@@ -9,7 +9,7 @@
  *   - model:npc_text body.model,npc_text agent.json::models.model(ModelPicker npc_text)
  *   - tools:M2 npc_text(CC npc_text);MCP npc_text M3npc_text
  */
-import type { AgentKernel, TurnRequest, TurnMessage } from '@forgeax/agent-runtime';
+import type { AgentKernel, TurnRequest, TurnMessage, PreparedHistory as RuntimePreparedHistory } from '@forgeax/agent-runtime';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
@@ -17,9 +17,12 @@ import { defaultProjectRoot } from '@forgeax/platform-io';
 import { getSessionManager } from '../core/session-registry';
 import { getPathManager } from '../fs/path-manager';
 import { materializeFileAttachments } from './materialize-file-attachments';
-import { orchestrationProfileOf } from './kernel-profile';
+import { hasNativeHistoryResume, orchestrationProfileOf } from './kernel-profile';
 import { ContextWindow, type LedgerReader } from '../context-window/context-window';
 import type { BlackboardAPI } from '../core/types';
+import { HistoryCoordinator } from '../history/coordinator';
+import { LedgerHistorySource, LedgerLaneStore } from '../history/ledger-history';
+import { renderHistoryPatch } from '../history/text-bridge';
 import { llmMessagesToTurnHistory } from './llm-history';
 import { getSystemPromptComposer, getHostTools } from '../orchestration-seams';
 import {
@@ -168,13 +171,15 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
         .join('\n')}\n\nIf these indicate a problem with code you wrote, fix it; otherwise acknowledge and continue.`
     : '';
   const replyLang = input.replyLanguage ? replyLanguageDirective(input.replyLanguage) : '';
-  const dynamicSuffix = [rebirth, episodic, runtimeFeedback, replyLang].filter((s) => s && s.trim()).join('\n\n---\n\n');
+  let dynamicSuffix = [rebirth, episodic, runtimeFeedback, replyLang].filter((s) => s && s.trim()).join('\n\n---\n\n');
 
-  // npc_text + npc_text:UI npc_text(input.model)npc_text;npc_text agent.json::models.model
-  // npc_text = [npc_text, ...fallback](--fallback-model npc_text),npc_text = npc_text
-  const resolvedModels = input.model ? { model: input.model } : await resolveAgentModels(input.sessionId, input.agentId);
-  const model = resolvedModels.model;
-  const fallbackModels = resolvedModels.fallbackModels;
+  // 模型 + 级联回退:UI 显式覆盖(input.model)是所选内核的模型。否则 agent.json
+  // 的模型只属于 Forgeax Core；不能把 Claude provider 名透传给 Codex/Cursor 等
+  // 独立订阅 runtime，否则会在模型 API 前被拒绝。租用内核未显式指定时使用其
+  // 本地 CLI 当前选择的模型。
+  const agentModels = input.model ? undefined : await resolveAgentModels(input.sessionId, input.agentId);
+  const model = input.model ?? (input.kernel.id === 'forgeax-core' ? agentModels?.model : undefined);
+  const fallbackModels = input.model ? undefined : (input.kernel.id === 'forgeax-core' ? agentModels?.fallbackModels : undefined);
 
   // 合并工具(去重,名字冲突时先到先得)→ 经 MCP 桥下发内核。
   // 优先级:FORGEAX_TOOLS(内置真值)> seam hostTools(产品壳注入,如 list_games/
@@ -234,8 +239,57 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   });
 
   const profile = orchestrationProfileOf(input.kernel);
+  let preparedHistory: RuntimePreparedHistory | undefined;
+  // Shared history is prepared by one coordinator for both native and rented kernels.
+  if (input.sessionId) {
+    try {
+      const session = getSessionManager().peek(input.sessionId);
+      const ledger = session?.getOrCreateLedger(input.agentId);
+      if (ledger) {
+        const coordinator = new HistoryCoordinator(new LedgerHistorySource(ledger), new LedgerLaneStore(ledger));
+        const result = await coordinator.prepare({
+          kernelId: input.kernel.id,
+          intake: profile.historyIntake,
+          // A rented CLI may only receive the post-cursor gap after its own
+          // adapter has established a resumable private chat for this thread.
+          // A new process/server restart has no such proof and therefore gets
+          // one authoritative snapshot instead of silently losing context.
+          nativeResumeAvailable: profile.historyIntake === 'structured'
+            || hasNativeHistoryResume(input.kernel, input.threadId),
+        });
+        if ('code' in result) throw new Error(`${result.code}: ${result.message}`);
+        await new LedgerLaneStore(ledger).put(result.lane);
+        ledger.append({
+          type: 'kernel_history_dispatching', ts: Date.now(), source: 'history-coordinator',
+          payload: {
+            laneId: result.lane.laneId, kernelId: input.kernel.id, epoch: result.lane.epoch,
+            mode: result.mode, ...(result.from ? { from: result.from } : {}),
+            ...(result.through ? { patchThrough: result.through } : {}), patchId: result.patchId,
+          },
+        } as never);
+        preparedHistory = {
+          mode: result.mode,
+          messages: result.messages,
+          patchId: result.patchId,
+          laneId: result.lane.laneId,
+          epoch: result.lane.epoch,
+          ...(result.through ? { through: result.through } : {}),
+          estimatedTokens: result.estimatedTokens,
+          redactedParts: result.redactedParts,
+        };
+        if (profile.historyIntake === 'text-bridge') {
+          const patch = renderHistoryPatch(result.messages, result.patchId);
+          if (patch) dynamicSuffix = [dynamicSuffix, patch].filter(Boolean).join('\n\n---\n\n');
+        }
+      }
+    } catch (error) {
+      // Do not silently execute a rented kernel without the history it was meant to receive.
+      if (input.sessionId && input.kernel.id !== 'forgeax-core') throw error;
+    }
+  }
+
   // Host-owned history is a kernel-owned capability, not an environment/kernel-id guess.
-  const history = profile.hostOwnedHistory
+  const history = profile.historyIntake === 'structured'
     ? await materializeNativeHistory(
         input.sessionId,
         input.agentId,
@@ -296,6 +350,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     ...(model ? { model } : {}),
     ...(fallbackModels && fallbackModels.length ? { fallbackModels } : {}),
     ...(history && history.length ? { history } : {}),
+    ...(preparedHistory ? { historyPlan: preparedHistory } : {}),
   };
 }
 

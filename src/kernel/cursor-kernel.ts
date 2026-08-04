@@ -92,6 +92,10 @@ export class CursorKernel implements AgentKernel {
     }));
   }
 
+  hasNativeHistoryResume(threadId: string): boolean {
+    return this.threadToCursor.has(threadId);
+  }
+
   async *runTurn(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {
     const ac = new AbortController();
     if (signal.aborted) ac.abort();

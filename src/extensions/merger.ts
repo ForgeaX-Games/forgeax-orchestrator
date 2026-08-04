@@ -8,11 +8,12 @@
  *
  * See docs/v2-vision/architecture-evolution/03-AGENT-SKILL-PLUGIN-TRINITY.md §2.1.
  */
-import type { ExtensionManifest } from '@forgeax/types';
+import { normalizeManifest, type ExtensionManifest, type ExtensionManifestV2 } from '@forgeax/types';
 import type { ExtensionOrigin, ScannedManifest } from './scanner';
 
 export interface MergedManifest {
   manifest: ExtensionManifest;
+  normalizedManifest?: ExtensionManifestV2;
   origin: ExtensionOrigin;
   originPath: string;
   /** Lower-precedence copies of the same id, ordered most→least specific. */
@@ -52,6 +53,7 @@ export function mergeManifests(scanned: ScannedManifest[]): MergeResult {
     const [head, ...rest] = copies;
     winners.push({
       manifest: head.manifest,
+      normalizedManifest: head.normalizedManifest ?? normalizeManifest(head.manifest),
       origin: head.origin,
       originPath: head.originPath,
       shadowedBy: rest.map((r) => ({ origin: r.origin, originPath: r.originPath })),

@@ -14,7 +14,8 @@
  *      message: string,           // 必填
  *      threadId?: string,         // UUID v4；缺则 provider 每次起独立 session（无续上下文）
  *      agentId?: string,          // 暂时只用于日志
- *      providerOverride?: string  // UI 选的内核 id(claude-code / codex / forgeax-core);内核路径据此 resolveKernel
+ *      providerOverride?: string, // UI 选的内核 id(claude-code / codex / forgeax-core);内核路径据此 resolveKernel
+ *      model?: string             // 可选：所选内核认可的显式模型；未传则用该 CLI 的当前模型
  *    }
  *
  *  响应：text/event-stream，每条事件 `event: <type>\ndata: <json>\n\n`。
@@ -62,6 +63,8 @@ interface ChatBody {
   threadId?: string;
   sessionId?: string;
   providerOverride?: string;
+  /** Selected kernel model. Never inherit a different kernel's agent model. */
+  model?: string;
   /** Doc 05 section 7 -- per-call id for `POST /api/cli/cancel`. */
   callId?: string;
   /** Doc 05 section 7 -- per-call deadline; the provider auto-aborts and
@@ -207,17 +210,27 @@ export function createCliRouter() {
         const payload = await toKernelErrorPayload(null, err);
         return c.json(payload, 503);
       }
-      const turnReq = await composeTurnRequest({
-        message,
-        agentId,
-        kernel: selectedKernel,
-        threadId: body.threadId,
-        sessionId: body.sessionId,
-        callId,
-        ...(extraTools.length ? { extraTools } : {}),
-        ...(Array.isArray(body.attachments) && body.attachments.length ? { attachments: body.attachments } : {}),
-        ...(body.replyLanguage === "en" || body.replyLanguage === "zh" ? { replyLanguage: body.replyLanguage } : {}),
-      });
+      let turnReq: Awaited<ReturnType<typeof composeTurnRequest>>;
+      try {
+        turnReq = await composeTurnRequest({
+          message,
+          agentId,
+          kernel: selectedKernel,
+          threadId: body.threadId,
+          sessionId: body.sessionId,
+          callId,
+          ...(typeof body.model === 'string' && body.model.trim() ? { model: body.model.trim() } : {}),
+          ...(extraTools.length ? { extraTools } : {}),
+          ...(Array.isArray(body.attachments) && body.attachments.length ? { attachments: body.attachments } : {}),
+          ...(body.replyLanguage === "en" || body.replyLanguage === "zh" ? { replyLanguage: body.replyLanguage } : {}),
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : String(error);
+        if (messageText.includes('history_unavailable')) {
+          return c.json({ code: 'history_unavailable', message: 'Unable to sync shared history; the turn was not sent.', retryable: true }, 409);
+        }
+        throw error;
+      }
 
       // 历史持久化(host-owned,核心目标):内核每轮的 KernelEvent 流由编排层**转录**进
       // per-agent 账本 —— 与具体内核(claude-code / codex / forgeax-core)无关,账本是
@@ -342,6 +355,7 @@ export function createCliRouter() {
                 ...(turnReq.input.attachments?.length
                   ? { attachments: turnReq.input.attachments as Array<Record<string, unknown>> }
                   : {}),
+                ...(turnReq.historyPlan ? { historyPlan: turnReq.historyPlan } : {}),
                 toolEvents,
               });
             } catch (e) {

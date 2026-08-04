@@ -21,5 +21,10 @@ export interface StoredEvent {
   seq?: number;
   /** Session generation id — seq is only comparable within the same sgen. */
   sgen?: string;
+  history?: {
+    eventId: string;
+    turnId?: string;
+    origin?: { kernelId: string; laneId: string; epoch: number };
+  };
   [key: string]: unknown;
 }

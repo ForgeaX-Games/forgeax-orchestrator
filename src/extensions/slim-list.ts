@@ -13,6 +13,7 @@ import { mergeManifests } from './merger';
 import type { MergedManifest } from './merger';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { computeAgentNaming, pickPersonName } from '../api/lib/agent-naming';
+import { normalizeManifest, type ExtensionManifestV2 } from '@forgeax/types';
 
 interface ExtensionManifest {
   schemaVersion?: number;
@@ -98,6 +99,8 @@ export interface ExtensionInfo {
   description?: { zh?: string; en?: string; ja?: string } | string;
   icon?: string;
   experimental?: boolean;
+  /** Canonical manifest-v2 contribution catalog for browser hosts. */
+  contributes?: ExtensionManifestV2['contributes'];
   workbench?: ExtensionManifest['provides'] extends infer P
     ? P extends { workbench?: infer W }
       ? W
@@ -232,6 +235,10 @@ function relativeManifestPathFrom(originPath: string): string {
 export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionInfo | null {
   const m = mergedManifest.manifest as ExtensionManifest;
   if (!m.id || !m.version || !m.kind || !m.displayName) return null;
+  let normalized = mergedManifest.normalizedManifest;
+  if (!normalized) {
+    try { normalized = normalizeManifest(mergedManifest.manifest); } catch { /* legacy test/projection without full schema */ }
+  }
       const slim: ExtensionInfo = {
         id: m.id,
         version: m.version,
@@ -240,6 +247,7 @@ export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionI
         description: m.description,
         icon: m.icon,
         experimental: m.experimental,
+        ...(normalized ? { contributes: normalized.contributes } : {}),
         source: {
           origin: mergedManifest.origin,
           relativeManifestPath: relativeManifestPathFrom(mergedManifest.originPath),
