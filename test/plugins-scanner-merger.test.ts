@@ -57,7 +57,8 @@ describe('scanner + merger', () => {
         panelTypes: [{ id: 'content', runtime: 'iframe', entry: './index.html' }],
         pages: [{
           id: 'main', title: 'Main', cardinality: 'singleton',
-          layout: './main.page.json', layoutVersion: 1,
+          layout: { version: 1, root: { kind: 'tabs', placements: ['content'], active: 'content' } },
+          layoutVersion: 1,
           panels: [{ id: 'content', panelType: { extension: 'self', id: 'content' } }],
         }],
         activities: [{ id: 'launcher', title: 'Page v2', pageType: { extension: 'self', id: 'main' } }],
@@ -123,6 +124,31 @@ describe('scanner + merger', () => {
     expect(merged.manifests[0].origin).toBe('project');
     expect(merged.manifests[0].manifest.version).toBe('0.3.0');
     expect(merged.manifests[0].shadowedBy.map((s) => s.origin)).toEqual(['user', 'builtin']);
+  });
+
+  it('merges the installed legacy video-game id with its current built-in identity', async () => {
+    mkplugin('builtin', '@forgeax-extension/wb-game-video', {
+      version: '0.2.0',
+      provides: { workbench: { id: 'wb-game-video' } },
+    });
+    mkplugin('user', '@forgeax/wb-game-video', {
+      version: '0.1.5',
+      provides: { workbench: { id: 'wb-game-video' } },
+    });
+
+    const scan = await scanAllExtensionOrigins(ROOTS());
+    const merged = mergeManifests(scan.found);
+
+    expect(scan.found.map((entry) => entry.manifest.id)).toEqual([
+      '@forgeax-extension/wb-game-video',
+      '@forgeax-extension/wb-game-video',
+    ]);
+    expect(merged.manifests).toHaveLength(1);
+    expect(merged.manifests[0]).toMatchObject({
+      origin: 'user',
+      manifest: { id: '@forgeax-extension/wb-game-video', version: '0.1.5' },
+    });
+    expect(merged.manifests[0]?.shadowedBy).toHaveLength(1);
   });
 
   it('topologically sorts by dependencies (deps before dependents)', async () => {

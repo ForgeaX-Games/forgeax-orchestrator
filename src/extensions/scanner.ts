@@ -40,6 +40,17 @@ export interface ScanResult {
   errors: ScanError[];
 }
 
+const LEGACY_EXTENSION_ID_MIGRATIONS = new Map<string, string>([
+  ['@forgeax/wb-game-video', '@forgeax-extension/wb-game-video'],
+]);
+
+function canonicalExtensionId(id: string): string {
+  if (id.startsWith('@forgeax-plugin/')) {
+    return id.replace('@forgeax-plugin/', '@forgeax-extension/');
+  }
+  return LEGACY_EXTENSION_ID_MIGRATIONS.get(id) ?? id;
+}
+
 /** Resolve the canonical root directory for each origin.
  *
  *  builtin: `<repo>/packages/marketplace/extensions`
@@ -153,14 +164,16 @@ async function scanExtensionOrigin(origin: ExtensionOrigin, root: string): Promi
         out.errors.push({ origin, originPath: manifestPath, reason });
         continue;
       }
-      // ADR 0025 M3 — persistent-id namespace migration: manifests authored
-      // before the Extension rename carry `@forgeax-plugin/*`. Normalize at
-      // this single read point so user-installed and project-specific extensions (old ids on
-      // the user's disk — the sanctioned compat exception) keep resolving.
-      if (typeof parsed.manifest.id === 'string' && parsed.manifest.id.startsWith('@forgeax-plugin/')) {
+      // ADR 0025 M3 — persistent-id namespace migration. Normalize at this
+      // single read point so old user/project installs merge with their current
+      // built-in identity instead of surfacing as duplicate activities.
+      if (typeof parsed.manifest.id === 'string') {
         const legacyId = parsed.manifest.id;
-        parsed.manifest.id = legacyId.replace('@forgeax-plugin/', '@forgeax-extension/');
-        console.warn(`[extensions/scanner] normalized legacy id ${legacyId} -> ${parsed.manifest.id} (${manifestPath})`);
+        const canonicalId = canonicalExtensionId(legacyId);
+        if (canonicalId !== legacyId) {
+          parsed.manifest.id = canonicalId;
+          console.warn(`[extensions/scanner] normalized legacy id ${legacyId} -> ${canonicalId} (${manifestPath})`);
+        }
       }
       // Doc 14 §4 — refuse entry.standalone.devOnly:true under production.
       // Authors use this to ship `bun --watch` shims without leaking into
@@ -206,11 +219,21 @@ function legacyProjection(manifest: ExtensionManifestV2): ExtensionManifest {
   delete (common as { contributes?: unknown }).contributes;
   delete (common as { categories?: unknown }).categories;
   if (firstPage) {
+    const launcher = manifest.contributes.activities?.find((activity) =>
+      activity.pageType?.extension === 'self' && activity.pageType.id === firstPage.id,
+    );
     return {
       ...common,
       kind: 'workbench',
       provides: {
-        workbench: { id: firstPage.id, hidden: !manifest.contributes.activities?.length },
+        workbench: {
+          id: firstPage.id,
+          icon: launcher?.icon ?? firstPage.icon,
+          position: launcher?.order,
+          hidden: !launcher,
+          ...(firstPage.matchProduces ? { matchProduces: firstPage.matchProduces } : {}),
+          ...(firstPage.preferredAgent ? { preferredAgent: firstPage.preferredAgent } : {}),
+        },
         agents: manifest.contributes.agents,
         skills: manifest.contributes.skills,
         tools: manifest.contributes.tools,

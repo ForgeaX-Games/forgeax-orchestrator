@@ -31,10 +31,6 @@ interface ExtensionManifest {
       position?: number;
       panelSize?: 'sm' | 'md' | 'lg';
       hidden?: boolean;
-      panes?: {
-        left?: { defaultWidth?: number; minWidth?: number; collapsible?: boolean; minHeight?: number; scrollable?: boolean };
-        center?: { defaultWidth?: number; minWidth?: number; collapsible?: boolean; minHeight?: number; scrollable?: boolean };
-      };
       preferredAgent?: string;
     };
     modelBinding?: {
@@ -260,12 +256,6 @@ export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionI
           position: m.provides.workbench.position,
           panelSize: m.provides.workbench.panelSize,
           hidden: m.provides.workbench.hidden,
-          // Doc 06 §panes — only project the keys the manifest explicitly set so
-          // a plugin without panes stays panes-undefined (Sidebar uses presence
-          // of `panes.left` to decide left-iframe vs placeholder render).
-          ...(m.provides.workbench.panes
-            ? { panes: m.provides.workbench.panes }
-            : {}),
           ...(m.provides.workbench.preferredAgent
             ? { preferredAgent: m.provides.workbench.preferredAgent }
             : {}),
