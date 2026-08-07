@@ -101,9 +101,7 @@ export { cloneHistoryBundle, createHistoryBundle, verifyHistoryBundle } from './
 export { authorizeHistory, type HistoryCapability, type HistoryPrincipal } from './history/authorizer';
 export { redactHistoryEntries } from './history/redactor';
 export {
-  createScopedExtensionCapabilities,
   getExtensionCapabilityControl,
-  type ScopedExtensionCapabilities,
   type ExtensionCapabilityControl,
   type ExtensionCapabilityInvocationContext,
   type ExtensionCapabilityInvocationOptions,

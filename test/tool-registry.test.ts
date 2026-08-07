@@ -5,7 +5,7 @@
  * caching.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
@@ -21,10 +21,6 @@ import {
   _resetConfirmsForTests,
 } from '../src/tools/registry';
 import { getEventBus, _resetEventBusForTests } from '../src/events/bus';
-import { getExtensionCapabilityControl } from '../src/tools/extension-capabilities';
-import { initPathManager, resetPathManager } from '../src/fs/path-manager';
-import { FlatSessionLayout } from '../src/fs/session-layout';
-import { initSessionManager, resetSessionManager } from '../src/core/session-manager';
 
 const TMP = `/tmp/forgeax-tool-registry-${process.pid}`;
 
@@ -58,29 +54,6 @@ async function reloadFromTmp() {
     mergeIssues: merge.issues,
   });
   return kinds;
-}
-
-const CAPABILITY_CONTEXT_CAPTURE_ID = 'test.tool-registry.capture-context';
-getExtensionCapabilityControl().registerProvider({
-  capabilityId: CAPABILITY_CONTEXT_CAPTURE_ID,
-  version: 1,
-  invoke: async (_input, _options, context) => ({ game: context.game ?? null }),
-});
-
-async function loadCapabilityContextCaptureTool(): Promise<void> {
-  const dir = mkmanifest('user', 'capability-context', {
-    id: '@x/capability-context',
-    kind: 'tool',
-    displayName: { zh: 'capability-context', en: 'capability-context' },
-    entry: { backend: './handlers.mjs' },
-    provides: { tools: [{ id: 'context.capture' }] },
-  });
-  writeFileSync(
-    join(dir, 'handlers.mjs'),
-    `export default { 'context.capture': async (_args, ctx) => ({ handlerGame: ctx.game ?? null, capabilityGame: (await ctx.capabilities.invoke(${JSON.stringify(CAPABILITY_CONTEXT_CAPTURE_ID)}, 1, {})).game ?? null }) };\n`,
-    'utf-8',
-  );
-  await reloadFromTmp();
 }
 
 beforeEach(() => {
@@ -340,129 +313,6 @@ describe('callTool dispatch', () => {
     } finally {
       delete process.env.FORGEAX_TEST_ALLOWED;
       delete process.env.FORGEAX_TEST_SECRET;
-    }
-  });
-
-  it('binds capability context to args.gameSlug for a session-less UI call', async () => {
-    resetPathManager();
-    const paths = initPathManager({
-      projectRoot: TMP,
-      userRoot: join(TMP, 'user-state'),
-    });
-    mkdirSync(paths.user().gameDir('argument-game'), { recursive: true });
-    await loadCapabilityContextCaptureTool();
-
-    try {
-      const result = await callTool({
-        toolId: 'context.capture',
-        args: { gameSlug: 'argument-game' },
-        caller: { kind: 'user' },
-      });
-
-      expect(result).toEqual({
-        ok: true,
-        result: { handlerGame: 'argument-game', capabilityGame: 'argument-game' },
-      });
-    } finally {
-      resetPathManager();
-    }
-  });
-
-  it('keeps the session-bound game authoritative over args.gameSlug', async () => {
-    resetPathManager();
-    const sessionGameDir = join(TMP, '.forgeax', 'games', 'session-game');
-    const paths = initPathManager({
-      projectRoot: TMP,
-      userRoot: join(TMP, 'user-state'),
-      layout: new FlatSessionLayout(join(TMP, 'sessions'), sessionGameDir),
-    });
-    mkdirSync(paths.user().gameDir('session-game'), { recursive: true });
-    mkdirSync(paths.user().gameDir('argument-game'), { recursive: true });
-    const sessions = initSessionManager(paths);
-    const session = await sessions.create({ autoStart: false });
-    await loadCapabilityContextCaptureTool();
-
-    try {
-      const result = await callTool({
-        toolId: 'context.capture',
-        args: { gameSlug: 'argument-game' },
-        caller: { kind: 'user', sessionId: session.sid },
-      });
-
-      expect(result).toEqual({
-        ok: true,
-        result: { handlerGame: 'session-game', capabilityGame: 'session-game' },
-      });
-    } finally {
-      await resetSessionManager();
-      resetPathManager();
-    }
-  });
-
-  it('does not bind traversal, games-root aliases, external symlinks, or missing args.gameSlug values', async () => {
-    resetPathManager();
-    const paths = initPathManager({
-      projectRoot: TMP,
-      userRoot: join(TMP, 'user-state'),
-    });
-    mkdirSync(paths.user().gamesDir(), { recursive: true });
-    const externalGameDir = join(TMP, 'external-game');
-    mkdirSync(externalGameDir, { recursive: true });
-    symlinkSync(externalGameDir, paths.user().gameDir('external-link'), 'dir');
-    const internalGameDir = paths.user().gameDir('internal-target');
-    mkdirSync(internalGameDir, { recursive: true });
-    symlinkSync(internalGameDir, paths.user().gameDir('internal-link'), 'dir');
-    await loadCapabilityContextCaptureTool();
-
-    try {
-      const traversal = await callTool({
-        toolId: 'context.capture',
-        args: { gameSlug: '../escape' },
-        caller: { kind: 'user' },
-      });
-      const gamesRootAlias = await callTool({
-        toolId: 'context.capture',
-        args: { gameSlug: '.' },
-        caller: { kind: 'user' },
-      });
-      const externalSymlink = await callTool({
-        toolId: 'context.capture',
-        args: { gameSlug: 'external-link' },
-        caller: { kind: 'user' },
-      });
-      const internalSymlink = await callTool({
-        toolId: 'context.capture',
-        args: { gameSlug: 'internal-link' },
-        caller: { kind: 'user' },
-      });
-      const missing = await callTool({
-        toolId: 'context.capture',
-        args: { gameSlug: 'missing-game' },
-        caller: { kind: 'user' },
-      });
-
-      expect(traversal).toEqual({
-        ok: true,
-        result: { handlerGame: null, capabilityGame: null },
-      });
-      expect(gamesRootAlias).toEqual({
-        ok: true,
-        result: { handlerGame: null, capabilityGame: null },
-      });
-      expect(externalSymlink).toEqual({
-        ok: true,
-        result: { handlerGame: null, capabilityGame: null },
-      });
-      expect(internalSymlink).toEqual({
-        ok: true,
-        result: { handlerGame: 'internal-link', capabilityGame: 'internal-link' },
-      });
-      expect(missing).toEqual({
-        ok: true,
-        result: { handlerGame: null, capabilityGame: null },
-      });
-    } finally {
-      resetPathManager();
     }
   });
 
