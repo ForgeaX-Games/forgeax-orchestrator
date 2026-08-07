@@ -20,7 +20,7 @@ function sourceFiles(dir: string): string[] {
 describe('workbench host dependency boundary', () => {
   test('pins the shared host release exactly', () => {
     const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
-    expect(manifest.dependencies?.['@forgeax/workbench-host']).toBe('0.2.6');
+    expect(manifest.dependencies?.['@forgeax/workbench-host']).toBe('0.2.0');
   });
 
   test('imports only contracts and Hono adapter subpaths', () => {
