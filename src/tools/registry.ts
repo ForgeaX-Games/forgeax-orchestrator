@@ -25,8 +25,6 @@
 import { getExtensionSnapshot } from '../extensions/registry';
 import type { ToolEntry } from '../extensions/kinds';
 import type { ToolCall, ToolResult, ImageGen } from '@forgeax/types';
-import { realpathSync, statSync } from 'node:fs';
-import { basename, isAbsolute, relative, sep } from 'node:path';
 import { getEventBus } from '../events/bus';
 import { isPaused } from '../runtime/pause';
 import { createImageGen } from '../lib/image-gateway/create-image-gen';
@@ -54,9 +52,8 @@ export type ToolHandler = (
     /** 用户数据根(`<projectRoot>/.forgeax/games/...` 所在);写用户工程数据的
      *  插件 handler 用此,而非 cwd(=插件安装目录)。宿主从 path-manager 注入。 */
     projectRoot: string;
-    /** 当前调用永久绑定的 game slug。session path/config 优先；无会话绑定时
-     *  可回落到已存在且经 PathManager 校验的 args.gameSlug。绝不回落全局
-     *  active game，避免写类工具跨项目漂移。 */
+    /** 当前调用会话永久绑定的 game slug。仅来自 session path/config；没有会话
+     *  绑定时省略，不回落全局 active game，避免写类工具跨项目漂移。 */
     game?: string;
     /** 宿主下注的图像生成能力(中立 @forgeax/types ImageGen 缝)。图像类插件
      *  handler 经此生图,不必反向 import 编排层的 vendor 实现。懒构造,非图像
@@ -246,41 +243,6 @@ function resolveSessionGame(req: ToolCall): string | undefined {
   }
 }
 
-/** Resolve an explicit game selected by a session-less UI/tool caller.
- *  PathManager remains the path/segment authority; the directory must exist
- *  and its parsed basename must still equal the caller's slug. Canonicalizing
- *  both paths additionally rejects symlinks outside the games root (or into a
- *  nested non-game directory) while retaining aliases to another direct child
- *  game. No `.forgeax/games` path is constructed here. */
-function resolveArgsGame(req: ToolCall): string | undefined {
-  if (typeof req.args !== 'object' || !req.args || Array.isArray(req.args)) return undefined;
-  const gameSlug = (req.args as Record<string, unknown>).gameSlug;
-  if (typeof gameSlug !== 'string' || !gameSlug) return undefined;
-  try {
-    const userPaths = getPathManager().user();
-    const gameDir = userPaths.gameDir(gameSlug);
-    if (!statSync(gameDir).isDirectory()) return undefined;
-    const parsedSlug = basename(gameDir);
-    if (parsedSlug !== gameSlug) return undefined;
-
-    const canonicalGamesRoot = realpathSync(userPaths.gamesDir());
-    const canonicalGameDir = realpathSync(gameDir);
-    const canonicalRelative = relative(canonicalGamesRoot, canonicalGameDir);
-    if (
-      !canonicalRelative ||
-      canonicalRelative === '..' ||
-      canonicalRelative.startsWith(`..${sep}`) ||
-      isAbsolute(canonicalRelative) ||
-      canonicalRelative.includes(sep)
-    ) {
-      return undefined;
-    }
-    return parsedSlug;
-  } catch {
-    return undefined;
-  }
-}
-
 function injectScopeSlugIfMissing(req: ToolCall, sessionGame?: string): void {
   if (typeof req.args !== 'object' || !req.args || Array.isArray(req.args)) return;
   if (!/^(gen3d|aiasset):/.test(req.toolId)) return;
@@ -366,7 +328,6 @@ export async function callTool(req: ToolCall): Promise<ToolResult> {
     return r;
   }
   const sessionGame = resolveSessionGame(req);
-  const capabilityGame = sessionGame ?? resolveArgsGame(req);
   injectScopeSlugIfMissing(req, sessionGame);
   try {
     const filteredEnv: Record<string, string | undefined> = {};
@@ -378,7 +339,7 @@ export async function callTool(req: ToolCall): Promise<ToolResult> {
       env: filteredEnv,
       cwd: entry.extensionDir,
       projectRoot,
-      ...(capabilityGame ? { game: capabilityGame } : {}),
+      ...(sessionGame ? { game: sessionGame } : {}),
     };
     const result = await handler(req.args, {
       caller: req.caller,
@@ -386,7 +347,7 @@ export async function callTool(req: ToolCall): Promise<ToolResult> {
       env: filteredEnv,
       cwd: entry.extensionDir,
       projectRoot,
-      ...(capabilityGame ? { game: capabilityGame } : {}),
+      ...(sessionGame ? { game: sessionGame } : {}),
       imageGen: createImageGen(filteredEnv),
       host: getHostAuthoring(),
       capabilities: createScopedExtensionCapabilities(capabilityContext),
