@@ -70,18 +70,7 @@ export function makeInProcessExecuteTool(
   const _requestToolApproval = deps.requestToolApproval ?? requestToolApproval;
   const _executeTool = deps.executeTool ?? executeTool;
   const projectMcp = createProjectMcpBridge(defaultProjectRoot());
-  return async (
-    name: string,
-    args: unknown,
-    sid?: string,
-    agentId?: string,
-    callId?: string,
-    turnCallId?: string,
-  ): Promise<unknown> => {
-    // 2026-08-06 外审根因:HostExecuteToolFn 的类型**早就声明**了 callId / turnCallId,
-    // 实现却只解构前四个 —— id 就在边界上被扔掉,于是工具审计账没有连接键,
-    // "哪次用户请求导致了哪次工具调用"只能靠时间戳猜。有值才带键(见 ToolAuditEntry)。
-    const trace = { ...(callId ? { callId } : {}), ...(turnCallId ? { turnCallId } : {}) };
+  return async (name: string, args: unknown, sid?: string, agentId?: string): Promise<unknown> => {
     if (!sid) throw new Error('forgeax-core kernel: missing hostSessionId for host-tool bridge');
     // Normalize catalog-derived ui_act_* and reject missing declarations before trust policy.
     const preflight = preflightUiToolDispatch(name, args, sid);
@@ -99,7 +88,7 @@ export function makeInProcessExecuteTool(
     const agent = session.scheduler.getAgent(agentPath);
     if (!agent) {
       // agent 不在线 —— trustTier 尚未求得,与 sessions.ts 一致记 'unknown' / allow=false。
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: name, trustTier: 'unknown', allow: false, error: `agent '${agentPath}' not live in session`, durationMs: Date.now() - start, ts: start });
+      appendToolAudit({ sid, agent: agentPath, tool: name, trustTier: 'unknown', allow: false, error: `agent '${agentPath}' not live in session`, durationMs: Date.now() - start, ts: start });
       throw new Error(`forgeax-core kernel: agent '${agentPath}' not live in session ${sid}`);
     }
 
@@ -120,7 +109,7 @@ export function makeInProcessExecuteTool(
     tt('htb.decision', { name, agent: agentPath, sid, trustTier, outcome: decision.outcome, cap: decision.capability });
     if (decision.outcome === 'deny') {
       // 信任闸硬拒 —— 审计记录 allow=false。
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: name, trustTier, allow: false, error: decision.reason ?? `denied by trust tier: ${name}`, durationMs: Date.now() - start, ts: start });
+      appendToolAudit({ sid, agent: agentPath, tool: name, trustTier, allow: false, error: decision.reason ?? `denied by trust tier: ${name}`, durationMs: Date.now() - start, ts: start });
       throw new Error(decision.reason ?? `denied by trust tier: ${name}`);
     }
     // ask:弹权限卡阻塞等用户(命中本会话 remember 直放);拒绝/超时 → 抛(fail-closed)。
@@ -143,7 +132,7 @@ export function makeInProcessExecuteTool(
       tt('htb.approval-result', { name, agent: agentPath, approved });
       if (!approved) {
         // 用户拒绝 —— 审计记录 allow=false。
-        appendToolAudit({ ...trace, sid, agent: agentPath, tool: name, trustTier, allow: false, error: 'denied by user', durationMs: Date.now() - start, ts: start });
+        appendToolAudit({ sid, agent: agentPath, tool: name, trustTier, allow: false, error: 'denied by user', durationMs: Date.now() - start, ts: start });
         throw new Error(`denied by user: ${name}`);
       }
     }
@@ -159,9 +148,6 @@ export function makeInProcessExecuteTool(
         projectRoot,
         agentId: agentPath,
         ...(scopeGame ? { game: scopeGame } : {}),
-        // 连接键往下传:产品壳的 host 工具(editor_ui_browse)据它把 ui-browse-metrics
-        // 连回主账本。不填的话上面那个字段就是个永不生效的声明 —— 那正是这轮在修的病。
-        ...(callId ? { callId: callId } : {}),
         eventBus: session.eventBus,
         sid,
       };
@@ -200,12 +186,12 @@ export function makeInProcessExecuteTool(
       }
       tt('htb.exec-done', { name, agent: agentPath, ms: Date.now() - start });
       // 工具执行成功 —— allow=true / ok=true。
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: name, trustTier, allow: true, ok: true, durationMs: Date.now() - start, ts: start });
+      appendToolAudit({ sid, agent: agentPath, tool: name, trustTier, allow: true, ok: true, durationMs: Date.now() - start, ts: start });
       return out;
     } catch (e) {
       tt('htb.exec-error', { name, agent: agentPath, ms: Date.now() - start, err: (e as Error).message });
       // 工具执行抛出 —— allow=true / ok=false,审计后照旧 rethrow。
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: name, trustTier, allow: true, ok: false, error: (e as Error).message, durationMs: Date.now() - start, ts: start });
+      appendToolAudit({ sid, agent: agentPath, tool: name, trustTier, allow: true, ok: false, error: (e as Error).message, durationMs: Date.now() - start, ts: start });
       throw e;
     }
   };

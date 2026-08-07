@@ -22,9 +22,6 @@ import { defaultProjectRoot } from '@forgeax/platform-io';
 import { getPathManager } from '../fs/path-manager';
 import { resolveAsk } from '../core/ask-user-registry';
 import { randomUUID } from 'node:crypto';
-import { findVisibleDoor } from '../kernel/action-door';
-import { catalogGet } from '../kernel/action-catalog';
-import { getSurfaceSnapshot, listSurfaces, shellLivePages, multiPageHint } from './bus';
 import { registerPermission, resolvePermission } from '../core/permission-registry';
 import { registerPerception, resolvePerception, pushPerceptionNote } from './lib/perception-registry';
 import { acquireUiLease, setUiManifest, uiInvokeTimeoutMs } from './lib/ui-manifest-registry';
@@ -490,10 +487,6 @@ export function createSessionsRouter() {
   // host-tool 的调用 HTTP 回调到这里:定位活 agent → 信任闸 → host 侧执行 → 回结果。
   // 信任闸(T-D)在此**唯一闸口**:trustTier 权威 = R6 loadAgentRecord 按加载路径定,
   // 不信子进程上报。fail-closed:任何缺失/异常都按 deny / error 返回(不静默放行)。
-  // 多页帮手已单源化到 api/bus(shellLivePages / multiPageHint)。
-  // 统一协议改道(walkDoorInstead)已于 2026-08-06 移至 kernel/door-reroute.ts ——
-  // 收口装在能力实现层(runForgeaxBuiltinTool 的 ui_invoke 分支),本路由与原生
-  // 内核的 host-tool-bridge 两张嘴共用一份,不再只盖 HTTP 这一口(B3)。
   r.post('/:sid/kernel-tool', async (c) => {
     const sid = c.req.param('sid');
     const start = Date.now();
@@ -501,16 +494,6 @@ export function createSessionsRouter() {
     const agentPath = typeof body.agentPath === 'string' && body.agentPath ? body.agentPath : 'forge';
     let toolName = typeof body.toolName === 'string' ? body.toolName : '';
     let args = body.args && typeof body.args === 'object' ? (body.args as Record<string, unknown>) : {};
-    // 连接键(2026-08-06 外审):租用内核走的就是这条 HTTP 口。非字符串/空串一律当缺失,
-    // 有值才带键 —— 消费方据"有没有这个键"判断能不能 join,写空串会让它连到错的地方。
-    const auditCallId = typeof body.callId === 'string' && body.callId.trim() ? body.callId.trim() : undefined;
-    const auditTurnCallId = typeof body.turnCallId === 'string' && body.turnCallId.trim() ? body.turnCallId.trim() : undefined;
-    // MCP shim 自铸的**这一次宿主执行**的 id。租用内核走的就是这条口,而内核铸的 callId
-    // 结构上过不了 MCP(tools/call 只有 name+arguments)—— 所以这条路上通常只有它。
-    // 两个键语义不同,谁都不许顶替谁:callId = 模型发起的那次调用;toolExecutionId = 落到
-    // 宿主的那一次执行。同一轮里连跑两个一模一样的 act,靠的就是后者才分得开。
-    const auditToolExecutionId = typeof body.toolExecutionId === 'string' && body.toolExecutionId.trim() ? body.toolExecutionId.trim() : undefined;
-    const trace = { ...(auditCallId ? { callId: auditCallId } : {}), ...(auditTurnCallId ? { turnCallId: auditTurnCallId } : {}), ...(auditToolExecutionId ? { toolExecutionId: auditToolExecutionId } : {}) };
     if (!toolName) return c.json({ ok: false, error: 'toolName required' }, 400);
     // Normalize catalog-derived ui_act_* and reject missing declarations before trust policy.
     const preflight = preflightUiToolDispatch(toolName, args, sid);
@@ -522,7 +505,7 @@ export function createSessionsRouter() {
     const agent = session.scheduler.getAgent(agentPath);
     if (!agent) {
       // agent 不在线 —— 审计记录 allow=false
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier: 'unknown', allow: false, error: `agent '${agentPath}' not live in session`, durationMs: Date.now() - start, ts: start });
+      appendToolAudit({ sid, agent: agentPath, tool: toolName, trustTier: 'unknown', allow: false, error: `agent '${agentPath}' not live in session`, durationMs: Date.now() - start, ts: start });
       return c.json({ ok: false, error: `agent '${agentPath}' not live in session` });
     }
 
@@ -549,7 +532,7 @@ export function createSessionsRouter() {
     });
     if (decision.outcome === 'deny') {
       // 信任闸硬拒 —— 审计记录 allow=false
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: false, error: decision.reason ?? 'denied by trust tier', durationMs: Date.now() - start, ts: start });
+      appendToolAudit({ sid, agent: agentPath, tool: toolName, trustTier, allow: false, error: decision.reason ?? 'denied by trust tier', durationMs: Date.now() - start, ts: start });
       return c.json({ ok: false, error: decision.reason ?? 'denied by trust tier' });
     }
     // ask:弹权限卡阻塞等用户(命中本会话 remember 直放);拒绝/超时 → 审计 + 拒。
@@ -569,7 +552,7 @@ export function createSessionsRouter() {
         ...(decision.reason ? { reason: decision.reason } : {}),
       });
       if (!approved) {
-        appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: false, error: 'denied by user', durationMs: Date.now() - start, ts: start });
+        appendToolAudit({ sid, agent: agentPath, tool: toolName, trustTier, allow: false, error: 'denied by user', durationMs: Date.now() - start, ts: start });
         return c.json({ ok: false, error: `denied by user: ${toolName}` });
       }
     }
@@ -587,11 +570,6 @@ export function createSessionsRouter() {
         projectRoot,
         agentId: agentPath,
         ...(scopeGame ? { game: scopeGame } : {}),
-        // 连接键往下传:产品壳的 host 工具(editor_ui_browse)据它把 ui-browse-metrics
-        // 连回主账本。不填的话上面那个字段就是个永不生效的声明 —— 那正是这轮在修的病。
-        ...(auditCallId ? { callId: auditCallId } : {}),
-        // 租用内核路径上,产品壳 host 工具(editor_ui_browse)的旁账只有这个键可连。
-        ...(auditToolExecutionId ? { toolExecutionId: auditToolExecutionId } : {}),
         eventBus: session.eventBus,
         sid,
       };
@@ -606,16 +584,16 @@ export function createSessionsRouter() {
           : rawErr instanceof Error ? rawErr.message
           : JSON.stringify(rawErr);
         // 工具执行返回 error 字段 —— ok=false
-        appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: false, error: errMsg, durationMs: Date.now() - start, ts: start });
+        appendToolAudit({ sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: false, error: errMsg, durationMs: Date.now() - start, ts: start });
         return c.json({ ok: false, error: errMsg });
       }
       // 工具执行成功
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: true, durationMs: Date.now() - start, ts: start });
+      appendToolAudit({ sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: true, durationMs: Date.now() - start, ts: start });
       return c.json({ ok: true, result: out });
     } catch (err: any) {
       const errMsg = err?.message ?? String(err);
       // 工具执行抛出异常
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: false, error: errMsg, durationMs: Date.now() - start, ts: start });
+      appendToolAudit({ sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: false, error: errMsg, durationMs: Date.now() - start, ts: start });
       return c.json({ ok: false, error: errMsg });
     }
   });
@@ -841,10 +819,6 @@ export function createSessionsRouter() {
     } finally {
       handle.dispose();
     }
-    // door 注解不在这里挂:ui_invoke 的真实链路是 MCP shim → /:sid/kernel-tool →
-    // runForgeaxBuiltinTool(进程内 perceptionQuery),从不经过本 HTTP 路由 ——
-    // 2026-08-05 终审发现挂在这里的注解对 agent 是死代码。现在注解长在能力实现层
-    // (forgeax-builtin-tools 的 ui_invoke 分支,annotateUiInvokeResult),两个执行口都盖。
     return c.json({ ok: true, reqId, snapshot });
   });
 

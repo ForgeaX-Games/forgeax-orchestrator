@@ -68,7 +68,6 @@ export function toWireEvents(ev: KernelEvent, st: WireFoldState): ChatEvent[] {
     case 'x.subagent.turn':
     case 'x.subagent.tool':
     case 'x.subagent.done':
-    case 'x.kernel.thread':
       return [];
     // 可观测性事件(压缩边界 / API 重试),wire ChatEvent 无对应 → 丢弃
     case 'compact_boundary':

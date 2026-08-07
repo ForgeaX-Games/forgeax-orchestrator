@@ -22,7 +22,6 @@
  *  事件类型来自 ChatEvent union（token / thinking / tool-call / tool-result / done / error）。
  */
 
-import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import {
@@ -48,8 +47,6 @@ import { toWireEvents, newWireFoldState } from "../../kernel/to-wire-events";
 import type { AgentKernel } from "@forgeax/agent-runtime";
 import { kernelEnabled } from "../../kernel/kernel-mode";
 import { transcribeKernelTurn } from "../../kernel/transcribe-turn";
-import { hostTelemetryEnabled } from "../../kernel/host-telemetry";
-import { startCliKernelTurn, unwrapMcpResultEnvelope, type CliKernelTurnTrace } from "../../kernel/cli-kernel-trace";
 import { tt, ttEnabled } from "../../lib/turn-trace";
 import { formatCacheHitRatio } from "../../lib/cache-ratio";
 import { getExtensionSnapshot } from "../../extensions/registry";
@@ -78,10 +75,6 @@ interface ChatBody {
   attachments?: Array<Record<string, unknown>>;
   /** 本轮期望回复语言(UI 结算)。透传进 composeTurnRequest → dynamicSuffix 指令。 */
   replyLanguage?: "en" | "zh";
-  /** 浏览器 `ui.request` span 的 W3C traceparent —— 服务端的 kernel.turn 挂在它下面,
-   *  链才连得起 `ui.send → ui.request → kernel.turn → agent.run → tool`。
-   *  缺失时服务端自建 root trace(链仍成立,只是少了浏览器那两段),**不伪造父 id**。 */
-  traceparent?: string;
 }
 
 interface CancelBody {
@@ -224,9 +217,6 @@ export function createCliRouter() {
     //    toWireEvents → SSE。前端按 event 名消费,零改。旧 cli-provider 路径见下方(默认 fallback)。
     if (kernelEnabled()) {
       const callId = typeof body.callId === "string" && body.callId.trim() ? body.callId.trim() : undefined;
-      // 一次生成、两处使用:compose 写进 manifest,转录写进 hook:turnStart。
-      // 这是"哪条工具面对应真正执行的那一轮"的连接键。
-      const turnAttemptId = randomUUID();
       const agentId = body.agentId ?? "default";
       // 该 agent 的插件 host-tools(exposedToAI + 命中 agent.json host-tools allow)→
       // extraTools 下发内核。conscious-agent 路径经 kits 桥自带这步;/api/cli/chat
@@ -246,7 +236,6 @@ export function createCliRouter() {
         turnReq = await composeTurnRequest({
           message,
           agentId,
-          turnAttemptId,
           kernel: selectedKernel,
           threadId: body.threadId,
           sessionId: body.sessionId,
@@ -313,58 +302,14 @@ export function createCliRouter() {
         // 内核 id 即 wire/账本的 providerId(claude-code / codex / forgeax-core)。
         // 在 try 外声明,让 finally 的账本转录也能拿到(刷新后据此还原来源 badge)。
         let providerId = "claude-code";
-        // 第 2 层全链路 trace(2026-08-06 外审):此前**只有** core/kernel-turn.ts 那条路
-        // 装了 kernel.turn span,而模型选择器里显式选 CLI 内核时走的是本路由 —— 于是
-        // 真实会话 0 个 span。磁盘实证:codex 35 个会话仅 5 个有 trace(那 5 个走原生
-        // 入口)。护栏/观测只装一个执行口、另一口整条绕开,这个病本工作流已犯过两次;
-        // 这里与 runKernelTurn 同名同形补上第二口。
-        let cliTrace: CliKernelTurnTrace | null = null;
-        let kernelRunFailed = false;
-        let kernelRunError: unknown;
         // 在 try 外声明,让 catch 能拿到内核去 probe(区分「内核不可用」与「运行时报错」)。
         // resolveKernel 抛错(unknown-id / not-registered)时它保持 null,由 err 自身分类。
         let kernel: AgentKernel | null = selectedKernel;
         try {
-          if (selectedKernel.id !== "forgeax-core" && hostTelemetryEnabled()) {
-            const tp = typeof body.traceparent === "string" && body.traceparent.trim() ? body.traceparent.trim() : undefined;
-            cliTrace = startCliKernelTurn({
-              kernelId: selectedKernel.id,
-              agentId,
-              ...(body.sessionId?.trim() ? { sid: body.sessionId.trim() } : {}),
-              ...(tp ? { traceparent: tp } : {}),
-            });
-          }
-        } catch { /* 遥测绝不反噬聊天主流程 */ }
-        try {
           providerId = selectedKernel.id;
           for await (const kev of kernel.runTurn(turnReq, ac.signal)) {
-            // x.* 观测事件在 wire 层没有对应类型(toWireEvents 对它们返回 []),
-            // 所以必须在这里单独落账 —— 否则**在租用内核实际走的这条路径上**它们被
-            // 静默丢弃。2026-08-05 终审实测:codex 会话账本里 x.kernel.thread 零命中,
-            // 而它承载的正是"本会话 ↔ 哪份内核转录"这个不落盘就永久丢失的指针。
-            // native 路径由 core/kernel-turn.ts 负责同样的事,两条路各管各的。
-            // 2026-08-06(外审#四):直写 ledger,不再经 eventBus.publish —— bus 的
-            // tree 门在 agent 未 scaffold 时 `candidates.length === 0` 就静默 return,
-            // 这条指针会无声消失。x.tools.manifest 走的就是 append 直写,同一 PR 里
-            // 知道正确做法却对新事件用了错的那套 —— 现在两条对齐。
-            const kind = (kev as { kind?: unknown }).kind;
-            if (typeof kind === 'string' && kind.startsWith('x.') && persistSession && persistAgent) {
-              try {
-                persistSession.getOrCreateLedger(persistAgent).append(
-                  { type: kind, ts: Date.now(), source: `agent:${persistAgent}`, payload: kev as unknown as Record<string, unknown> },
-                  persistAgent,
-                );
-              } catch { /* 观测通道绝不影响主流程 */ }
-            }
             for (const wire of toWireEvents(kev, fold)) {
-              let out: ChatEvent = { ...wire, providerId };
-              // 工具结果必须在**写进 SSE 之前**处理:先把连接键取给 span,再把 MCP 信封剥掉。
-              // 顺序反了就白做 —— 前端 store 只认字符串 result,信封一旦发出去,工具卡的正文
-              // 就整段消失。剥的逻辑与 core/kernel-turn.ts 共用同一份(两个执行口从不各写各的)。
-              if (out.type === "tool-result") {
-                cliTrace?.onToolResult(out.callId, out.ok, out.result, out.error);
-                out = { ...out, result: unwrapMcpResultEnvelope(out.result) };
-              }
+              const out: ChatEvent = { ...wire, providerId };
               // 内核 yield 出的终态 error(如第三方 CLI 未装 → spawn ENOENT 被 kernel 包成
               // code:'protocol' 的裸串)在这里统一翻成友好文案:probe 内核确认是否真不可用,
               // 是 → kernel_unavailable + 成因指引;否 → 保留原 code(真·运行时报错)。
@@ -377,10 +322,7 @@ export function createCliRouter() {
               switch (out.type) {
                 case "token": asstText += out.text ?? ""; break;
                 case "thinking": thinkingText += out.text ?? ""; break;
-                // 第 4 层 tool span —— 与 core/kernel-turn.ts 调同一个状态机(cli-kernel-trace)。
-                // 观测异常由该模块内部吞掉,这里不再包一层,免得两口的降级策略各写各的又走偏。
-                // (tool-result 的 onToolResult 在上面 writeSSE 之前已调,此处只落账本。)
-                case "tool-call": cliTrace?.onToolCall(out.callId, out.name); toolEvents.push({ kind: "call", callId: out.callId, name: out.name, args: out.args }); break;
+                case "tool-call": toolEvents.push({ kind: "call", callId: out.callId, name: out.name, args: out.args }); break;
                 case "tool-result": toolEvents.push({ kind: "result", callId: out.callId, ok: out.ok, result: out.result, error: out.error }); break;
                 case "done": {
                   stopReason = out.stopReason; usage = out.usage;
@@ -410,33 +352,12 @@ export function createCliRouter() {
             }
           }
         } catch (err: any) {
-          kernelRunFailed = true;
-          kernelRunError = err;
           // 单一翻译点:内核不可用(resolveKernel 抛 KernelUnavailableError,或 probe 判定
           // 内核 down)→ 友好 kernel_unavailable + 成因;真·运行时报错(网络/LLM/工具)→
           // 保留原样并标 turn_failed,不再被 catch-all 一律误标成 kernel_unavailable。
           const payload = await toKernelErrorPayload(kernel, err);
           await sse.writeSSE({ event: "error", data: JSON.stringify({ ...payload, providerId }) });
         } finally {
-          // span 必须在 finally 收口:抛异常/被 abort 时也要收。收不了口的 kernel.turn
-          // 是这套 trace 用来定位「卡在内核」的信号,漏收会变成误报源。
-          try {
-            const u = usage as { inputTokens?: unknown; outputTokens?: unknown } | undefined;
-            const traceUsage = u && typeof u.inputTokens === "number" && Number.isFinite(u.inputTokens)
-              && typeof u.outputTokens === "number" && Number.isFinite(u.outputTokens)
-              ? { inputTokens: u.inputTokens, outputTokens: u.outputTokens }
-              : undefined;
-            const cancelled = stopReason === "cancelled" || ac.signal.aborted;
-            cliTrace?.end({
-              ok: !kernelRunFailed && !cancelled,
-              reason: stopReason,
-              ...(typeof turnReq.model === "string" && turnReq.model ? { model: turnReq.model } : {}),
-              ...(traceUsage ? { usage: traceUsage } : {}),
-              ...(kernelRunFailed
-                ? { error: kernelRunError instanceof Error ? kernelRunError.message : String(kernelRunError) }
-                : {}),
-            });
-          } catch { /* 遥测收口失败静默降级 */ }
           c.req.raw.signal.removeEventListener("abort", onAbort);
           // Transcribe the kernel turn into the host-owned ledger (kernel-agnostic,
           // keyed to `persistAgent` = the agentId the UI replays with). Direct WAL
@@ -456,7 +377,6 @@ export function createCliRouter() {
                   ? { attachments: turnReq.input.attachments as Array<Record<string, unknown>> }
                   : {}),
                 ...(turnReq.historyPlan ? { historyPlan: turnReq.historyPlan } : {}),
-                turnAttemptId,
                 toolEvents,
               });
             } catch (e) {

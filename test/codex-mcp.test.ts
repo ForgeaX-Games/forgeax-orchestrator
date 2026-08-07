@@ -492,54 +492,6 @@ describe('forgeax-tools-server — double allowlist (process-level)', () => {
       srv.close();
     }
   });
-
-  // 2026-08-06 外审②:codex 铸的 callId 结构上不过 MCP(tools/call 只有 name+arguments),
-  // 所以宿主执行的连接键必须由 shim 自铸、随结果回传。这几条钉的就是那把键。
-  test('每次 tools/call 回一个自铸的 toolExecutionId —— 宿主执行的连接键', async () => {
-    const { mkdtempSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
-    const dir = mkdtempSync(join(tmpdir(), 'fxt-execid-'));
-    const specsFile = join(dir, 'specs.json');
-    writeFileSync(
-      specsFile,
-      JSON.stringify([{ name: 'my_host_tool', description: 'x', inputSchema: { type: 'object', properties: {} } }]),
-    );
-    const srv = spawnServer({ FORGEAX_TOOL_SPECS_FILE: specsFile });
-    try {
-      await srv.rpc('initialize', { protocolVersion: '2024-11-05' });
-      // 桥不可用(无 SERVER_URL)也照样回 id —— 宿主没记上这一行时,要能看出"有 id 但旁账
-      // 查无此行"(可观察的缺席),而不是根本无从查起。
-      const a = await srv.rpc('tools/call', { name: 'my_host_tool', arguments: {} });
-      const b = await srv.rpc('tools/call', { name: 'my_host_tool', arguments: {} });
-      const idA = a.result.structuredContent?.forgeax?.toolExecutionId;
-      const idB = b.result.structuredContent?.forgeax?.toolExecutionId;
-      expect(idA).toMatch(/^fxt-[0-9a-f-]{36}$/);
-      // **同名同参连调两次必须拿到两个不同的 id** —— 这正是外审的验收判据:
-      // 一对一关联不能靠工具名、顺序或时间戳。
-      expect(idB).not.toBe(idA);
-      // 文本正文不受影响(协议层只对带 content 数组的对象原样透传,回裸串会把键丢掉)。
-      expect(a.result.content?.[0]?.text).toContain('bridge unavailable');
-      expect(a.result.isError).toBe(true);
-    } finally {
-      srv.close();
-    }
-  });
-
-  test('前缀 fxt- 与内核 callId 可辨 —— 两个语义不许互相冒充', async () => {
-    const srv = spawnServer({ FORGEAX_FXT_EXPOSE: 'ui_snapshot' });
-    try {
-      await srv.rpc('initialize', { protocolVersion: '2024-11-05' });
-      const r = await srv.rpc('tools/call', { name: 'ui_snapshot', arguments: {} });
-      const id: string = r.result.structuredContent?.forgeax?.toolExecutionId;
-      expect(id.startsWith('fxt-')).toBe(true);
-      // codex 的两种调用 id 形态都不以 fxt- 开头,一眼可辨。
-      expect(id.startsWith('call_')).toBe(false);
-      expect(id.startsWith('exec-')).toBe(false);
-    } finally {
-      srv.close();
-    }
-  });
 });
 
 describe('permission-server — shared MCP protocol (process-level)', () => {

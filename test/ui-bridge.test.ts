@@ -559,9 +559,7 @@ describe('P1-8 headless 回落 — surface both/server 的 ui_invoke', () => {
         eventBus: replyingBus({ unavailable: true, reason: 'surface unavailable' }, lease),
       },
     );
-    const { door: outDoor, ...outRest } = out as Record<string, unknown> & { door?: { certainty?: string } };
-    expect(typeof outDoor?.certainty).toBe('string'); // door 注解必带(2026-08-05 终审 P0)
-    expect(outRest).toEqual({ unavailable: true, reason: 'surface unavailable' });
+    expect(out).toEqual({ unavailable: true, reason: 'surface unavailable' });
     expect(handlerCalls).toBe(0);
   });
 

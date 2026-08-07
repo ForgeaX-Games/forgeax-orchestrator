@@ -23,7 +23,7 @@ import type { BlackboardAPI } from './types';
 import { resolveKernel } from '../kernel/resolve-kernel';
 import { tt } from '../lib/turn-trace';
 import { hostTelemetryEnabled } from '../kernel/host-telemetry';
-import { startCliKernelTurn, unwrapMcpResultEnvelope, type CliKernelTurnTrace } from '../kernel/cli-kernel-trace';
+import { startCliKernelTurn, type CliKernelTurnTrace } from '../kernel/cli-kernel-trace';
 import { deriveThreadId } from '../lib/thread-id';
 
 /** `turn.done.reason === 'error'` 但上游没发过显式 error 事件时,合成可读错误——
@@ -139,9 +139,6 @@ export async function runKernelTurn(opts: KernelTurnOpts): Promise<{ aborted: bo
           break;
         case 'tool.call': {
           toolName.set(ev.callId, ev.name);
-          // 第 4 层 tool span。状态机在 cli-kernel-trace 里只有一份,两个执行口各调各的 ——
-          // 本工作流三次栽在「只装一个执行口」,这次从结构上不给第二份实现存在的机会。
-          cliTrace?.onToolCall(ev.callId, ev.name);
           const args = (ev.args ?? {}) as Record<string, unknown>;
           eventBus.hook(Hook.StreamLLM, {
             chunk: { type: 'tool_call', id: ev.callId, name: ev.name, arguments: JSON.stringify(args) },
@@ -156,13 +153,7 @@ export async function runKernelTurn(opts: KernelTurnOpts): Promise<{ aborted: bo
             turn,
           });
           break;
-        case 'tool.result': {
-          // 收口第 4 层。result 里若带 shim 自铸的 toolExecutionId,由 tracer 取出记进 span
-          // attrs —— 那是把这次调用连到两份旁账的唯一键。**取键在剥信封之前**。
-          cliTrace?.onToolResult(ev.callId, ev.ok, ev.result, ev.error);
-          // 连接键已经进了 span,信封到此为止:再往下就是账本 / 历史 / 工具卡,它们要的是
-          // 工具真正说的那句话,不是传输层元数据。
-          const toolResult = unwrapMcpResultEnvelope(ev.result);
+        case 'tool.result':
           // P0(历史归属):把工具结果**内容**也带进 bus → 落 per-agent 账本,让 forgeax
           // 拥有可回放的完整一轮(此前只记 name+durationMs,丢了 result)。kernel-neutral:
           // claude-code / codex / forgeax-core 的 tool.result 都带 {callId,ok,result}。
@@ -171,11 +162,10 @@ export async function runKernelTurn(opts: KernelTurnOpts): Promise<{ aborted: bo
             callId: ev.callId,
             durationMs: 0,
             ok: ev.ok,
-            ...(toolResult !== undefined ? { result: toolResult } : {}),
+            ...(ev.result !== undefined ? { result: ev.result } : {}),
             ...(ev.ok ? {} : { error: ev.error ?? 'tool failed' }),
           });
           break;
-        }
         case 'turn.usage':
           usage = { inputTokens: ev.inputTokens ?? 0, outputTokens: ev.outputTokens ?? 0 };
           eventBus.hook(Hook.StreamLLM, {

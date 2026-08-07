@@ -167,10 +167,7 @@ describe('ActionCatalog trust matrix', () => {
             eventBus: { publish: () => publishes++ },
           },
         );
-        // ui_invoke 结果自 2026-08-05 起必带 door 注解(能力层挂载,终审 P0 修复)。
-        const { door: resultDoor, ...resultRest } = result as Record<string, unknown> & { door?: { certainty?: string } };
-        expect(typeof resultDoor?.certainty).toBe('string');
-        expect(resultRest).toEqual({
+        expect(result).toEqual({
           status: 'completed',
           stateDigest: { actionId, args: {} },
           executedVia: 'headless',
@@ -276,9 +273,7 @@ describe('ActionCatalog cross-cutting invariants', () => {
         eventBus: { publish: () => publishes++ },
       },
     );
-    const { door: annotatedDoor, ...resultSansDoor } = result as Record<string, unknown> & { door?: { certainty?: string } };
-    expect(typeof annotatedDoor?.certainty).toBe('string');
-    expect(resultSansDoor).toEqual({
+    expect(result).toEqual({
       unavailable: true,
       reason: 'no live UI executor binding for action "role.open"',
     });
@@ -301,9 +296,7 @@ describe('ActionCatalog cross-cutting invariants', () => {
         eventBus: { publish: () => publishes++ },
       },
     );
-    const { door: annotatedDoor, ...resultSansDoor } = result as Record<string, unknown> & { door?: { certainty?: string } };
-    expect(typeof annotatedDoor?.certainty).toBe('string');
-    expect(resultSansDoor).toEqual({
+    expect(result).toEqual({
       status: 'completed',
       stateDigest: { actionId, args: {} },
       executedVia: 'headless',
