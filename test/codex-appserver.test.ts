@@ -11,6 +11,7 @@ import {
   createCodexNotifState,
   mapCodexNotification,
 } from '../src/kernel/codex-appserver';
+import { readToolExecutionId } from '../src/kernel/cli-kernel-trace';
 
 function drain(fn: (q: KernelEventQueue) => void) {
   const q = new KernelEventQueue();
@@ -164,14 +165,39 @@ describe('codex-appserver mapNotification', () => {
     expect(out[1]).toEqual({ kind: 'tool.result', callId: 'm3', ok: true, result: '{"count":0}' });
   });
 
-  test('mcpToolCall failed → tool.result not ok with error message', async () => {
+  test('mcpToolCall 失败 → tool.result 不 ok,且**必须带 result**', async () => {
     const st = createCodexNotifState();
     const q = new KernelEventQueue();
     mapCodexNotification('item/started', { item: { id: 'm4', type: 'mcpToolCall', server: 'fxt', tool: 'boom' } }, st, q);
     mapCodexNotification('item/completed', { item: { id: 'm4', type: 'mcpToolCall', status: 'failed', error: { message: 'kaboom' } } }, st, q);
     q.end();
     const out = await collect(q);
-    expect(out[1]).toEqual({ kind: 'tool.result', callId: 'm4', ok: false, error: 'kaboom' });
+    // 连接键就在结果里 —— 失败事件也得带 result。item 没给 result 时稳定产出空串,
+    // 让下游"读不到键"是可观察的缺席,而不是根本没有这个字段可读。
+    expect(out[1]).toEqual({ kind: 'tool.result', callId: 'm4', ok: false, error: 'kaboom', result: '' });
+  });
+
+  test('失败结果里的连接键必须跨过适配层 —— 失败行最有审计价值', async () => {
+    // 2026-08-06 外审 MAJOR-2:宿主工具返回 error → MCP 结果 isError:true → codex 把 item
+    // 标成失败。此前失败分支只 push error,于是真实 NOT_FOUND 路径永远跨不了账本。
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('item/completed', {
+      item: {
+        id: 'm9', type: 'mcpToolCall', server: 'fxt', tool: 'editor_ui_browse', status: 'failed',
+        result: {
+          content: [{ type: 'text', text: '{"ok":false,"error":{"code":"not_found"}}' }],
+          structuredContent: { forgeax: { toolExecutionId: 'fxt-fail-1' } },
+          isError: true,
+        },
+      },
+    }, st, q);
+    q.end();
+    const out = await collect(q);
+    const ev = out.find((c) => c.kind === 'tool.result');
+    if (ev?.kind !== 'tool.result') throw new Error('缺少 tool.result 事件');
+    expect(ev.ok).toBe(false);
+    expect(readToolExecutionId(ev.result)).toBe('fxt-fail-1');
   });
 
   test('mcpToolCall preserves structuredContent alongside text', async () => {

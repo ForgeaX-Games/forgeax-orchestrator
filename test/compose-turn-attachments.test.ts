@@ -80,6 +80,14 @@ describe('composeTurnRequest selected-kernel policy', () => {
     ]);
     expect(JSON.stringify(req)).not.toMatch(/QUJD|REVG|R0hJ/);
     expect(req.input.text).toContain('/uploads/data.zip');
+
+    // manifest 的轮序连接键:上一轮已转录(账本里有 1 条 user_input),本轮 compose
+    // 在轮开始时取 nextTurnOrdinal() 应为 2 —— 与本轮转录后 hook:turnStart.payload.turn
+    // 同值。此前 manifest 只有依赖调用方传入的 callId(FORGE 前端不传,实测三条全空),
+    // 配轮只能靠文件相邻。
+    const events = await session.getOrCreateLedger('forge').readAllEvents();
+    const manifest = events.find((event) => event.type === 'x.tools.manifest');
+    expect((manifest?.payload as { turn?: number } | undefined)?.turn).toBe(2);
     unregisterKernel('explicit-native');
   });
 

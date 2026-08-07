@@ -38,6 +38,18 @@ afterEach(() => {
 });
 
 describe('ActionCatalog', () => {
+
+  test('door 门位事实经构建原样存活 —— 白名单丢弃会让咽喉改道整条失效', () => {
+    // 2026-08-05 实测:compileEntry 白名单没放行 door,catalogGet 拿不到别名事实,
+    // findVisibleDoor 配不出 game.switch 的门,ui_act_game_switch 又走回无头直调。
+    buildActionCatalog(undefined, registryOptions());
+    expect(catalogGet('game.switch')?.door).toEqual({ menuCommandId: 'game.pick' });
+    // 2026-08-06 rail 死门下线:host.sidebar 无发布者,railTab/railMode 声明会把
+    // agent 以最高置信度指向必死的 open('rail:...')。撤声明后这两个能力回到
+    // "门位未知"的诚实态;rail 重新发布前,这里断言它们**不许**带 door 事实。
+    expect(catalogGet('role.open')?.door).toBeUndefined();
+    expect(catalogGet('app.set_mode')?.door).toBeUndefined();
+  });
   test('atomically assembles all 25 trusted action declarations', () => {
     const catalog = catalogAll();
 

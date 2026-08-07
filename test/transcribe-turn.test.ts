@@ -33,6 +33,101 @@ afterEach(async () => {
 });
 
 describe("transcribeKernelTurn — host-owned, kernel-agnostic ledger", () => {
+  test("轮序递增、工具名回填、时间戳来源如实标注 —— 账本要能当训练数据切分", async () => {
+    // 2026-08-05:这三样此前是硬编码 —— `turn: 1` 三处字面量(每轮都记第 1 轮,
+    // 账本按轮切不开)、toolResult 的 `name: ""`(工具名丢失)、`durationMs: 0`
+    // (这里根本没测量,写 0 是假值)。另:本函数在整轮结束后**批量**写入,
+    // 所有 ts 都是转录时刻而非事件时刻(实测 52 事件挤进 12 毫秒),故如实标 tsSource。
+    const session = await getSessionManager().create({ displayName: "t" });
+    const agentId = "forge";
+    const turn = (message: string) =>
+      transcribeKernelTurn(session, agentId, {
+        message,
+        asstText: "ok",
+        thinkingText: "",
+        stopReason: "end_turn",
+        model: "gpt-5.6-sol",
+        toolEvents: [
+          { kind: "call", callId: "c1", name: "editor_ui_browse", args: { verb: "look" } },
+          { kind: "result", callId: "c1", ok: true, result: { ok: true } },
+        ],
+      });
+
+    turn("第一轮");
+    turn("第二轮");
+    turn("第三轮");
+
+    const events = await session.getOrCreateLedger(agentId).readAllEvents();
+    const turns = (type: string) =>
+      events.filter((e) => e.type === type).map((e) => (e.payload as { turn?: number }).turn);
+    expect(turns("hook:turnStart")).toEqual([1, 2, 3]);
+    expect(turns("hook:assistantMessage")).toEqual([1, 2, 3]);
+    expect(turns("hook:turnEnd")).toEqual([1, 2, 3]);
+
+    // 工具名按 callId 回填,不再是空串
+    const results = events.filter((e) => e.type === "hook:toolResult");
+    expect(results.map((e) => (e.payload as { name?: string }).name)).toEqual([
+      "editor_ui_browse", "editor_ui_browse", "editor_ui_browse",
+    ]);
+    // 未测量的耗时宁可缺字段也不写假 0
+    expect((results[0]!.payload as { durationMs?: number }).durationMs).toBeUndefined();
+    // 每条都标注时间戳来源 —— 消费方据此知道真实时序要去内核 rollout 取
+    for (const e of events) {
+      expect((e.payload as { tsSource?: string }).tsSource).toBe("transcription");
+    }
+  });
+
+  test("工具返回体里嵌套 {type:'user_input'} 不会虚增轮序 —— 子串判据的坑", async () => {
+    // 2026-08-05 终审实测:计数曾用 `line.includes('\"user_input\"')`,而 agent
+    // **回读自己的轨迹账本**时返回体里就全是这种对象(序列化后不被转义),
+    // 实测轮序从 [1,2] 变成 [1,3]。而回读账本正是本项目沉淀 skill 的目标场景。
+    const session = await getSessionManager().create({ displayName: "t" });
+    const agentId = "forge";
+    transcribeKernelTurn(session, agentId, {
+      message: "第一轮", asstText: "a", thinkingText: "", stopReason: "end_turn", model: "m",
+      toolEvents: [
+        { kind: "call", callId: "c1", name: "read_ledger", args: {} },
+        { kind: "result", callId: "c1", ok: true,
+          result: { events: [{ type: "user_input", content: "x" }, { type: "user_input", content: "y" }] } },
+      ],
+    });
+
+    await resetSessionManager();
+    initSessionManager(initPathManager({ userRoot }));
+    const revived = await getSessionManager().open(session.sid);
+    transcribeKernelTurn(revived, agentId, {
+      message: "第二轮", asstText: "a", thinkingText: "", stopReason: "end_turn", model: "m", toolEvents: [],
+    });
+
+    const events = await revived.getOrCreateLedger(agentId).readAllEvents();
+    expect(events.filter((e) => e.type === "hook:turnStart").map((e) => (e.payload as { turn?: number }).turn))
+      .toEqual([1, 2]);
+  });
+
+  test("轮序跨 ledger 重建存活 —— 进程重启后不从 1 重来", async () => {
+    // 计数器同步维护在 EventLedger 内,并在 _initShardIndex 从当前分片重建,
+    // 所以重启(= 新建 ledger 实例读同一盘)后轮序继续往下走,不回退。
+    const session = await getSessionManager().create({ displayName: "t" });
+    const agentId = "forge";
+    const rec = {
+      message: "m", asstText: "a", thinkingText: "", stopReason: "end_turn" as const,
+      model: "gpt-5.6-sol", toolEvents: [],
+    };
+    transcribeKernelTurn(session, agentId, { ...rec });
+    transcribeKernelTurn(session, agentId, { ...rec });
+
+    // 丢掉内存态,像重启一样从盘上重建
+    await resetSessionManager();
+    const pm2 = initPathManager({ userRoot });
+    initSessionManager(pm2);
+    const revived = await getSessionManager().open(session.sid);
+    transcribeKernelTurn(revived, agentId, { ...rec });
+
+    const events = await revived.getOrCreateLedger(agentId).readAllEvents();
+    expect(events.filter((e) => e.type === "hook:turnStart").map((e) => (e.payload as { turn?: number }).turn))
+      .toEqual([1, 2, 3]);
+  });
+
   test("一轮(user+工具往返+assistant)写进 agentId 账本,形状对齐 replay,且不落 root", async () => {
     const session = await getSessionManager().create({ displayName: "t" });
     const sid = session.sid;

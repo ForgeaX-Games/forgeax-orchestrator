@@ -9,6 +9,7 @@
  *   - model:npc_text body.model,npc_text agent.json::models.model(ModelPicker npc_text)
  *   - tools:M2 npc_text(CC npc_text);MCP npc_text M3npc_text
  */
+import { randomUUID } from 'node:crypto';
 import type { AgentKernel, TurnRequest, TurnMessage, PreparedHistory as RuntimePreparedHistory } from '@forgeax/agent-runtime';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -98,6 +99,10 @@ export interface ComposeInput {
   threadId?: string;
   sessionId?: string;
   callId?: string;
+  /** 本次 compose 尝试的唯一 id。调用方生成并**同时**传给转录,让 manifest 与
+   *  真正执行的那一轮 hook:turnStart 共享同一个键 —— 否则多条同 turn 的 manifest
+   *  依然裁决不了哪条生效(2026-08-06 外审:上一轮只加了 id、没建立链路)。 */
+  turnAttemptId?: string;
   /** Stable identities of inbound messages already persisted for this turn.
    *  Excluded from host-owned history because they are also `input.text`. */
   historyExcludeEvents?: readonly EventIdentity[];
@@ -237,6 +242,46 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
         : 'host') as 'local' | 'host',
     };
   });
+
+  // 模型是照着"这一轮它能看见哪些工具"做决策的,而这个工具面是动态组装的
+  // (persona 白名单 + 插件在装状态 + catalog 派生的 UI action),事后从 git 复原
+  // 不出来 —— 两套账本都没记它。只记名字与投递方式,不序列化 schema(每轮都写会
+  // 把账本撑爆)。纯观测:任何失败都吞掉,绝不影响这一轮。
+  try {
+    if (input.sessionId) {
+      const session = getSessionManager().peek(input.sessionId);
+      if (session) {
+        const manifestLedger = session.getOrCreateLedger(input.agentId);
+        manifestLedger.append({
+          type: 'x.tools.manifest',
+          ts: Date.now(),
+          source: 'compose-turn-request',
+          payload: {
+            // 连接键,两把:manifest 在轮**开始**时写、转录在轮**结束**时写,只靠文件
+            // 相邻配对的话,重叠轮次 / 被 409 拒发的轮 / 冷启首轮都会把工具面安到错误
+            // 的轮上,而且发生时无任何标记可察觉。callId 逐字对上本轮 hook:toolCall,
+            // 但它依赖调用方传入(2026-08-06 实测:FORGE 前端不传,真实账本三条 manifest
+            // 全空)。turn 不依赖调用方:转录侧在 append user_input **之前**取
+            // nextTurnOrdinal(),这里在轮开始时取,两处读到同一计数,与本轮
+            // hook:turnStart.payload.turn 同值。被 409 拒发的轮不转录、不涨计数,
+            // 只会留下一条同 turn 值的孤儿 manifest —— 可察觉,不误配。
+            ...(input.callId ? { callId: input.callId } : {}),
+            // turnAttemptId:每次 compose 唯一。turn 是**意向**轮序,可能重号 ——
+            // 这一轮若随后被 history_unavailable 拒发(409),user_input 不会增加,
+            // 重试就产生第二条同 turn 的 manifest(2026-08-06 外审;我先前注释里
+            // 说"可察觉,不误配"是过头了:消费方拿到两条根本裁决不了哪条生效)。
+            // 消费方应先按 turnAttemptId 取最后一条,turn 只作分组线索。
+            turnAttemptId: input.turnAttemptId ?? randomUUID(),
+            turn: manifestLedger.nextTurnOrdinal(),
+            turnSemantics: 'intended-ordinal-may-repeat-on-retry',
+            count: deliveredTools.length,
+            tools: deliveredTools.map(({ name, delivery }) => ({ name, delivery })),
+            trustTier: record.trustTier,
+          },
+        });
+      }
+    }
+  } catch { /* 观测通道绝不影响主流程 */ }
 
   const profile = orchestrationProfileOf(input.kernel);
   let preparedHistory: RuntimePreparedHistory | undefined;

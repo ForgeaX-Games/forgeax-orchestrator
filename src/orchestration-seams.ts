@@ -51,6 +51,15 @@ export interface HostToolRunCtx {
   projectRoot: string;
   /** 会话绑定的业务作用域 slug(studio 语境 = game)。 */
   game?: string;
+  /** 本轮工具调用 id —— 与工具审计账、agent 事件账本的 `hook:toolCall.payload.callId`
+   *  **同一个键**。产品壳的 host 工具据它把自己的旁账(如 ui-browse-metrics)连回主账。
+   *  2026-08-06 外审:这两份旁账此前只有 sid+agent+时间戳,跨账本只能靠时间猜。
+   *  缺失时消费方按"这行连不上"处理 —— 不要伪造。 */
+  callId?: string;
+  /** MCP shim 自铸的**这一次宿主执行**的 id。与 `callId` 语义不同:租用内核(经 MCP)这条
+   *  路上通常只有它(内核 callId 过不了 MCP),原生内核那条路上通常只有 callId。
+   *  消费方据**实际存在哪个键**判断这一行能连到链上的哪一层 —— 缺就是缺,不要伪造。 */
+  toolExecutionId?: string;
   perception?: (kind: 'world' | 'frame', query?: unknown) => Promise<unknown>;
 }
 

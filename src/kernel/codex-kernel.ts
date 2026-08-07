@@ -419,7 +419,16 @@ export class CodexKernel implements AgentKernel {
       } else {
         codexThreadId = await startFresh();
       }
-      if (codexThreadId && tid) this.appThreadIdMap.set(tid, codexThreadId);
+      if (codexThreadId && tid && !this.appThreadIdMap.has(tid)) {
+        this.appThreadIdMap.set(tid, codexThreadId);
+        yield {
+          kind: 'x.kernel.thread',
+          kernelId: 'codex',
+          threadId: tid,
+          kernelThreadId: codexThreadId,
+          transport: 'app-server',
+        };
+      }
       if (!codexThreadId) {
         yield { kind: 'turn.usage' };
         yield { kind: 'error', error: { code: 'protocol', message: 'codex thread/start returned no id' } };
@@ -542,6 +551,18 @@ export class CodexKernel implements AgentKernel {
           // 首轮记下 codex thread_id 以便后续 resume(threadId ≠ codex thread_id)。
           if (tid && state.threadId && !this.threadIdMap.has(tid)) {
             this.threadIdMap.set(tid, state.threadId);
+            // 这个映射此前只活在上面这张内存 Map 里,进程一重启就没了 —— 而内核
+            // 自己的 rollout(模型视角的完整记录:提示词/真实输出/观察/真时间戳)
+            // 是按 codex thread id 命名落在隔离 CODEX_HOME 下的。不落盘这条指针,
+            // 事后就只能靠时间戳猜哪个 rollout 对应哪个会话。经 x.* 扩展通道发出,
+            // session 的总线→账本观察者会把它持久化进本 agent 的账本。
+            yield {
+              kind: 'x.kernel.thread',
+              kernelId: 'codex',
+              threadId: tid,
+              kernelThreadId: state.threadId,
+              transport: 'exec',
+            };
           }
         }
       } catch (streamErr) {

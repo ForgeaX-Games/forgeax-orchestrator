@@ -39,6 +39,9 @@ export interface KernelTurnRecord {
   stopReason: "end_turn" | "tool_use" | "max_tokens" | "cancelled";
   usage?: unknown;
   model?: string;
+  /** 与本轮 x.tools.manifest 共享的尝试 id —— 消费方按它精确配对工具面与执行轮,
+   *  turn 只作分组线索(它在 409 重试时会重号)。 */
+  turnAttemptId?: string;
   historyPlan?: PreparedHistory;
   toolEvents: Array<
     | { kind: "call"; callId: string; name: string; args: unknown }
@@ -94,6 +97,19 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
       });
     }
   }
+  // 轮序:此前三处硬编码 `turn: 1`,于是每一轮都记成第 1 轮,账本无法按轮切分
+  // (训练样本以轮为单位)。计数器同步维护在 ledger 里、跨进程重启存活。
+  const turnOrdinal = led.nextTurnOrdinal();
+  // toolResult 的 name 此前硬编码空串;同一轮内按 callId 回填真名。
+  const toolNamesByCallId = new Map<string, string>();
+  for (const t of rec.toolEvents) {
+    if (t.kind === "call") toolNamesByCallId.set(t.callId, t.name);
+  }
+  // 本函数在整轮**结束后**一次性批量写入,所以这里所有 ts 都是转录时刻而非事件
+  // 发生时刻(实测 52 个事件挤进 12 个毫秒)。不伪造时间,而是如实标记来源,
+  // 让消费方知道该去内核 rollout 取真实时序。
+  const TS_SOURCE = "transcription" as const;
+
   append(ev({
     type: "user_input",
     ts: t0,
@@ -104,9 +120,10 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
       content: rec.message,
       llmMessage: { role: "user", content: [{ type: "text", text: rec.contextText ?? rec.message }] },
       ...(durableAtts.length ? { attachments: durableAtts } : {}),
+      tsSource: TS_SOURCE,
     },
   }));
-  append(ev({ type: "hook:turnStart", ts: t0, source: `agent:${ap}`, payload: { turn: 1, turnId, ...(pid ? { providerId: pid } : {}) } }), ap);
+  append(ev({ type: "hook:turnStart", ts: t0, source: `agent:${ap}`, payload: { turn: turnOrdinal, turnId, ...(rec.turnAttemptId ? { turnAttemptId: rec.turnAttemptId } : {}), ...(pid ? { providerId: pid } : {}), tsSource: TS_SOURCE } }), ap);
 
   for (const t of rec.toolEvents) {
     if (t.kind === "call") {
@@ -115,7 +132,7 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
           type: "hook:toolCall",
           ts: Date.now(),
           source: `agent:${ap}`,
-          payload: { name: t.name, args: t.args, callId: t.callId, toolCall: { id: t.callId, name: t.name, arguments: t.args } },
+          payload: { name: t.name, args: t.args, callId: t.callId, toolCall: { id: t.callId, name: t.name, arguments: t.args }, tsSource: TS_SOURCE },
         }),
         ap,
       );
@@ -126,12 +143,14 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
           ts: Date.now(),
           source: `agent:${ap}`,
           payload: {
-            name: "",
+            name: toolNamesByCallId.get(t.callId) ?? "",
             callId: t.callId,
             ok: t.ok,
-            durationMs: 0,
+            // durationMs 此前硬编码 0 —— 这里根本没测量。宁可缺字段也不写假值;
+            // 真实耗时在内核 rollout 的 mcp_tool_call_end.duration。
             ...(t.result !== undefined ? { result: t.result } : {}),
             ...(t.ok ? {} : { error: t.error ?? "tool failed" }),
+            tsSource: TS_SOURCE,
           },
         }),
         ap,
@@ -151,17 +170,18 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
             content: [{ type: "text", text: rec.asstText }],
             ...(rec.thinkingText.trim() ? { thinking: rec.thinkingText } : {}),
           },
-          turn: 1,
+          turn: turnOrdinal,
           ...(rec.model ? { model: rec.model } : {}),
           ...(rec.usage ? { usage: rec.usage } : {}),
           ...(pid ? { providerId: pid } : {}),
+          tsSource: TS_SOURCE,
         },
       }),
       ap,
     );
   }
 
-  const endCursor = append(ev({ type: "hook:turnEnd", ts: Date.now(), source: `agent:${ap}`, payload: { turn: 1, turnId, reason: rec.stopReason } }), ap);
+  const endCursor = append(ev({ type: "hook:turnEnd", ts: Date.now(), source: `agent:${ap}`, payload: { turn: turnOrdinal, turnId, reason: rec.stopReason, tsSource: TS_SOURCE } }), ap);
   if (rec.historyPlan?.laneId && rec.providerId && typeof rec.historyPlan.epoch === 'number') {
     led.append(ev({
       type: 'kernel_history_applied', ts: Date.now(), source: 'history-coordinator',
