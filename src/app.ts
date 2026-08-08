@@ -53,6 +53,7 @@ import { createPrefsRouter } from '@forgeax/platform-io';
 import { sessionScope } from './api/lib/session-scope';
 import { bootCliProviders } from './cli-providers';
 import { initPathManager } from './fs/path-manager';
+import { installEventJournal } from './events/journal-sink';
 import type { SessionLayout } from './fs/session-layout';
 import {
   initOrchestrationSeams,
@@ -191,6 +192,10 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
     stateRoot: ctx.stateRootFactory?.(instanceRoot),
     layout: ctx.sessionLayoutFactory?.(instanceRoot),
   });
+  // 把 topic 总线的事件落盘。人点界面与 AI 派发走同一条 topic、只用 source 区分,
+  // 而总线本身只有 2048 槽内存环 —— 不接这一根线,人这一侧的操作历史留不下来。
+  // 总线早就留好了 setJournalSink 插槽,只是生产代码从没调用过。
+  installEventJournal({ projectRoot: instanceRoot });
   // Install shell-injected orchestration seams once at boot (same idiom as the
   // path/session managers above). Read-only on the hot path thereafter.
   initOrchestrationSeams({

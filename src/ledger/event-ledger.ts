@@ -50,6 +50,11 @@ export class EventLedger {
   // Keep the safety net but skip it after the first successful append.
   private _dirEnsured = false;
   private _currentLine = 0;
+  /** 本 (sid, agentPath) 已记录的 user_input 条数 —— 轮次序数的来源。
+   *  转录是**同步**的(transcribeKernelTurn),而 readAllEvents() 是 async,
+   *  所以计数必须在这里同步维护;`_initShardIndex` 本来就同步读当前分片全文,
+   *  顺手把它数出来,计数即可跨进程重启存活(不重启也不会从 1 重来)。 */
+  private _userInputCount = 0;
 
   constructor(
     public readonly sid: string,
@@ -127,6 +132,7 @@ export class EventLedger {
       this._dirEnsured = true;
     }
     appendFileSync(this._currentShardPath(), JSON.stringify(stored) + "\n", "utf-8");
+    if (event.type === "user_input") this._userInputCount += 1;
     const cursor = { shard: this._currentShard, line: ++this._currentLine, eventId };
 
     this._appendCount++;
@@ -135,6 +141,11 @@ export class EventLedger {
       this._maybeRotate();
     }
     return cursor;
+  }
+
+  /** 下一轮的序数(= 已记录 user_input 数 + 1)。同步、O(1)。 */
+  nextTurnOrdinal(): number {
+    return this._userInputCount + 1;
   }
 
   async readAllWithCursors(): Promise<Array<{ event: StoredEvent; cursor: LedgerCursor }>> {
@@ -212,6 +223,24 @@ export class EventLedger {
       const raw = readFileSync(this._currentShardPath(), "utf-8");
       this._currentLine = raw.split("\n").filter(Boolean).length;
     } catch { this._currentLine = 0; }
+    // 轮序基线:**逐行解析 + 跨全部分片**,两条都是被实测逼出来的。
+    //  ① 子串判据会误加:工具返回体里嵌套 {type:'user_input'} 对象时(agent 回读
+    //     自己的轨迹账本就会产生这种返回,而那正是本项目的目标场景),序列化后
+    //     `"type":"user_input"` 未被转义,`includes` 命中 —— 实测轮序从 [1,2] 变成
+    //     [1,3]。必须比较解析后的 event.type。
+    //  ② 只数当前分片会在 5MB 轮转后把轮序重置回 1,产生重复轮号,离线按轮切分
+    //     直接错乱。构造时读全部分片一次(每个 ledger 实例只发生一次)换取全局单调。
+    this._userInputCount = 0;
+    for (const path of this._listShardPaths()) {
+      let raw: string;
+      try { raw = readFileSync(path, "utf-8"); } catch { continue; }
+      for (const line of raw.split("\n")) {
+        if (!line) continue;
+        try {
+          if ((JSON.parse(line) as { type?: unknown }).type === "user_input") this._userInputCount += 1;
+        } catch { /* 半行/损坏行不计数,宁可少算也不误加 */ }
+      }
+    }
   }
 
   private _maybeRotate(): void {

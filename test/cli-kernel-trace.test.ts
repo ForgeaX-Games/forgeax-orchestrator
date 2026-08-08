@@ -11,6 +11,10 @@ let captured: Array<{ sid: string | undefined; records: Rec[] }> = [];
 const flat = (): Rec[] => captured.flatMap((c) => c.records);
 const spans = (): Rec[] => flat().filter((r) => r.kind === 'span');
 const logs = (): Rec[] => flat().filter((r) => r.kind === 'log');
+// 一轮现在产三层(kernel.turn → agent.run → tool),按名字选,别赌发射顺序。
+// (内层先收口,所以 `find(endTs != null)` 拿到的是 agent.run —— 曾让一条断言碰巧通过。)
+const kernelProv = (): Rec => spans().find((s) => s.name === 'kernel.turn' && s.provisional)!;
+const kernelFinal = (): Rec => spans().find((s) => s.name === 'kernel.turn' && s.endTs != null)!;
 
 const TP = `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`;
 
@@ -37,10 +41,10 @@ describe('cli-kernel-trace', () => {
 
   test('end ok:final span(status ok + usage/model/reason attrs)+ done log', () => {
     const h = startCliKernelTurn({ kernelId: 'codebuddy', agentId: 'forge', sid: 'sid-1', traceparent: TP });
-    const provSpanId = spans().find((s) => s.provisional)!.spanId;
+    const provSpanId = kernelProv().spanId;
     captured = []; // 只看 end 的产出
     h.end({ ok: true, reason: 'stop', model: 'claude-opus-4-8', usage: { inputTokens: 10, outputTokens: 20 } });
-    const fin = spans().find((s) => s.endTs != null)!;
+    const fin = kernelFinal();
     expect(fin.spanId).toBe(provSpanId); // 与 provisional 同 span(收口同一条)
     expect(fin.status).toEqual({ code: 'ok' });
     expect(fin.attrs['usage.input']).toBe(10);
@@ -57,21 +61,21 @@ describe('cli-kernel-trace', () => {
     const h = startCliKernelTurn({ kernelId: 'codebuddy', agentId: 'forge' });
     captured = [];
     h.end({ ok: false, error: 'boom' });
-    const fin = spans().find((s) => s.endTs != null)!;
+    const fin = kernelFinal();
     expect(fin.status).toEqual({ code: 'error', message: 'boom' });
     expect(logs().find((l) => l.msg === 'kernel.turn done')!.level).toBe('error');
   });
 
   test('无 traceparent → 自建 root(无 parentSpanId,32hex traceId)', () => {
     startCliKernelTurn({ kernelId: 'codex', agentId: 'forge' });
-    const prov = spans().find((s) => s.provisional)!;
+    const prov = kernelProv();
     expect(prov.parentSpanId).toBeUndefined();
     expect(prov.traceId).toMatch(/^[0-9a-f]{32}$/);
   });
 
   test('非法 traceparent → 当作无 parent(自建 root,不挂坏 parent)', () => {
     startCliKernelTurn({ kernelId: 'codex', agentId: 'forge', traceparent: 'not-a-traceparent' });
-    expect(spans().find((s) => s.provisional)!.parentSpanId).toBeUndefined();
+    expect(kernelProv().parentSpanId).toBeUndefined();
   });
 
   test('未接 host-telemetry → 静默 no-op(不抛、无产出)', () => {

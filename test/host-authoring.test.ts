@@ -218,7 +218,10 @@ describe('role actions in a true cold start', () => {
       context,
     );
 
-    expect(created).toEqual({
+    // ui_invoke 结果自 2026-08-05 起必带 door 注解(能力层挂载,终审 P0 修复)。
+    const { door: createdDoor, ...createdRest } = created as Record<string, unknown> & { door?: { certainty?: string } };
+    expect(typeof createdDoor?.certainty).toBe('string');
+    expect(createdRest).toEqual({
       status: 'completed',
       stateDigest: { id, scope: 'project' },
       executedVia: 'headless',

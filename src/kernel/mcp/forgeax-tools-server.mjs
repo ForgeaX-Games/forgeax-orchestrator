@@ -28,6 +28,7 @@
  */
 import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { createMcpDispatcher, serveStdio } from '../../mcp/protocol.mjs';
 import {
@@ -62,30 +63,72 @@ const BRIDGED = loadBridgedSpecs();
 // 可达 ~5s(waitForTreeNode 5s + grace)→ 留足 90s 上限,既不卡死 CC 又容纳慢工具。
 const BRIDGE_TIMEOUT_MS = 90_000;
 
-/** 桥接调用:HTTP POST 回宿主 /api/sessions/:sid/kernel-tool;带超时;fail-closed。 */
+/** 一次宿主执行的自铸 id。**唯一铸造点**,四个出口共用。
+ *
+ *  为什么必须自铸:内核(codex)铸的 callId **结构上过不了 MCP** —— `tools/call` 的参数
+ *  只有 `{name, arguments}`,没有携带调用 id 的位置。于是宿主侧两份旁账
+ *  (kernel-tool-audit / ui-browse-metrics)历来只有 sid+agent+时间戳,"哪次模型调用
+ *  导致了哪次宿主执行"只能靠时间猜 —— 同一轮里连着跑两个一模一样的 act 就彻底分不开。
+ *
+ *  为什么这样能连上:本 id 随 MCP 结果的 `structuredContent` 回给内核,内核把工具结果
+ *  原样回报给编排层(实证:本机 codex rollout 里 2811 次真实回传,其中 1873 次来自一个
+ *  **根本没声明 outputSchema** 的 server → 不需要 outputSchema 也照收),于是编排层拿到
+ *  `内核 callId → toolExecutionId → 两份旁账`,整条链可机械行走。
+ *
+ *  为什么不叫 callId:两个语义不许互相冒充。内核 callId 标识"模型发起的那次调用",
+ *  toolExecutionId 标识"经 MCP 落到宿主的那一次执行"。前缀 `fxt-` 一眼可辨。 */
+function newToolExecutionId() {
+  // 铸 id 失败也绝不能拖垮工具调用本身 —— 观测是旁路。拿不到就返回 undefined:
+  // 下游据「有没有这个键」判断能不能 join,缺席是可观察的,阻断执行则是事故。
+  try {
+    return `fxt-${randomUUID()}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 桥接调用:HTTP POST 回宿主 /api/sessions/:sid/kernel-tool;带超时;fail-closed。
+ *  返回 `{isError, text, toolExecutionId}` —— **失败分支也带 id**:宿主没记上这一行时,
+ *  查得到"有这个 id 但旁账里查无此行"(可观察的缺席),而不是根本无从查起。 */
 async function bridgeCall(toolName, args) {
-  if (!SERVER_URL || !BRIDGE_SID) return { isError: true, text: 'bridge unavailable (no server url / sid)' };
+  const toolExecutionId = newToolExecutionId();
+  if (!SERVER_URL || !BRIDGE_SID) return { isError: true, text: 'bridge unavailable (no server url / sid)', toolExecutionId };
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), BRIDGE_TIMEOUT_MS);
   try {
     const res = await fetch(`${SERVER_URL}/api/sessions/${encodeURIComponent(BRIDGE_SID)}/kernel-tool`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ agentPath: BRIDGE_AGENT, toolName, args: args ?? {} }),
+      body: JSON.stringify({ agentPath: BRIDGE_AGENT, toolName, args: args ?? {}, ...(toolExecutionId ? { toolExecutionId } : {}) }),
       signal: ac.signal,
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body?.ok === false) {
-      return { isError: true, text: String(body?.error ?? `bridge HTTP ${res.status}`) };
+      return { isError: true, text: String(body?.error ?? `bridge HTTP ${res.status}`), toolExecutionId };
     }
     const r = body.result;
-    return { isError: false, text: typeof r === 'string' ? r : JSON.stringify(r ?? '') };
+    return { isError: false, text: typeof r === 'string' ? r : JSON.stringify(r ?? ''), toolExecutionId };
   } catch (e) {
     const msg = ac.signal.aborted ? `bridge timeout after ${BRIDGE_TIMEOUT_MS}ms (tool ${toolName})` : `bridge transport error: ${e?.message ?? e}`;
-    return { isError: true, text: msg };
+    return { isError: true, text: msg, toolExecutionId };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** 桥结果 → MCP tool result。**必须回带 content 数组的对象**:协议层的 toToolResult 只对
+ *  「带 content 数组的对象」原样透传,回裸字符串会把 structuredContent 连同连接键一起丢掉。 */
+function bridgeToolResult(r, content) {
+  return {
+    content: content ?? [{ type: 'text', text: r.text }],
+    // 自铸内容收进 `forgeax` 命名空间:① 第三方 MCP server 的 structuredContent 里绝不会有
+    // 这个键,消费方据此**确定性**区分"我们自造的信封"与"别人的业务结果",不靠数键个数
+    // (上一版按形状剥,把第三方业务结果剥成了纯文本 —— 2026-08-06 外审 MAJOR-1);
+    // ② 以后要加字段(版本 / 耗时)一律加在里面,消费端判据不用跟着改,形状不被冻死。
+    // 铸不出 id 时不写空键 —— 消费方据键的有无判断能不能 join。
+    ...(r.toolExecutionId ? { structuredContent: { forgeax: { toolExecutionId: r.toolExecutionId } } } : {}),
+    ...(r.isError ? { isError: true } : {}),
+  };
 }
 
 // ── 感知接地(R5/M8):query_world / capture_frame 的真实后端 ────────────
@@ -254,12 +297,12 @@ const UI_CONTRACT = (() => {
 for (const spec of UI_CONTRACT.tools ?? []) {
   if (spec?.name === 'ui_snapshot') {
     // ui_snapshot 只读,但仍走 kernel-tool 以复用同一执行口(read → 信任闸直放)。
-    TOOLS.ui_snapshot = { spec, run: async (args) => (await bridgeCall('ui_snapshot', args ?? {})).text };
+    TOOLS.ui_snapshot = { spec, run: async (args) => bridgeToolResult(await bridgeCall('ui_snapshot', args ?? {})) };
   } else if (spec?.name === 'ui_invoke') {
     TOOLS.ui_invoke = {
       spec,
       run: async (args) =>
-        (await bridgeCall('ui_invoke', { actionId: args?.actionId ?? null, args: args?.args ?? {} })).text,
+        bridgeToolResult(await bridgeCall('ui_invoke', { actionId: args?.actionId ?? null, args: args?.args ?? {} })),
     };
   } else if (spec?.name === 'ui_screenshot') {
     // ui_screenshot(P3)只读兜底证据,同 ui_snapshot 走 kernel-tool 闸。宿主成功时
@@ -270,24 +313,24 @@ for (const spec of UI_CONTRACT.tools ?? []) {
       spec,
       run: async (args) => {
         const r = await bridgeCall('ui_screenshot', args ?? {});
-        if (r.isError) return r.text;
+        if (r.isError) return bridgeToolResult(r);
         try {
           const parts = JSON.parse(r.text);
           // 守卫不绑定 image 在数组中的位置(§2.5:勿硬编码生产端形状),只认「存在一枚
           // 带 string data 的 image part」;下方 map 逐项按 p.type 处理,与顺序无关。
           if (Array.isArray(parts) && parts.some((p) => p?.type === 'image' && typeof p?.data === 'string')) {
-            return {
-              content: parts.map((p) =>
-                p.type === 'image'
-                  ? { type: 'image', data: p.data, mimeType: p.mimeType ?? 'image/png' }
-                  : { type: 'text', text: String(p.text ?? '') },
-              ),
-            };
+            // 连接键仍走 bridgeToolResult 这唯一一处拼装(只换 content)—— 在这里手抄一份
+            // structuredContent 就是第二份事实源,本工作流已经因此栽过四次。
+            return bridgeToolResult(r, parts.map((p) =>
+              p.type === 'image'
+                ? { type: 'image', data: p.data, mimeType: p.mimeType ?? 'image/png' }
+                : { type: 'text', text: String(p.text ?? '') },
+            ));
           }
         } catch {
           /* 非 JSON → 按文本透传 */
         }
-        return r.text;
+        return bridgeToolResult(r);
       },
     };
   }
@@ -513,11 +556,7 @@ async function currentTools() {
         description: t.description ?? '',
         inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
         async run(args) {
-          const result = await bridgeCall(t.name, args);
-          return {
-            ...(result.isError ? { isError: true } : {}),
-            content: [{ type: 'text', text: result.text }],
-          };
+          return bridgeToolResult(await bridgeCall(t.name, args));
         },
       });
     }

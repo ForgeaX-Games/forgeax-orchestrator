@@ -162,7 +162,11 @@ export function mapCodexNotification(
             : (typeof it.error === 'string' ? it.error : '');
           const resText = extractMcpResult(it);
           const msg = errText || (typeof resText === 'string' ? resText : JSON.stringify(resText)) || (it.status ? String(it.status) : 'failed');
-          queue.push({ kind: 'tool.result', callId: it.id, ok: false, error: msg });
+          // 失败也要带 result:宿主工具返回 error → MCP 结果 isError:true → codex 把 item 标成
+          // 失败,但**连接键就在这份结果的 structuredContent 里**。不带 result,失败调用就永远
+          // 连不回旁账 —— 而失败行恰恰最有审计价值(2026-08-06 外审 MAJOR-2;同一个病刚在工具
+          // 审计账上修过一次,这里又犯了一遍)。
+          queue.push({ kind: 'tool.result', callId: it.id, ok: false, error: msg, result: resText });
         }
         return;
       }
