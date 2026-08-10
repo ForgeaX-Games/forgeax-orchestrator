@@ -12,7 +12,8 @@
  *                             -c approval_policy / -s|-c sandbox_mode / -m <model>` + prompt 组装
  *  - {@link buildCodexSingleAgentArgs} Codex 原生多 Agent 工具的进程级关闭参数
  *  - {@link buildCodexAppServerGlobalArgs} app-server 全局参数组装
- *  - {@link CODEX_APPROVAL_POLICY} / {@link CODEX_SANDBOX_MODE} 放行模式常量
+ *  - {@link toCodexPermission} 中立档位 → `approval_policy`/`sandbox_mode` 方言翻译
+ *    (+ {@link CODEX_SUPPORTED_PERMISSION_MODES} 本内核真能兑现的档位表)
  *  - JSONL→KernelEvent 映射:re-export 自 codex-mapper.ts(本身已是隔离的 codex-ism)
  *
  * Codex 执行面与 CC 的关键差异(供薄脊梁理解):
@@ -21,12 +22,14 @@
  *    sandbox 走 `-c sandbox_mode=...`)。
  *  - systemPrompt 无 flag → 把 charter+persona 作「指令」前置进 prompt(headless 安全,
  *    不碰仓内 AGENTS.md)。
- *  - headless 放行:`--skip-git-repo-check` + `-c approval_policy=never` +
- *    `-s workspace-write`(首轮)/ `-c sandbox_mode=workspace-write`(resume)。
+ *  - headless 放行:`--skip-git-repo-check` + `-c approval_policy=never` + sandbox 档位
+ *    (首轮 `-s <mode>` / resume `-c sandbox_mode=<mode>`);`<mode>` 由中立档派生,
+ *    默认全权限 = `danger-full-access`,见 {@link toCodexPermission}。
  *  - 用量:只有 token(turn.completed.usage),无 $ cost → turn.usage.costUsd 留空。
  *  - 无 per-tool 权限回调(走 sandbox/approval 模式)→ requestPermission 不接。
  */
-import type { TurnRequest } from '@forgeax/agent-runtime';
+import type { PermissionMode, TurnRequest } from '@forgeax/agent-runtime';
+import { DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 
@@ -53,10 +56,62 @@ export {
   type CodexRawEvent,
 } from './codex-mapper';
 
-/** headless 放行:不卡审批(per-tool 权限交给 sandbox)。 */
-export const CODEX_APPROVAL_POLICY = 'never' as const;
-/** headless sandbox:工作区可写(首轮 `-s`,resume 经 `-c sandbox_mode=`)。 */
-export const CODEX_SANDBOX_MODE = 'workspace-write' as const;
+/** codex headless 的放行姿态 = `approval_policy` + `sandbox_mode` 两个旋钮的组合。
+ *  它们不再各自持值,而是由中立档位派生({@link toCodexPermission})—— 本内核的
+ *  权限控制点就是这一处翻译 + 下面的 supported 表。 */
+export interface CodexPermission {
+  readonly approvalPolicy: 'never';
+  readonly sandboxMode: 'workspace-write' | 'danger-full-access';
+}
+
+/** `codex app-server` 的真实权限旋钮。它不是 `exec` 的薄包装，
+ * 因此 thread/turn 的 approvalPolicy 与 sandbox 必须单独翻译。 */
+export interface CodexAppServerPermission {
+  readonly approvalPolicy: 'on-request' | 'never';
+  readonly sandbox: 'read-only' | 'workspace-write' | 'danger-full-access';
+}
+
+/** 中立档 → app-server thread/turn 参数。 */
+export function toCodexAppServerPermission(mode: PermissionMode): CodexAppServerPermission {
+  switch (mode) {
+    case 'unrestricted':
+      return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
+    case 'autoEdits':
+      return { approvalPolicy: 'never', sandbox: 'workspace-write' };
+    case 'gated':
+      return { approvalPolicy: 'on-request', sandbox: 'workspace-write' };
+    case 'planning':
+      return { approvalPolicy: 'on-request', sandbox: 'read-only' };
+  }
+}
+
+/**
+ * 中立档位 → codex 方言。
+ *   autoEdits    → never + workspace-write   (自动改,但关在工作区里)
+ *   unrestricted → never + danger-full-access(全权限,危险方式)
+ *
+ * `gated` / `planning` **不在支持列表**:codex headless 既无 per-tool 审批闸
+ * (`approval_policy` 只有 never 有意义,否则 headless 无人应答会挂),也无只读
+ * 强制,给不出这两档。不静默假装 —— 由 supported 表让 UI 只列真能兑现的档。
+ */
+export function toCodexPermission(mode: PermissionMode): CodexPermission {
+  return mode === 'unrestricted'
+    ? { approvalPolicy: 'never', sandboxMode: 'danger-full-access' }
+    : { approvalPolicy: 'never', sandboxMode: 'workspace-write' };
+}
+
+/** codex 能兑现的档位(只两档,见 toCodexPermission 的说明)。 */
+export const CODEX_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = [
+  'autoEdits',
+  'unrestricted',
+];
+
+/** codex 默认档 —— 派生自全内核默认,不独立持值。
+ *
+ *  诚实标注:codex 的 `apply_patch` 等编辑路径**不可靠地触发 hook**
+ *  (openai/codex#16732),故 hook-gate 在 codex 上不能当作可依赖的收窄面;
+ *  该内核的实际收窄靠 `sandbox_mode`(workspace-write 把写限制在工作区)。 */
+export const CODEX_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
 
 /**
  * ForgeaX 已经用 agent-tree（`AgentTree` + `Scheduler`）和 `delegate_to_subagent`
@@ -152,7 +207,12 @@ export function buildCodexArgs(
   codexThreadId: string | undefined,
   hooksActive = false,
   mcpOverrides: string[] = [],
+  // fail-safe 缺省(同 cc):漏传时走 req.permissionMode。注意越界档的 clamp 在 kernel 侧,
+  // 这里只做翻译 —— 直接调本函数且传了越界档的调用方,由 toCodexPermission 落到 workspace-write。
+  permissionMode: PermissionMode = req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE,
 ): string[] {
+  // 放行姿态:中立档 → codex 两旋钮(唯一翻译处)。越界档由 kernel 侧先 clamp。
+  const { approvalPolicy, sandboxMode } = toCodexPermission(permissionMode);
   // 诚实标注(no-op):中立 `systemPrompt.mode` 与 `req.toolPolicy` 在 codex headless **无落点**——
   // codex 无 `--system-prompt(-file)` flag(指令只能前置进 prompt,见下),也无 per-tool 放行/
   // 拒绝闸(headless 固定 approval_policy=never + sandbox_mode)。故 mode/toolPolicy 在此被忽略,
@@ -181,7 +241,7 @@ export function buildCodexArgs(
     ...buildCodexSingleAgentArgs(),
     ...(hooksActive ? ['--dangerously-bypass-hook-trust'] : []),
     '-c',
-    `approval_policy="${CODEX_APPROVAL_POLICY}"`,
+    `approval_policy="${approvalPolicy}"`,
     // fxt MCP 注入(本轮工具);无工具轮为空(零回归)。放在 message 位置参数之前。
     ...mcpOverrides,
     ...(req.model ? ['-m', req.model] : []),
@@ -195,10 +255,10 @@ export function buildCodexArgs(
       codexThreadId,
       ...common,
       '-c',
-      `sandbox_mode="${CODEX_SANDBOX_MODE}"`,
+      `sandbox_mode="${sandboxMode}"`,
       message,
     ];
   }
 
-  return ['exec', ...common, '-s', CODEX_SANDBOX_MODE, message];
+  return ['exec', ...common, '-s', sandboxMode, message];
 }

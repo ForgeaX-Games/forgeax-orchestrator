@@ -67,6 +67,9 @@ export interface ForgeaxToolsRuntime {
 export interface MaterializeOptions {
   /** Stable-ish id folded into the temp dir name for traceability (e.g. callId). */
   runtimeId: string;
+  /** Per-kernel posture for MCP clients whose native permission callback does
+   * not observe tools executed through this per-turn server. */
+  permissionMode?: 'gated' | 'unrestricted';
   /** Drop perception tools (query_world / capture_frame) from the server. */
   disablePerception?: boolean;
   /** Drop the ui_* bridge tools from the server. */
@@ -149,6 +152,7 @@ export async function materializeForgeaxToolsRuntime(
     FORGEAX_SID: req.hostSessionId?.trim() || req.session.threadId?.trim() || '',
     FORGEAX_AGENT: req.session.agentId?.trim() || 'forge',
     FORGEAX_TOOL_SPECS_FILE: specsFile,
+    ...(options.permissionMode ? { FORGEAX_KERNEL_PERMISSION_MODE: options.permissionMode } : {}),
     // Double-allowlist client side: the server filters BOTH list and call.
     FORGEAX_FXT_EXPOSE: enabledTools.join(','),
     ...(req.capabilityGeneration !== undefined

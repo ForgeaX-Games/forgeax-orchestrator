@@ -2,10 +2,10 @@
  *
  *  覆盖:三层 set-union(deny 不被高层吞)/ fail-safe(缺文件、坏 JSON、坏条目)/
  *  mtime 缓存翻新 / evaluateSettingsRules 的 deny>ask>allow 顺序与 shell 结构感知。
- *  HOME 重定向到临时目录 —— 不读真用户 ~/.forgeax(测试封闭性)。 */
+ *  FORGEAX_USER_DIR 重定向到临时目录 —— 不读真用户 ~/.forgeax(测试封闭性)。 */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   clearSettingsPermissionRulesCache,
@@ -13,34 +13,40 @@ import {
   loadSettingsPermissionRules,
   ruleLabel,
 } from '../src/api/lib/permission-settings';
+import { resolveUserDir } from '../src/fs/user-dir';
 
-let home: string;
+let userDir: string;
 let project: string;
-let savedHome: string | undefined;
+let savedUserDir: string | undefined;
 
 function writeSettings(dir: string, file: string, permissions: unknown): void {
   mkdirSync(join(dir, '.forgeax'), { recursive: true });
   writeFileSync(join(dir, '.forgeax', file), JSON.stringify({ permissions }));
 }
 
+function writeUserSettings(permissions: unknown): void {
+  writeFileSync(join(userDir, 'settings.json'), JSON.stringify({ permissions }));
+}
+
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'fx-perm-home-'));
+  userDir = mkdtempSync(join(tmpdir(), 'fx-perm-user-'));
   project = mkdtempSync(join(tmpdir(), 'fx-perm-proj-'));
-  savedHome = process.env.HOME;
-  process.env.HOME = home;
+  savedUserDir = process.env.FORGEAX_USER_DIR;
+  process.env.FORGEAX_USER_DIR = userDir;
   clearSettingsPermissionRulesCache();
 });
 
 afterEach(() => {
-  process.env.HOME = savedHome;
-  rmSync(home, { recursive: true, force: true });
+  if (savedUserDir === undefined) delete process.env.FORGEAX_USER_DIR;
+  else process.env.FORGEAX_USER_DIR = savedUserDir;
+  rmSync(userDir, { recursive: true, force: true });
   rmSync(project, { recursive: true, force: true });
   clearSettingsPermissionRulesCache();
 });
 
 describe('loadSettingsPermissionRules — 分层 set-union', () => {
-  test('user + project + local 三层 deny 全部生效(union,不覆盖)', () => {
-    writeSettings(home, 'settings.json', { deny: ['Bash(rm *)'] });
+  test('FORGEAX_USER_DIR user + project + local 三层 deny 全部生效(union,不覆盖)', () => {
+    writeUserSettings({ deny: ['Bash(rm *)'] });
     writeSettings(project, 'settings.json', { deny: ['Bash(git push*)'], allow: ['Read'] });
     writeSettings(project, 'settings.local.json', { ask: ['Bash(curl *)'] });
     const rules = loadSettingsPermissionRules(project);
@@ -53,7 +59,7 @@ describe('loadSettingsPermissionRules — 分层 set-union', () => {
   });
 
   test('同形规则跨层去重(以先出现层为准)', () => {
-    writeSettings(home, 'settings.json', { deny: ['Bash(rm *)'] });
+    writeUserSettings({ deny: ['Bash(rm *)'] });
     writeSettings(project, 'settings.json', { deny: ['Bash(rm *)'] });
     expect(loadSettingsPermissionRules(project).deny).toHaveLength(1);
   });
@@ -65,7 +71,7 @@ describe('loadSettingsPermissionRules — 分层 set-union', () => {
     // 坏 JSON 层被跳过,好层照常。
     mkdirSync(join(project, '.forgeax'), { recursive: true });
     writeFileSync(join(project, '.forgeax', 'settings.json'), '{oops');
-    writeSettings(home, 'settings.json', { deny: ['Bash(rm *)', 42, 'Bad('] });
+    writeUserSettings({ deny: ['Bash(rm *)', 42, 'Bad('] });
     const rules = loadSettingsPermissionRules(project);
     expect(rules.deny).toHaveLength(1);
   });
@@ -77,6 +83,12 @@ describe('loadSettingsPermissionRules — 分层 set-union', () => {
     await new Promise((r) => setTimeout(r, 20));
     writeSettings(project, 'settings.json', { deny: ['Bash(rm *)', 'Write'] });
     expect(loadSettingsPermissionRules(project).deny).toHaveLength(2);
+  });
+});
+
+describe('resolveUserDir — 默认 user root', () => {
+  test('未提供 FORGEAX_USER_DIR 时使用默认 home/.forgeax', () => {
+    expect(resolveUserDir({})).toBe(join(homedir(), '.forgeax'));
   });
 });
 

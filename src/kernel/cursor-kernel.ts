@@ -43,14 +43,17 @@ import { defaultProjectRoot } from '@forgeax/platform-io';
 import {
   buildCursorArgs,
   createCursorMapperState,
+  CURSOR_DEFAULT_PERMISSION_MODE,
   CURSOR_DRIVER_LABEL,
   CURSOR_FALLBACK_MODELS,
+  CURSOR_SUPPORTED_PERMISSION_MODES,
   ensureCursorHooksConfig,
   flushCursorMapper,
   mapCursorEvent,
   probeCursorModels,
   type CursorRawEvent,
 } from './cursor-profile';
+import { clampMode } from './permission-config';
 import { buildCursorHomeWithoutUserMcp, disposeCursorHome } from './cursor-home';
 import { materializeForgeaxToolsRuntime, type ForgeaxToolsRuntime } from './mcp/forgeax-tools-runtime';
 import { materializeCursorToolsWorkspace, type CursorToolsWorkspace } from './cursor-tools-workspace';
@@ -63,6 +66,10 @@ export class CursorKernel implements AgentKernel {
   readonly displayName = CURSOR_DRIVER_LABEL;
   readonly orchestrationProfile = RENTED_KERNEL_PROFILE;
   readonly fallbackModels = CURSOR_FALLBACK_MODELS;
+  readonly permissionCapabilities = {
+    supported: CURSOR_SUPPORTED_PERMISSION_MODES,
+    defaultMode: CURSOR_DEFAULT_PERMISSION_MODE,
+  } as const;
 
   /** 真实模型目录:`cursor-agent --list-models`(见 cursor-profile)。
    *  失败 → 编排层降级 last-known → fallbackModels。 */
@@ -166,10 +173,24 @@ export class CursorKernel implements AgentKernel {
       // prompt 走 stdin(不进 argv):cursor `-p` 无位置参数时从 stdin 读 prompt。
       // 这样首轮的超长 charter+persona+task 不再撑爆 Windows cmd.exe 的 ~8191 命令
       // 行上限(否则 GBK「命令行太长。」+ exit 1)。stdin 是管道、不受长度限制,全平台一致。
+      // 本轮档位:cursor 只能兑现 unrestricted(去掉 `--force` 会让 agent 自动拒一切
+      // = 静默瘫掉,不是「更严」)。越界档 clamp 并出声,不假装遵守。
+      const requestedMode = req.permissionMode ?? CURSOR_DEFAULT_PERMISSION_MODE;
+      const clamped = clampMode(
+        requestedMode,
+        CURSOR_SUPPORTED_PERMISSION_MODES,
+        CURSOR_DEFAULT_PERMISSION_MODE,
+      );
+      if (clamped.downgraded) {
+        process.stderr.write(
+          `[cursor-kernel] permissionMode="${requestedMode}" 在 cursor headless 无落点(只有 --force 全放行 / default 全拒两态),已按 "${clamped.mode}" 启动。收窄请用 .cursor/hooks.json 的 hook-gate。\n`,
+        );
+      }
       const { args, message } = buildCursorArgs(
         req,
         cursorChatId,
         toolsWorkspace ? { root: toolsWorkspace.root, projectRoot } : undefined,
+        clamped.mode,
       );
       const { lines, exit } = spawnJsonl<CursorRawEvent>({
         cmd: binary,

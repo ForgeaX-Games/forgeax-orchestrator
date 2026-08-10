@@ -21,7 +21,6 @@
  * 不能每次 stat+read 三个文件以外还重复 parse。
  */
 import { readFileSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import {
@@ -31,14 +30,12 @@ import {
   type PermissionRule,
   type PermissionRuleSet,
 } from '@forgeax/types';
+import { resolveUserDir } from '../../fs/user-dir';
 
-/** 分层来源(低→高)。permissions 桶做 set-union,层序只影响 source 标注。
- *  user 层基准 = `$HOME`(POSIX 语义,Node os.homedir 同口径;bun 的 homedir()
- *  不读运行时改写的 $HOME → 显式先看 env,测试才能封闭重定向)。 */
+/** 分层来源(低→高)。permissions 桶做 set-union,层序只影响 source 标注。 */
 function settingsPaths(projectRoot: string): Array<{ path: string; source: string }> {
-  const home = process.env.HOME || homedir();
   return [
-    { path: resolve(home, '.forgeax', 'settings.json'), source: 'user' },
+    { path: resolve(resolveUserDir(), 'settings.json'), source: 'user' },
     { path: resolve(projectRoot, '.forgeax', 'settings.json'), source: 'project' },
     { path: resolve(projectRoot, '.forgeax', 'settings.local.json'), source: 'local' },
   ];

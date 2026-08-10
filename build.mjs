@@ -4,7 +4,8 @@
 // (remote agent runtime). Shipped as a self-contained npm tarball (no forgeax-os
 // checkout), it inlines the `@forgeax/*` workspace source (types, agent-runtime,
 // platform-io, agent-host client) and leaves third-party deps external (installed
-// via package.json `dependencies`).
+// via package.json `dependencies`). Inlined workspace packages may introduce
+// additional third-party bare imports — re-declare them here and gate with pack:check.
 //
 // NOTE: cli spawns sibling *packages* at runtime — `@forgeax/agent-host/serve`
 // and `@forgeax/cli/serve` — via import.meta.resolve. Those are NOT bundled
