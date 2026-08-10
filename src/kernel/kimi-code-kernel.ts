@@ -6,11 +6,9 @@ import type {
   KernelModelCatalog,
   PermissionCall,
   PermissionDecision,
-  PermissionMode,
   TurnHandle,
   TurnRequest,
 } from '@forgeax/agent-runtime';
-import { clampMode, DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
 import type { McpServer } from '@agentclientprotocol/sdk';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { existsSync } from 'node:fs';
@@ -89,50 +87,11 @@ function toProjectMcpServers(projectRoot: string, requestedTools: readonly strin
     }));
 }
 
-/**
- * kimi 能兑现的档位:只有 `gated` / `unrestricted` 两档。
- *
- * 它走 ACP,**没有 spawn 期的放行 flag**,权限面就是 runTurn 里的 per-call `onPermission`
- * 回调。所以:
- *  - `unrestricted` = 无规则命中即放行(不弹审批);
- *  - `gated`        = 无规则命中就交 host 闸(有 prompt 则问);
- *  - `autoEdits` / `planning` **不声明** —— 前者要能区分「编辑类工具」、后者要能强制只读,
- *    kimi 侧都没有可靠的工具分类可依,硬映射等于猜。不猜。
- */
-export const KIMI_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = ['gated', 'unrestricted'];
-
-/** kimi 默认档 —— 派生自全内核默认,不独立持值。 */
-export const KIMI_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
-
-/** kimi per-call 闸的决策(纯函数,便于单测 —— 它是本内核唯一的权限落点)。
- *
- *  求值顺序刻意与 cc 一致:**规则先行且对档位免疫**。deny 规则、内容级 ask 永远压过
- *  「全权限」档,否则「默认全权限」就等于把闸拆了。只有无规则命中时,档位才说话。 */
-export type KimiPermissionPlan = 'deny-by-rule' | 'deny-no-prompt' | 'ask' | 'allow';
-export function planKimiPermission(
-  ruleBehavior: 'allow' | 'deny' | 'ask' | undefined,
-  mode: PermissionMode,
-  hasPrompt: boolean,
-): KimiPermissionPlan {
-  if (ruleBehavior === 'deny') return 'deny-by-rule';
-  if (ruleBehavior === 'allow') return 'allow';
-  if (ruleBehavior === 'ask') return hasPrompt ? 'ask' : 'deny-no-prompt';
-  // 无规则命中 → 档位说话:unrestricted = 基线放行(不弹审批);gated = 交 host 闸。
-  if (mode === 'unrestricted') return 'allow';
-  // gated 且没有审批通道 → **fail-closed**。用户显式要求逐项把闸,这时静默放行
-  // 就等于把 gated 悄悄变成 unrestricted;与上面规则级 ask 的处理保持同一姿态。
-  return hasPrompt ? 'ask' : 'deny-no-prompt';
-}
-
 export class KimiCodeKernel implements AgentKernel {
   readonly id = 'kimi-code';
   readonly displayName = KIMI_CODE_DRIVER_LABEL;
   readonly orchestrationProfile = RENTED_KERNEL_PROFILE;
   readonly fallbackModels = KIMI_CODE_FALLBACK_MODELS;
-  readonly permissionCapabilities = {
-    supported: KIMI_SUPPORTED_PERMISSION_MODES,
-    defaultMode: KIMI_DEFAULT_PERMISSION_MODE,
-  } as const;
   readonly capabilities: KernelCapabilities = {
     streaming: true,
     thinking: true,
@@ -212,20 +171,6 @@ export class KimiCodeKernel implements AgentKernel {
     const events: KernelEvent[] = [];
     let wake: (() => void) | null = null;
     let ended = false;
-    // Kimi's native ACP permission callback does not observe calls made by the
-    // per-turn fxt MCP server. Resolve the supported posture before mounting
-    // that server and carry it through its environment as a fail-closed gate.
-    const requestedMode = req.permissionMode ?? KIMI_DEFAULT_PERMISSION_MODE;
-    const { mode: permissionMode, downgraded } = clampMode(
-      requestedMode,
-      KIMI_SUPPORTED_PERMISSION_MODES,
-      KIMI_DEFAULT_PERMISSION_MODE,
-    );
-    if (downgraded) {
-      process.stderr.write(
-        `[kimi-code] permissionMode="${requestedMode}" 在 kimi 无落点(无 spawn 期放行档、无只读强制),已按 "${permissionMode}" 运行。\n`,
-      );
-    }
     const push = (event: KernelEvent) => {
       events.push(event);
       if (wake) {
@@ -239,7 +184,6 @@ export class KimiCodeKernel implements AgentKernel {
       if ((req.tools?.length ?? 0) > 0) {
         runtime = await materializeForgeaxToolsRuntime(req, {
           runtimeId: req.callId || req.hostSessionId || threadId || 'kimi-code',
-          permissionMode: permissionMode === 'gated' ? 'gated' : 'unrestricted',
         });
       }
     } catch (error) {
@@ -250,14 +194,14 @@ export class KimiCodeKernel implements AgentKernel {
     const permissionRules = loadSettingsPermissionRules(projectRoot);
     const onPermission = async (call: PermissionCall): Promise<PermissionDecision> => {
       const verdict = evaluateSettingsRules(permissionRules, call.name, call.args);
-      const plan = planKimiPermission(verdict?.behavior, permissionMode, !!req.requestPermission);
-      if (plan === 'deny-by-rule') {
-        return { behavior: 'deny', message: `denied by rule ${ruleLabel(verdict!.rule)}` };
+      if (verdict?.behavior === 'deny') {
+        return { behavior: 'deny', message: `denied by rule ${ruleLabel(verdict.rule)}` };
       }
-      if (plan === 'deny-no-prompt') {
+      if (verdict?.behavior === 'allow') return { behavior: 'allow' };
+      if (verdict?.behavior === 'ask' && !req.requestPermission) {
         return { behavior: 'deny', message: 'permission requires confirmation, but no prompt is available' };
       }
-      if (plan === 'ask') return req.requestPermission!(call);
+      if (req.requestPermission) return req.requestPermission(call);
       return { behavior: 'allow' };
     };
 

@@ -19,7 +19,6 @@ import { getSessionManager } from '../core/session-registry';
 import { getPathManager } from '../fs/path-manager';
 import { materializeFileAttachments } from './materialize-file-attachments';
 import { hasNativeHistoryResume, orchestrationProfileOf } from './kernel-profile';
-import { standingModeFor } from './permission-config';
 import { ContextWindow, type LedgerReader } from '../context-window/context-window';
 import type { BlackboardAPI } from '../core/types';
 import { HistoryCoordinator } from '../history/coordinator';
@@ -345,9 +344,6 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
       )
     : undefined;
 
-  // 该内核的 standing 权限档(设置页写的项目级配置);未配过 → undefined = 走内核默认档。
-  const standingMode = standingModeFor(String(input.kernel.id), projectRoot);
-
   // Every attachment is materialized. Native kinds remain path-only references; unsupported
   // kinds become path notes. This keeps base64 off the sidecar wire and durable history.
   let uploadBase = projectRoot;
@@ -394,10 +390,6 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     // npc_text fork-extract npc_text;forgeax-core npc_text=no-op,rented(cc)npc_text
     memoryAutonomy: false,
     trustTier: record.trustTier,
-    // 权限姿态:设置页写的 per-kernel standing 档位(项目级 .forgeax/kernel-permissions.json)。
-    // 只在用户显式配过时才填 —— 缺省留空,让各内核落自己的默认档(全内核默认 SSOT 在
-    // permission-config.ts)。内核因此不需要知道「设置页」存在,只看这一个中立字段。
-    ...(standingMode ? { permissionMode: standingMode } : {}),
     ...(input.sessionId ? { hostSessionId: input.sessionId } : {}),
     ...(input.traceparent ? { traceparent: input.traceparent } : {}),
     ...(model ? { model } : {}),

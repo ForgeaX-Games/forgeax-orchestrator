@@ -47,9 +47,9 @@ import {
   chatEventToKernel,
   CODEBUDDY_DRIVER_LABEL,
   CODEBUDDY_FALLBACK_MODELS,
-  CBC_DEFAULT_PERMISSION_MODE,
-  CBC_SUPPORTED_PERMISSION_MODES,
   probeStreamJsonModels,
+  toCbcPermissionMode,
+  type CbcPermissionMode,
 } from './cbc-profile';
 
 export class CbcKernel implements AgentKernel {
@@ -57,11 +57,6 @@ export class CbcKernel implements AgentKernel {
   readonly displayName = CODEBUDDY_DRIVER_LABEL;
   readonly orchestrationProfile = RENTED_KERNEL_PROFILE;
   readonly fallbackModels = CODEBUDDY_FALLBACK_MODELS;
-  readonly permissionCapabilities = {
-    supported: CBC_SUPPORTED_PERMISSION_MODES,
-    defaultMode: CBC_DEFAULT_PERMISSION_MODE,
-    lowGearHangs: true,
-  } as const;
 
   /** 真实模型目录:cc 同款 stream-json 控制面(见 cbc-profile 模型目录注释)。
    *  返回的就是 TUI `/model` 那份(云端企业配置,含 -ioa 内部渠道模型)。 */
@@ -84,7 +79,7 @@ export class CbcKernel implements AgentKernel {
   /** callId → 在飞 turn 的 AbortController(供 openHandle().cancel 杀进程)。 */
   private static readonly inflight = new Map<string, AbortController>();
   /** callId → 下一轮 spawn 要用的 permission-mode(headless 无 mid-turn 通道,只影响下一轮)。 */
-  private static readonly pendingPermissionMode = new Map<string, PermissionMode>();
+  private static readonly pendingPermissionMode = new Map<string, CbcPermissionMode>();
 
   private binary(): Promise<string> {
     return (this.binaryPromise ??= resolveBinary({
@@ -157,14 +152,13 @@ export class CbcKernel implements AgentKernel {
     }
   }
 
-  /** 从中立 TurnRequest 拼 `codebuddy -p` argv —— 委托给 cbc-profile。
-   *  档位解析同 cc:pending(控制面,最近的活动作) ?? req.permissionMode(standing 配置) ?? 默认档。 */
+  /** 从中立 TurnRequest 拼 `codebuddy -p` argv —— 委托给 cbc-profile。 */
   private buildArgs(req: TurnRequest, projectRoot: string): string[] {
     const tid = req.session.threadId?.trim();
     const session = buildCbcSessionArgs(tid, projectRoot, this.startedThreadIds);
     if (session.threadId) this.startedThreadIds.add(session.threadId);
     const pendingMode = req.callId ? CbcKernel.pendingPermissionMode.get(req.callId) : undefined;
-    return buildCbcArgs(req, projectRoot, session.args, pendingMode ?? req.permissionMode);
+    return buildCbcArgs(req, projectRoot, session.args, pendingMode);
   }
 
   openHandle(callId: string): TurnHandle {
@@ -174,8 +168,7 @@ export class CbcKernel implements AgentKernel {
     return {
       async setPermissionMode(mode: PermissionMode): Promise<void> {
         // headless `codebuddy -p` 一次性 spawn,无 mid-turn control 通道 → 只能影响**下一轮**。
-        // 存中立档位,翻方言在 cbc-profile 出口(单点)。
-        CbcKernel.pendingPermissionMode.set(callId, mode);
+        CbcKernel.pendingPermissionMode.set(callId, toCbcPermissionMode(mode));
       },
       async setModel(): Promise<void> {},
       interrupt: kill,

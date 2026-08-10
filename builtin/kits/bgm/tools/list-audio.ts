@@ -10,8 +10,6 @@ import { LIST_AUDIO_SPEC } from "../../../../src/lib/wb-bgm/tool-specs";
 
 const tool: ToolDefinition = {
   ...LIST_AUDIO_SPEC,
-  // Compatibility forwarder only. apply-audio-plan reads state internally.
-  condition: () => false,
   async execute(args) {
     const a = args as { slug?: string };
     if (!a.slug || !a.slug.trim()) {

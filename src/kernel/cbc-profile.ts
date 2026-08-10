@@ -24,7 +24,7 @@
  *
  * 日后整包外迁到 `packages/kernel-adaptors/codebuddy` 时,搬「本文件 + cbc-kernel.ts」。
  */
-import type { PermissionMode, TurnRequest } from '@forgeax/agent-runtime';
+import type { TurnRequest } from '@forgeax/agent-runtime';
 import { existsSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
@@ -36,7 +36,6 @@ import {
   toCcPermissionMode,
   type CcPermissionMode,
 } from './cc-profile';
-import { DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
 
 const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
 
@@ -98,23 +97,9 @@ export function toCbcModel(m?: string): string | undefined {
   return oneM ? `${base}-1m` : base;
 }
 
-/** cbc 能兑现的档位:枚举与 cc 一致(同一 `--permission-mode` 分叉),故四档全支持。
- *
- *  ⚠️ 已知风险(不再偷偷抬档,改为如实告知):cbc 把原生 project MCP 调用当
- *  DeferExecuteTool,**低档 + 携带 project MCP 的轮次可能等一个 Studio 答不了的
- *  审批而挂住**。历史实现对这种轮次强制抬到 bypassPermissions 来规避,但那等于
- *  静默改掉用户显式选择(见 buildCbcArgs 内注释),故已移除。选低档的用户由 UI
- *  的 riskyGearHint 提示承担这个风险。 */
-export const CBC_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = [
-  'gated',
-  'autoEdits',
-  'planning',
-  'unrestricted',
-];
-
-/** cbc 默认档 —— 派生自全内核默认,不独立持值(headless 无 permission-prompt-tool,
- *  必须自足放行;host-tool 经 `--allowedTools` 显式放行)。 */
-export const CBC_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
+/** 默认 permission-mode:headless cbc 无 permission-prompt-tool,沿用 cc 基线 acceptEdits
+ *  (自动放行编辑;host-tool 经 `--allowedTools` 显式放行,不卡审批)。 */
+const DEFAULT_CBC_PERMISSION_MODE: CbcPermissionMode = 'acceptEdits';
 
 /** 是否已有该 thread 的 cbc on-disk session 文件(决定 resume vs 新建,重启安全)。
  *  cbc 编码:去掉前导 `/`、把 `/` 换 `-`、**保留点号**(与 cc 的 `[/.]→-` 不同)。 */
@@ -314,8 +299,7 @@ export function buildCbcArgs(
   req: TurnRequest,
   _projectRoot: string,
   sessionArgs: string[],
-  // fail-safe 缺省(同 cc):漏传时走 req.permissionMode,不静默跳最高放行档。
-  permissionMode: PermissionMode = req.permissionMode ?? CBC_DEFAULT_PERMISSION_MODE,
+  permissionMode: CbcPermissionMode = DEFAULT_CBC_PERMISSION_MODE,
 ): string[] {
   const sp = req.systemPrompt;
   const systemPrompt = sp.persona?.trim()
@@ -329,15 +313,14 @@ export function buildCbcArgs(
   const hermeticArgs = buildCbcHermeticArgs(req.trustTier);
   const budgetArgs = buildCbcBudgetArgs(req.budget);
   const fallbackArgs = buildCbcFallbackArgs(req.fallbackModels);
-  // 历史上这里对「携带 mcp__ 工具的轮次」强制抬到 bypassPermissions:a peer agent CLI 把原生
-  // project MCP 调用当 DeferExecuteTool,非交互流模式下低档会等一个 Studio 中途答不了的
-  // 审批而挂住。
-  //
-  // 现在默认档已是 `unrestricted`,那条抬档对默认路径是 no-op —— 它唯一还能生效的场合,
-  // 就是**用户显式选了更严的档**,于是等于静默改掉用户的选择(实测:选 gated 后真实 argv
-  // 仍是 bypassPermissions)。故移除:尊重显式档位,挂住风险由 UI 的 riskyGearHint 明示,
-  // 不在这里偷偷改档。
-  const effectivePermissionMode = toCcPermissionMode(permissionMode);
+  // a peer agent CLI treats native project MCP calls as DeferExecuteTool. In its
+  // non-interactive stream mode `acceptEdits` still waits for an approval that
+  // Studio cannot answer mid-turn; the project MCP is already turn-scoped and
+  // explicitly allowlisted above, so use the headless bypass only for turns
+  // that actually carry a project MCP capability.
+  const effectivePermissionMode = req.tools.some((tool) => tool.name.startsWith('mcp__'))
+    ? 'bypassPermissions'
+    : permissionMode;
 
   const spKey = req.hostSessionId?.trim() || tid || req.session.agentId?.trim() || 'x';
   const systemPromptArgs = buildCbcSystemPromptArgs(systemPrompt, sp.mode ?? 'append', spKey);

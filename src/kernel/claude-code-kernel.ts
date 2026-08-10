@@ -49,11 +49,11 @@ import {
   ccSessionExists,
   CLAUDE_CODE_DRIVER_LABEL,
   CLAUDE_CODE_FALLBACK_MODELS,
-  CC_DEFAULT_PERMISSION_MODE,
-  CC_SUPPORTED_PERMISSION_MODES,
   probeStreamJsonModels,
   registerTurnGate,
   releaseTurnGate,
+  toCcPermissionMode,
+  type CcPermissionMode,
 } from './cc-profile';
 
 export class ClaudeCodeKernel implements AgentKernel {
@@ -61,10 +61,6 @@ export class ClaudeCodeKernel implements AgentKernel {
   readonly displayName = CLAUDE_CODE_DRIVER_LABEL;
   readonly fallbackModels = CLAUDE_CODE_FALLBACK_MODELS;
   readonly orchestrationProfile = RENTED_KERNEL_PROFILE;
-  readonly permissionCapabilities = {
-    supported: CC_SUPPORTED_PERMISSION_MODES,
-    defaultMode: CC_DEFAULT_PERMISSION_MODE,
-  } as const;
 
   /** 真实模型目录:stream-json 控制面 initialize 的 `models` —— 与 TUI `/model`
    *  同一份(按订阅现算)。失败 → 编排层降级 last-known → fallbackModels。 */
@@ -189,27 +185,20 @@ export class ClaudeCodeKernel implements AgentKernel {
   }
 
   /** 从中立 TurnRequest 拼 `claude -p` argv —— 委托给 cc-profile(所有 CC-isms 在那)。
-   *
-   *  档位解析(全在中立轴上,方言翻译只在 cc-profile 出口发生一次):
-   *    pendingMode(setPermissionMode RPC —— 最近一次**活的**控制面动作)
-   *      ?? req.permissionMode(本轮随请求带来的档位,实际由设置页 standing 配置填充)
-   *      ?? cc-profile 默认档(= 全内核默认)
-   *  pending 优先:`req.permissionMode` 现在承载的是**持久配置**(每轮都填),若让它压过
-   *  RPC,用户/宿主一旦配过 standing 档,mid-turn 的 setPermissionMode 就永远失效
-   *  (例如 plan 只读闸切不进去)。故最近的显式动作优先。 */
+   *  permissionMode 取自 openHandle().setPermissionMode 设过的值(经中立模式翻译),
+   *  缺省 → cc-profile 的默认(headless acceptEdits)。 */
   private buildArgs(req: TurnRequest, projectRoot: string): string[] {
     const tid = req.session.threadId?.trim();
     const session = buildSessionArgs(tid, projectRoot, this.startedThreadIds);
     if (session.threadId) this.startedThreadIds.add(session.threadId);
     const pendingMode = req.callId ? ClaudeCodeKernel.pendingPermissionMode.get(req.callId) : undefined;
-    return buildCcArgs(req, projectRoot, session.args, pendingMode ?? req.permissionMode);
+    return buildCcArgs(req, projectRoot, session.args, pendingMode);
   }
 
-  /** callId → 下一轮 spawn 要用的**中立**档位(由 setPermissionMode 原样存入)。
+  /** callId → 下一轮 spawn 要用的 CC permission-mode(由 setPermissionMode 翻译填入)。
    *  headless `claude -p` 无法 mid-turn 改 permission-mode(没有 SDK control 通道),
-   *  故 setPermissionMode 只能影响**下一轮** spawn 的 argv —— 见 openHandle 注释。
-   *  存中立值而非 CC 枚举:方言翻译保持单点(cc-profile),此处不提前落方言。 */
-  private static readonly pendingPermissionMode = new Map<string, PermissionMode>();
+   *  故 setPermissionMode 只能影响**下一轮** spawn 的 argv —— 见 openHandle 注释。 */
+  private static readonly pendingPermissionMode = new Map<string, CcPermissionMode>();
 
   openHandle(callId: string): TurnHandle {
     const kill = async (): Promise<void> => {
@@ -218,10 +207,10 @@ export class ClaudeCodeKernel implements AgentKernel {
     return {
       async setPermissionMode(mode: PermissionMode): Promise<void> {
         // headless `claude -p` 是一次性 spawn,**无 mid-turn control 通道**(那是 CC
-        // SDK 的能力,headless 没有)→ 不能改正在飞的这一轮。我们做能做的:把中立档位
-        // 原样存下,**下一轮**该 callId 的 spawn argv 即生效(翻方言在 cc-profile
-        // 出口做)。这是 headless 形态的真实上限,不静默假装。
-        ClaudeCodeKernel.pendingPermissionMode.set(callId, mode);
+        // SDK 的能力,headless 没有)→ 不能改正在飞的这一轮。我们做能做的:把中立模式
+        // 经 cc-profile 翻成 CC 枚举存下,**下一轮**该 callId 的 spawn argv 即生效
+        // (`--permission-mode <translated>`)。这是 headless 形态的真实上限,不静默假装。
+        ClaudeCodeKernel.pendingPermissionMode.set(callId, toCcPermissionMode(mode));
       },
       async setModel(): Promise<void> {},
       interrupt: kill,

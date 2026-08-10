@@ -25,7 +25,6 @@ import type {
   TurnDoneReason,
   TurnRequest,
 } from '@forgeax/agent-runtime';
-import { DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
 import { spawn } from 'node:child_process';
 import { existsSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -225,21 +224,9 @@ export function toCcPermissionMode(mode: PermissionMode): CcPermissionMode {
   }
 }
 
-/** cc 能兑现的档位 = 中立轴四档全支持(`--permission-mode` 原生四值一一对应)。
- *  设置页的下拉选项由本表派生,故 UI 永远只列该内核真能兑现的档。 */
-export const CC_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = [
-  'gated',
-  'autoEdits',
-  'planning',
-  'unrestricted',
-];
-
-/** cc 默认档 —— **派生**自全内核默认,不独立持值;改默认去 permission-config.ts 那一处。
- *
- *  headless 无 MCP permission-prompt(见 buildMcpArgs),故默认档必须自足放行:
- *  基线 `unrestricted`(→ `bypassPermissions`)下 `permissions.deny` 与 PreToolUse
- *  hook 仍然生效(实测结论见 permission-config.ts 的默认档注释),收窄靠它们。 */
-export const CC_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
+/** npc_text permission-mode:headless npc_text MCP permission-prompt(npc_text buildMcpArgs),
+ *  npc_text acceptEdits(= npc_text 'autoEdits')npc_text */
+const DEFAULT_CC_PERMISSION_MODE: CcPermissionMode = 'acceptEdits';
 
 /** session npc_text:UUID threadId npc_text `--session-id`,npc_text `--resume`npc_text
  *  npc_text argv npc_text + npc_text/npc_text(npc_text startedThreadIds)npc_text */
@@ -363,16 +350,14 @@ function buildHookSettingsArgs(realSid: string, agentId: string, key: string): s
 
 /**
  * npc_text TurnRequest npc_text `claude -p` argv(systemPrompt npc_text composeTurnRequest)npc_text
- * `permissionMode` 收**中立**档位(缺省 {@link CC_DEFAULT_PERMISSION_MODE}),方言翻译
- * 只发生在本函数内一次({@link toCcPermissionMode})—— 调用方(kernel)不碰 CC-ism。
+ * `permissionMode` npc_text {@link DEFAULT_CC_PERMISSION_MODE};npc_text
+ * (npc_text {@link toCcPermissionMode} npc_text)npc_text
  */
 export function buildCcArgs(
   req: TurnRequest,
   projectRoot: string,
   sessionArgs: string[],
-  // 缺省先看 `req.permissionMode` 再落默认档 —— **fail-safe**:漏传第 4 参的调用方
-  // 会拿到本轮请求的档位,而不是静默跳到最高放行档(权限相关的默认必须往紧的方向兜)。
-  permissionMode: PermissionMode = req.permissionMode ?? CC_DEFAULT_PERMISSION_MODE,
+  permissionMode: CcPermissionMode = DEFAULT_CC_PERMISSION_MODE,
 ): string[] {
   const sp = req.systemPrompt;
   const systemPrompt = sp.persona?.trim()
@@ -411,7 +396,7 @@ export function buildCcArgs(
     '--output-format=stream-json',
     '--include-partial-messages',
     '--verbose',
-    '--permission-mode', toCcPermissionMode(permissionMode),
+    '--permission-mode', permissionMode,
     ...hermeticArgs,
     ...hookSettingsArgs,
     ...mcpArgs,

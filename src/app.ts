@@ -10,7 +10,6 @@
 // 自己只负责 Bun.serve + 静态 SPA + engine/interface 进程 spawn + vite 代理。
 
 import { Hono } from 'hono';
-import type { AgentKernel } from '@forgeax/agent-runtime';
 import { createHonoWorkbenchRouter } from '@forgeax/workbench-host/http/hono';
 import {
   configureWorkbenchAgentTools,
@@ -21,7 +20,6 @@ import { createFilesRouter } from '@forgeax/platform-io';
 import { createFsBrowserRouter } from '@forgeax/platform-io';
 import { createSettingsRouter } from './api/settings';
 import { createMemorySettingsRouter } from './api/memory-settings';
-import { createKernelPermissionsRouter } from './api/kernel-permissions';
 import { createBootSplashRouter } from '@forgeax/platform-io';
 import { createVersionRouter } from '@forgeax/platform-io';
 import { createChangelogRouter } from '@forgeax/platform-io';
@@ -144,10 +142,6 @@ export interface ProductContext {
    * forging browser-controlled headers. Omitted for standalone UI-only hosts.
    */
   resolveLlmTestRequestSource?: (request: Request) => LlmTestRequestSource;
-  /** Product-owned kernel registry view used by capability APIs. The shell
-   * registers product-specific kernels (for example forgeax-core), while the
-   * orchestrator still supplies its built-in kernels as a fallback. */
-  kernelProvider?: () => readonly AgentKernel[];
 }
 
 export interface ForgeaxApp {
@@ -245,7 +239,6 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   app.route('/api/fs', createFsBrowserRouter());
   app.route('/api/settings', createSettingsRouter());
   app.route('/api/memory-settings', createMemorySettingsRouter());
-  app.route('/api/kernel-permissions', createKernelPermissionsRouter(ctx.kernelProvider));
   app.route('/api/boot-splash', createBootSplashRouter());
   app.route('/api/version', createVersionRouter());
   app.route('/api/changelog', createChangelogRouter());

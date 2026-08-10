@@ -48,7 +48,6 @@ const SERVER_URL = (process.env.FORGEAX_SERVER_URL || '').replace(/\/$/, '');
 const BRIDGE_SID = process.env.FORGEAX_SID || '';
 const BRIDGE_AGENT = process.env.FORGEAX_AGENT || '';
 const SPECS_FILE = process.env.FORGEAX_TOOL_SPECS_FILE || '';
-const KERNEL_PERMISSION_MODE = process.env.FORGEAX_KERNEL_PERMISSION_MODE || '';
 
 /** 从 specs 文件读非内置工具规格(name/description/inputSchema)。 */
 function loadBridgedSpecs() {
@@ -129,15 +128,6 @@ function bridgeToolResult(r, content) {
     // 铸不出 id 时不写空键 —— 消费方据键的有无判断能不能 join。
     ...(r.toolExecutionId ? { structuredContent: { forgeax: { toolExecutionId: r.toolExecutionId } } } : {}),
     ...(r.isError ? { isError: true } : {}),
-  };
-}
-
-/** The fxt MCP process has no ACP approval callback. A gated Kimi turn must
- * therefore fail closed here instead of silently becoming unrestricted. */
-function permissionDenied(name) {
-  return {
-    isError: true,
-    content: [{ type: 'text', text: `Permission to use ${name} has been denied: the active kernel posture is gated and this MCP path has no interactive approval channel.` }],
   };
 }
 
@@ -554,10 +544,7 @@ async function currentTools() {
       .filter((entry) => isExposed(entry.spec.name))
       .map((entry) => ({
         ...entry.spec,
-        async run(args) {
-          if (KERNEL_PERMISSION_MODE === 'gated') return permissionDenied(entry.spec.name);
-          return entry.client.callTool(entry.remoteName, args);
-        },
+        async run(args) { return entry.client.callTool(entry.remoteName, args); },
       }));
     const projectNames = new Set(projectMcp.byName.keys());
     const bridged = [];
@@ -569,7 +556,6 @@ async function currentTools() {
         description: t.description ?? '',
         inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
         async run(args) {
-          if (KERNEL_PERMISSION_MODE === 'gated') return permissionDenied(t.name);
           return bridgeToolResult(await bridgeCall(t.name, args));
         },
       });
