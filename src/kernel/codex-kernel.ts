@@ -23,7 +23,7 @@ import type {
   TurnHandle,
   TurnRequest,
 } from '@forgeax/agent-runtime';
-import { RENTED_KERNEL_PROFILE } from './kernel-profile';
+import { CODEX_KERNEL_PROFILE } from './kernel-profile';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
@@ -36,6 +36,7 @@ import { sidecarEnabled } from './kernel-mode';
 import { resolveBinary } from '../cli-providers/shared/resolve-binary';
 import {
   buildCodexAppServerGlobalArgs,
+  buildCodexAppServerTurnInput,
   buildCodexArgs,
   toCodexAppServerPermission,
   CODEX_DEFAULT_PERMISSION_MODE,
@@ -97,7 +98,7 @@ export class CodexKernel implements AgentKernel {
 
   readonly id = 'codex';
   readonly displayName = CODEX_DRIVER_LABEL;
-  readonly orchestrationProfile = RENTED_KERNEL_PROFILE;
+  readonly orchestrationProfile = CODEX_KERNEL_PROFILE;
   readonly fallbackModels = CODEX_FALLBACK_MODELS;
   readonly permissionCapabilities = {
     supported: CODEX_SUPPORTED_PERMISSION_MODES,
@@ -446,16 +447,13 @@ export class CodexKernel implements AgentKernel {
         return;
       }
 
-      const task = req.systemPrompt.dynamicSuffix?.trim()
-        ? `${req.input.text}\n\n${req.systemPrompt.dynamicSuffix.trim()}`
-        : req.input.text;
       await client.request('turn/start', {
         threadId: codexThreadId,
         sandboxPolicy: { type: appServerPermission.sandbox === 'danger-full-access'
           ? 'dangerFullAccess'
           : appServerPermission.sandbox === 'read-only' ? 'readOnly' : 'workspaceWrite' },
         approvalPolicy: appServerPermission.approvalPolicy,
-        input: [{ type: 'text', text: task, text_elements: [] }],
+        input: buildCodexAppServerTurnInput(req),
       });
 
       for await (const ev of queue) {

@@ -148,6 +148,45 @@ export function buildCodexAppServerGlobalArgs(
   ];
 }
 
+/**
+ * Build the app-server turn input without ever putting image bytes in the
+ * JSON-RPC text field. Codex's app-server has a dedicated `localImage` input
+ * variant; the path points at the upload materialized by composeTurnRequest.
+ *
+ * Keeping this projection here is important: `TurnRequest` may still carry
+ * untrusted inline data at other API boundaries, but the Codex wire must be
+ * path-only or a large image can trip Codex's 1 MiB input-text limit.
+ */
+export function buildCodexAppServerTurnInput(
+  req: TurnRequest,
+): Array<Record<string, unknown>> {
+  const sp = req.systemPrompt;
+  const task = sp.dynamicSuffix?.trim()
+    ? `${req.input.text}\n\n${sp.dynamicSuffix.trim()}`
+    : req.input.text;
+  const input: Array<Record<string, unknown>> = [
+    // app-server receives charter/persona through thread/start's
+    // developerInstructions; only send the user task here.
+    { type: 'text', text: task, text_elements: [] },
+  ];
+  for (const attachment of req.input.attachments ?? []) {
+    if (attachment.kind !== 'image' || typeof attachment.path !== 'string' || !attachment.path.trim()) continue;
+    input.push({ type: 'localImage', path: attachment.path });
+  }
+  return input;
+}
+
+function codexImageArgs(req: TurnRequest): string[] {
+  const args: string[] = [];
+  for (const attachment of req.input.attachments ?? []) {
+    if (attachment.kind !== 'image' || typeof attachment.path !== 'string' || !attachment.path.trim()) continue;
+    // Repeat the option so the following prompt can never be consumed as an
+    // additional image path by a variadic CLI parser.
+    args.push('--image', attachment.path);
+  }
+  return args;
+}
+
 // ─── settings.permissions 拦截面(046 楔子3) ─────────────────────────
 // codex 无 per-invocation hooks flag → 在 `<workspace>/.codex/hooks.json` 写**静态**
 // PreToolUse hook(kernel-permission-hook.mjs 同步回调 forgeax `/:sid/hook-gate`:
@@ -242,6 +281,7 @@ export function buildCodexArgs(
     ...(hooksActive ? ['--dangerously-bypass-hook-trust'] : []),
     '-c',
     `approval_policy="${approvalPolicy}"`,
+    ...codexImageArgs(req),
     // fxt MCP 注入(本轮工具);无工具轮为空(零回归)。放在 message 位置参数之前。
     ...mcpOverrides,
     ...(req.model ? ['-m', req.model] : []),

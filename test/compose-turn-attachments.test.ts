@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { registerKernel, unregisterKernel, type AgentKernel, type KernelCapabilities } from '@forgeax/agent-runtime';
 import { composeTurnRequest } from '../src/kernel/compose-turn-request';
 import { resolveKernel } from '../src/kernel/resolve-kernel';
-import { NATIVE_KERNEL_PROFILE, RENTED_KERNEL_PROFILE } from '../src/kernel/kernel-profile';
+import { CODEX_KERNEL_PROFILE, NATIVE_KERNEL_PROFILE, RENTED_KERNEL_PROFILE } from '../src/kernel/kernel-profile';
 import { initPathManager, resetPathManager } from '../src/fs/path-manager';
 import { getSessionManager, initSessionManager, resetSessionManager } from '../src/core/session-manager';
 import { transcribeKernelTurn } from '../src/kernel/transcribe-turn';
@@ -31,8 +31,11 @@ function kernel(id: string, profile: typeof RENTED_KERNEL_PROFILE): AgentKernel 
 }
 
 let root: string;
+let previousProjectRoot: string | undefined;
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'fx-compose-attachments-'));
+  previousProjectRoot = process.env.FORGEAX_PROJECT_ROOT;
+  process.env.FORGEAX_PROJECT_ROOT = root;
   resetPathManager();
   await resetSessionManager();
   initSessionManager(initPathManager({ userRoot: root }));
@@ -41,6 +44,8 @@ afterEach(async () => {
   _resetSnapshotForTests();
   await resetSessionManager();
   resetPathManager();
+  if (previousProjectRoot === undefined) delete process.env.FORGEAX_PROJECT_ROOT;
+  else process.env.FORGEAX_PROJECT_ROOT = previousProjectRoot;
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -55,6 +60,37 @@ describe('composeTurnRequest selected-kernel policy', () => {
     expect(req.input.attachments).toBeUndefined();
     expect(req.input.text).toContain('/uploads/shot.png');
     expect(JSON.stringify(req)).not.toContain('QUJD');
+  });
+
+  for (const kernelId of ['claude-code', 'cursor-agent', 'codebuddy', 'kimi-code']) {
+    test(`${kernelId} large image stays path-only and never enters text as base64`, async () => {
+      const sid = (await getSessionManager().create({ displayName: `${kernelId}-image` })).sid;
+      const req = await composeTurnRequest({
+        message: 'inspect the screenshot', agentId: 'forge', sessionId: sid,
+        kernel: kernel(kernelId, RENTED_KERNEL_PROFILE),
+        attachments: [{
+          kind: 'image', name: 'large.png', mediaType: 'image/png', data: 'large-inline-payload',
+        }],
+      });
+      expect(req.input.attachments).toBeUndefined();
+      expect(req.input.text).toContain('/uploads/large.png');
+      expect(JSON.stringify(req)).not.toContain('large-inline-payload');
+    });
+  }
+
+  test('codex kernel keeps image as a durable path-only attachment', async () => {
+    const sid = (await getSessionManager().create({ displayName: 'codex-image' })).sid;
+    const req = await composeTurnRequest({
+      message: 'inspect the screenshot', agentId: 'forge', sessionId: sid,
+      kernel: kernel('codex-test', CODEX_KERNEL_PROFILE),
+      attachments: [{
+        kind: 'image', name: 'large.png', mediaType: 'image/png', data: 'large-inline-payload',
+      }],
+    });
+    expect(req.input.attachments).toEqual([{
+      kind: 'image', path: expect.stringContaining('/uploads/large.png'), mediaType: 'image/png',
+    }]);
+    expect(JSON.stringify(req)).not.toContain('large-inline-payload');
   });
 
   test('native kernel gets path-only image/document and explicit override gets host history', async () => {

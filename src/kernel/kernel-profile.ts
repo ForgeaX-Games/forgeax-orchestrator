@@ -22,6 +22,18 @@ export const RENTED_KERNEL_PROFILE: KernelOrchestrationProfile = Object.freeze({
   historyIntake: 'text-bridge',
 });
 
+/**
+ * Codex accepts images as durable local-file inputs. Keep this separate from
+ * the generic rented profile: the other rented CLIs do not have the same
+ * path-based image contract, and passing an inline base64 payload to them is
+ * both unsupported and needlessly large.
+ */
+export const CODEX_KERNEL_PROFILE: KernelOrchestrationProfile = Object.freeze({
+  nativeAttachmentKinds: ['image'] as NativeAttachmentKind[],
+  hostOwnedHistory: false,
+  historyIntake: 'text-bridge',
+});
+
 export const NATIVE_KERNEL_PROFILE: KernelOrchestrationProfile = Object.freeze({
   nativeAttachmentKinds: ['image', 'document'] as NativeAttachmentKind[],
   hostOwnedHistory: true,
