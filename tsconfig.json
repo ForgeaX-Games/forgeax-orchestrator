@@ -24,7 +24,11 @@
       "@forgeax/types": ["../../contracts/types/src/index.ts"],
       "@forgeax/types/*": ["../../contracts/types/src/*"],
       "@forgeax/agent-runtime": ["../../contracts/agent-runtime/src/index.ts"],
-      "@forgeax/agent-runtime/*": ["../../contracts/agent-runtime/src/*"]
+      "@forgeax/agent-runtime/*": ["../../contracts/agent-runtime/src/*"],
+      "@forgeax/agent-host": ["../../agent-host/src/index.ts"],
+      "@forgeax/agent-host/*": ["../../agent-host/src/*"],
+      "@forgeax/platform-io": ["../../platform-io/src/index.ts"],
+      "@forgeax/platform-io/*": ["../../platform-io/src/*"]
     }
   },
   "include": ["src", "bin", "test", "builtin"]

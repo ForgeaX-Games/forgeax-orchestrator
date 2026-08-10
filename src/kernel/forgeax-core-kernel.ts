@@ -45,6 +45,11 @@ import {
   registerKernel,
 } from '@forgeax/agent-runtime';
 import { NATIVE_KERNEL_PROFILE } from './kernel-profile';
+import { toWire } from './forgeax-core-wire';
+import {
+  CORE_DEFAULT_PERMISSION_MODE,
+  CORE_SUPPORTED_PERMISSION_MODES,
+} from './permission-config';
 
 // os2 接入:re-export getKernel,让外部宿主(studio remoteAgentRuntime)从本模块一处
 // 同时拿 registerForgeaxCoreKernel + getKernel(不必再单独解析 @forgeax/agent-runtime)。
@@ -151,28 +156,8 @@ async function connectWithRetry(
   }
 }
 
-/** TurnRequest → 可序列化线上子集(去函数:requestPermission/hooks)。 */
-function toWire(req: TurnRequest): Record<string, unknown> {
-  return {
-    session: req.session,
-    callId: req.callId,
-    input: req.input,
-    history: req.history,
-    systemPrompt: req.systemPrompt,
-    tools: req.tools,
-    toolsRevision: req.toolsRevision,
-    liveHostContext: req.liveHostContext,
-    toolPolicy: req.toolPolicy,
-    budget: req.budget,
-    model: req.model,
-    fallbackModels: req.fallbackModels,
-    trustTier: req.trustTier,
-    hostSessionId: req.hostSessionId,
-    // 全链路 trace:把上游 W3C traceparent 透过 unix-socket 带进 sidecar,
-    //   sidecar 的 kernel.turn 据此挂成上游 span 的 child(否则在边界被丢)。
-    traceparent: req.traceparent,
-  };
-}
+/** TurnRequest → 可序列化线上子集(去函数:requestPermission/hooks)。
+ *  实现搬到 ./forgeax-core-wire(白名单值得被独立单测钉住,见该文件注释)。 */
 
 /** 一轮的事件 push→pull sink(单连接多轮:按 callId 路由 notify)。 */
 interface TurnSink {
@@ -214,6 +199,10 @@ class ForgeaxCoreServeKernel implements AgentKernel {
   readonly displayName = 'forgeax-core · native kernel · gateway metering';
   readonly orchestrationProfile = NATIVE_KERNEL_PROFILE;
   readonly capabilities = CAPS;
+  readonly permissionCapabilities = {
+    supported: CORE_SUPPORTED_PERMISSION_MODES,
+    defaultMode: CORE_DEFAULT_PERMISSION_MODE,
+  } as const;
 
   /** 模型目录 = LLM gateway 目录(disk models.json ∩ LiteLLM live)。原生内核
    *  经 gateway 路由,能跑的模型集合就是 gateway 的集合——委托共享实现

@@ -37,14 +37,18 @@ import { resolveBinary } from '../cli-providers/shared/resolve-binary';
 import {
   buildCodexAppServerGlobalArgs,
   buildCodexArgs,
+  toCodexAppServerPermission,
+  CODEX_DEFAULT_PERMISSION_MODE,
   CODEX_DRIVER_LABEL,
   CODEX_FALLBACK_MODELS,
+  CODEX_SUPPORTED_PERMISSION_MODES,
   createCodexMapperState,
   ensureCodexHooksConfig,
   flushCodexMapper,
   mapCodexEvent,
   type CodexRawEvent,
 } from './codex-profile';
+import { clampMode } from './permission-config';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { evaluateSettingsRules, loadSettingsPermissionRules } from '../api/lib/permission-settings';
 import { CodexAppServerClient, type ServerRequest } from './codex-appserver-client';
@@ -95,6 +99,10 @@ export class CodexKernel implements AgentKernel {
   readonly displayName = CODEX_DRIVER_LABEL;
   readonly orchestrationProfile = RENTED_KERNEL_PROFILE;
   readonly fallbackModels = CODEX_FALLBACK_MODELS;
+  readonly permissionCapabilities = {
+    supported: CODEX_SUPPORTED_PERMISSION_MODES,
+    defaultMode: CODEX_DEFAULT_PERMISSION_MODE,
+  } as const;
   readonly capabilities: KernelCapabilities = {
     // `codex exec --json` 的 agent_message 是整段(item.completed),非 token 级流式。
     streaming: false,
@@ -304,6 +312,8 @@ export class CodexKernel implements AgentKernel {
 
     const queue = new KernelEventQueue();
     const notifState = createCodexNotifState();
+    const permissionMode = req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE;
+    const appServerPermission = toCodexAppServerPermission(permissionMode);
 
     // 审批 server-request:settings.permissions 规则先行(046 楔子3:deny 即拒 /
     // allow 即批 / ask 强制走卡),未命中 → 中立 requestPermission(= Studio 审批卡),
@@ -399,8 +409,8 @@ export class CodexKernel implements AgentKernel {
         const model = req.model?.trim() || undefined;
         const res = await client.request('thread/start', {
           cwd: projectRoot,
-          sandbox: 'workspace-write',
-          approvalPolicy: 'on-request',
+          sandbox: appServerPermission.sandbox,
+          approvalPolicy: appServerPermission.approvalPolicy,
           ...(developerInstructions?.trim() ? { developerInstructions } : {}),
           ...(model ? { model } : {}),
           ephemeral: false,
@@ -441,6 +451,10 @@ export class CodexKernel implements AgentKernel {
         : req.input.text;
       await client.request('turn/start', {
         threadId: codexThreadId,
+        sandboxPolicy: { type: appServerPermission.sandbox === 'danger-full-access'
+          ? 'dangerFullAccess'
+          : appServerPermission.sandbox === 'read-only' ? 'readOnly' : 'workspaceWrite' },
+        approvalPolicy: appServerPermission.approvalPolicy,
         input: [{ type: 'text', text: task, text_elements: [] }],
       });
 
@@ -601,7 +615,20 @@ export class CodexKernel implements AgentKernel {
   private buildArgs(req: TurnRequest, hooksActive = false, mcpOverrides: string[] = []): string[] {
     const tid = req.session.threadId?.trim();
     const codexThreadId = tid ? this.threadIdMap.get(tid) : undefined;
-    return buildCodexArgs(req, codexThreadId, hooksActive, mcpOverrides);
+    // 本轮档位:codex 只能兑现 autoEdits / unrestricted,越界(gated/planning)先 clamp
+    // 到默认档并出声 —— 不静默把「只读/把闸」当成跑通了。
+    const requested = req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE;
+    const { mode, downgraded } = clampMode(
+      requested,
+      CODEX_SUPPORTED_PERMISSION_MODES,
+      CODEX_DEFAULT_PERMISSION_MODE,
+    );
+    if (downgraded) {
+      process.stderr.write(
+        `[codex-kernel] permissionMode="${requested}" 在 codex headless 无落点(无 per-tool 闸/无只读强制),已降级为 "${mode}"。收窄请用 sandbox_mode 或 settings 规则。\n`,
+      );
+    }
+    return buildCodexArgs(req, codexThreadId, hooksActive, mcpOverrides, mode);
   }
 
   openHandle(callId: string): TurnHandle {
@@ -609,11 +636,11 @@ export class CodexKernel implements AgentKernel {
       CodexKernel.inflight.get(callId)?.abort();
     };
     return {
-      // no-op(诚实标注):codex headless 的权限语义 = spawn 时固定的
-      // `approval_policy=never` + `sandbox_mode=workspace-write`(见 codex-profile),
-      // **没有 per-tool 权限闸,也没有 mid-turn control 通道**改 sandbox。因此中立
-      // PermissionMode 在 codex 上无落点 —— 既不能 mid-turn 改,也无「下一轮 argv」语义
-      // 上的合理映射(planning/gated 在纯 sandbox 模式下无对应)。保持 no-op,不静默假装。
+      // no-op(诚实标注):codex headless 的权限语义在 spawn 时由 argv 固定
+      // (`approval_policy=never` + `sandbox_mode=<档>`,见 codex-profile),**没有
+      // per-tool 权限闸,也没有 mid-turn control 通道**改 sandbox → 正在飞的这一轮改不了。
+      // 档位入口只有一个:`TurnRequest.permissionMode`(buildArgs 处 clamp 后翻方言);
+      // 本 RPC 保持 no-op,不静默假装能改。
       async setPermissionMode(): Promise<void> {},
       async setModel(): Promise<void> {},
       interrupt: kill,

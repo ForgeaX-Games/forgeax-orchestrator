@@ -22,7 +22,8 @@
  *  - 用量:result.usage 只有 token,无 $ cost → turn.usage.costUsd 留空。
  *  - 无 per-tool 权限回调(走 --force / hooks)→ requestPermission 不接。
  */
-import type { KernelModelInfo, TurnRequest } from '@forgeax/agent-runtime';
+import type { KernelModelInfo, PermissionMode, TurnRequest } from '@forgeax/agent-runtime';
+import { DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import { resolveBinary } from '../cli-providers/shared/resolve-binary';
@@ -106,6 +107,27 @@ export {
 // ⚠️ cursor 无 shell 直 exec hook 命令:`VAR=` 前缀与含 `://` 参数都会打断解析
 // (2026-06-16 实测)→ 命令串只含双引号路径,不带 env 前缀/URL 参数。
 
+/**
+ * cursor 能兑现的档位:**只有 `unrestricted` 一档**。
+ *
+ * 上面那段实测结论决定了这一点 —— headless 只有两态:不加 `--force` 时 default 模式
+ * 自动**拒**掉一切需审批操作(agent 直接废掉,不是「更严格」而是「不可用」),加了
+ * 就是全放行。故 `gated`/`autoEdits`/`planning` 都给不出:
+ *   - 下拉里 cursor 只会出现一项,这是真实能力,不是漏做;
+ *   - 想收窄不靠降档,靠 hooks.json 那条 hook-gate(deny 实测强制生效)+ 规则。
+ */
+export const CURSOR_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = ['unrestricted'];
+
+/** cursor 默认档 —— 派生自全内核默认(恰好也是它唯一可兑现的档)。 */
+export const CURSOR_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
+
+/** 中立档位 → cursor argv 片段(本内核唯一的放行姿态出口)。
+ *  非 `unrestricted` 档位不该走到这里(kernel 侧已 clamp);兜底也返回 `--force`,
+ *  因为去掉它等于让 agent 自动拒一切 = 静默瘫掉,比放行更糟。 */
+export function toCursorPermissionArgs(_mode: PermissionMode): string[] {
+  return ['--force'];
+}
+
 /** hooks.json 归属标记:命中才允许覆盖(不吃掉用户自己的 hooks.json)。 */
 const CURSOR_HOOKS_MARKER = 'cursor-permission-hook.mjs';
 
@@ -162,6 +184,8 @@ export function buildCursorArgs(
   req: TurnRequest,
   cursorChatId: string | undefined,
   workspace?: { root: string; projectRoot: string },
+  // fail-safe 缺省(同 cc):漏传时走 req.permissionMode。
+  permissionMode: PermissionMode = req.permissionMode ?? CURSOR_DEFAULT_PERMISSION_MODE,
 ): { args: string[]; message: string } {
   const isFirstTurn = !cursorChatId;
 
@@ -191,9 +215,11 @@ export function buildCursorArgs(
     '-p',
     '--output-format', 'stream-json',
     '--stream-partial-output',
-    // 信任工作区(headless 必需)+ force 平滑基线;危险操作的审批卡 hook 见 task 2e。
+    // 信任工作区(headless 必需)。
     '--trust',
-    '--force',
+    // 放行姿态:经 toCursorPermissionArgs 归口(不再内联裸 `--force`);
+    // 危险操作的收窄面 = .cursor/hooks.json 的 hook-gate。
+    ...toCursorPermissionArgs(permissionMode),
     // 自动信任 .cursor/mcp.json 里的 MCP server(含 forgeax host-tools),headless 不弹信任框。
     '--approve-mcps',
     ...(selectedModel ? ['--model', selectedModel] : []),
