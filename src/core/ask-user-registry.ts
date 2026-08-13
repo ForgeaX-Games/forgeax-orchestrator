@@ -10,8 +10,15 @@
 
 import { tt } from '../lib/turn-trace';
 
+export interface AskReplyItem {
+  questionId: string;
+  values: string[];
+}
+
+export type AskReply = AskReplyItem[];
+
 interface Pending {
-  resolve: (values: string[] | null) => void;
+  resolve: (answers: AskReply | null) => void;
   /** 仅在传了有限正超时时存在;缺省 = 无超时(像 the reference agent CLI 一样无限等用户回答)。 */
   timer?: ReturnType<typeof setTimeout>;
 }
@@ -23,8 +30,8 @@ function keyOf(sid: string, agentPath: string): string {
 }
 
 export interface AskHandle {
-  /** Resolves to the chosen label array, or null when aborted / timed out. */
-  promise: Promise<string[] | null>;
+  /** Resolves to every question's chosen values, or null when aborted. */
+  promise: Promise<AskReply | null>;
   /** Idempotent cleanup —— removes the pending entry + clears the timer. */
   dispose(): void;
 }
@@ -44,8 +51,8 @@ export function registerAsk(sid: string, agentPath: string, timeoutMs: number): 
     pending.delete(key);
   }
 
-  let settle!: (values: string[] | null) => void;
-  const promise = new Promise<string[] | null>((res) => {
+  let settle!: (answers: AskReply | null) => void;
+  const promise = new Promise<AskReply | null>((res) => {
     settle = res;
   });
 
@@ -79,7 +86,7 @@ export function registerAsk(sid: string, agentPath: string, timeoutMs: number): 
 /** Resolve a pending ask with the user's selection. Returns true when a
  *  matching pending entry was found and resolved, false otherwise (already
  *  answered / timed out / unknown key). */
-export function resolveAsk(sid: string, agentPath: string, values: string[]): boolean {
+export function resolveAsk(sid: string, agentPath: string, answers: AskReply): boolean {
   const exactKey = keyOf(sid, agentPath);
   let key = exactKey;
   let entry = pending.get(key);
@@ -97,6 +104,6 @@ export function resolveAsk(sid: string, agentPath: string, values: string[]): bo
   if (!entry) return false;
   if (entry.timer) clearTimeout(entry.timer);
   pending.delete(key);
-  entry.resolve(values);
+  entry.resolve(answers);
   return true;
 }

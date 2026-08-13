@@ -30,15 +30,21 @@ import { FileActivityLedger } from "../ledger/file-activity-ledger";
 import type { FileLockMap } from "../fs/agent-fs-recorder";
 import { bindSystemEventLog } from "../ledger/system-event-log";
 import { Logger } from "./logger";
-import type { SessionConfig, ModelsConfig } from "./types";
+import type { Event, SessionConfig, ModelsConfig } from "./types";
 import type { PathManagerAPI, SessionLayerAPI } from "../fs/types";
 import { createOrGetFSWatcher } from "../fs/watcher";
+import { getPathManager } from "../fs/path-manager";
 import { AgentKitReloadCoordinator } from "../kits/reload-coordinator";
 import { clearRememberedForSession } from "../kernel/tool-approval";
 import { clearUiStateForSession } from "../api/lib/ui-manifest-registry";
 import { runAutoExtract } from "../soul/auto-extract";
 import { tryKernelForkExtract } from "../soul/fork-extract";
 import { resolveKernel } from "../kernel/resolve-kernel";
+import { canonicalToolName } from "../kernel/canonical-tool-name";
+import type { ArtifactResolver, ArtifactTurnContext } from "../orchestration-seams";
+import type { ArtifactResolvedPayload, ArtifactSummary } from "@forgeax/types/artifact-summary";
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 
 /** One pending delegate_to_subagent awaiting the sub-agent's turn-end.
  *  Keyed by sub-agent's `agentPath` (e.g. "suzu"). */
@@ -63,6 +69,9 @@ export interface SessionInitConfig {
    *  （wipe blackboard 命名空间 / dispose ledger）。SessionManager 默认
    *  包出 `(agentPath) => session.freeAgentState(agentPath)`。 */
   onAgentFreed?: (agentPath: string) => void | Promise<void>;
+  /** Host-owned final-settle artifact derivation. Optional for standalone
+   * orchestrator consumers; the product shell injects it at app boot. */
+  artifactResolver?: ArtifactResolver;
 }
 
 /** Pull plain text out of a `hook:assistantMessage` payload. The assistant
@@ -83,6 +92,49 @@ function extractAssistantText(payload: unknown): string {
       .trim();
   }
   return "";
+}
+
+function stableArtifactId(sid: string, turnId: string, checkpointMsgId?: string): string {
+  return createHash("sha256")
+    .update(`${sid}\0${turnId}\0${checkpointMsgId ?? ""}`)
+    .digest("hex");
+}
+
+function askResultHasAnswer(value: unknown): boolean {
+  let source = value;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof source === "string") {
+      const raw = source.trim().replace(/^\[ask_user\]\s*/i, "");
+      try { source = JSON.parse(raw) as unknown; continue; } catch {
+        return /「[^」]+」/.test(raw);
+      }
+    }
+    if (!source || typeof source !== "object" || Array.isArray(source)) return false;
+    const envelope = source as { ok?: unknown; questions?: unknown; text?: unknown; structuredContent?: unknown };
+    if (envelope.ok === true && Array.isArray(envelope.questions)) break;
+    if (envelope.structuredContent !== null && envelope.structuredContent !== undefined) {
+      source = envelope.structuredContent;
+      continue;
+    }
+    if (typeof envelope.text === "string") {
+      source = envelope.text;
+      continue;
+    }
+    return false;
+  }
+  if (!source || typeof source !== "object" || Array.isArray(source)) return false;
+  const record = source as { ok?: unknown; questions?: unknown };
+  if (record.ok !== true || !Array.isArray(record.questions)) return false;
+  return record.questions.some((question) => {
+    if (!question || typeof question !== "object" || Array.isArray(question)) return false;
+    const values = (question as { values?: unknown }).values;
+    return Array.isArray(values) && values.some((item) => typeof item === "string" && item.trim().length > 0);
+  });
+}
+
+function askToolResultResolved(payload: Record<string, unknown>): boolean {
+  if (typeof payload.error === "string" && payload.error) return false;
+  return askResultHasAnswer(payload.result ?? payload.resultData);
 }
 
 export class Session {
@@ -148,12 +200,34 @@ export class Session {
    *  back across chat tabs — the root of the "做一点就停/反复说继续" loop. */
   private readonly latestAssistantText = new Map<string, string>();
 
+  /** New turn protocol state. A turn is not considered settled until its
+   * `hook:turnEnd` is observed and any ask_user wait has completed. */
+  private readonly artifactResolver?: ArtifactResolver;
+  private readonly artifactTurns = new Map<string, {
+    turnId: string;
+    checkpointMsgId?: string;
+    startedAt: number;
+    eligible: boolean;
+    waitingForInput?: boolean;
+  }>();
+  private readonly pendingAskCalls = new Set<string>();
+  /** CLI AskUserQuestion calls are answered through the permission side
+   * channel. Their tool result is often a human-readable sentence rather than
+   * the native structured `{ ok, questions }` payload, so keep provenance
+   * beside the pending call instead of guessing from result prose. */
+  private readonly permissionAskCalls = new Set<string>();
+  /** Add the active turn id to tool events that predate the payload turnId
+   * field. EventLedger persists it as history metadata for precise attribution. */
+  private readonly activeTurnIds = new Map<string, string>();
+  private readonly artifactResolutionInFlight = new Map<string, Promise<void>>();
+
   private disposed = false;
 
   constructor(private readonly init: SessionInitConfig) {
     this.sid = init.sid;
     this.paths = init.paths.session(init.sid);
     this.config = init.config;
+    this.artifactResolver = init.artifactResolver;
 
     this.blackboard = new Blackboard(this.paths.root() + "/blackboard.json");
     this.blackboard.loadFromDisk();
@@ -183,6 +257,20 @@ export class Session {
       onAgentAttached: (agent) => this.kitReloadCoordinator?.registerAgent(agent),
       onAgentDetached: (agentPath) => {
         this.kitReloadCoordinator?.unregisterAgent(agentPath);
+        // A detached agent may never emit a tool result. Drop its Ask wait
+        // keys and any in-memory artifact turn that cannot receive a final
+        // lifecycle event; otherwise a later agent with the same path can be
+        // held in waiting_for_input forever.
+        for (const key of this.pendingAskCalls) {
+          if (key.startsWith(`${agentPath}:`)) this.pendingAskCalls.delete(key);
+        }
+        for (const key of this.permissionAskCalls) {
+          if (key.startsWith(`${agentPath}:`)) this.permissionAskCalls.delete(key);
+        }
+        if (!this.liveTurns.has(agentPath)) {
+          this.artifactTurns.delete(agentPath);
+          this.activeTurnIds.delete(agentPath);
+        }
         // Target of a pending delegation is going away (shutdown/restart/remove/
         // crash) — `hook:turnEnd` will never fire for it, so without this the
         // `delegations` entry leaks forever and permanently blocks future
@@ -254,12 +342,43 @@ export class Session {
     // 顺序无关；dispose 时按注册逆序 unsub。
     this._busUnsubs = [
       this._bindLedgerPersistence(),
+      this._bindArtifactResolution(),
       this._bindAgentCommandRouting(),
       this._bindDelegationCallback(),
       this._bindAutoExtract(),
       bindSystemEventLog(this.paths.globalEventsLog(), this.eventBus),
       () => this.liveTurns.dispose(),
     ];
+    // Reopen/restart recovery is best-effort and never blocks Session
+    // construction. The same resolver + append-before-broadcast path is used
+    // for repaired terminal events, so a crash between turn-end and artifact
+    // WAL append cannot permanently lose the card.
+    queueMicrotask(() => { void this._reconcileArtifactTurns(); });
+  }
+
+  /** Explicit settle hook for kernel paths that transcribe their WAL directly
+   * instead of publishing the lifecycle events through this EventBus (the CLI
+   * kernel path is one such caller). */
+  async resolveArtifactTurn(context: ArtifactTurnContext): Promise<void> {
+    await this._resolveArtifact(context);
+  }
+
+  /** Project root used for attribution of relative tool paths. In Studio the
+   * session is nested under the bound game, so the session state directory is
+   * deliberately not used as the execution root. */
+  artifactProjectRoot(): string {
+    try {
+      if (this.config.defaultDir) {
+        // Tool hooks may report project-root-relative paths such as
+        // `.forgeax/games/<slug>/src/file.ts`, while SnapshotStore diffs are
+        // game-relative.  The project root is the directory containing the
+        // `.forgeax/games` tree, not the bound game directory itself.
+        return resolve(getPathManager().user().gamesDir(), "..", "..");
+      }
+    } catch {
+      /* Fall back to the generic session root for standalone consumers. */
+    }
+    return this.paths.root();
   }
 
   // ─── turn-end → 自动沉淀(USER.md + 分层记忆)──────────────────────────────
@@ -428,6 +547,307 @@ export class Session {
 
   private readonly _busUnsubs: Array<() => void>;
 
+  // ─── final settle → host-owned artifact resolution ──────────────────────
+
+  private async _reconcileArtifactTurns(): Promise<void> {
+    if (!this.artifactResolver) return;
+    const paths = new Set<string>(this.ledgers.keys());
+    for (const node of this.tree.list()) paths.add(node.path);
+
+    for (const agentPath of paths) {
+      let events: Array<import("../ledger/types").StoredEvent>;
+      try {
+        events = await this.getOrCreateLedger(agentPath).readAllEvents();
+      } catch {
+        continue;
+      }
+
+      const starts = new Map<string, {
+        startedAt: number;
+        checkpointMsgId?: string;
+        eligible: boolean;
+        waitingForInput: boolean;
+      }>();
+      const resolved = new Set<string>();
+      const permissionAskCalls = new Set<string>();
+      for (const event of events) {
+        const payload = event.payload ?? {};
+        if (event.type === "artifact:resolved" && typeof payload.artifactId === "string") {
+          resolved.add(payload.artifactId);
+          continue;
+        }
+        if (event.type === "hook:turnStart") {
+          const turnId = typeof payload.turnId === "string" && payload.turnId
+            ? payload.turnId
+            : event.history?.turnId;
+          if (!turnId) continue;
+          starts.set(turnId, {
+            startedAt: event.ts,
+            ...(typeof payload.msgId === "string" ? { checkpointMsgId: payload.msgId } : {}),
+            eligible: payload.artifactResolutionExpected !== false,
+            waitingForInput: false,
+          });
+          continue;
+        }
+        if (event.type === "hook:toolCall") {
+          const name = typeof payload.name === "string" ? payload.name : undefined;
+          const turnId = event.history?.turnId ?? (typeof payload.turnId === "string" ? payload.turnId : undefined);
+          if (turnId && name && canonicalToolName(name) === "ask_user") {
+            const nested = payload.toolCall && typeof payload.toolCall === "object"
+              ? payload.toolCall as Record<string, unknown>
+              : undefined;
+            const callId = typeof payload.callId === "string"
+              ? payload.callId
+              : typeof payload.toolCallId === "string"
+                ? payload.toolCallId
+                : typeof nested?.id === "string" ? nested.id : `anonymous:${event.ts}`;
+            const pendingKey = `${turnId}:${callId}`;
+            if (payload.permissionPrompt === true) permissionAskCalls.add(pendingKey);
+            const start = starts.get(turnId);
+            if (start) start.waitingForInput = true;
+          }
+          continue;
+        }
+        if (event.type === "hook:toolResult") {
+          const turnId = event.history?.turnId ?? (typeof payload.turnId === "string" ? payload.turnId : undefined);
+          if (turnId) {
+            const start = starts.get(turnId);
+            const callId = typeof payload.callId === "string"
+              ? payload.callId
+              : typeof payload.toolCallId === "string" ? payload.toolCallId : undefined;
+            const pendingKeys = [...permissionAskCalls].filter((key) => key.startsWith(`${turnId}:`));
+            const matchedKey = callId
+              ? `${turnId}:${callId}`
+              : pendingKeys.length === 1 ? pendingKeys[0] : undefined;
+            const permissionPrompt = matchedKey ? permissionAskCalls.has(matchedKey) : false;
+            if (matchedKey) permissionAskCalls.delete(matchedKey);
+            const resolved = permissionPrompt
+              ? payload.error === undefined && payload.ok !== false
+              : askToolResultResolved(payload);
+            if (start && start.waitingForInput && !resolved) {
+              // An expired/invalid Ask result is not a final settle. Keep the
+              // turn blocked so recovery cannot manufacture an artifact.
+              start.waitingForInput = true;
+            } else if (start) {
+              start.waitingForInput = false;
+            }
+          }
+          continue;
+        }
+        if (event.type !== "hook:turnEnd") continue;
+        const turnId = typeof payload.turnId === "string" && payload.turnId
+          ? payload.turnId
+          : event.history?.turnId;
+        if (!turnId) continue;
+        const start = starts.get(turnId);
+        if (!start || !start.eligible || payload.artifactResolutionExpected === false) continue;
+        const waitingForInput = payload.aborted !== true
+          && (payload.waitingForInput === true || start.waitingForInput);
+        if (waitingForInput) {
+          // Keep the start record through an interaction checkpoint.  A
+          // restarted session may see the eventual ask result and final
+          // turn-end later in the same ledger; deleting it here would make
+          // that recovery path permanently lose the artifact resolution.
+          continue;
+        }
+        starts.delete(turnId);
+        for (const key of permissionAskCalls) {
+          if (key.startsWith(`${turnId}:`)) permissionAskCalls.delete(key);
+        }
+        const artifactId = stableArtifactId(this.sid, turnId, start.checkpointMsgId ?? (typeof payload.msgId === "string" ? payload.msgId : undefined));
+        if (resolved.has(artifactId)) continue;
+        void this._resolveArtifact({
+          sid: this.sid,
+          agentId: agentPath,
+          projectRoot: this.artifactProjectRoot(),
+          ...(this.config.defaultDir ? { game: this.config.defaultDir } : {}),
+          turnId,
+          ...((start.checkpointMsgId ?? (typeof payload.msgId === "string" ? payload.msgId : undefined))
+            ? { checkpointMsgId: start.checkpointMsgId ?? (payload.msgId as string) }
+            : {}),
+          startedAt: start.startedAt,
+          settledAt: event.ts,
+          ...(typeof event.seq === "number" ? { anchorSeq: event.seq } : {}),
+          ...(payload.aborted === true ? { aborted: true } : {}),
+          ...(typeof payload.error === "string" ? { error: payload.error } : {}),
+        });
+      }
+    }
+  }
+
+  /** Observe the lifecycle boundary only. File attribution remains in the
+   * resolver, which can use the checkpoint CAS and the WAL as its two sources
+   * of truth; this observer must not inspect the workspace itself. */
+  private _bindArtifactResolution(): () => void {
+    return this.eventBus.observe((event, emitterId) => {
+      if (!emitterId || !this.artifactResolver) return;
+
+      if (event.type === "hook:turnStart") {
+        const payload = (event.payload ?? {}) as Record<string, unknown>;
+        const turnId = typeof payload.turnId === "string" && payload.turnId
+          ? payload.turnId
+          : `legacy:${event.ts}`;
+        const checkpointMsgId = typeof payload.msgId === "string" && payload.msgId
+          ? payload.msgId
+          : undefined;
+        this.artifactTurns.set(emitterId, {
+          turnId,
+          ...(checkpointMsgId ? { checkpointMsgId } : {}),
+          startedAt: event.ts,
+          eligible: payload.artifactResolutionExpected !== false,
+        });
+        this.activeTurnIds.set(emitterId, turnId);
+        return;
+      }
+
+      if (event.type === "hook:toolCall") {
+        const payload = (event.payload ?? {}) as Record<string, unknown>;
+        const nested = payload.toolCall && typeof payload.toolCall === "object"
+          ? payload.toolCall as Record<string, unknown>
+          : undefined;
+        const name = typeof payload.name === "string"
+          ? payload.name
+          : typeof nested?.name === "string" ? nested.name : undefined;
+        if (name && canonicalToolName(name) === "ask_user") {
+          const callId = typeof payload.callId === "string"
+            ? payload.callId
+            : typeof payload.toolCallId === "string"
+              ? payload.toolCallId
+              : typeof nested?.id === "string" ? nested.id : `anonymous:${event.ts}`;
+          this.pendingAskCalls.add(`${emitterId}:${callId}`);
+          if (payload.permissionPrompt === true) this.permissionAskCalls.add(`${emitterId}:${callId}`);
+        }
+        return;
+      }
+
+      if (event.type === "hook:toolResult") {
+        const payload = (event.payload ?? {}) as Record<string, unknown>;
+        const callId = typeof payload.callId === "string"
+          ? payload.callId
+          : typeof payload.toolCallId === "string" ? payload.toolCallId : undefined;
+        const turn = this.artifactTurns.get(emitterId);
+        const pendingKeys = [...this.pendingAskCalls].filter((key) => key.startsWith(`${emitterId}:`));
+        const matchedKeys = callId
+          ? this.pendingAskCalls.has(`${emitterId}:${callId}`) ? [`${emitterId}:${callId}`] : []
+          : pendingKeys;
+        const matchedPending = matchedKeys.length > 0;
+        const permissionPrompt = matchedKeys.length === 1 && this.permissionAskCalls.has(matchedKeys[0]!);
+        const askResult = permissionPrompt
+          ? payload.error === undefined && payload.ok !== false
+          : askToolResultResolved(payload);
+        for (const key of matchedKeys) {
+          this.pendingAskCalls.delete(key);
+          this.permissionAskCalls.delete(key);
+        }
+        if (turn && matchedPending) turn.waitingForInput = !askResult;
+        return;
+      }
+
+      if (event.type !== "hook:turnEnd") return;
+      const turn = this.artifactTurns.get(emitterId);
+      if (!turn) return;
+      const payload = (event.payload ?? {}) as Record<string, unknown>;
+      if (!turn.eligible || payload.artifactResolutionExpected === false) {
+        this.artifactTurns.delete(emitterId);
+        this.activeTurnIds.delete(emitterId);
+        return;
+      }
+      const waitingForInput = payload.aborted !== true && (payload.waitingForInput === true
+        || turn.waitingForInput === true
+        || [...this.pendingAskCalls].some((key) => key.startsWith(`${emitterId}:`)));
+      if (waitingForInput) {
+        // This is an interaction checkpoint, not a final settle. Keep the
+        // turn open so the eventual ask reply gets one artifact resolution.
+        turn.waitingForInput = true;
+        return;
+      }
+
+      this.artifactTurns.delete(emitterId);
+      this.activeTurnIds.delete(emitterId);
+      for (const key of this.pendingAskCalls) {
+        if (key.startsWith(`${emitterId}:`)) this.pendingAskCalls.delete(key);
+      }
+      for (const key of this.permissionAskCalls) {
+        if (key.startsWith(`${emitterId}:`)) this.permissionAskCalls.delete(key);
+      }
+      const context: ArtifactTurnContext = {
+        sid: this.sid,
+        agentId: emitterId,
+        projectRoot: this.artifactProjectRoot(),
+        ...(this.config.defaultDir ? { game: this.config.defaultDir } : {}),
+        turnId: turn.turnId,
+        ...(turn.checkpointMsgId ? { checkpointMsgId: turn.checkpointMsgId } : {}),
+        ...(typeof event.seq === "number" ? { anchorSeq: event.seq } : {}),
+        startedAt: turn.startedAt,
+        settledAt: event.ts,
+        ...(payload.aborted === true ? { aborted: true } : {}),
+        ...(typeof payload.error === "string" ? { error: payload.error } : {}),
+      };
+      void this._resolveArtifact(context);
+    });
+  }
+
+  private _resolveArtifact(context: ArtifactTurnContext): Promise<void> {
+    const artifactId = stableArtifactId(context.sid ?? this.sid, context.turnId, context.checkpointMsgId);
+    const existing = this.artifactResolutionInFlight.get(artifactId);
+    if (existing) return existing;
+
+    const work = (async () => {
+      let payload: ArtifactResolvedPayload;
+      try {
+        payload = await this.artifactResolver!.resolveTurn(context);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.logger.error(context.agentId, undefined, `artifact resolution failed: ${reason}`);
+        const summary: ArtifactSummary = {
+          id: artifactId,
+          sid: context.sid ?? this.sid,
+          turnId: context.turnId,
+          ...(context.checkpointMsgId ? { checkpointMsgId: context.checkpointMsgId } : {}),
+          files: [],
+          status: "unavailable",
+          derivedUnavailable: true,
+          unavailableReason: reason,
+          reliableCandidatePaths: [],
+          agents: [context.agentId],
+          durationMs: Math.max(0, context.settledAt - context.startedAt),
+        };
+        payload = {
+          schemaVersion: 1,
+          artifactId,
+          turnId: context.turnId,
+          ...(context.checkpointMsgId ? { checkpointMsgId: context.checkpointMsgId } : {}),
+          ...(context.anchorSeq !== undefined ? { anchorSeq: context.anchorSeq } : {}),
+          resolution: { kind: "unavailable", reason, reliableCandidatePaths: [], summary },
+        };
+      }
+
+      const ledger = this.getOrCreateLedger(context.agentId);
+      const prior = await ledger.readAllEvents();
+      if (prior.some((event) => event.type === "artifact:resolved" && event.payload?.artifactId === payload.artifactId)) return;
+
+      const event: Event = {
+        type: "artifact:resolved",
+        source: "host:artifact-deriver",
+        ts: Date.now(),
+        payload: payload as unknown as Record<string, unknown>,
+      };
+      // Append confirmation comes before live broadcast. The persistence
+      // observer below skips this host-owned source to avoid a second WAL row.
+      ledger.append(event, context.agentId, {
+        eventId: `artifact:${payload.artifactId}`,
+        turnId: payload.turnId,
+      });
+      this.eventBus.publish(event, context.agentId);
+    })().finally(() => {
+      if (this.artifactResolutionInFlight.get(artifactId) === work) {
+        this.artifactResolutionInFlight.delete(artifactId);
+      }
+    });
+    this.artifactResolutionInFlight.set(artifactId, work);
+    return work;
+  }
+
   // ─── EventBus → ledger persistence ───────────────────────────────────────
 
   /** 镜像 agenteam ref `session-manager._bindEventBus`：所有跟某个 agent 关联的
@@ -442,6 +862,14 @@ export class Session {
       // 是双倍噪声 + LLM 历史污染。用专门的 LLM slot（file-activity-recent）按需
       // 注入，比每个 write 自动塞 prompt 更可控。
       if (event.type.startsWith("file-activity:")) return;
+      // `_resolveArtifact` appends its WAL row synchronously before publishing
+      // the live event. Re-appending here would make replay show duplicates.
+      if (event.type === "artifact:resolved" && event.source === "host:artifact-deriver") return;
+
+      if (event.type === "hook:turnStart" && emitterId) {
+        const turnId = (event.payload as Record<string, unknown> | undefined)?.turnId;
+        if (typeof turnId === "string" && turnId) this.activeTurnIds.set(emitterId, turnId);
+      }
 
       const candidates: string[] = [];
       if (emitterId && this.tree.get(emitterId)) candidates.push(emitterId);
@@ -454,12 +882,18 @@ export class Session {
       if (event.to && event.isBlocked?.()) return;
       for (const agentPath of candidates) {
         try {
-          this.getOrCreateLedger(agentPath).append(event, emitterId);
+          const turnId = this.activeTurnIds.get(agentPath);
+          this.getOrCreateLedger(agentPath).append(
+            event,
+            emitterId,
+            turnId ? { turnId } : undefined,
+          );
         } catch (err) {
           const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
           this.logger.error(agentPath, undefined, `WAL append "${event.type}" failed: ${msg}`);
         }
       }
+      if (event.type === "hook:turnEnd" && emitterId) this.activeTurnIds.delete(emitterId);
     });
   }
 

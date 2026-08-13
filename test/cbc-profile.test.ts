@@ -2,12 +2,19 @@ import { describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { buildCbcMcpArgs } from '../src/kernel/cbc-profile';
+import { buildCbcArgs, buildCbcMcpArgs } from '../src/kernel/cbc-profile';
 
 const request = {
   tools: [{ name: 'npc_wire', description: 'wire', inputSchema: { type: 'object' } }],
   session: { agentId: 'forge' },
   hostSessionId: 'sid',
+} as never;
+
+const turnRequest = {
+  ...request,
+  input: { text: 'hello' },
+  systemPrompt: { charter: 'charter', persona: '' },
+  budget: {},
 } as never;
 
 describe('cbc builtin adoption surface', () => {
@@ -17,6 +24,13 @@ describe('cbc builtin adoption surface', () => {
     expect(configPath).toBeTruthy();
     const config = JSON.parse(readFileSync(configPath!, 'utf8')) as { mcpServers?: { fxt?: { env?: Record<string, string> } } };
     expect(config.mcpServers?.fxt?.env?.FORGEAX_TOOL_SPECS_FILE).toBeUndefined();
+  });
+
+  test('always disables native TodoWrite, including without pack policy', () => {
+    const args = buildCbcArgs(turnRequest, '/tmp', []);
+    const i = args.indexOf('--disallowedTools');
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe('TodoWrite');
   });
 
   test('routes project MCP through fxt without mounting a second native server', () => {

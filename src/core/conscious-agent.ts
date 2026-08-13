@@ -51,6 +51,7 @@ import { ContextEngine } from "../kits/slot/context-engine";
 import { runToolBatch as runToolBatchKit } from "../kits/tool/tool-batch-runner";
 import { runKernelTurn } from "./kernel-turn";
 import { kernelEnabled } from "../kernel/kernel-mode";
+import { randomUUID } from "node:crypto";
 
 import type {
   AgentContext,
@@ -527,7 +528,19 @@ export class ConsciousAgent extends BaseAgent {
     this.contextWindow.trackEvents(events);
 
     this.blackboard.set(this.agentPath, BLACKBOARD_KEYS.RUNNING, true, { persist: false });
-    this.boundEventBus.hook(Hook.TurnStart, { turn: this.currentTurn, eventCount: events.length });
+    const turnStartedAt = Date.now();
+    const turnId = randomUUID();
+    const checkpointMsgId = events
+      .map((event) => event.payload?.msgId)
+      .find((value): value is string => typeof value === "string" && value.length > 0);
+    this.boundEventBus.hook(Hook.TurnStart, {
+      turn: this.currentTurn,
+      eventCount: events.length,
+      turnId,
+      artifactResolutionExpected: true,
+      schemaVersion: 2,
+      ...(checkpointMsgId ? { msgId: checkpointMsgId } : {}),
+    });
     tt("turn.start", { agent: this.agentPath, turn: this.currentTurn, sid: this.sid, events: events.length });
     let turnError: string | undefined;
 
@@ -741,8 +754,17 @@ export class ConsciousAgent extends BaseAgent {
         console.error(`process failed: ${turnError}`);
       }
     } finally {
+      const durationMs = Math.max(0, Date.now() - turnStartedAt);
       tt("turn.end", { agent: this.agentPath, turn: this.currentTurn, aborted: signal.aborted, error: turnError });
-      this.boundEventBus.hook(Hook.TurnEnd, { turn: this.currentTurn, aborted: signal.aborted, error: turnError });
+      this.boundEventBus.hook(Hook.TurnEnd, {
+        turn: this.currentTurn,
+        turnId,
+        aborted: signal.aborted,
+        error: turnError,
+        durationMs,
+        artifactResolutionExpected: true,
+        schemaVersion: 2,
+      });
       this.blackboard.set(this.agentPath, BLACKBOARD_KEYS.RUNNING, false, { persist: false });
     }
   }
@@ -792,7 +814,16 @@ export class ConsciousAgent extends BaseAgent {
     this.boundEventBus.hook(Hook.AssistantMessage, { llmMessage: assistantMsg, turn: this.currentTurn });
 
     this.blackboard.set(this.agentPath, BLACKBOARD_KEYS.RUNNING, true, { persist: false });
-    this.boundEventBus.hook(Hook.TurnStart, { turn: this.currentTurn, eventCount: 1 });
+    const commandTurnId = randomUUID();
+    this.boundEventBus.hook(Hook.TurnStart, {
+      turn: this.currentTurn,
+      eventCount: 1,
+      turnId: commandTurnId,
+      // A queued UI command is an internal continuation of the current user
+      // request; it must not create a second artifact card by borrowing the
+      // latest checkpoint.
+      artifactResolutionExpected: false,
+    });
     let results: Awaited<ReturnType<ToolBatchRunner>>;
     try {
       results = await this.runToolBatchFn({
@@ -811,7 +842,12 @@ export class ConsciousAgent extends BaseAgent {
       }
       return;
     } finally {
-      this.boundEventBus.hook(Hook.TurnEnd, { turn: this.currentTurn, aborted: signal.aborted });
+      this.boundEventBus.hook(Hook.TurnEnd, {
+        turn: this.currentTurn,
+        turnId: commandTurnId,
+        aborted: signal.aborted,
+        artifactResolutionExpected: false,
+      });
       this.blackboard.set(this.agentPath, BLACKBOARD_KEYS.RUNNING, false, { persist: false });
     }
 

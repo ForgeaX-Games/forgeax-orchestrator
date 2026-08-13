@@ -88,20 +88,21 @@ function newToolExecutionId() {
   }
 }
 
-/** 桥接调用:HTTP POST 回宿主 /api/sessions/:sid/kernel-tool;带超时;fail-closed。
- *  返回 `{isError, text, toolExecutionId}` —— **失败分支也带 id**:宿主没记上这一行时,
- *  查得到"有这个 id 但旁账里查无此行"(可观察的缺席),而不是根本无从查起。 */
+/** 桥接调用:HTTP POST 回宿主 /api/sessions/:sid/kernel-tool;普通工具带超时。
+ * ask_user 是阻塞式人机交互，必须一直等到回答或调用方中断，不能套用普通工具
+ * 的执行上限。调用方终止 MCP 进程时，未完成 fetch 会随进程一起结束。 */
 async function bridgeCall(toolName, args) {
   const toolExecutionId = newToolExecutionId();
   if (!SERVER_URL || !BRIDGE_SID) return { isError: true, text: 'bridge unavailable (no server url / sid)', toolExecutionId };
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), BRIDGE_TIMEOUT_MS);
+  const blockingUserInput = toolName === 'ask_user';
+  const ac = blockingUserInput ? null : new AbortController();
+  const timer = ac ? setTimeout(() => ac.abort(), BRIDGE_TIMEOUT_MS) : undefined;
   try {
     const res = await fetch(`${SERVER_URL}/api/sessions/${encodeURIComponent(BRIDGE_SID)}/kernel-tool`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ agentPath: BRIDGE_AGENT, toolName, args: args ?? {}, ...(toolExecutionId ? { toolExecutionId } : {}) }),
-      signal: ac.signal,
+      ...(ac ? { signal: ac.signal } : {}),
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body?.ok === false) {
@@ -110,10 +111,10 @@ async function bridgeCall(toolName, args) {
     const r = body.result;
     return { isError: false, text: typeof r === 'string' ? r : JSON.stringify(r ?? ''), toolExecutionId };
   } catch (e) {
-    const msg = ac.signal.aborted ? `bridge timeout after ${BRIDGE_TIMEOUT_MS}ms (tool ${toolName})` : `bridge transport error: ${e?.message ?? e}`;
+    const msg = ac?.signal.aborted ? `bridge timeout after ${BRIDGE_TIMEOUT_MS}ms (tool ${toolName})` : `bridge transport error: ${e?.message ?? e}`;
     return { isError: true, text: msg, toolExecutionId };
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 

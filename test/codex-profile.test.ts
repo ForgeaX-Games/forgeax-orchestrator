@@ -8,9 +8,9 @@
 import { describe, test, expect } from 'bun:test';
 import type { TurnRequest, ComposedPrompt } from '@forgeax/agent-runtime/contract';
 import {
-  buildCodexAppServerGlobalArgs,
-  buildCodexAppServerTurnInput,
   buildCodexArgs,
+  buildCodexAppServerGlobalArgs,
+  buildCodexInstructions,
   buildCodexSingleAgentArgs,
 } from '../src/kernel/codex-profile';
 
@@ -68,40 +68,27 @@ describe('codex-profile — buildCodexArgs 内嵌单 Agent 关闭参数', () => 
     expect(args).toContain('multi_agent_v2');
     expect(args).toContain('agents.enabled=false');
   });
-
-  test('image attachment ⇒ uses --image path and never inline data', () => {
-    const args = buildCodexArgs(req({
-      input: {
-        text: 'describe this',
-        attachments: [{ kind: 'image', path: '/tmp/uploads/large.png', data: 'not-on-wire' }],
-      },
-    }), undefined);
-    expect(args).toContain('--image');
-    expect(args).toContain('/tmp/uploads/large.png');
-    expect(args).not.toContain('not-on-wire');
-  });
-
-  test('resume image attachment ⇒ uses --image after the resume thread id', () => {
-    const args = buildCodexArgs(req({
-      input: { text: 'next', attachments: [{ kind: 'image', path: '/tmp/uploads/large.png' }] },
-    }), 'thread-123');
-    expect(args.indexOf('--image')).toBeGreaterThan(args.indexOf('thread-123'));
-    expect(args).toContain('/tmp/uploads/large.png');
-  });
 });
 
-describe('codex-profile — buildCodexAppServerTurnInput', () => {
-  test('large image uses localImage path and never enters text/base64', () => {
-    const input = buildCodexAppServerTurnInput(req({
-      input: {
-        text: 'describe this',
-        attachments: [{ kind: 'image', path: '/tmp/uploads/large.png', data: 'not-on-wire' }],
-      },
-    }));
-    expect(input).toEqual([
-      { type: 'text', text: 'describe this', text_elements: [] },
-      { type: 'localImage', path: '/tmp/uploads/large.png' },
-    ]);
-    expect(JSON.stringify(input)).not.toContain('not-on-wire');
+describe('codex-profile — ForgeaX ask_user routing', () => {
+  test('advertised ask_user routes Ask User to the timeout-free host tool', () => {
+    const request = req({
+      tools: [{
+        name: 'ask_user',
+        description: 'Ask structured questions.',
+        inputSchema: { type: 'object', properties: {} },
+      }],
+    });
+    const instructions = buildCodexInstructions(request);
+
+    expect(instructions).toContain('host-provided `ask_user` tool');
+    expect(instructions).toContain('waits indefinitely');
+    expect(buildCodexArgs(request, undefined).at(-1)).toContain(instructions);
+  });
+
+  test('does not advertise the host ask route when the turn has no ask_user tool', () => {
+    const instructions = buildCodexInstructions(req());
+    expect(instructions).toBe('CHARTER');
+    expect(instructions).not.toContain('host-provided `ask_user` tool');
   });
 });

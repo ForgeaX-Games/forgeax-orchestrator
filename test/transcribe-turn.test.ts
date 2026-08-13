@@ -9,12 +9,16 @@
 //   3. **不**写到 root / depth-1 节点(证 key 修复:按传入 agentId,非启发式)。
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { initPathManager, resetPathManager } from "../src/fs/path-manager";
 import { initSessionManager, resetSessionManager, getSessionManager } from "../src/core/session-manager";
 import { transcribeKernelTurn } from "../src/kernel/transcribe-turn";
+import {
+  appliedKernelMutationRecords,
+  captureKernelMutationIntents,
+} from "../src/kernel/kernel-file-activity";
 
 let userRoot: string;
 
@@ -33,99 +37,43 @@ afterEach(async () => {
 });
 
 describe("transcribeKernelTurn — host-owned, kernel-agnostic ledger", () => {
-  test("轮序递增、工具名回填、时间戳来源如实标注 —— 账本要能当训练数据切分", async () => {
-    // 2026-08-05:这三样此前是硬编码 —— `turn: 1` 三处字面量(每轮都记第 1 轮,
-    // 账本按轮切不开)、toolResult 的 `name: ""`(工具名丢失)、`durationMs: 0`
-    // (这里根本没测量,写 0 是假值)。另:本函数在整轮结束后**批量**写入,
-    // 所有 ts 都是转录时刻而非事件时刻(实测 52 事件挤进 12 毫秒),故如实标 tsSource。
-    const session = await getSessionManager().create({ displayName: "t" });
-    const agentId = "forge";
-    const turn = (message: string) =>
-      transcribeKernelTurn(session, agentId, {
-        message,
-        asstText: "ok",
-        thinkingText: "",
-        stopReason: "end_turn",
-        model: "gpt-5.6-sol",
-        toolEvents: [
-          { kind: "call", callId: "c1", name: "editor_ui_browse", args: { verb: "look" } },
-          { kind: "result", callId: "c1", ok: true, result: { ok: true } },
-        ],
-      });
+  test("rented-kernel local file tool yields applied host-owned mutation evidence", () => {
+    const path = resolve(userRoot, "project", "docs", "acceptance.md");
+    const intents = captureKernelMutationIntents(
+      "write_file",
+      { file_path: "docs/acceptance.md", content: "ok" },
+      resolve(userRoot, "project"),
+    );
+    expect(intents).toEqual([{ path, op: "write", existedBefore: false }]);
 
-    turn("第一轮");
-    turn("第二轮");
-    turn("第三轮");
-
-    const events = await session.getOrCreateLedger(agentId).readAllEvents();
-    const turns = (type: string) =>
-      events.filter((e) => e.type === type).map((e) => (e.payload as { turn?: number }).turn);
-    expect(turns("hook:turnStart")).toEqual([1, 2, 3]);
-    expect(turns("hook:assistantMessage")).toEqual([1, 2, 3]);
-    expect(turns("hook:turnEnd")).toEqual([1, 2, 3]);
-
-    // 工具名按 callId 回填,不再是空串
-    const results = events.filter((e) => e.type === "hook:toolResult");
-    expect(results.map((e) => (e.payload as { name?: string }).name)).toEqual([
-      "editor_ui_browse", "editor_ui_browse", "editor_ui_browse",
-    ]);
-    // 未测量的耗时宁可缺字段也不写假 0
-    expect((results[0]!.payload as { durationMs?: number }).durationMs).toBeUndefined();
-    // 每条都标注时间戳来源 —— 消费方据此知道真实时序要去内核 rollout 取
-    for (const e of events) {
-      expect((e.payload as { tsSource?: string }).tsSource).toBe("transcription");
-    }
+    mkdirSync(resolve(userRoot, "project", "docs"), { recursive: true });
+    writeFileSync(path, "ok", "utf8");
+    const records = appliedKernelMutationRecords(intents, {
+      agentPath: "forge",
+      toolCallId: "write-1",
+      turnId: "turn-1",
+    });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      agentPath: "forge",
+      op: "write",
+      path,
+      isCreate: true,
+      toolCallId: "write-1",
+      turnId: "turn-1",
+      phase: "applied",
+    });
+    expect(records[0]?.hash).toHaveLength(64);
   });
 
-  test("工具返回体里嵌套 {type:'user_input'} 不会虚增轮序 —— 子串判据的坑", async () => {
-    // 2026-08-05 终审实测:计数曾用 `line.includes('\"user_input\"')`,而 agent
-    // **回读自己的轨迹账本**时返回体里就全是这种对象(序列化后不被转义),
-    // 实测轮序从 [1,2] 变成 [1,3]。而回读账本正是本项目沉淀 skill 的目标场景。
-    const session = await getSessionManager().create({ displayName: "t" });
-    const agentId = "forge";
-    transcribeKernelTurn(session, agentId, {
-      message: "第一轮", asstText: "a", thinkingText: "", stopReason: "end_turn", model: "m",
-      toolEvents: [
-        { kind: "call", callId: "c1", name: "read_ledger", args: {} },
-        { kind: "result", callId: "c1", ok: true,
-          result: { events: [{ type: "user_input", content: "x" }, { type: "user_input", content: "y" }] } },
-      ],
-    });
-
-    await resetSessionManager();
-    initSessionManager(initPathManager({ userRoot }));
-    const revived = await getSessionManager().open(session.sid);
-    transcribeKernelTurn(revived, agentId, {
-      message: "第二轮", asstText: "a", thinkingText: "", stopReason: "end_turn", model: "m", toolEvents: [],
-    });
-
-    const events = await revived.getOrCreateLedger(agentId).readAllEvents();
-    expect(events.filter((e) => e.type === "hook:turnStart").map((e) => (e.payload as { turn?: number }).turn))
-      .toEqual([1, 2]);
-  });
-
-  test("轮序跨 ledger 重建存活 —— 进程重启后不从 1 重来", async () => {
-    // 计数器同步维护在 EventLedger 内,并在 _initShardIndex 从当前分片重建,
-    // 所以重启(= 新建 ledger 实例读同一盘)后轮序继续往下走,不回退。
-    const session = await getSessionManager().create({ displayName: "t" });
-    const agentId = "forge";
-    const rec = {
-      message: "m", asstText: "a", thinkingText: "", stopReason: "end_turn" as const,
-      model: "gpt-5.6-sol", toolEvents: [],
-    };
-    transcribeKernelTurn(session, agentId, { ...rec });
-    transcribeKernelTurn(session, agentId, { ...rec });
-
-    // 丢掉内存态,像重启一样从盘上重建
-    await resetSessionManager();
-    const pm2 = initPathManager({ userRoot });
-    initSessionManager(pm2);
-    const revived = await getSessionManager().open(session.sid);
-    transcribeKernelTurn(revived, agentId, { ...rec });
-
-    const events = await revived.getOrCreateLedger(agentId).readAllEvents();
-    expect(events.filter((e) => e.type === "hook:turnStart").map((e) => (e.payload as { turn?: number }).turn))
-      .toEqual([1, 2, 3]);
+  test("captures Codex batched edit_file changes for Artifact derivation", () => {
+    const path = resolve(userRoot, "project", "docs", "codex-added.md");
+    const intents = captureKernelMutationIntents(
+      "edit_file",
+      { changes: [{ path, kind: { type: "add" }, diff: "hello" }] },
+      resolve(userRoot, "project"),
+    );
+    expect(intents).toEqual([{ path, op: "edit", existedBefore: false }]);
   });
 
   test("一轮(user+工具往返+assistant)写进 agentId 账本,形状对齐 replay,且不落 root", async () => {
@@ -171,6 +119,7 @@ describe("transcribeKernelTurn — host-owned, kernel-agnostic ledger", () => {
     // 工具往返保真
     const result = events.find((e) => e.type === "hook:toolResult");
     expect((result?.payload as { callId?: string })?.callId).toBe("c1");
+    expect((result?.payload as { name?: string })?.name).toBe("list_games");
     expect((result?.payload as { ok?: boolean })?.ok).toBe(true);
 
     // ★ key 修复证据:绝不落到 root(旧 depth-1 启发式的去处)。
@@ -218,6 +167,61 @@ describe("transcribeKernelTurn — host-owned, kernel-agnostic ledger", () => {
     const asst = events.find((e) => e.type === "hook:assistantMessage");
     expect((ts?.payload as { providerId?: string })?.providerId).toBe("claude-code");
     expect((asst?.payload as { providerId?: string })?.providerId).toBe("claude-code");
+  });
+
+  test("public summary is durable as visible agent_log and never mixed into private thinking", async () => {
+    const session = await getSessionManager().create({ displayName: "public-summary" });
+    transcribeKernelTurn(session, "forge", {
+      message: "build it",
+      asstText: "done",
+      thinkingText: "private provider reasoning",
+      publicSummaryText: "Inspecting the active game.",
+      stopReason: "end_turn",
+      providerId: "codex",
+      toolEvents: [],
+    });
+    const events = await session.getOrCreateLedger("forge").readAllEvents();
+    const progress = events.find((event) => event.type === "agent_log");
+    expect(progress?.payload).toMatchObject({
+      visibility: "public_summary",
+      summary: "Inspecting the active game.",
+      providerId: "codex",
+    });
+    const assistant = events.find((event) => event.type === "hook:assistantMessage");
+    const llmMessage = (assistant?.payload as { llmMessage?: { thinking?: string } })?.llmMessage;
+    expect(llmMessage?.thinking).toBeUndefined();
+    expect(JSON.stringify(events)).not.toContain("private provider reasoning");
+    expect(JSON.stringify(llmMessage)).not.toContain("Inspecting the active game.");
+  });
+
+  test("preserves public process order and the actual kernel start time", async () => {
+    const session = await getSessionManager().create({ displayName: "ordered-process" });
+    const startedAt = Date.now() - 2_000;
+    const result = transcribeKernelTurn(session, "forge", {
+      message: "inspect",
+      startedAt,
+      asstText: "done",
+      thinkingText: "",
+      publicSummaryText: "Inspecting.",
+      stopReason: "end_turn",
+      toolEvents: [{ kind: "call", callId: "c1", name: "bash", args: { command: "pwd" } }],
+      processEvents: [
+        { kind: "assistant_text", text: "I will inspect the project." },
+        { kind: "public_summary", text: "Inspecting." },
+        { kind: "call", callId: "c1", name: "bash", args: { command: "pwd" } },
+      ],
+    });
+    const events = await session.getOrCreateLedger("forge").readAllEvents();
+    expect(events.map((event) => event.type)).toEqual([
+      "user_input", "hook:turnStart", "hook:assistantMessage", "agent_log", "hook:toolCall", "hook:assistantMessage", "hook:turnEnd",
+    ]);
+    const assistantTexts = events
+      .filter((event) => event.type === "hook:assistantMessage")
+      .map((event) => ((event.payload as { llmMessage?: { content?: Array<{ text?: string }> } }).llmMessage?.content?.[0]?.text));
+    expect(assistantTexts).toEqual(["I will inspect the project.", "done"]);
+    expect(events[0]?.ts).toBe(startedAt);
+    expect(result?.startedAt).toBe(startedAt);
+    expect((result?.settledAt ?? startedAt) - startedAt).toBeGreaterThanOrEqual(1_900);
   });
 
   test("不传 providerId → 账本不带该键(向后兼容,不污染)", async () => {

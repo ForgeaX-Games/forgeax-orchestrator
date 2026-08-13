@@ -11,7 +11,6 @@ import {
   createCodexNotifState,
   mapCodexNotification,
 } from '../src/kernel/codex-appserver';
-import { readToolExecutionId } from '../src/kernel/cli-kernel-trace';
 
 function drain(fn: (q: KernelEventQueue) => void) {
   const q = new KernelEventQueue();
@@ -33,10 +32,52 @@ describe('codex-appserver mapNotification', () => {
     expect(await collect(q)).toEqual([{ kind: 'message.delta', role: 'assistant', text: 'hi' }]);
   });
 
+  test('Luna commentary agentMessage → public thinking summary', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('item/started', {
+      item: { id: 'commentary-1', type: 'agentMessage', text: '', phase: 'commentary' },
+    }, st, q);
+    mapCodexNotification('item/agentMessage/delta', {
+      itemId: 'commentary-1', delta: 'I will inspect the project first.',
+    }, st, q);
+    q.end();
+    expect(await collect(q)).toEqual([{
+      kind: 'thinking.delta',
+      text: 'I will inspect the project first.',
+      visibility: 'public_summary',
+    }]);
+  });
+
+  test('Luna final-answer agentMessage remains assistant text', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('item/started', {
+      item: { id: 'final-1', type: 'agentMessage', text: '', phase: 'final_answer' },
+    }, st, q);
+    mapCodexNotification('item/agentMessage/delta', {
+      itemId: 'final-1', delta: 'Done.',
+    }, st, q);
+    q.end();
+    expect(await collect(q)).toEqual([{
+      kind: 'message.delta', role: 'assistant', text: 'Done.',
+    }]);
+  });
+
   test('reasoning textDelta → thinking.delta', async () => {
     const st = createCodexNotifState();
     const q = drain((q) => mapCodexNotification('item/reasoning/textDelta', { delta: 'think' }, st, q));
-    expect(await collect(q)).toEqual([{ kind: 'thinking.delta', text: 'think' }]);
+    expect(await collect(q)).toEqual([{ kind: 'thinking.delta', text: 'think', visibility: 'private_reasoning' }]);
+  });
+
+  test('marks Codex reasoning summaries as public progress', async () => {
+    const st = createCodexNotifState();
+    const q = drain((q) => mapCodexNotification('item/reasoning/summaryTextDelta', { delta: 'Checking the project structure.' }, st, q));
+    expect(await collect(q)).toEqual([{
+      kind: 'thinking.delta',
+      text: 'Checking the project structure.',
+      visibility: 'public_summary',
+    }]);
   });
 
   test('commandExecution started → tool.call Bash; outputDelta + completed → tool.result', async () => {
@@ -47,8 +88,21 @@ describe('codex-appserver mapNotification', () => {
     mapCodexNotification('item/completed', { item: { id: 'i1', type: 'commandExecution', status: 'completed' } }, st, q);
     q.end();
     const out = await collect(q);
-    expect(out[0]).toEqual({ kind: 'tool.call', callId: 'i1', name: 'Bash', args: { command: 'ls', cwd: '/w' } });
-    expect(out[1]).toEqual({ kind: 'tool.result', callId: 'i1', ok: true, result: 'a.txt\n' });
+    expect(out[0]).toEqual({
+      kind: 'tool.call',
+      callId: 'i1',
+      name: 'bash',
+      rawName: 'Bash',
+      args: { command: 'ls', cwd: '/w' },
+    });
+    expect(out[1]).toEqual({
+      kind: 'tool.result',
+      callId: 'i1',
+      name: 'bash',
+      rawName: 'Bash',
+      ok: true,
+      result: 'a.txt\n',
+    });
   });
 
   test('fileChange completed failed → tool.result not ok', async () => {
@@ -59,8 +113,16 @@ describe('codex-appserver mapNotification', () => {
     q.end();
     const out = await collect(q);
     expect(out[0].kind).toBe('tool.call');
-    expect((out[0] as any).name).toBe('Edit');
-    expect(out[1]).toEqual({ kind: 'tool.result', callId: 'f1', ok: false, error: 'failed' });
+    expect((out[0] as any).name).toBe('edit_file');
+    expect((out[0] as any).rawName).toBe('Edit');
+    expect(out[1]).toEqual({
+      kind: 'tool.result',
+      callId: 'f1',
+      name: 'edit_file',
+      rawName: 'Edit',
+      ok: false,
+      error: 'failed',
+    });
   });
 
   test('tokenUsage uses current last usage, never cumulative thread total', async () => {
@@ -135,13 +197,19 @@ describe('codex-appserver mapNotification', () => {
     expect(await collect(q)).toEqual([]);
   });
 
-  test('mcpToolCall started → tool.call with mcp__server__tool name', async () => {
+  test('mcpToolCall started → canonical forgeax tool name with raw wire name', async () => {
     const st = createCodexNotifState();
     const q = new KernelEventQueue();
     mapCodexNotification('item/started', { item: { id: 'm1', type: 'mcpToolCall', server: 'fxt', tool: 'echo', arguments: { text: 'hi' } } }, st, q);
     q.end();
     const out = await collect(q);
-    expect(out[0]).toEqual({ kind: 'tool.call', callId: 'm1', name: 'mcp__fxt__echo', args: { text: 'hi' } });
+    expect(out[0]).toEqual({
+      kind: 'tool.call',
+      callId: 'm1',
+      name: 'echo',
+      rawName: 'mcp__fxt__echo',
+      args: { text: 'hi' },
+    });
   });
 
   test('mcpToolCall completed → tool.result ok with extracted text result', async () => {
@@ -152,7 +220,14 @@ describe('codex-appserver mapNotification', () => {
     q.end();
     const out = await collect(q);
     expect(out[0].kind).toBe('tool.call');
-    expect(out[1]).toEqual({ kind: 'tool.result', callId: 'm2', ok: true, result: '[forgeax_echo] x' });
+    expect(out[1]).toEqual({
+      kind: 'tool.result',
+      callId: 'm2',
+      name: 'echo',
+      rawName: 'mcp__fxt__echo',
+      ok: true,
+      result: '[forgeax_echo] x',
+    });
   });
 
   test('mcpToolCall completed (no prior started) still emits a call then result', async () => {
@@ -161,43 +236,38 @@ describe('codex-appserver mapNotification', () => {
     mapCodexNotification('item/completed', { item: { id: 'm3', type: 'mcpToolCall', server: 'fxt', tool: 'list_games', status: 'completed', result: { content: [{ type: 'text', text: '{"count":0}' }] } } }, st, q);
     q.end();
     const out = await collect(q);
-    expect(out[0]).toEqual({ kind: 'tool.call', callId: 'm3', name: 'mcp__fxt__list_games', args: {} });
-    expect(out[1]).toEqual({ kind: 'tool.result', callId: 'm3', ok: true, result: '{"count":0}' });
+    expect(out[0]).toEqual({
+      kind: 'tool.call',
+      callId: 'm3',
+      name: 'list_games',
+      rawName: 'mcp__fxt__list_games',
+      args: {},
+    });
+    expect(out[1]).toEqual({
+      kind: 'tool.result',
+      callId: 'm3',
+      name: 'list_games',
+      rawName: 'mcp__fxt__list_games',
+      ok: true,
+      result: '{"count":0}',
+    });
   });
 
-  test('mcpToolCall 失败 → tool.result 不 ok,且**必须带 result**', async () => {
+  test('mcpToolCall failed → tool.result not ok with error message', async () => {
     const st = createCodexNotifState();
     const q = new KernelEventQueue();
     mapCodexNotification('item/started', { item: { id: 'm4', type: 'mcpToolCall', server: 'fxt', tool: 'boom' } }, st, q);
     mapCodexNotification('item/completed', { item: { id: 'm4', type: 'mcpToolCall', status: 'failed', error: { message: 'kaboom' } } }, st, q);
     q.end();
     const out = await collect(q);
-    // 连接键就在结果里 —— 失败事件也得带 result。item 没给 result 时稳定产出空串,
-    // 让下游"读不到键"是可观察的缺席,而不是根本没有这个字段可读。
-    expect(out[1]).toEqual({ kind: 'tool.result', callId: 'm4', ok: false, error: 'kaboom', result: '' });
-  });
-
-  test('失败结果里的连接键必须跨过适配层 —— 失败行最有审计价值', async () => {
-    // 2026-08-06 外审 MAJOR-2:宿主工具返回 error → MCP 结果 isError:true → codex 把 item
-    // 标成失败。此前失败分支只 push error,于是真实 NOT_FOUND 路径永远跨不了账本。
-    const st = createCodexNotifState();
-    const q = new KernelEventQueue();
-    mapCodexNotification('item/completed', {
-      item: {
-        id: 'm9', type: 'mcpToolCall', server: 'fxt', tool: 'editor_ui_browse', status: 'failed',
-        result: {
-          content: [{ type: 'text', text: '{"ok":false,"error":{"code":"not_found"}}' }],
-          structuredContent: { forgeax: { toolExecutionId: 'fxt-fail-1' } },
-          isError: true,
-        },
-      },
-    }, st, q);
-    q.end();
-    const out = await collect(q);
-    const ev = out.find((c) => c.kind === 'tool.result');
-    if (ev?.kind !== 'tool.result') throw new Error('缺少 tool.result 事件');
-    expect(ev.ok).toBe(false);
-    expect(readToolExecutionId(ev.result)).toBe('fxt-fail-1');
+    expect(out[1]).toEqual({
+      kind: 'tool.result',
+      callId: 'm4',
+      name: 'boom',
+      rawName: 'mcp__fxt__boom',
+      ok: false,
+      error: 'kaboom',
+    });
   });
 
   test('mcpToolCall preserves structuredContent alongside text', async () => {

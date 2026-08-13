@@ -70,10 +70,10 @@ describe('cc-profile — systemPrompt mode', () => {
 });
 
 describe('cc-profile — toolPolicy', () => {
-  test('缺省 ⇒ 不发 --tools / --disallowedTools(零回归)', () => {
+  test('缺省 ⇒ 始终禁用 CC 自带 TodoWrite', () => {
     const args = buildCcArgs(req(), ROOT, []);
     expect(args).not.toContain('--tools');
-    expect(args).not.toContain('--disallowedTools');
+    expect(valuesAfter(args, '--disallowedTools')).toEqual(['TodoWrite']);
   });
 
   test('allow ⇒ --tools 逗号分隔单值', () => {
@@ -86,26 +86,31 @@ describe('cc-profile — toolPolicy', () => {
   test('deny ⇒ --disallowedTools 变长展开', () => {
     const args = buildCcArgs(req({ toolPolicy: { deny: ['Bash', 'Write'] } }), ROOT, []);
     expect(args).toContain('--disallowedTools');
-    expect(valuesAfter(args, '--disallowedTools')).toEqual(['Bash', 'Write']);
+    expect(valuesAfter(args, '--disallowedTools')).toEqual(['TodoWrite', 'Bash', 'Write']);
   });
 
   test('allow+deny 同存', () => {
     const args = buildCcArgs(req({ toolPolicy: { allow: ['Read'], deny: ['Bash'] } }), ROOT, []);
     expect(args[args.indexOf('--tools') + 1]).toBe('Read');
-    expect(valuesAfter(args, '--disallowedTools')).toEqual(['Bash']);
+    expect(valuesAfter(args, '--disallowedTools')).toEqual(['TodoWrite', 'Bash']);
   });
 
   test('变长 --disallowedTools 不吞末尾位置参数 message', () => {
     const args = buildCcArgs(req({ input: { text: 'PROMPT_MSG' }, toolPolicy: { deny: ['Bash'] } }), ROOT, []);
     // message 是最后一个 arg,且不被并进 disallowedTools(后续有 --*-system-prompt* flag 终止变长)。
     expect(args[args.length - 1]).toBe('PROMPT_MSG');
-    expect(valuesAfter(args, '--disallowedTools')).toEqual(['Bash']);
+    expect(valuesAfter(args, '--disallowedTools')).toEqual(['TodoWrite', 'Bash']);
   });
 
   test('空/全空白项被过滤', () => {
     const args = buildCcArgs(req({ toolPolicy: { allow: ['', '  '], deny: [''] } }), ROOT, []);
     expect(args).not.toContain('--tools');
-    expect(args).not.toContain('--disallowedTools');
+    expect(valuesAfter(args, '--disallowedTools')).toEqual(['TodoWrite']);
+  });
+
+  test('自定义 deny 与 TodoWrite 去重', () => {
+    const args = buildCcArgs(req({ toolPolicy: { deny: ['TodoWrite', 'Bash'] } }), ROOT, []);
+    expect(valuesAfter(args, '--disallowedTools')).toEqual(['TodoWrite', 'Bash']);
   });
 });
 

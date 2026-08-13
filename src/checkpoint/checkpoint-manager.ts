@@ -33,6 +33,10 @@ interface MessageRecord {
   manifestId: string | null; // null = 该消息时刻无游戏目录 / 快照失败
   providerId?: string;
   checkpointMode?: "native" | "host-compatible";
+  /** New turn protocol marker. Legacy records intentionally omit it and are
+   * never eligible for artifact reconciliation. */
+  artifactResolutionExpected?: true;
+  schemaVersion?: 2;
 }
 
 interface RewindRecord {
@@ -293,6 +297,8 @@ export class CheckpointManager {
         manifestId,
         ...(meta.providerId ? { providerId: meta.providerId } : {}),
         ...(meta.checkpointMode ? { checkpointMode: meta.checkpointMode } : {}),
+        artifactResolutionExpected: true,
+        schemaVersion: 2,
       };
       try {
         this.record(sc, rec);

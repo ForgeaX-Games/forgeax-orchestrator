@@ -16,6 +16,7 @@
  * KernelEvent(原产 ChatEvent)。
  */
 import type { KernelEvent } from '@forgeax/agent-runtime';
+import { canonicalToolFields } from './canonical-tool-name';
 
 /** app-server 起不来时抛出 → CodexKernel 回退到 exec 路径(在 yield 任何事件前抛)。 */
 export class AppServerUnavailable extends Error {}
@@ -50,10 +51,22 @@ export interface CodexNotifState {
   ended: boolean;
   /** 已发过 tool.call 的 item.id(去重:同一 item 的重复 started 不重发 call)。 */
   toolCallsOpened: Set<string>;
+  /** item.id → source tool name, reused when a completion omits it. */
+  toolNamesById: Map<string, string>;
+  /** agentMessage item.id → Codex message phase. Luna emits its public work
+   * narration as commentary messages rather than reasoning summaries. */
+  messagePhasesById: Map<string, 'commentary' | 'final_answer'>;
 }
 
 export function createCodexNotifState(): CodexNotifState {
-  return { outputByItem: new Map(), lastUsage: undefined, ended: false, toolCallsOpened: new Set() };
+  return {
+    outputByItem: new Map(),
+    lastUsage: undefined,
+    ended: false,
+    toolCallsOpened: new Set(),
+    toolNamesById: new Map(),
+    messagePhasesById: new Map(),
+  };
 }
 
 /** MCP 工具名统一为 `mcp__{server}__{tool}`(plan §9.1)。缺 server 时退化为
@@ -111,13 +124,20 @@ export function mapCodexNotification(
   switch (method) {
     case 'item/agentMessage/delta':
       if (typeof params?.delta === 'string' && params.delta) {
-        queue.push({ kind: 'message.delta', role: 'assistant', text: params.delta });
+        const phase = state.messagePhasesById.get(params?.itemId);
+        queue.push(phase === 'commentary'
+          ? { kind: 'thinking.delta', text: params.delta, visibility: 'public_summary' }
+          : { kind: 'message.delta', role: 'assistant', text: params.delta });
       }
       return;
     case 'item/reasoning/textDelta':
+      if (typeof params?.delta === 'string' && params.delta) {
+        queue.push({ kind: 'thinking.delta', text: params.delta, visibility: 'private_reasoning' });
+      }
+      return;
     case 'item/reasoning/summaryTextDelta':
       if (typeof params?.delta === 'string' && params.delta) {
-        queue.push({ kind: 'thinking.delta', text: params.delta });
+        queue.push({ kind: 'thinking.delta', text: params.delta, visibility: 'public_summary' });
       }
       return;
     case 'item/commandExecution/outputDelta': {
@@ -129,11 +149,18 @@ export function mapCodexNotification(
     case 'item/started': {
       const it = params?.item;
       if (!it?.id) return;
+      if (it.type === 'agentMessage') {
+        if (it.phase === 'commentary' || it.phase === 'final_answer') {
+          state.messagePhasesById.set(it.id, it.phase);
+        }
+        return;
+      }
       // 去重:同一 item.id 只发一次 tool.call(plan §9.1 按 item.id 去重)。
       const openCall = (name: string, args: unknown): void => {
         if (state.toolCallsOpened.has(it.id)) return;
         state.toolCallsOpened.add(it.id);
-        queue.push({ kind: 'tool.call', callId: it.id, name, args });
+        state.toolNamesById.set(it.id, name);
+        queue.push({ kind: 'tool.call', callId: it.id, ...canonicalToolFields(name), args });
       };
       if (it.type === 'commandExecution') {
         openCall('Bash', { command: it.command, cwd: it.cwd });
@@ -147,37 +174,73 @@ export function mapCodexNotification(
     case 'item/completed': {
       const it = params?.item;
       if (!it?.id) return;
+      if (it.type === 'agentMessage') {
+        state.messagePhasesById.delete(it.id);
+        return;
+      }
       if (it.type === 'mcpToolCall') {
         // 极少数情况直接发 completed(无 started)→ 补一条 call。
         if (!state.toolCallsOpened.has(it.id)) {
           state.toolCallsOpened.add(it.id);
-          queue.push({ kind: 'tool.call', callId: it.id, name: mcpToolName(it), args: it.arguments ?? {} });
+          const rawName = mcpToolName(it);
+          state.toolNamesById.set(it.id, rawName);
+          queue.push({
+            kind: 'tool.call',
+            callId: it.id,
+            ...canonicalToolFields(rawName),
+            args: it.arguments ?? {},
+          });
         }
+        const rawName = state.toolNamesById.get(it.id) ?? mcpToolName(it);
+        const fields = canonicalToolFields(rawName);
         const ok = it.status === 'completed' || it.status === 'succeeded';
         if (ok) {
-          queue.push({ kind: 'tool.result', callId: it.id, ok: true, result: extractMcpResult(it) });
+          queue.push({
+            kind: 'tool.result',
+            callId: it.id,
+            ...(fields.rawName ? fields : {}),
+            ok: true,
+            result: extractMcpResult(it),
+          });
         } else {
           const errText = (it.error && typeof it.error === 'object' && typeof it.error.message === 'string')
             ? it.error.message
             : (typeof it.error === 'string' ? it.error : '');
           const resText = extractMcpResult(it);
           const msg = errText || (typeof resText === 'string' ? resText : JSON.stringify(resText)) || (it.status ? String(it.status) : 'failed');
-          // 失败也要带 result:宿主工具返回 error → MCP 结果 isError:true → codex 把 item 标成
-          // 失败,但**连接键就在这份结果的 structuredContent 里**。不带 result,失败调用就永远
-          // 连不回旁账 —— 而失败行恰恰最有审计价值(2026-08-06 外审 MAJOR-2;同一个病刚在工具
-          // 审计账上修过一次,这里又犯了一遍)。
-          queue.push({ kind: 'tool.result', callId: it.id, ok: false, error: msg, result: resText });
+          queue.push({
+            kind: 'tool.result',
+            callId: it.id,
+            ...(fields.rawName ? fields : {}),
+            ok: false,
+            error: msg,
+          });
         }
         return;
       }
       if (it.type === 'commandExecution' || it.type === 'fileChange') {
         const ok = it.status === 'completed' || it.status === 'succeeded';
+        const rawName =
+          state.toolNamesById.get(it.id) ?? (it.type === 'commandExecution' ? 'Bash' : 'Edit');
+        const fields = canonicalToolFields(rawName);
         const out = state.outputByItem.get(it.id) ?? (typeof it.aggregatedOutput === 'string' ? it.aggregatedOutput : '');
         state.outputByItem.delete(it.id);
         queue.push(
           ok
-            ? { kind: 'tool.result', callId: it.id, ok: true, result: out }
-            : { kind: 'tool.result', callId: it.id, ok: false, error: it.status ? `${it.status}${out ? ': ' + out : ''}` : (out || 'failed') },
+            ? {
+                kind: 'tool.result',
+                callId: it.id,
+                ...(fields.rawName ? fields : {}),
+                ok: true,
+                result: out,
+              }
+            : {
+                kind: 'tool.result',
+                callId: it.id,
+                ...(fields.rawName ? fields : {}),
+                ok: false,
+                error: it.status ? `${it.status}${out ? ': ' + out : ''}` : (out || 'failed'),
+              },
         );
       }
       // agentMessage/reasoning 文本已经经 delta 流式 → 忽略。

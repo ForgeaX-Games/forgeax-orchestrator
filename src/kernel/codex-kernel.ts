@@ -85,6 +85,7 @@ import {
   ensureCodexSessionHome,
 } from './codex-session-home';
 import { CodexAppServerPool, type OwnedCodexAppServer } from './codex-appserver-pool';
+import { registerAsk, type AskHandle } from '../core/ask-user-registry';
 
 /** Emit a structured turn failure (the neutral spine has no codex_mcp_* code, so
  *  the machine code rides in the `protocol` message prefix). Keeps the B5
@@ -99,6 +100,21 @@ function* historyResumeFailure(message: string): Generator<KernelEvent> {
   yield { kind: 'turn.usage' };
   yield { kind: 'error', error: { code: 'protocol', message } };
   yield { kind: 'turn.done', reason: 'error' };
+}
+
+function hasCodexMcpTools(req: TurnRequest): boolean {
+  return req.tools?.some((tool) => tool.name !== 'ask_user') ?? false;
+}
+
+function askUserDynamicTools(req: TurnRequest): Array<Record<string, unknown>> | undefined {
+  const tool = req.tools?.find((candidate) => candidate.name === 'ask_user');
+  if (!tool) return undefined;
+  return [{
+    type: 'function',
+    name: tool.name,
+    description: tool.description ?? 'Ask the user one to three blocking questions.',
+    inputSchema: tool.inputSchema ?? { type: 'object' },
+  }];
 }
 
 export type CodexTurnTransport = 'app-server' | 'exec';
@@ -297,7 +313,8 @@ export class CodexKernel implements AgentKernel {
     let runtime: ForgeaxToolsRuntime | undefined;
     try {
       if (signal?.aborted) throw new Error('codex app-server admission cancelled');
-      runtime = await materializeForgeaxToolsRuntime(req, {
+      const mcpTools = req.tools?.filter((tool) => tool.name !== 'ask_user') ?? [];
+      runtime = await materializeForgeaxToolsRuntime({ ...req, tools: mcpTools }, {
         runtimeId: req.callId || req.hostSessionId || req.session.threadId || 'codex-appserver',
       });
       if (signal?.aborted) throw new Error('codex app-server admission cancelled');
@@ -396,7 +413,7 @@ export class CodexKernel implements AgentKernel {
       if (tid && !this.appThreadIdMap.has(tid)) {
         const permission = toCodexAppServerPermission(req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE);
         const started = await this.startAppServerThread(owned.session.client, req, permission, owned.home);
-        const requiredFxtUnavailable = req.tools.length > 0
+        const requiredFxtUnavailable = hasCodexMcpTools(req)
           && [...started.readiness.pending, ...started.readiness.failed].includes(CODEX_MCP_SERVER_KEY);
         if (started.threadId && !requiredFxtUnavailable) {
           this.appThreadIdMap.set(tid, started.threadId);
@@ -442,6 +459,7 @@ export class CodexKernel implements AgentKernel {
       ...(developerInstructions?.trim() ? { developerInstructions } : {}),
       ...(model ? { model } : {}),
       ephemeral: false,
+      ...(askUserDynamicTools(req) ? { dynamicTools: askUserDynamicTools(req) } : {}),
     });
     const threadId = res?.thread?.id;
     if (!threadId) return { readiness: { ready: false, pending: ['thread/start'], failed: [] } };
@@ -452,7 +470,7 @@ export class CodexKernel implements AgentKernel {
     try {
       readiness = await client.waitForThreadMcpServers(
         threadId,
-        [...codexSessionNativeStdioMcpNames(home), ...(req.tools.length ? [CODEX_MCP_SERVER_KEY] : [])],
+        [...codexSessionNativeStdioMcpNames(home), ...(hasCodexMcpTools(req) ? [CODEX_MCP_SERVER_KEY] : [])],
         { signal },
       );
     } catch (error) {
@@ -514,6 +532,12 @@ export class CodexKernel implements AgentKernel {
         return;
       } catch (e) {
         if (!(e instanceof AppServerUnavailable)) throw e;
+        if (req.tools?.some((tool) => tool.name === 'ask_user')) {
+          yield* codexMcpFailure(
+            `codex_appserver_required: Ask User requires Codex app-server's timeout-free dynamic tool channel; refusing finite MCP fallback: ${(e as Error).message}`,
+          );
+          return;
+        }
         // App-server and exec keep different native thread identifiers. A
         // non-snapshot request prepared for an app-server owner must never be
         // sent through exec. Clear every stale owner and require a new compose,
@@ -563,11 +587,40 @@ export class CodexKernel implements AgentKernel {
     const notifState = createCodexNotifState();
     const permissionMode = req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE;
     const appServerPermission = toCodexAppServerPermission(permissionMode);
+    const activeAskHandles = new Set<AskHandle>();
 
     // 审批 server-request:settings.permissions 规则先行(046 楔子3:deny 即拒 /
     // allow 即批 / ask 强制走卡),未命中 → 中立 requestPermission(= Studio 审批卡),
     // 都没有 → 默认放行(headless --force 类比,原基线)。
     const handleServerRequest = async (rpc: ServerRequest): Promise<unknown> => {
+      if (rpc.method === 'item/tool/call') {
+        const p = (rpc.params ?? {}) as Record<string, unknown>;
+        if (p.namespace == null && p.tool === 'ask_user' && askUserDynamicTools(req)) {
+          const callId = typeof p.callId === 'string' && p.callId
+            ? p.callId
+            : `ask-${String(rpc.id)}`;
+          const args = p.arguments && typeof p.arguments === 'object' ? p.arguments : {};
+          queue.push({ kind: 'tool.call', callId, name: 'ask_user', args });
+          const sid = req.hostSessionId?.trim() || req.session.threadId?.trim() || '';
+          const agent = req.session.agentId?.trim() || 'forge';
+          const handle = registerAsk(sid, agent, 0);
+          activeAskHandles.add(handle);
+          try {
+            const answers = await handle.promise;
+            if (answers === null) {
+              queue.push({ kind: 'tool.result', callId, name: 'ask_user', ok: false, error: 'Ask User was interrupted.' });
+              return { contentItems: [{ type: 'inputText', text: 'Ask User was interrupted.' }], success: false };
+            }
+            const result = JSON.stringify({ ok: true, questions: answers });
+            queue.push({ kind: 'tool.result', callId, name: 'ask_user', ok: true, result });
+            return { contentItems: [{ type: 'inputText', text: result }], success: true };
+          } finally {
+            activeAskHandles.delete(handle);
+            handle.dispose();
+          }
+        }
+        throw new Error(`unsupported codex dynamic tool: ${String(p.namespace ?? '')}/${String(p.tool ?? '')}`);
+      }
       // MCP elicitation(server 向 client 要表单/URL):fxt 不主动发,但 client 仍须显式
       // decline/cancel 不支持的 elicitation,且**绝不**把它误判为「用户已批准」(plan §9.3)。
       const elicit = classifyElicitation(rpc.method);
@@ -617,6 +670,8 @@ export class CodexKernel implements AgentKernel {
     let activeCodexThreadId: string | undefined;
     let activeCodexTurnId: string | undefined;
     const onAbort = () => {
+      for (const handle of activeAskHandles) handle.dispose();
+      activeAskHandles.clear();
       if (activeClient && activeCodexThreadId && activeCodexTurnId) {
         void activeClient.request('turn/interrupt', {
           threadId: activeCodexThreadId,
@@ -676,7 +731,10 @@ export class CodexKernel implements AgentKernel {
       if (codexThreadId) {
         if (!tid || this.appThreadOwnerMap.get(tid) !== client) {
           try {
-            await client.request('thread/resume', { threadId: codexThreadId });
+            await client.request('thread/resume', {
+              threadId: codexThreadId,
+              ...(askUserDynamicTools(req) ? { dynamicTools: askUserDynamicTools(req) } : {}),
+            });
           } catch {
             if (tid) {
               this.appThreadIdMap.delete(tid);
@@ -706,7 +764,7 @@ export class CodexKernel implements AgentKernel {
       // including a reused native thread. A previous warm/turn may have seen
       // fxt ready and a later startup retry may have failed or been cancelled;
       // never submit a tool-less model turn from that stale thread.
-      if (req.tools.length > 0) {
+      if (hasCodexMcpTools(req)) {
         let readiness: { ready: boolean; pending: string[]; failed: string[] };
         try {
           readiness = await client.waitForThreadMcpServers(
@@ -779,6 +837,8 @@ export class CodexKernel implements AgentKernel {
       }
       reusable = client.alive && !ac.signal.aborted;
     } finally {
+      for (const handle of activeAskHandles) handle.dispose();
+      activeAskHandles.clear();
       ac.signal.removeEventListener('abort', onAbort);
       if (reusable) {
         // Do not retain callbacks that close over a completed turn while idle.
@@ -816,9 +876,10 @@ export class CodexKernel implements AgentKernel {
       const hooksActive = ensureCodexHooksConfig(projectRoot);
 
       // fxt MCP runtime(本轮工具)。materialize 失败 = fail-closed(plan §6.3)。
-      if ((req.tools?.length ?? 0) > 0) {
+      const mcpTools = req.tools?.filter((tool) => tool.name !== 'ask_user') ?? [];
+      if (mcpTools.length > 0) {
         try {
-          runtime = await materializeForgeaxToolsRuntime(req, {
+          runtime = await materializeForgeaxToolsRuntime({ ...req, tools: mcpTools }, {
             runtimeId: req.callId || req.hostSessionId || req.session.threadId || 'codex-exec',
           });
         } catch (e) {

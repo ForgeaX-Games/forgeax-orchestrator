@@ -177,4 +177,37 @@ describe('LiveTurnTracker.thinkingOnlyEmitterIds', () => {
     ]);
     tracker.dispose();
   });
+
+  test('permission prompt provenance survives a live snapshot', () => {
+    const bus = new EventBus();
+    const tracker = new LiveTurnTracker(bus);
+    bus.publish(
+      { source: 'agent:coder', type: 'hook:turnStart', payload: { turn: 1 }, ts: 1 },
+      'coder',
+    );
+    bus.publish(
+      {
+        source: 'agent:coder',
+        type: 'stream:tool_use',
+        payload: {
+          toolUseId: 'permission-call',
+          name: 'AskUserQuestion',
+          input: { questions: [] },
+          permissionPrompt: true,
+        },
+        ts: 2,
+      },
+      'coder',
+    );
+    expect(tracker.snapshots()[0]?.toolCalls).toEqual([
+      {
+        callId: 'permission-call',
+        name: 'AskUserQuestion',
+        args: { questions: [] },
+        permissionPrompt: true,
+        status: 'running',
+      },
+    ]);
+    tracker.dispose();
+  });
 });

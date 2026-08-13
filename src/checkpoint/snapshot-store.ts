@@ -608,6 +608,17 @@ export class SnapshotStore {
     });
   }
 
+  /** 正向轮次差异:从 base 快照(FROM)到当前磁盘(TO)。
+   *
+   * `diffStats` 保留回退预览的历史参数语义(base 省略时是当前盘,
+   * target 是要回退到的快照),交付派生不应自行排列两个 manifest。
+   * 这里先把当前盘拍入同一 CAS store,再以 base → current 方向计算差异。
+   */
+  async diffSince(targetDir: string, base: Manifest): Promise<DiffStats> {
+    const current = await this.snapshot(targetDir, { reason: "diff-since" });
+    return this.diffStats(targetDir, current, base);
+  }
+
   /** 单文件行级 diff(从 blob 池读内容);null = 二进制/超限,只算「变更」。 */
   private _lineDiff(
     a: ManifestEntry | undefined,
@@ -628,8 +639,8 @@ export class SnapshotStore {
     const aText = a ? this._readBlobText(a.h) : "";
     const bText = b ? this._readBlobText(b.h) : "";
     if (aText === null || bText === null) return null; // 二进制/blob 丢失
-    const aLines = aText === "" ? [] : aText.split("\n");
-    const bLines = bText === "" ? [] : bText.split("\n");
+    const aLines = splitTextLines(aText);
+    const bLines = splitTextLines(bText);
     if (aLines.length > LINE_DIFF_MAX_LINES || bLines.length > LINE_DIFF_MAX_LINES) return null;
     // b = 目标(回退后),a = 基准(当前)。insertions = 回退会加回的行。
     return lcsDiffCounts(aLines, bLines);
@@ -655,6 +666,18 @@ function sha256(content: Buffer): string {
 
 function toPosix(p: string): string {
   return sep === "/" ? p : p.split(sep).join("/");
+}
+
+/** Split text into lines under POSIX semantics: a trailing newline terminates
+ * the last line rather than starting an empty one. Counting it as a line made
+ * every added/deleted file report one insertion/deletion too many
+ * (`"round3 ok\n"` → 2 lines), which surfaced as `+2` on a one-line new file
+ * in the delivery card. */
+function splitTextLines(text: string): string[] {
+  if (text === "") return [];
+  const lines = text.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
 }
 
 function diffEntryMaps(

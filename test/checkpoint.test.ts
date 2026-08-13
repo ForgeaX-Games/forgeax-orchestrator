@@ -277,6 +277,25 @@ describe("SnapshotStore", () => {
     expect(sumIns).toBe(stats.insertions);
     expect(sumDel).toBe(stats.deletions);
   });
+
+  test("diffSince:按轮次正向统计 base → current", async () => {
+    write("code.ts", "base\n");
+    const store = new SnapshotStore(storeDir);
+    const base = await store.snapshot(gameDir);
+
+    write("code.ts", "base\nnew-1\nnew-2\n");
+    const stats = await store.diffSince(gameDir, base);
+
+    expect(stats.filesChanged).toEqual(["code.ts"]);
+    expect(stats.insertions).toBe(2);
+    expect(stats.deletions).toBe(0);
+    expect(stats.files[0]).toMatchObject({
+      path: "code.ts",
+      status: "modified",
+      insertions: 2,
+      deletions: 0,
+    });
+  });
 });
 
 describe("lcsDiffCounts", () => {

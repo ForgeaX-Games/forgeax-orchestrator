@@ -38,6 +38,18 @@ function wire(ev: KernelEvent): ChatEvent[] {
 }
 
 describe('toWireEvents — golden wire mapping (all 12 KernelEvent kinds)', () => {
+  it('marks native ask_user as structured rather than permission-side-channel', () => {
+    expect(toWireEvents({ kind: 'tool.call', callId: 'ask-1', name: 'ask_user', args: { question: 'Pick' } }, newWireFoldState())).toEqual([
+      {
+        type: 'tool-call',
+        callId: 'ask-1',
+        name: 'ask_user',
+        args: { question: 'Pick' },
+        permissionPrompt: false,
+      },
+    ]);
+  });
+
   it('message.delta → token', () => {
     expect(wire({ kind: 'message.delta', role: 'assistant', text: 'hello' })).toEqual([
       { type: 'token', text: 'hello' },

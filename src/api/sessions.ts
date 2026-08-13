@@ -479,20 +479,28 @@ export function createSessionsRouter() {
   });
 
   // POST /:sid/ask-reply —— 解开 `ask_user` 工具阻塞的 Promise。前端在用户选完
-  // 选项后调用。键 = sid::agent(agent 默认串行,同一 agent 同刻至多一个 ask
+  // 选项后统一提交所有问题。键 = sid::agent(agent 默认串行,同一 agent 同刻至多一个 ask
   // pending,见 core/ask-user-registry.ts)。未命中(已超时/已答/键不对)返回
   // ok:false,前端忽略即可——不报错、不污染聊天历史、不触发新 turn。
   r.post('/:sid/ask-reply', async (c) => {
     const sid = c.req.param('sid');
     const body = await c.req.json().catch(() => ({}));
     const agent = typeof body.agent === 'string' && body.agent ? body.agent : null;
-    const values = Array.isArray(body.values)
-      ? body.values.filter((v: unknown): v is string => typeof v === 'string')
-      : null;
-    if (!agent || !values) {
-      return c.json({ error: 'agent (string) and values (string[]) required' }, 400);
+    const answers = Array.isArray(body.answers)
+      ? body.answers.flatMap((answer: unknown) => {
+          if (!answer || typeof answer !== 'object') return [];
+          const row = answer as Record<string, unknown>;
+          if (typeof row.questionId !== 'string' || !row.questionId.trim() || !Array.isArray(row.values)) return [];
+          const values = row.values.filter((value): value is string => typeof value === 'string');
+          return [{ questionId: row.questionId.trim(), values }];
+        })
+      : Array.isArray(body.values)
+        ? [{ questionId: 'question-1', values: body.values.filter((value: unknown): value is string => typeof value === 'string') }]
+        : null;
+    if (!agent || !answers || answers.length === 0) {
+      return c.json({ error: 'agent (string) and answers ({ questionId, values[] }[]) required' }, 400);
     }
-    const ok = resolveAsk(sid, agent, values);
+    const ok = resolveAsk(sid, agent, answers);
     return c.json({ ok, ...(ok ? {} : { reason: 'no-pending' }) });
   });
 
@@ -509,6 +517,10 @@ export function createSessionsRouter() {
   // /permission-request reads + clears them after the await and returns them so
   // the MCP can inject updatedInput.answers back into the CLI.
   const permissionAnswers = new Map<string, Record<string, string>>();
+  // UI-only structured copy of the same answer. `answers` remains the CLI
+  // protocol (one string per question); this map preserves multi-select
+  // boundaries for the collapsed summary and WAL replay.
+  const permissionAnswerValues = new Map<string, Record<string, string[]>>();
   // POST /:sid/kernel-tool —— host-tool 桥(T-A)。内核 CC 经 fxt MCP server 把对
   // host-tool 的调用 HTTP 回调到这里:定位活 agent → 信任闸 → host 侧执行 → 回结果。
   // 信任闸(T-D)在此**唯一闸口**:trustTier 权威 = R6 loadAgentRecord 按加载路径定,
@@ -542,7 +554,21 @@ export function createSessionsRouter() {
     args = preflight.args as Record<string, unknown>;
 
     const session = getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
-    const agent = session.scheduler.getAgent(agentPath);
+    // /api/cli/chat can rent the kernel without a browser WS having opened the
+    // session first. Ensure the target exists at the authoritative tool
+    // boundary before applying trust policy; otherwise the first native
+    // callback can be rejected merely because the restored session has not
+    // attached its root agent yet.
+    let agent = session.scheduler.getAgent(agentPath);
+    if (!agent && session.tree.get(agentPath)) {
+      try {
+        await session.scheduler.attachAgent(agentPath);
+        await session.scheduler.startAgent(agentPath);
+        agent = session.scheduler.getAgent(agentPath);
+      } catch (err: any) {
+        appendToolAudit({ sid, agent: agentPath, tool: toolName, trustTier: 'unknown', allow: false, error: `agent '${agentPath}' attach failed: ${err?.message ?? err}`, durationMs: Date.now() - start, ts: start });
+      }
+    }
     if (!agent) {
       // agent 不在线 —— 审计记录 allow=false
       appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier: 'unknown', allow: false, error: `agent '${agentPath}' not live in session`, durationMs: Date.now() - start, ts: start });
@@ -733,12 +759,20 @@ export function createSessionsRouter() {
     // Own the request by (sid, agent) so a turn abort/end can release it.
     // sid here == FORGEAX_SID the MCP server posted to == threadId; agent ==
     // FORGEAX_AGENT. cli/chat.ts's turn-end hook recomputes the identical pair.
-    const handle = registerPermission(reqId, PERMISSION_TIMEOUT_MS, { sid, agent });
+    // AskUserQuestion is not a security approval. It is a blocking user-input
+    // request and therefore has no deadline; ordinary command/file approvals
+    // remain fail-closed on the ten-minute permission timeout.
+    const timeoutMs = toolName === 'AskUserQuestion' ? 0 : PERMISSION_TIMEOUT_MS;
+    const handle = registerPermission(reqId, timeoutMs, { sid, agent });
     let allow = false;
+    let settledAnswers: Record<string, string> | undefined;
+    let settledAnswerValues: Record<string, string[]> | undefined;
     try {
       allow = await handle.promise;
     } finally {
       handle.dispose();
+      settledAnswers = permissionAnswers.get(reqId);
+      settledAnswerValues = permissionAnswerValues.get(reqId);
       // Tell the UI to dismiss the card regardless of how it settled (reply /
       // timeout / abort) so a stale prompt never lingers.
       session.eventBus.publish(
@@ -746,7 +780,14 @@ export function createSessionsRouter() {
           type: 'permission:resolved',
           ts: Date.now(),
           source: `agent:${agent}`,
-          payload: { reqId, allow },
+          payload: {
+            reqId,
+            allow,
+            toolName,
+            input: input ?? null,
+            ...(settledAnswers ? { answers: settledAnswers } : {}),
+            ...(settledAnswerValues ? { answerValues: settledAnswerValues } : {}),
+          },
         },
         agent,
       );
@@ -755,6 +796,7 @@ export function createSessionsRouter() {
     // inject updatedInput.answers (without these, CC gets "did not answer").
     const answers = permissionAnswers.get(reqId);
     permissionAnswers.delete(reqId);
+    permissionAnswerValues.delete(reqId);
     return { allow, ...(answers ? { answers } : {}) };
   }
 
@@ -863,6 +905,15 @@ export function createSessionsRouter() {
         if (typeof v === 'string') a[k] = v;
       }
       if (Object.keys(a).length > 0) permissionAnswers.set(reqId, a);
+    }
+    if (allow && body.answerValues && typeof body.answerValues === 'object') {
+      const values: Record<string, string[]> = {};
+      for (const [key, raw] of Object.entries(body.answerValues as Record<string, unknown>)) {
+        if (!Array.isArray(raw)) continue;
+        const normalized = raw.filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+        if (normalized.length > 0) values[key] = normalized;
+      }
+      if (Object.keys(values).length > 0) permissionAnswerValues.set(reqId, values);
     }
     // 「记住本会话」:allow && remember → 记住该 agent 的该 capability,本会话内同类免卡。
     // 必须在 resolvePermission 之前(此时 pendingCtx 仍在)。

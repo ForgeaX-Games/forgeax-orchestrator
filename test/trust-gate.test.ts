@@ -197,4 +197,10 @@ describe('委派/编排原语始终放行(含 imported)', () => {
     expect(checkKernelTool('imported', 'list_agents').outcome).toBe('allow');
     expect(checkKernelTool(undefined, 'delegate_to_subagent').outcome).toBe('allow');
   });
+
+  test('deliver_summary 纯上报工具 → allow(含 imported 与缺省 trust)', () => {
+    expect(checkKernelTool('own', 'deliver_summary').outcome).toBe('allow');
+    expect(checkKernelTool('imported', 'deliver_summary').outcome).toBe('allow');
+    expect(checkKernelTool(undefined, 'deliver_summary').outcome).toBe('allow');
+  });
 });

@@ -12,6 +12,7 @@ import type {
   PermissionDecision,
   TurnDoneReason,
 } from '@forgeax/agent-runtime';
+import { canonicalToolFields } from './canonical-tool-name';
 
 interface ToolState {
   name: string;
@@ -35,9 +36,20 @@ function toolName(update: {
 }): string {
   const programmatic = update._meta?.toolName ?? update._meta?.tool_name;
   if (typeof programmatic === 'string' && programmatic.trim()) return programmatic.trim();
-  if (update.title?.trim() && /^(Bash|Edit|Read|Grep|Glob|WebFetch|WebSearch|Think)$/i.test(update.title.trim())) {
-    const title = update.title.trim();
-    return title.charAt(0).toUpperCase() + title.slice(1);
+  const title = update.title?.trim();
+  if (title) {
+    // Kimi's ACP bridge may expose the original MCP capability in the
+    // human-readable title instead of _meta.toolName. Preserve that raw name
+    // so canonicalToolFields can project mcp__fxt__todo_write and
+    // mcp__fxt__deliver_summary into the task-flow cards.
+    const mcpName = title.match(/(?:^|[\s(:])((?:mcp__|fxt__)[A-Za-z0-9_-]+)/i)?.[1];
+    if (mcpName) return mcpName;
+    if (/^(todo_write|deliver_summary|ask_user|read_file|write_file|edit_file|multi_edit|apply_patch|grep|glob|bash|subagent)$/i.test(title)) {
+      return title;
+    }
+    if (/^(Bash|Edit|Read|Grep|Glob|WebFetch|WebSearch|Think)$/i.test(title)) {
+      return title.charAt(0).toUpperCase() + title.slice(1);
+    }
   }
   switch (update.kind) {
     case 'read':
@@ -105,7 +117,7 @@ function openTool(
   state.tools.set(update.toolCallId, current);
   if (current.emitted) return [];
   current.emitted = true;
-  return [{ kind: 'tool.call', callId: update.toolCallId, name: current.name, args: current.args }];
+  return [{ kind: 'tool.call', callId: update.toolCallId, ...canonicalToolFields(current.name), args: current.args }];
 }
 
 function finishTool(
@@ -131,10 +143,11 @@ function finishTool(
       ? {
           kind: 'tool.result',
           callId: update.toolCallId,
+          ...canonicalToolFields(current.name),
           ok: false,
           error: typeof result === 'string' ? result : JSON.stringify(result),
         }
-      : { kind: 'tool.result', callId: update.toolCallId, ok: true, result },
+      : { kind: 'tool.result', callId: update.toolCallId, ...canonicalToolFields(current.name), ok: true, result },
   );
   return out;
 }

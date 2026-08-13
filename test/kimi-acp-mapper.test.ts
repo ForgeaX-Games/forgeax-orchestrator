@@ -58,9 +58,13 @@ describe('kimi-acp-mapper', () => {
       status: 'completed',
       rawOutput: 'a.txt',
     }, state);
-    expect(started).toEqual([{ kind: 'tool.call', callId: '1:tc', name: 'Bash', args: { command: 'ls' } }]);
+    expect(started).toEqual([
+      { kind: 'tool.call', callId: '1:tc', name: 'bash', rawName: 'Bash', args: { command: 'ls' } },
+    ]);
     expect(duplicate).toEqual([]);
-    expect(done).toEqual([{ kind: 'tool.result', callId: '1:tc', ok: true, result: 'a.txt' }]);
+    expect(done).toEqual([
+      { kind: 'tool.result', callId: '1:tc', name: 'bash', rawName: 'Bash', ok: true, result: 'a.txt' },
+    ]);
   });
 
   test('recovers tool args from ACP content when rawInput is omitted', () => {
@@ -73,7 +77,22 @@ describe('kimi-acp-mapper', () => {
       status: 'in_progress',
       content: [{ type: 'content', content: { type: 'text', text: '{"command":"printf ok"}' } }],
     }, state)).toEqual([
-      { kind: 'tool.call', callId: '1:bash', name: 'Bash', args: { command: 'printf ok' } },
+      { kind: 'tool.call', callId: '1:bash', name: 'bash', rawName: 'Bash', args: { command: 'printf ok' } },
+    ]);
+  });
+
+  test('preserves MCP capability names exposed through the ACP title', () => {
+    const state = createKimiAcpMapperState();
+    expect(mapKimiAcpUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: '1:todo',
+      title: 'mcp__fxt__todo_write',
+      status: 'completed',
+      rawInput: { todos: [] },
+      rawOutput: { ok: true },
+    }, state)).toEqual([
+      { kind: 'tool.call', callId: '1:todo', name: 'todo_write', rawName: 'mcp__fxt__todo_write', args: { todos: [] } },
+      { kind: 'tool.result', callId: '1:todo', name: 'todo_write', rawName: 'mcp__fxt__todo_write', ok: true, result: { ok: true } },
     ]);
   });
 
@@ -86,8 +105,15 @@ describe('kimi-acp-mapper', () => {
       status: 'failed',
       content: [{ type: 'content', content: { type: 'text', text: 'denied' } }],
     }, state)).toEqual([
-      { kind: 'tool.call', callId: '2:tc', name: 'Edit', args: { input: 'denied' } },
-      { kind: 'tool.result', callId: '2:tc', ok: false, error: 'denied' },
+      { kind: 'tool.call', callId: '2:tc', name: 'edit_file', rawName: 'Edit', args: { input: 'denied' } },
+      {
+        kind: 'tool.result',
+        callId: '2:tc',
+        name: 'edit_file',
+        rawName: 'Edit',
+        ok: false,
+        error: 'denied',
+      },
     ]);
   });
 

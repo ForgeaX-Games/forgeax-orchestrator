@@ -12,6 +12,12 @@ import { Hono } from "hono";
 import { createCliRouter } from "../src/api/cli/chat";
 import { _resetRegistry, registerProvider } from "../src/cli-providers/registry";
 import type { CliProvider, ChatEvent } from "../src/cli-providers/types";
+import { initPathManager, resetPathManager, getPathManager } from "../src/fs/path-manager";
+import { initSessionManager, resetSessionManager } from "../src/core/session-manager";
+import { getCheckpointManager } from "../src/checkpoint/checkpoint-manager";
+import { basename, join } from "node:path";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const MOCK_CAPS = {
   streaming: true,
@@ -237,5 +243,66 @@ describe("/api/cli/chat", () => {
     expect(res.status).toBe(503);
     const body: any = await res.json();
     expect(body.error).toMatch(/no cli-provider/);
+  });
+
+  test("session CLI 消息写入 MessageRecord，代码 rewind 可用且下一条消息定格 pending", async () => {
+    const userRoot = mkdtempSync(join(tmpdir(), "cli-checkpoint-user-"));
+    const projectRoot = mkdtempSync(join(tmpdir(), "cli-checkpoint-project-"));
+    const slug = basename(projectRoot);
+    const gameDir = join(projectRoot, ".forgeax", "games", slug);
+    mkdirSync(gameDir, { recursive: true });
+    const source = join(gameDir, "main.ts");
+    writeFileSync(source, "base\n", "utf-8");
+
+    resetPathManager();
+    await resetSessionManager();
+    initPathManager({ userRoot, projectRoot });
+    const sm = initSessionManager(getPathManager());
+    const session = await sm.create({ displayName: "cli checkpoint" });
+
+    registerProvider(makeMockProvider({
+      id: "checkpoint-mock",
+      events: [{ type: "done", stopReason: "end_turn" }],
+    }), { default: true });
+
+    try {
+      const post = () => app.fetch(new Request("http://localhost/api/cli/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "edit it", sessionId: session.sid, agentId: "forge" }),
+      }));
+
+      const first = await post();
+      expect(first.status).toBe(200);
+      await readSSEEvents(first);
+
+      const indexFile = join(getPathManager().session(session.sid).root(), "checkpoints.jsonl");
+      const firstRecord = JSON.parse(readFileSync(indexFile, "utf-8").split("\n")[0]!);
+      expect(firstRecord.kind).toBe("message");
+      expect(firstRecord.msgId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(firstRecord.manifestId).toBeString();
+
+      writeFileSync(source, "changed\n", "utf-8");
+      const rewind = await getCheckpointManager().rewind(session, firstRecord.msgId, "code");
+      expect("error" in rewind).toBe(false);
+      expect(readFileSync(source, "utf-8")).toBe("base\n");
+
+      const second = await post();
+      expect(second.status).toBe(200);
+      await readSSEEvents(second);
+      expect(getCheckpointManager().pendingOf(session)).toBeNull();
+
+      const records = readFileSync(indexFile, "utf-8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(records.filter((record) => record.kind === "message")).toHaveLength(2);
+      expect(records.some((record) => record.kind === "rewind-status" && record.status === "finalized")).toBe(true);
+    } finally {
+      await resetSessionManager();
+      resetPathManager();
+      rmSync(userRoot, { recursive: true, force: true });
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -178,12 +178,11 @@ function buildCbcSystemPromptArgs(text: string, mode: 'append' | 'replace', key:
 
 /** 工具面策略 argv(中立 toolPolicy → cbc `--tools` / `--disallowedTools`,与 cc 一致)。 */
 function buildCbcToolPolicyArgs(policy: TurnRequest['toolPolicy']): string[] {
-  if (!policy) return [];
   const out: string[] = [];
-  const allow = policy.allow?.filter((t) => typeof t === 'string' && t.trim());
+  const allow = policy?.allow?.filter((t): t is string => typeof t === 'string' && t.trim().length > 0);
   if (allow && allow.length) out.push('--tools', allow.join(','));
-  const deny = policy.deny?.filter((t) => typeof t === 'string' && t.trim());
-  if (deny && deny.length) out.push('--disallowedTools', ...deny);
+  const deny = new Set(['TodoWrite', ...(policy?.deny ?? [])].filter((t): t is string => typeof t === 'string' && t.trim().length > 0));
+  out.push('--disallowedTools', ...deny);
   return out;
 }
 

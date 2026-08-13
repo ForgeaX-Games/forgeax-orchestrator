@@ -18,6 +18,8 @@ export interface LiveToolCall {
   callId: string;
   name: string;
   args?: unknown;
+  /** CLI permission prompts are rendered by PermissionPrompt, not AskUserCard. */
+  permissionPrompt?: boolean;
   status: "running" | "done" | "error";
 }
 
@@ -189,10 +191,13 @@ export class LiveTurnTracker {
         const callId = payload.toolUseId as string | undefined;
         if (!callId) return;
         t.hasToolActivity = true;
+        const prev = t.toolCalls.get(callId);
+        const permissionPrompt = payload.permissionPrompt === true || prev?.permissionPrompt === true;
         t.toolCalls.set(callId, {
           callId,
-          name: typeof payload.name === "string" ? payload.name : "tool",
-          args: payload.input,
+          name: typeof payload.name === "string" ? payload.name : prev?.name ?? "tool",
+          args: payload.input ?? prev?.args,
+          ...(permissionPrompt ? { permissionPrompt: true } : {}),
           status: "running",
         });
         return;
@@ -210,10 +215,13 @@ export class LiveTurnTracker {
         const callId = tc?.id;
         if (!callId) return;
         t.hasToolActivity = true;
+        const prev = t.toolCalls.get(callId);
+        const permissionPrompt = payload.permissionPrompt === true || prev?.permissionPrompt === true;
         t.toolCalls.set(callId, {
           callId,
-          name: (payload.name as string) ?? tc?.name ?? "tool",
-          args: payload.args,
+          name: (payload.name as string) ?? tc?.name ?? prev?.name ?? "tool",
+          args: payload.args ?? prev?.args,
+          ...(permissionPrompt ? { permissionPrompt: true } : {}),
           status: "running",
         });
         return;

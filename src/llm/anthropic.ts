@@ -225,12 +225,13 @@ function toAnthropicSidecar(sidecarData: LLMMessage["providerSidecarData"]): Ant
           ? [{ type: "text", text: item.text }]
           : [];
       case "thinking":
-        return typeof item.thinking === "string"
-          ? [{
-              type: "thinking",
-              thinking: item.thinking,
-              signature: typeof item.signature === "string" ? item.signature : undefined,
-            }]
+        // Anthropic requires a signature on every thinking block that is sent
+        // back as assistant history. Some compatible gateways stream the
+        // thinking text but omit signature_delta. Never replay that malformed
+        // block: keep the signed/tool blocks and let the provider continue
+        // from the durable assistant/tool history instead of returning a 400.
+        return typeof item.thinking === "string" && typeof item.signature === "string" && item.signature.trim()
+          ? [{ type: "thinking", thinking: item.thinking, signature: item.signature }]
           : [];
       case "redacted_thinking":
         return typeof item.data === "string"

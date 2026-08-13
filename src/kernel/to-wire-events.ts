@@ -9,6 +9,7 @@
  */
 import type { KernelEvent, TurnDoneReason } from '@forgeax/agent-runtime';
 import type { ChatEvent } from '../cli-providers/types';
+import { canonicalToolName } from './canonical-tool-name';
 
 export interface WireFoldState {
   usage?: {
@@ -30,13 +31,41 @@ export function toWireEvents(ev: KernelEvent, st: WireFoldState): ChatEvent[] {
     case 'message.delta':
       return [{ type: 'token', text: ev.text }];
     case 'thinking.delta':
-      return [{ type: 'thinking', text: ev.text }];
+      return [{
+        type: 'thinking',
+        text: ev.text,
+        ...(ev.visibility ? { visibility: ev.visibility } : {}),
+      }];
     case 'tool.call':
-      return [{ type: 'tool-call', callId: ev.callId, name: ev.name, args: ev.args }];
+      return [{
+        type: 'tool-call',
+        callId: ev.callId,
+        name: ev.name,
+        ...(ev.rawName ? { rawName: ev.rawName } : {}),
+        args: ev.args,
+        // The kernel path exposes the host-owned structured ask_user tool.
+        // Mark it explicitly so the legacy CLI UI adapter does not route it
+        // into the permission-only AskUserQuestion renderer.
+        ...(canonicalToolName(ev.name) === 'ask_user' ? { permissionPrompt: false } : {}),
+      }];
     case 'tool.call.delta':
-      return [{ type: 'tool-call-delta', callId: ev.callId, name: ev.name, argumentsDelta: ev.argsDelta }];
+      return [{
+        type: 'tool-call-delta',
+        callId: ev.callId,
+        name: ev.name,
+        ...(ev.rawName ? { rawName: ev.rawName } : {}),
+        argumentsDelta: ev.argsDelta,
+      }];
     case 'tool.result':
-      return [{ type: 'tool-result', callId: ev.callId, ok: ev.ok, result: ev.result, error: ev.error }];
+      return [{
+        type: 'tool-result',
+        callId: ev.callId,
+        ...(ev.name ? { name: ev.name } : {}),
+        ...(ev.rawName ? { rawName: ev.rawName } : {}),
+        ok: ev.ok,
+        result: ev.result,
+        error: ev.error,
+      }];
     case 'turn.usage':
       // 折叠,等 done 时一并带出
       st.usage = {

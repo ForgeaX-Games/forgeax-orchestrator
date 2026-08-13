@@ -114,6 +114,33 @@ export const CODEX_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = [
 export const CODEX_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
 
 /**
+ * Codex also has a native `request_user_input` tool whose availability depends
+ * on the Codex collaboration mode. ForgeaX does not use that surface: it
+ * projects a host-owned `ask_user` dynamic tool through Codex app-server
+ * so the question can block and resume through the Studio clarification card.
+ *
+ * Keep this adapter note conditional on the actual tool projection. A generic
+ * Codex consumer that did not advertise `ask_user` must not be told to call a
+ * tool it does not have.
+ */
+export function buildCodexInstructions(req: TurnRequest): string {
+  const sp = req.systemPrompt;
+  const base = sp.persona?.trim()
+    ? `${sp.charter}\n\n---\n\n## Persona\n\n${sp.persona.trim()}`
+    : sp.charter;
+  const hasHostAskUser = req.tools?.some((tool) => tool.name === 'ask_user') ?? false;
+  if (!hasHostAskUser) return base;
+
+  const interaction = [
+    '## ForgeaX interaction tools',
+    '',
+    'When the user or these instructions say Ask User or `ask_user`, call the host-provided `ask_user` tool.',
+    'This blocking tool is connected to the Studio clarification card and waits indefinitely until the user answers or interrupts the turn.',
+  ].join('\n');
+  return [base, interaction].filter((part) => part?.trim()).join('\n\n---\n\n');
+}
+
+/**
  * ForgeaX 已经用 agent-tree（`AgentTree` + `Scheduler`）和 `delegate_to_subagent`
  * 工具做统一的 sub-agent 编排，Codex 在这里只是 AgentKernel，不应再向模型暴露
  * 第二套原生 spawn/send/wait 工具。
@@ -261,9 +288,7 @@ export function buildCodexArgs(
   // AGENTS.md** → 改为把 charter+persona 作为「指令」前置进 prompt(headless 安全,不碰文件)。
   // dynamicSuffix(当轮记忆/感知)以 user 后缀拼在任务后。
   const sp = req.systemPrompt;
-  const instructions = sp.persona?.trim()
-    ? `${sp.charter}\n\n---\n\n## Persona\n\n${sp.persona.trim()}`
-    : sp.charter;
+  const instructions = buildCodexInstructions(req);
   const task = sp.dynamicSuffix?.trim()
     ? `${req.input.text}\n\n${sp.dynamicSuffix.trim()}`
     : req.input.text;

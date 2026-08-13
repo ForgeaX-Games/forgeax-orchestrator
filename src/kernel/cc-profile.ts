@@ -33,6 +33,7 @@ import { resolve as resolvePath } from 'node:path';
 import type { ChatEvent } from '../cli-providers/types';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { isProjectMcpToolName, readProjectMcpServers } from './project-mcp';
+import { canonicalToolFields } from './canonical-tool-name';
 
 const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
 
@@ -285,12 +286,11 @@ function buildSystemPromptArgs(text: string, mode: 'append' | 'replace', key: st
  * npc_text `--disallowedTools` npc_text messagenpc_text
  */
 function buildToolPolicyArgs(policy: TurnRequest['toolPolicy']): string[] {
-  if (!policy) return [];
   const out: string[] = [];
-  const allow = policy.allow?.filter((t) => typeof t === 'string' && t.trim());
+  const allow = policy?.allow?.filter((t) => typeof t === 'string' && t.trim());
   if (allow && allow.length) out.push('--tools', allow.join(','));
-  const deny = policy.deny?.filter((t) => typeof t === 'string' && t.trim());
-  if (deny && deny.length) out.push('--disallowedTools', ...deny);
+  const deny = new Set(['TodoWrite', ...(policy?.deny ?? [])].filter((t) => typeof t === 'string' && t.trim()));
+  out.push('--disallowedTools', ...deny);
   return out;
 }
 
@@ -573,16 +573,33 @@ export function* chatEventToKernel(ev: ChatEvent): Generator<KernelEvent> {
       yield { kind: 'message.delta', role: 'assistant', text: ev.text };
       return;
     case 'thinking':
-      yield { kind: 'thinking.delta', text: ev.text };
+      yield { kind: 'thinking.delta', text: ev.text, visibility: ev.visibility ?? 'private_reasoning' };
       return;
     case 'tool-call':
-      yield { kind: 'tool.call', callId: ev.callId, name: ev.name, args: ev.args };
+      yield {
+        kind: 'tool.call',
+        callId: ev.callId,
+        ...canonicalToolFields(ev.rawName ?? ev.name),
+        args: ev.args,
+      };
       return;
     case 'tool-call-delta':
-      yield { kind: 'tool.call.delta', callId: ev.callId, name: ev.name, argsDelta: ev.argumentsDelta };
+      yield {
+        kind: 'tool.call.delta',
+        callId: ev.callId,
+        ...canonicalToolFields(ev.rawName ?? ev.name),
+        argsDelta: ev.argumentsDelta,
+      };
       return;
     case 'tool-result':
-      yield { kind: 'tool.result', callId: ev.callId, ok: ev.ok, result: ev.result, error: ev.error };
+      yield {
+        kind: 'tool.result',
+        callId: ev.callId,
+        ...(ev.name || ev.rawName ? canonicalToolFields(ev.rawName ?? ev.name!) : {}),
+        ok: ev.ok,
+        result: ev.result,
+        error: ev.error,
+      };
       return;
     case 'done':
       yield {

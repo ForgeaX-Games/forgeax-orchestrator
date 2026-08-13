@@ -48,7 +48,9 @@ export const CODEX_MCP_SERVER_KEY = 'fxt';
  *  and app-server `mcpToolCall` item events (plan §5.5). */
 export const MIN_CODEX_MCP_VERSION = '0.122.0';
 
-/** MCP timeouts (seconds) — startup probe + per-tool ceiling (plan §5.3). */
+/** MCP timeouts (seconds) — startup probe + ordinary per-tool ceiling (plan §5.3).
+ * Blocking ask_user is delivered as an app-server dynamic tool and therefore
+ * never enters this finite MCP execution path. */
 export const CODEX_MCP_STARTUP_TIMEOUT_SEC = 10;
 export const CODEX_MCP_TOOL_TIMEOUT_SEC = 100;
 

@@ -27,6 +27,7 @@
  * thread.started 时记下(用于 `codex exec resume <thread_id>`)。
  */
 import type { KernelEvent } from '@forgeax/agent-runtime';
+import { canonicalToolFields } from './canonical-tool-name';
 
 // ─── codex JSONL raw 事件形状(只声明本映射用到的字段，其余 tolerant) ──
 
@@ -42,6 +43,8 @@ export interface CodexItem {
   type: string;
   /** agent_message / reasoning */
   text?: string;
+  /** Newer Codex JSONL marks progress vs final assistant messages. */
+  phase?: 'commentary' | 'final_answer';
   /** command_execution */
   command?: string;
   status?: string;
@@ -77,10 +80,12 @@ export interface CodexMapperState {
   doneEmitted: boolean;
   /** 已为某 item.id 发过 tool.call,避免 item.started/updated 重复发 call。 */
   toolCallsOpened: Set<string>;
+  /** item.id → source tool name, reused when the completed item omits it. */
+  toolNamesById: Map<string, string>;
 }
 
 export function createCodexMapperState(): CodexMapperState {
-  return { doneEmitted: false, toolCallsOpened: new Set() };
+  return { doneEmitted: false, toolCallsOpened: new Set(), toolNamesById: new Map() };
 }
 
 const TOOL_ITEM_TYPES = new Set([
@@ -138,7 +143,9 @@ export function* mapCodexEvent(raw: CodexRawEvent, state: CodexMapperState): Gen
       const item = (raw as { item: CodexItem }).item;
       if (item && isToolItem(item) && !state.toolCallsOpened.has(item.id)) {
         state.toolCallsOpened.add(item.id);
-        yield { kind: 'tool.call', callId: item.id, name: toolName(item), args: toolArgs(item) };
+        const rawName = toolName(item);
+        state.toolNamesById.set(item.id, rawName);
+        yield { kind: 'tool.call', callId: item.id, ...canonicalToolFields(rawName), args: toolArgs(item) };
       }
       return;
     }
@@ -147,7 +154,11 @@ export function* mapCodexEvent(raw: CodexRawEvent, state: CodexMapperState): Gen
       const item = (raw as { item: CodexItem }).item;
       if (!item) return;
       if (item.type === 'agent_message') {
-        if (item.text) yield { kind: 'message.delta', role: 'assistant', text: item.text };
+        if (item.text) {
+          yield item.phase === 'commentary'
+            ? { kind: 'thinking.delta', text: item.text, visibility: 'public_summary' }
+            : { kind: 'message.delta', role: 'assistant', text: item.text };
+        }
         return;
       }
       if (item.type === 'reasoning') {
@@ -158,12 +169,17 @@ export function* mapCodexEvent(raw: CodexRawEvent, state: CodexMapperState): Gen
         // 极少数情况下 codex 直接发 item.completed(无 started)→ 补一条 call。
         if (!state.toolCallsOpened.has(item.id)) {
           state.toolCallsOpened.add(item.id);
-          yield { kind: 'tool.call', callId: item.id, name: toolName(item), args: toolArgs(item) };
+          const rawName = toolName(item);
+          state.toolNamesById.set(item.id, rawName);
+          yield { kind: 'tool.call', callId: item.id, ...canonicalToolFields(rawName), args: toolArgs(item) };
         }
         const ok = toolOk(item);
+        const rawName = state.toolNamesById.get(item.id) ?? toolName(item);
+        const fields = canonicalToolFields(rawName);
         yield {
           kind: 'tool.result',
           callId: item.id,
+          ...(fields.rawName ? fields : {}),
           ok,
           result: toolResult(item),
           error: ok ? undefined : (item.aggregated_output ?? `exit ${item.exit_code ?? '?'}`),

@@ -21,11 +21,12 @@ import type { Event } from "../core/types";
 import type { Session } from "../core/session";
 import type { PreparedHistory } from "@forgeax/agent-runtime";
 import { randomUUID } from "node:crypto";
+import { canonicalToolName } from "./canonical-tool-name";
 
 export interface KernelTurnRecord {
   /** 本轮用户输入文本(渲染 user 气泡)。 */
   message: string;
-  /** Host-owned checkpoint foreign key, shared with the UI user bubble. */
+  /** Server-owned checkpoint identity for the inbound user message. */
   msgId?: string;
   /** Model-visible user context. Defaults to message; may include durable attachment path notes. */
   contextText?: string;
@@ -36,16 +37,25 @@ export interface KernelTurnRecord {
   providerId?: string;
   /** 累计的 assistant 文本。 */
   asstText: string;
+  /** Wall-clock time captured before kernel execution begins. */
+  startedAt?: number;
   /** 累计的 thinking 文本。 */
   thinkingText: string;
+  /** Explicitly user-visible progress summary. Kept separate from private reasoning. */
+  publicSummaryText?: string;
   stopReason: "end_turn" | "tool_use" | "max_tokens" | "cancelled";
   usage?: unknown;
   model?: string;
-  /** 与本轮 x.tools.manifest 共享的尝试 id —— 消费方按它精确配对工具面与执行轮,
-   *  turn 只作分组线索(它在 409 重试时会重号)。 */
-  turnAttemptId?: string;
   historyPlan?: PreparedHistory;
   toolEvents: Array<
+    | { kind: "call"; callId: string; name: string; args: unknown }
+    | { kind: "result"; callId: string; ok: boolean; result?: unknown; error?: string }
+  >;
+  /** Ordered public process stream. New callers use this to preserve the
+   * model-emitted summary/tool sequence across refresh. */
+  processEvents?: Array<
+    | { kind: "assistant_text"; text: string }
+    | { kind: "public_summary"; text: string }
     | { kind: "call"; callId: string; name: string; args: unknown }
     | { kind: "result"; callId: string; ok: boolean; result?: unknown; error?: string }
   >;
@@ -53,13 +63,25 @@ export interface KernelTurnRecord {
 
 /** 把一轮内核 turn 转录进 `session` 下 `agentPath` 的 per-agent 账本。
  *  空轮(无文本/思考/工具)直接跳过,不落噪声。 */
-export function transcribeKernelTurn(session: Session, agentPath: string, rec: KernelTurnRecord): void {
+export function transcribeKernelTurn(
+  session: Session,
+  agentPath: string,
+  rec: KernelTurnRecord,
+): { turnId: string; startedAt: number; settledAt: number } | undefined {
   if (!agentPath) return;
-  if (!(rec.asstText.trim() || rec.thinkingText.trim() || rec.toolEvents.length)) return;
+  if (!(
+    rec.asstText.trim()
+    || rec.publicSummaryText?.trim()
+    || rec.toolEvents.length
+    || rec.processEvents?.some((event) =>
+      event.kind === "assistant_text" ? event.text.trim() : true)
+  )) return;
 
   const led = session.getOrCreateLedger(agentPath);
   const ap = agentPath;
-  const t0 = Date.now();
+  const t0 = typeof rec.startedAt === "number" && Number.isFinite(rec.startedAt)
+    ? rec.startedAt
+    : Date.now();
   const ev = (o: Record<string, unknown>) => o as unknown as Event;
 
   const pid = rec.providerId;
@@ -99,19 +121,6 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
       });
     }
   }
-  // 轮序:此前三处硬编码 `turn: 1`,于是每一轮都记成第 1 轮,账本无法按轮切分
-  // (训练样本以轮为单位)。计数器同步维护在 ledger 里、跨进程重启存活。
-  const turnOrdinal = led.nextTurnOrdinal();
-  // toolResult 的 name 此前硬编码空串;同一轮内按 callId 回填真名。
-  const toolNamesByCallId = new Map<string, string>();
-  for (const t of rec.toolEvents) {
-    if (t.kind === "call") toolNamesByCallId.set(t.callId, t.name);
-  }
-  // 本函数在整轮**结束后**一次性批量写入,所以这里所有 ts 都是转录时刻而非事件
-  // 发生时刻(实测 52 个事件挤进 12 个毫秒)。不伪造时间,而是如实标记来源,
-  // 让消费方知道该去内核 rollout 取真实时序。
-  const TS_SOURCE = "transcription" as const;
-
   append(ev({
     type: "user_input",
     ts: t0,
@@ -120,22 +129,76 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
     handoff: "turn",
     payload: {
       content: rec.message,
-      llmMessage: { role: "user", content: [{ type: "text", text: rec.contextText ?? rec.message }] },
       ...(rec.msgId ? { msgId: rec.msgId } : {}),
+      llmMessage: { role: "user", content: [{ type: "text", text: rec.contextText ?? rec.message }] },
       ...(durableAtts.length ? { attachments: durableAtts } : {}),
-      tsSource: TS_SOURCE,
     },
   }));
-  append(ev({ type: "hook:turnStart", ts: t0, source: `agent:${ap}`, payload: { turn: turnOrdinal, turnId, ...(rec.turnAttemptId ? { turnAttemptId: rec.turnAttemptId } : {}), ...(pid ? { providerId: pid } : {}), tsSource: TS_SOURCE } }), ap);
+  append(ev({
+    type: "hook:turnStart",
+    ts: t0,
+    source: `agent:${ap}`,
+    payload: {
+      turn: 1,
+      turnId,
+      artifactResolutionExpected: true,
+      schemaVersion: 2,
+      ...(rec.msgId ? { msgId: rec.msgId } : {}),
+      ...(pid ? { providerId: pid } : {}),
+    },
+  }), ap);
 
-  for (const t of rec.toolEvents) {
+  const callNames = new Map<string, string>();
+  const orderedProcess = rec.processEvents ?? [
+    ...rec.toolEvents,
+    ...(rec.publicSummaryText?.trim()
+      ? [{ kind: "public_summary" as const, text: rec.publicSummaryText }]
+      : []),
+  ];
+  for (const t of orderedProcess) {
+    if (t.kind === "assistant_text") {
+      if (!t.text.trim()) continue;
+      append(
+        ev({
+          type: "hook:assistantMessage",
+          ts: Date.now(),
+          source: `agent:${ap}`,
+          payload: {
+            llmMessage: { role: "assistant", content: [{ type: "text", text: t.text }] },
+            turn: 1,
+            ...(pid ? { providerId: pid } : {}),
+          },
+        }),
+        ap,
+      );
+      continue;
+    }
+    if (t.kind === "public_summary") {
+      if (!t.text.trim()) continue;
+      append(
+        ev({
+          type: "agent_log",
+          ts: Date.now(),
+          source: `agent:${ap}`,
+          payload: {
+            visibility: "public_summary",
+            summary: t.text,
+            ...(pid ? { providerId: pid } : {}),
+          },
+        }),
+        ap,
+      );
+      continue;
+    }
     if (t.kind === "call") {
+      const name = canonicalToolName(t.name);
+      callNames.set(t.callId, name);
       append(
         ev({
           type: "hook:toolCall",
           ts: Date.now(),
           source: `agent:${ap}`,
-          payload: { name: t.name, args: t.args, callId: t.callId, toolCall: { id: t.callId, name: t.name, arguments: t.args }, tsSource: TS_SOURCE },
+          payload: { name, ...(name !== t.name ? { rawName: t.name } : {}), args: t.args, callId: t.callId, toolCall: { id: t.callId, name, arguments: t.args } },
         }),
         ap,
       );
@@ -146,14 +209,16 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
           ts: Date.now(),
           source: `agent:${ap}`,
           payload: {
-            name: toolNamesByCallId.get(t.callId) ?? "",
+            // Preserve the call name for replay consumers (notably the
+            // host-owned artifact semantic projection). Older transcriptions
+            // left this blank, which made a valid deliver_summary result
+            // disappear after refresh.
+            name: callNames.get(t.callId) ?? "",
             callId: t.callId,
             ok: t.ok,
-            // durationMs 此前硬编码 0 —— 这里根本没测量。宁可缺字段也不写假值;
-            // 真实耗时在内核 rollout 的 mcp_tool_call_end.duration。
+            durationMs: 0,
             ...(t.result !== undefined ? { result: t.result } : {}),
             ...(t.ok ? {} : { error: t.error ?? "tool failed" }),
-            tsSource: TS_SOURCE,
           },
         }),
         ap,
@@ -161,7 +226,7 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
     }
   }
 
-  if (rec.asstText.trim() || rec.thinkingText.trim()) {
+  if (rec.asstText.trim()) {
     append(
       ev({
         type: "hook:assistantMessage",
@@ -171,20 +236,32 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
           llmMessage: {
             role: "assistant",
             content: [{ type: "text", text: rec.asstText }],
-            ...(rec.thinkingText.trim() ? { thinking: rec.thinkingText } : {}),
           },
-          turn: turnOrdinal,
+          turn: 1,
           ...(rec.model ? { model: rec.model } : {}),
           ...(rec.usage ? { usage: rec.usage } : {}),
           ...(pid ? { providerId: pid } : {}),
-          tsSource: TS_SOURCE,
         },
       }),
       ap,
     );
   }
 
-  const endCursor = append(ev({ type: "hook:turnEnd", ts: Date.now(), source: `agent:${ap}`, payload: { turn: turnOrdinal, turnId, reason: rec.stopReason, tsSource: TS_SOURCE } }), ap);
+  const settledAt = Date.now();
+  const endCursor = append(ev({
+    type: "hook:turnEnd",
+    ts: settledAt,
+    source: `agent:${ap}`,
+    payload: {
+      turn: 1,
+      turnId,
+      reason: rec.stopReason,
+      artifactResolutionExpected: true,
+      schemaVersion: 2,
+      ...(rec.msgId ? { msgId: rec.msgId } : {}),
+      ...(rec.stopReason === "cancelled" ? { aborted: true } : {}),
+    },
+  }), ap);
   if (rec.historyPlan?.laneId && rec.providerId && typeof rec.historyPlan.epoch === 'number') {
     led.append(ev({
       type: 'kernel_history_applied', ts: Date.now(), source: 'history-coordinator',
@@ -194,4 +271,5 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
       },
     }));
   }
+  return { turnId, startedAt: t0, settledAt };
 }

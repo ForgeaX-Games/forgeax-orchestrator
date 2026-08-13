@@ -11,7 +11,7 @@
 
 interface Pending {
   resolve: (allow: boolean) => void;
-  timer: ReturnType<typeof setTimeout>;
+  timer?: ReturnType<typeof setTimeout>;
   /** Owner of this request, so a turn that aborts/ends can release every
    *  permission it was blocking. `sid` is the thread/session id the MCP
    *  permission-server posted to (== FORGEAX_SID); `agent` is its FORGEAX_AGENT
@@ -49,7 +49,7 @@ export function registerPermission(
   // random UUIDs, but keep the map clean).
   const prev = pending.get(reqId);
   if (prev) {
-    clearTimeout(prev.timer);
+    if (prev.timer) clearTimeout(prev.timer);
     prev.resolve(false);
     pending.delete(reqId);
   }
@@ -57,19 +57,21 @@ export function registerPermission(
   let settle!: (allow: boolean) => void;
   const promise = new Promise<boolean>((res) => { settle = res; });
 
-  const timer = setTimeout(() => {
-    if (pending.get(reqId)?.resolve === settle) pending.delete(reqId);
-    settle(false); // fail closed on timeout
-  }, timeoutMs);
+  const timer = timeoutMs > 0 && Number.isFinite(timeoutMs)
+    ? setTimeout(() => {
+        if (pending.get(reqId)?.resolve === settle) pending.delete(reqId);
+        settle(false); // fail closed on timeout
+      }, timeoutMs)
+    : undefined;
 
-  pending.set(reqId, { resolve: settle, timer, sid: owner.sid, agent: owner.agent });
+  pending.set(reqId, { resolve: settle, ...(timer ? { timer } : {}), sid: owner.sid, agent: owner.agent });
 
   return {
     promise,
     dispose() {
       const cur = pending.get(reqId);
       if (cur && cur.resolve === settle) {
-        clearTimeout(cur.timer);
+        if (cur.timer) clearTimeout(cur.timer);
         pending.delete(reqId);
       }
     },
@@ -82,7 +84,7 @@ export function registerPermission(
 export function resolvePermission(reqId: string, allow: boolean): boolean {
   const entry = pending.get(reqId);
   if (!entry) return false;
-  clearTimeout(entry.timer);
+  if (entry.timer) clearTimeout(entry.timer);
   pending.delete(reqId);
   entry.resolve(allow);
   return true;

@@ -135,7 +135,14 @@ export async function runKernelTurn(opts: KernelTurnOpts): Promise<{ aborted: bo
           break;
         case 'thinking.delta':
           thinkingText += ev.text;
-          eventBus.hook(Hook.StreamLLM, { chunk: { type: 'thinking', text: ev.text }, turn });
+          eventBus.hook(Hook.StreamLLM, {
+            chunk: {
+              type: 'thinking',
+              text: ev.text,
+              ...(ev.visibility ? { visibility: ev.visibility } : {}),
+            },
+            turn,
+          });
           break;
         case 'tool.call': {
           toolName.set(ev.callId, ev.name);

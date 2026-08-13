@@ -386,6 +386,8 @@ export interface ToolDefinition {
     type: "object";
     properties: Record<string, unknown>;
     required?: string[];
+    /** Preserve JSON Schema keywords used by provider-facing tool contracts. */
+    [keyword: string]: unknown;
   };
   validateInput?: (
     args: Record<string, unknown>,

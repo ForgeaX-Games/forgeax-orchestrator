@@ -26,6 +26,7 @@
  * `timestamp_ms` 存在 **且** `model_call_id` 缺失 时发 message.delta,丢弃合并快照。
  */
 import type { KernelEvent } from '@forgeax/agent-runtime';
+import { canonicalToolFields } from './canonical-tool-name';
 
 interface RawUsage {
   inputTokens?: number;
@@ -72,10 +73,18 @@ export interface CursorMapperState {
    *  规则丢弃)→ 全程零 delta。此时拿 `result.result`(整轮全文)补一条 delta,
    *  避免回答被静默吞掉。正常情况(已流式发过)则不补,防止整段重播。 */
   emittedText: boolean;
+  /** Started tool names keyed by call id; MCP completed envelopes may omit args. */
+  toolNamesById: Record<string, string>;
 }
 
 export function createCursorMapperState(): CursorMapperState {
-  return { sessionId: undefined, doneEmitted: false, lastUsage: undefined, emittedText: false };
+  return {
+    sessionId: undefined,
+    doneEmitted: false,
+    lastUsage: undefined,
+    emittedText: false,
+    toolNamesById: {},
+  };
 }
 
 function captureUsage(state: CursorMapperState, raw: RawUsage | undefined): void {
@@ -96,8 +105,9 @@ function toolDisplayName(keyed: string): string {
     case 'shell':
       return 'Bash';
     case 'edit':
-    case 'write':
       return 'Edit';
+    case 'write':
+      return 'Write';
     case 'read':
       return 'Read';
     case 'search':
@@ -222,13 +232,19 @@ export function mapCursorEvent(raw: CursorRawEvent, state: CursorMapperState): K
       if (!env || !callId) return out;
       if (raw.subtype === 'started') {
         const args = (env.body.args as unknown) ?? {};
-        out.push({ kind: 'tool.call', callId, name: cursorToolName(env.keyed, env.body), args });
+        const rawName = cursorToolName(env.keyed, env.body);
+        state.toolNamesById[callId] = rawName;
+        out.push({ kind: 'tool.call', callId, ...canonicalToolFields(rawName), args });
       } else if (raw.subtype === 'completed') {
         const { ok, text } = flattenToolResult(env.body.result);
+        const rawName = state.toolNamesById[callId] ?? cursorToolName(env.keyed, env.body);
+        const fields = canonicalToolFields(
+          env.keyed === 'mcpToolCall' ? rawName : toolDisplayName(env.keyed),
+        );
         out.push(
           ok
-            ? { kind: 'tool.result', callId, ok: true, result: text }
-            : { kind: 'tool.result', callId, ok: false, error: text },
+            ? { kind: 'tool.result', callId, ...fields, ok: true, result: text }
+            : { kind: 'tool.result', callId, ...fields, ok: false, error: text },
         );
       }
       return out;

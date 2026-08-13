@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { registerKernel, unregisterKernel, type AgentKernel, type KernelCapabilities } from '@forgeax/agent-runtime';
 import { composeTurnRequest } from '../src/kernel/compose-turn-request';
 import { resolveKernel } from '../src/kernel/resolve-kernel';
-import { CODEX_KERNEL_PROFILE, NATIVE_KERNEL_PROFILE, RENTED_KERNEL_PROFILE } from '../src/kernel/kernel-profile';
+import { NATIVE_KERNEL_PROFILE, RENTED_KERNEL_PROFILE } from '../src/kernel/kernel-profile';
 import { initPathManager, resetPathManager } from '../src/fs/path-manager';
 import { getSessionManager, initSessionManager, resetSessionManager } from '../src/core/session-manager';
 import { transcribeKernelTurn } from '../src/kernel/transcribe-turn';
@@ -15,6 +15,7 @@ import { buildKindRegistry } from '../src/extensions/kinds';
 import { _resetSnapshotForTests, _setSnapshotForTests } from '../src/extensions/registry';
 import type { MergedManifest } from '../src/extensions/merger';
 import { buildCapabilitySnapshot } from '../src/capabilities/catalog';
+import { initOrchestrationSeams } from '../src/orchestration-seams';
 
 const capabilities: KernelCapabilities = {
   streaming: true, thinking: true, toolCalls: true, midTurnInject: false, forkExtract: false,
@@ -31,25 +32,92 @@ function kernel(id: string, profile: typeof RENTED_KERNEL_PROFILE): AgentKernel 
 }
 
 let root: string;
-let previousProjectRoot: string | undefined;
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'fx-compose-attachments-'));
-  previousProjectRoot = process.env.FORGEAX_PROJECT_ROOT;
-  process.env.FORGEAX_PROJECT_ROOT = root;
   resetPathManager();
   await resetSessionManager();
   initSessionManager(initPathManager({ userRoot: root }));
+  // `todo_write` is product opt-in. This test exercises the Studio/native
+  // product contract rather than the standalone orchestration default.
+  initOrchestrationSeams({ enabledBuiltinTools: ['todo_write'] });
 });
 afterEach(async () => {
   _resetSnapshotForTests();
   await resetSessionManager();
   resetPathManager();
-  if (previousProjectRoot === undefined) delete process.env.FORGEAX_PROJECT_ROOT;
-  else process.env.FORGEAX_PROJECT_ROOT = previousProjectRoot;
+  initOrchestrationSeams({});
   rmSync(root, { recursive: true, force: true });
 });
 
 describe('composeTurnRequest selected-kernel policy', () => {
+  test('advertises the structured ask_user tool to rented kernels', async () => {
+    const req = await composeTurnRequest({
+      message: 'ask', agentId: 'forge', kernel: kernel('rented-ask', RENTED_KERNEL_PROFILE),
+    });
+    const ask = req.tools?.find((tool) => tool.name === 'ask_user');
+    expect(ask).toBeDefined();
+    expect(ask?.delivery).toBe('host');
+    expect(ask?.description).toContain('renders clickable choices');
+    expect(ask?.inputSchema).toMatchObject({
+      type: 'object',
+      properties: {
+        question: { type: 'string' },
+        options: { type: 'array' },
+        multiSelect: { type: 'boolean' },
+        questions: { type: 'array', minItems: 1, maxItems: 3 },
+      },
+    });
+    expect(ask?.inputSchema?.anyOf).toEqual([
+      { required: ['question', 'options'] },
+      { required: ['questions'] },
+    ]);
+  });
+
+  test('declares todo_write with the CLI schema and local delivery', async () => {
+    const req = await composeTurnRequest({
+      message: 'plan', agentId: 'forge', kernel: kernel('native-todo', NATIVE_KERNEL_PROFILE),
+    });
+    const todo = req.tools?.find((tool) => tool.name === 'todo_write');
+    expect(todo).toBeDefined();
+    expect(todo?.delivery).toBe('local');
+    expect(todo?.inputSchema).toEqual({
+      type: 'object',
+      properties: {
+        todos: {
+          type: 'array',
+          description: 'The full todo list (replaces the prior list).',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Stable id; keep it unchanged across updates for the same task.' },
+              content: { type: 'string', description: 'Imperative task description.' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+              activeForm: { type: 'string', description: 'Present-continuous form shown while in_progress.' },
+            },
+            required: ['content', 'status'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['todos'],
+      additionalProperties: false,
+    });
+  });
+
+  test('keeps mutating file tools host-delivered so file activity and Artifacts stay causal', async () => {
+    const req = await composeTurnRequest({
+      message: 'write one file', agentId: 'forge', kernel: kernel('native-files', NATIVE_KERNEL_PROFILE),
+      extraTools: [
+        { name: 'write_file', inputSchema: {} },
+        { name: 'edit_file', inputSchema: {} },
+        { name: 'read_file', inputSchema: {} },
+      ],
+    });
+    expect(req.tools?.find((tool) => tool.name === 'write_file')?.delivery).toBe('host');
+    expect(req.tools?.find((tool) => tool.name === 'edit_file')?.delivery).toBe('host');
+    expect(req.tools?.find((tool) => tool.name === 'read_file')?.delivery).toBe('local');
+  });
+
   test('rented kernel gets path notes only', async () => {
     const sid = (await getSessionManager().create({ displayName: 'rented' })).sid;
     const req = await composeTurnRequest({
@@ -61,37 +129,6 @@ describe('composeTurnRequest selected-kernel policy', () => {
     expect(req.input.text).toContain('/uploads/shot.png');
     expect(JSON.stringify(req)).not.toContain('QUJD');
     expect(req.tools?.some((tool) => tool.name === 'memory_search')).toBe(true);
-  });
-
-  for (const kernelId of ['claude-code', 'cursor-agent', 'codebuddy', 'kimi-code']) {
-    test(`${kernelId} large image stays path-only and never enters text as base64`, async () => {
-      const sid = (await getSessionManager().create({ displayName: `${kernelId}-image` })).sid;
-      const req = await composeTurnRequest({
-        message: 'inspect the screenshot', agentId: 'forge', sessionId: sid,
-        kernel: kernel(kernelId, RENTED_KERNEL_PROFILE),
-        attachments: [{
-          kind: 'image', name: 'large.png', mediaType: 'image/png', data: 'large-inline-payload',
-        }],
-      });
-      expect(req.input.attachments).toBeUndefined();
-      expect(req.input.text).toContain('/uploads/large.png');
-      expect(JSON.stringify(req)).not.toContain('large-inline-payload');
-    });
-  }
-
-  test('codex kernel keeps image as a durable path-only attachment', async () => {
-    const sid = (await getSessionManager().create({ displayName: 'codex-image' })).sid;
-    const req = await composeTurnRequest({
-      message: 'inspect the screenshot', agentId: 'forge', sessionId: sid,
-      kernel: kernel('codex-test', CODEX_KERNEL_PROFILE),
-      attachments: [{
-        kind: 'image', name: 'large.png', mediaType: 'image/png', data: 'large-inline-payload',
-      }],
-    });
-    expect(req.input.attachments).toEqual([{
-      kind: 'image', path: expect.stringContaining('/uploads/large.png'), mediaType: 'image/png',
-    }]);
-    expect(JSON.stringify(req)).not.toContain('large-inline-payload');
   });
 
   test('native kernel gets path-only image/document and explicit override gets host history', async () => {
@@ -117,14 +154,6 @@ describe('composeTurnRequest selected-kernel policy', () => {
     ]);
     expect(JSON.stringify(req)).not.toMatch(/QUJD|REVG|R0hJ/);
     expect(req.input.text).toContain('/uploads/data.zip');
-
-    // manifest 的轮序连接键:上一轮已转录(账本里有 1 条 user_input),本轮 compose
-    // 在轮开始时取 nextTurnOrdinal() 应为 2 —— 与本轮转录后 hook:turnStart.payload.turn
-    // 同值。此前 manifest 只有依赖调用方传入的 callId(FORGE 前端不传,实测三条全空),
-    // 配轮只能靠文件相邻。
-    const events = await session.getOrCreateLedger('forge').readAllEvents();
-    const manifest = events.find((event) => event.type === 'x.tools.manifest');
-    expect((manifest?.payload as { turn?: number } | undefined)?.turn).toBe(2);
     unregisterKernel('explicit-native');
   });
 

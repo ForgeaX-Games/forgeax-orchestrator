@@ -63,9 +63,12 @@ import {
   type HostToolSpec,
   type HostUiActionHandler,
   type AssetPathPolicy,
+  type DeliveryEnricher,
+  type ArtifactResolver,
 } from './orchestration-seams';
 import { ensureUserDirDefaults } from './defaults/scaffold';
 import { initSessionManager } from './core/session-manager';
+import { createRoundDeliveryEnricher } from './checkpoint/round-delivery';
 import {
   buildActionCatalog,
   HEADLESS_ACTION_GRANDFATHER_IDS,
@@ -120,6 +123,17 @@ export interface ProductContext {
   /** Host-only tool specs (list_games / query_world / capture_frame …) exposed
    *  to agents and gated by the host-tool bridge. (Stage A §3, §2.4) */
   hostTools?: HostToolSpec[];
+  /** Opt-in builtin tools this product enables. Builtins that are opt-in
+   *  (compose-turn-request's OPT_IN_BUILTIN_TOOLS, e.g. `todo_write`) are
+   *  advertised only when named here; default off keeps the orchestration layer
+   *  generic for other consumers. */
+  enabledBuiltinTools?: readonly string[];
+  /** Optional orchestrator-owned delivery derivation. The seam stays narrow so
+   *  the product shell does not need to know checkpoint/ledger internals. */
+  delivery?: DeliveryEnricher;
+  /** Host-owned final-turn artifact resolver. Defaults to the checkpoint
+   * deriver used by Studio when omitted. */
+  artifactResolver?: ArtifactResolver;
   /** UI 语义操作层的 headless 等价 handler(surface:'both'|'server' 的 action,UI
    *  不在线时 ui_invoke 回落到这里执行;server 是行为 SSOT,方案 §5)。 */
   hostUiActions?: HostUiActionHandler[];
@@ -178,6 +192,8 @@ export function mountWorkbenchHost(
  */
 export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp> {
   const { instanceRoot } = ctx;
+  const delivery = ctx.delivery ?? createRoundDeliveryEnricher();
+  const artifactResolver = ctx.artifactResolver ?? (delivery as unknown as ArtifactResolver);
 
   buildActionCatalog(undefined, {
     headlessHandlerActionIds: [
@@ -207,8 +223,11 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   initOrchestrationSeams({
     systemPromptComposer: ctx.systemPromptComposer,
     hostTools: ctx.hostTools,
+    delivery,
+    artifactResolver,
     hostUiActions: ctx.hostUiActions,
     assetPathPolicy: ctx.assetPathPolicy,
+    enabledBuiltinTools: ctx.enabledBuiltinTools,
   });
   if (ctx.workbenchHost) {
     await configureWorkbenchAgentTools(ctx.workbenchHost);

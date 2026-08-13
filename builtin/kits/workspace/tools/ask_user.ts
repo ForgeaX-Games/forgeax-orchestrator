@@ -1,4 +1,4 @@
-/** ask_user —— 让 agent 向用户抛出一个带选项的问题，由用户单选/多选作答，
+/** ask_user —— 让 agent 一次向用户抛出 1–3 个带选项的问题，由用户统一作答，
  *  选择结果作为 tool_result 回流。
  *
  *  机制（见 .claude/docs/需求/ask-user-tool-需求单.md）：
@@ -22,6 +22,35 @@ interface AskOption {
   description?: string;
 }
 
+interface AskQuestion {
+  id: string;
+  question: string;
+  header?: string;
+  options: AskOption[];
+  multiSelect: boolean;
+}
+
+function objectOf(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+/** Keep the original flat one-question shape as a wire-compatible alias. */
+export function normalizeAskUserArgs(args: Record<string, unknown>): Record<string, unknown> {
+  if (typeof args.question === "string" && args.question.trim()) return args;
+  if (!Array.isArray(args.questions) || args.questions.length !== 1) return args;
+  const question = objectOf(args.questions[0]);
+  if (!question) return args;
+  return {
+    ...args,
+    ...(question.question !== undefined ? { question: question.question } : {}),
+    ...(question.header !== undefined ? { header: question.header } : {}),
+    ...(question.options !== undefined ? { options: question.options } : {}),
+    ...(question.multiSelect !== undefined ? { multiSelect: question.multiSelect } : {}),
+  };
+}
+
 function readOptions(args: Record<string, unknown>): AskOption[] {
   const raw = args.options;
   if (!Array.isArray(raw)) return [];
@@ -37,6 +66,27 @@ function readOptions(args: Record<string, unknown>): AskOption[] {
     }
   }
   return out;
+}
+
+export function normalizeAskUserQuestions(args: Record<string, unknown>): AskQuestion[] {
+  const source = Array.isArray(args.questions)
+    ? args.questions
+    : typeof args.question === "string"
+      ? [args]
+      : [];
+  return source.flatMap((value, index): AskQuestion[] => {
+    const row = objectOf(value);
+    if (!row || typeof row.question !== "string") return [];
+    const id = typeof row.id === "string" && row.id.trim() ? row.id.trim() : `question-${index + 1}`;
+    const header = typeof row.header === "string" && row.header.trim() ? row.header.trim() : undefined;
+    return [{
+      id,
+      question: row.question,
+      ...(header ? { header } : {}),
+      options: readOptions(row),
+      multiSelect: row.multiSelect === true,
+    }];
+  });
 }
 
 export default {
@@ -67,15 +117,16 @@ export default {
     "question.\n" +
     "- If you recommend a specific option, make that the first option in the list " +
     "and add \"(Recommended)\" at the end of the label.\n" +
-    "- One question per call; give 2–5 distinct, mutually-exclusive options, each " +
-    "with a short description of its trade-off.",
+    "- Ask 1–3 related questions in one call and wait for the shared confirmation. " +
+    "Give each question 1–5 distinct choices with short trade-off descriptions; " +
+    "the UI adds the free-text Other choice automatically.",
   guidance:
     "**ask_user**: Reach for this whenever you would otherwise ask the user a " +
     "clarifying or decision question in prose and the answer is a choice among " +
     "a few options — it's almost always better to let them click than to type. " +
     "Good triggers: ambiguous requirements, picking an approach/tech, scoping " +
     "(which features/levels), confirming an assumption before a big step. Give " +
-    "2–5 distinct, mutually-exclusive options each with a short description; " +
+    "1–5 distinct, mutually-exclusive options each with a short description; " +
     "multiSelect:true when not mutually exclusive.",
   input_schema: {
     type: "object",
@@ -94,43 +145,96 @@ export default {
       options: {
         type: "array",
         description:
-          "2–5 distinct, mutually-exclusive choices (the UI auto-adds an " +
+          "1–5 distinct, mutually-exclusive choices (the UI auto-adds an " +
           "\"Other\" free-text option, so do not add one yourself).",
         items: {
-          type: "object",
-          properties: {
-            label: {
-              type: "string",
-              description: "Concise display text for the option (1–5 words). Append \" (Recommended)\" if you recommend it.",
+          anyOf: [
+            { type: "string" },
+            {
+              type: "object",
+              properties: {
+                label: {
+                  type: "string",
+                  description: "Concise display text for the option (1–5 words). Append \" (Recommended)\" if you recommend it.",
+                },
+                description: {
+                  type: "string",
+                  description: "Short explanation of what this option means / its trade-off (recommended).",
+                },
+              },
+              required: ["label"],
             },
-            description: {
-              type: "string",
-              description: "Short explanation of what this option means / its trade-off (recommended).",
-            },
-          },
-          required: ["label"],
+          ],
         },
+        minItems: 1,
+        maxItems: 5,
       },
       multiSelect: {
         type: "boolean",
         description: "true = checkbox multi-select (choices not mutually exclusive); default false = radio single-select.",
       },
+      questions: {
+        type: "array",
+        minItems: 1,
+        maxItems: 3,
+        description:
+          "One to three related questions shown as separate cards and submitted together.",
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "Optional stable question id." },
+            question: { type: "string" },
+            header: { type: "string" },
+            options: {
+              type: "array",
+              minItems: 1,
+              maxItems: 5,
+              items: {
+                anyOf: [
+                  { type: "string" },
+                  {
+                    type: "object",
+                    properties: { label: { type: "string" }, description: { type: "string" } },
+                    required: ["label"],
+                  },
+                ],
+              },
+            },
+            multiSelect: { type: "boolean" },
+          },
+          required: ["question", "options"],
+        },
+      },
     },
-    required: ["question", "options"],
+    // Keep the two supported wire shapes explicit for providers that perform
+    // JSON-schema validation before invoking the host tool.
+    anyOf: [
+      { required: ["question", "options"] },
+      { required: ["questions"] },
+    ],
   },
   validateInput(args) {
-    if (typeof args.question !== "string" || !args.question.trim()) {
-      return "ask_user: 'question' (non-empty string) is required.";
+    if (Array.isArray(args.questions) && (args.questions.length < 1 || args.questions.length > 3)) {
+      return "ask_user: 'questions' must contain 1–3 items.";
     }
-    const opts = readOptions(args);
-    if (opts.length === 0) {
-      return "ask_user: 'options' must be a non-empty array of { label } items.";
+    const questions = normalizeAskUserQuestions(args);
+    if (questions.length === 0) return "ask_user: at least one non-empty question is required.";
+    if (questions.some((question) => !question.question.trim())) {
+      return "ask_user: every 'question' must be a non-empty string.";
+    }
+    // The chat card always appends a free-text "Other" choice. Providers
+    // therefore only need to send at least one concrete option; requiring two
+    // here incorrectly rejects a valid question whose second choice is Other.
+    if (questions.some((question) => question.options.length < 1 || question.options.length > 5)) {
+      return "ask_user: every question must provide 1–5 options.";
+    }
+    if (new Set(questions.map((question) => question.id)).size !== questions.length) {
+      return "ask_user: question ids must be unique.";
     }
     return undefined;
   },
   async execute(args, ctx: AgentContext): Promise<ToolOutput> {
-    const opts = readOptions(args);
-    const multi = args.multiSelect === true;
+    const questions = normalizeAskUserQuestions(args);
     const sid = ctx.tree.sid;
     const agentPath = ctx.agentPath;
 
@@ -146,19 +250,23 @@ export default {
     ctx.signal.addEventListener("abort", onAbort, { once: true });
 
     try {
-      const values = await handle.promise;
-      if (values === null) {
+      const answers = await handle.promise;
+      if (answers === null) {
         // 无超时:null 只来自 abort(中断本轮)或被新的 ask 取代,不存在"超时未答"。
         return ctx.signal.aborted ? "(用户中断,未作答)" : "(问题已取消)";
       }
       // 不做选项白名单过滤 —— 除了给定选项,UI 还允许用户「其他…」自填自由文本,
       // 这类值不在 opts 里,必须如实带回(只去空白)。
-      const known = new Set(opts.map((o) => o.label));
-      const picked = values.map((v) => v.trim()).filter(Boolean);
-      if (picked.length === 0) return "用户未选择任何项";
-      const tagOf = (v: string) => (known.has(v) ? `「${v}」` : `「${v}」(自填)`);
-      const rendered = picked.map(tagOf).join("");
-      return multi ? `用户(多选)选择了: ${rendered}` : `用户选择了: ${tagOf(picked[0]!)}`;
+      const byId = new Map(answers.map((answer) => [answer.questionId, answer.values]));
+      const picked = questions.map((question) => ({
+        questionId: question.id,
+        values: (byId.get(question.id) ?? []).map((value) => value.trim()).filter(Boolean),
+      }));
+      if (picked.some((answer) => answer.values.length === 0)) return "用户未完成全部问题";
+      return JSON.stringify({
+        ok: true,
+        questions: picked,
+      });
     } finally {
       ctx.signal.removeEventListener("abort", onAbort);
       handle.dispose();

@@ -14,6 +14,7 @@
 //   result is_error                              → ChatEvent error
 
 import type { ChatEvent } from '../types';
+import { canonicalToolFields } from '../../kernel/canonical-tool-name';
 
 type ToolUseBuffer = { id: string; name: string; partialArgs: string };
 
@@ -131,6 +132,7 @@ export interface MappedUsage {
 export interface ClaudeMapperState {
   sessionId?: string;
   toolUseByIndex: Map<number, ToolUseBuffer>;
+  toolNamesById: Map<string, string>;
   /** Set once result/message_stop emits done — guards against double-emit. */
   doneEmitted: boolean;
   /** Latest usage snapshot from assistant message_start / message_delta /
@@ -143,6 +145,7 @@ export function createClaudeMapperState(): ClaudeMapperState {
   return {
     sessionId: undefined,
     toolUseByIndex: new Map(),
+    toolNamesById: new Map(),
     doneEmitted: false,
     lastUsage: undefined,
   };
@@ -254,6 +257,9 @@ export function mapClaudeEvent(raw: ClaudeRawEvent, state: ClaudeMapperState): C
           out.push({
             type: 'tool-result',
             callId: tr.tool_use_id ?? '',
+            ...(tr.tool_use_id && state.toolNamesById.has(tr.tool_use_id)
+              ? canonicalToolFields(state.toolNamesById.get(tr.tool_use_id)!)
+              : {}),
             ok: !isErr,
             ...(isErr ? { error: text } : { result: text }),
           });
@@ -289,15 +295,20 @@ export function mapClaudeEvent(raw: ClaudeRawEvent, state: ClaudeMapperState): C
         if (d.type === 'text_delta' && typeof d.text === 'string') {
           out.push({ type: 'token', text: d.text });
         } else if (d.type === 'thinking_delta' && typeof d.thinking === 'string') {
-          out.push({ type: 'thinking', text: d.thinking });
+          out.push({ type: 'thinking', text: d.thinking, visibility: 'private_reasoning' });
         } else if (d.type === 'thinking_delta' && typeof d.text === 'string') {
           // Some SDK versions put thinking text under `text` instead of `thinking`.
-          out.push({ type: 'thinking', text: d.text });
+          out.push({ type: 'thinking', text: d.text, visibility: 'private_reasoning' });
         } else if (d.type === 'input_json_delta' && typeof d.partial_json === 'string') {
           const buf = typeof ev.index === 'number' ? state.toolUseByIndex.get(ev.index) : undefined;
           if (buf) {
             buf.partialArgs += d.partial_json;
-            out.push({ type: 'tool-call-delta', callId: buf.id, name: buf.name, argumentsDelta: d.partial_json });
+            out.push({
+              type: 'tool-call-delta',
+              callId: buf.id,
+              ...canonicalToolFields(buf.name),
+              argumentsDelta: d.partial_json,
+            });
           }
         }
         return out;
@@ -313,7 +324,8 @@ export function mapClaudeEvent(raw: ClaudeRawEvent, state: ClaudeMapperState): C
             } catch {
               args = { _raw: buf.partialArgs };
             }
-            out.push({ type: 'tool-call', name: buf.name, args, callId: buf.id });
+            state.toolNamesById.set(buf.id, buf.name);
+            out.push({ type: 'tool-call', ...canonicalToolFields(buf.name), args, callId: buf.id });
             state.toolUseByIndex.delete(ev.index);
           }
         }

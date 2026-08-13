@@ -11,6 +11,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
@@ -460,6 +461,47 @@ function spawnServer(env: Record<string, string>, server = SERVER) {
 }
 
 describe('forgeax-tools-server — double allowlist (process-level)', () => {
+  test('ask_user ignores the ordinary bridge deadline and waits for the host reply', async () => {
+    const http = createServer((_req, res) => {
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, result: { ok: true, questions: [] } }));
+      }, 60);
+    });
+    await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve));
+    const address = http.address();
+    if (!address || typeof address === 'string') throw new Error('test HTTP server has no TCP address');
+
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'fxt-ask-no-timeout-'));
+    const specsFile = join(dir, 'specs.json');
+    writeFileSync(specsFile, JSON.stringify([{
+      name: 'ask_user',
+      description: 'blocking ask',
+      inputSchema: { type: 'object', properties: {} },
+    }]));
+    const srv = spawnServer({
+      FORGEAX_FXT_EXPOSE: 'ask_user',
+      FORGEAX_TOOL_SPECS_FILE: specsFile,
+      FORGEAX_SERVER_URL: `http://127.0.0.1:${address.port}`,
+      FORGEAX_SID: 'sid',
+      FORGEAX_AGENT: 'forge',
+      FORGEAX_BRIDGE_TIMEOUT_MS: '20',
+    });
+    try {
+      await srv.rpc('initialize', { protocolVersion: '2024-11-05' });
+      const result = await srv.rpc('tools/call', { name: 'ask_user', arguments: { questions: [] } });
+      expect(result.result.isError).toBeFalsy();
+      expect(result.result.content[0].text).toContain('"ok":true');
+    } finally {
+      srv.close();
+      http.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('remember + memory_search use the shared layered-memory runtime', async () => {
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');

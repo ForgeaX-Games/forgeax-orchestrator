@@ -41,10 +41,31 @@ export interface ChatRequest {
 
 export type ChatEvent = (
   | { type: 'token'; text: string }
-  | { type: 'thinking'; text: string }
-  | { type: 'tool-call'; name: string; args: unknown; callId: string }
-  | { type: 'tool-call-delta'; callId: string; name: string; argumentsDelta: string }
-  | { type: 'tool-result'; callId: string; ok: boolean; result?: unknown; error?: string }
+  | {
+      type: 'thinking';
+      text: string;
+      visibility?: 'public_summary' | 'private_reasoning';
+    }
+  | {
+      type: 'tool-call';
+      name: string;
+      rawName?: string;
+      args: unknown;
+      callId: string;
+      /** Native kernel ask_user is a structured interactive tool. Legacy CLI
+       * AskUserQuestion uses the permission side-channel instead. */
+      permissionPrompt?: boolean;
+    }
+  | { type: 'tool-call-delta'; callId: string; name: string; rawName?: string; argumentsDelta: string }
+  | {
+      type: 'tool-result';
+      callId: string;
+      name?: string;
+      rawName?: string;
+      ok: boolean;
+      result?: unknown;
+      error?: string;
+    }
   /**
    * Per-turn completion. Optional fields:
    *  - cost (USD): claude-code surfaces `result.total_cost_usd`; forgeax cli

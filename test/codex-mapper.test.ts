@@ -52,6 +52,15 @@ describe('mapCodexEvent — item 级映射', () => {
     expect(evs).toEqual([{ kind: 'message.delta', role: 'assistant', text: 'hello world' }]);
   });
 
+  test('commentary agent_message → public thinking summary', () => {
+    const evs = run([
+      { type: 'item.completed', item: { id: 'm-progress', type: 'agent_message', phase: 'commentary', text: 'Inspecting files.' } },
+    ]);
+    expect(evs).toEqual([{
+      kind: 'thinking.delta', text: 'Inspecting files.', visibility: 'public_summary',
+    }]);
+  });
+
   test('reasoning item.completed → thinking.delta', () => {
     const evs = run([
       { type: 'item.completed', item: { id: 'r1', type: 'reasoning', text: 'let me think' } },
@@ -64,7 +73,9 @@ describe('mapCodexEvent — item 级映射', () => {
     const started = run([
       { type: 'item.started', item: { id: 't1', type: 'command_execution', command: 'ls -la' } },
     ], state);
-    expect(started).toEqual([{ kind: 'tool.call', callId: 't1', name: 'shell', args: { command: 'ls -la' } }]);
+    expect(started).toEqual([
+      { kind: 'tool.call', callId: 't1', name: 'bash', rawName: 'shell', args: { command: 'ls -la' } },
+    ]);
 
     const completed = run([
       {
@@ -73,7 +84,15 @@ describe('mapCodexEvent — item 级映射', () => {
       },
     ], state);
     expect(completed).toEqual([
-      { kind: 'tool.result', callId: 't1', ok: true, result: 'file.txt', error: undefined },
+      {
+        kind: 'tool.result',
+        callId: 't1',
+        name: 'bash',
+        rawName: 'shell',
+        ok: true,
+        result: 'file.txt',
+        error: undefined,
+      },
     ]);
   });
 
@@ -86,19 +105,33 @@ describe('mapCodexEvent — item 级映射', () => {
     expect(completed[0]).toMatchObject({ kind: 'tool.result', callId: 't2', ok: false, error: 'boom' });
   });
 
-  test('mcp tool item → tool.call(mcp__server__tool)/tool.result', () => {
+  test('mcp tool item → canonical forgeax tool.call/tool.result', () => {
     const state = createCodexMapperState();
     const started = run([
       { type: 'item.started', item: { id: 'mc1', type: 'mcp_tool_call', server: 'fxt', tool: 'list_games', arguments: { a: 1 } } },
     ], state);
     expect(started).toEqual([
-      { kind: 'tool.call', callId: 'mc1', name: 'mcp__fxt__list_games', args: { a: 1 } },
+      {
+        kind: 'tool.call',
+        callId: 'mc1',
+        name: 'list_games',
+        rawName: 'mcp__fxt__list_games',
+        args: { a: 1 },
+      },
     ]);
     const completed = run([
       { type: 'item.completed', item: { id: 'mc1', type: 'mcp_tool_call', status: 'completed', result: { ok: 1 } } },
     ], state);
     expect(completed).toEqual([
-      { kind: 'tool.result', callId: 'mc1', ok: true, result: { ok: 1 }, error: undefined },
+      {
+        kind: 'tool.result',
+        callId: 'mc1',
+        name: 'list_games',
+        rawName: 'mcp__fxt__list_games',
+        ok: true,
+        result: { ok: 1 },
+        error: undefined,
+      },
     ]);
   });
 
@@ -107,8 +140,16 @@ describe('mapCodexEvent — item 级映射', () => {
       { type: 'item.completed', item: { id: 't3', type: 'command_execution', command: 'pwd', exit_code: 0, aggregated_output: '/x' } },
     ]);
     expect(evs).toEqual([
-      { kind: 'tool.call', callId: 't3', name: 'shell', args: { command: 'pwd' } },
-      { kind: 'tool.result', callId: 't3', ok: true, result: '/x', error: undefined },
+      { kind: 'tool.call', callId: 't3', name: 'bash', rawName: 'shell', args: { command: 'pwd' } },
+      {
+        kind: 'tool.result',
+        callId: 't3',
+        name: 'bash',
+        rawName: 'shell',
+        ok: true,
+        result: '/x',
+        error: undefined,
+      },
     ]);
   });
 

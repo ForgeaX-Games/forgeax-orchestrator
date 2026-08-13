@@ -14,6 +14,18 @@ import {
 // 这组用例锁三道闸门。
 
 describe('permission-registry denyPermissionsForSession()', () => {
+  test('zero timeout stays pending until the user explicitly answers', async () => {
+    const h = registerPermission('p-no-timeout', 0, { sid: 's0', agent: 'forge' });
+    const early = await Promise.race([
+      h.promise.then(() => 'settled'),
+      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 25)),
+    ]);
+    expect(early).toBe('pending');
+    expect(resolvePermission('p-no-timeout', true)).toBe(true);
+    expect(await h.promise).toBe(true);
+    h.dispose();
+  });
+
   test('releases (deny) every pending owned by the session, immediately', async () => {
     const a = registerPermission('p-a', 60_000, { sid: 's1', agent: 'forge' });
     const b = registerPermission('p-b', 60_000, { sid: 's1', agent: 'forge' });

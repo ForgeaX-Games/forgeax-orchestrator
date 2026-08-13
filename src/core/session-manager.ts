@@ -46,6 +46,7 @@ import type { AgentJson, ModelsConfig, SessionConfig } from "./types";
 import type { PathManagerAPI } from "../fs/types";
 import { createOrGetFSWatcher } from "../fs/watcher";
 import { recoverAgentLedger } from "../ledger/ledger-recovery";
+import { getArtifactResolver } from "../orchestration-seams";
 
 // create() only builds an empty session container (session.json +
 // blackboard.json). The session's home + game binding are established by the
@@ -498,6 +499,7 @@ export class SessionManager {
       paths: this.paths,
       config,
       agentFactory: factory,
+      artifactResolver: getArtifactResolver(),
     });
 
     // 把 session.logger 接入 console bridge router —— 此后**在该 sid scope 下跑**

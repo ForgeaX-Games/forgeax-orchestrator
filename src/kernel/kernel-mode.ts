@@ -4,7 +4,7 @@
  * **ship-gate 已翻:全局默认 = 内核 + sidecar**(sidecar 经 `sidecarEnabled()` 耦合默认同开)。
  * 三道前置闸已通:① 测试预载默认 cli(套件耐默认开);② 权限卡真 sid + 核心 parity(矩阵见
  * ship-gate-parity-matrix.md);③ R3-02 kernel-only 擦 key(`FORGEAX_KERNEL_ONLY=1`)。多模态图片
- * 输入当前为 UI 占位(非实流)→ 不构成回归;模型级联回退/逐工具/ask_user e2e 列 P2 backlog。
+ * 输入当前为 UI 占位(非实流)→ 不构成回归;模型级联回退/逐工具 e2e 列 P2 backlog。
  *
  * 逃生回旧 in-process 路径:`FORGEAX_KERNEL=cli`(或 `=off`)/ `FORGEAX_NO_KERNEL=1` /
  * `<projectRoot>/.forgeax/use-cli` 文件(部署级)。

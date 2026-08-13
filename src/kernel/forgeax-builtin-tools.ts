@@ -26,12 +26,15 @@ import {
   isFirstClassUiToolName,
   resolveFirstClassUiTool,
 } from '../api/lib/ui-manifest-registry';
-import { getHostTool, getHostUiAction, type HostToolRunCtx } from '../orchestration-seams';
+import {
+  getHostTool,
+  getDeliveryEnricher,
+  getHostUiAction,
+  type DeliveryContext,
+  type HostToolRunCtx,
+} from '../orchestration-seams';
 import { catalogGet } from './action-catalog';
-import { findVisibleDoor } from './action-door';
-import { getSurfaceSnapshot, shellLivePages, multiPageHint } from '../api/bus';
 import { getBuiltinHeadlessUiAction } from './ui-headless-actions';
-import { walkDoorInstead, DoorWalkDispatched } from './door-reroute';
 import { NPC_TOOL_CONTRACTS } from '@forgeax/types/npc-tools';
 
 /** 仅需 publish 的最小事件发布口（EventBus、绑定 bus、测试桩均可满足）。 */
@@ -43,6 +46,7 @@ export interface EventPublisher {
  * 游戏语义工具已迁至产品壳，经 HostToolSpec seam 注入。 */
 const BUILTIN_NAMES: ReadonlySet<string> = new Set([
   'echo',
+  'todo_write',
   'memory_search',
   'remember',
   'soul_create',
@@ -122,10 +126,6 @@ export interface BuiltinToolCtx {
   eventBus?: EventPublisher;
   /** 会话 id，用于 UI lease、runtime binding 与 catalog projection。 */
   sid?: string;
-  /** 本轮工具调用 id —— 透传给 HostToolRunCtx,让产品壳的旁账能连回主账本。 */
-  callId?: string;
-  /** MCP shim 自铸的这一次宿主执行 id —— 租用内核路径上旁账唯一能连的键。 */
-  toolExecutionId?: string;
 }
 
 const PERCEPTION_TIMEOUT_MS = 8_000;
@@ -139,41 +139,20 @@ function memoryRef(ctx: BuiltinToolCtx): LayeredMemoryRef {
 }
 
 /** 将内置工具上下文适配为 seam 工具使用的 HostToolRunCtx。 */
-/** ui_invoke 的门注解 —— 长在能力实现层,谁调 runForgeaxBuiltinTool 都被盖到。
- *  此前挂在 /:sid/perception-query 路由里,而 ui_invoke 的真实链路(MCP shim →
- *  kernel-tool → 本函数的进程内 perceptionQuery)从不经过那条路由 —— "没门的能力
- *  必须明说"这条硬约束等于从未装上(2026-08-05 终审 P0)。 */
-export function annotateUiInvokeResult(out: unknown, actionId: string, actionArgs: unknown): unknown {
-  if (!out || typeof out !== 'object' || Array.isArray(out) || !actionId) return out;
-  try {
-    const menubar = getSurfaceSnapshot('host.menubar') as { menus?: unknown } | null;
-    const sidebar = getSurfaceSnapshot('host.sidebar') as { entries?: Array<{ id?: unknown; label?: unknown }> } | null;
-    const door = findVisibleDoor(
-      { menus: menubar?.menus ?? null, rail: sidebar?.entries ?? null, fact: catalogGet(actionId)?.door },
-      actionId,
-      actionArgs,
-    );
-    const pages = shellLivePages();
-    return {
-      ...(out as Record<string, unknown>),
-      door,
-      ...(pages > 1 ? { multiplePages: multiPageHint(pages) } : {}),
-    };
-  } catch {
-    return out; // 注解失败不拦执行结果 —— 但绝不伪造 door
-  }
-}
-
 export function hostToolRunCtx(ctx: BuiltinToolCtx): HostToolRunCtx {
-  return {
+  const delivery = getDeliveryEnricher();
+  const deliveryContext: DeliveryContext = {
     ...(ctx.sid ? { sid: ctx.sid } : {}),
     agentId: ctx.agentId,
     projectRoot: ctx.projectRoot,
     ...(ctx.game ? { game: ctx.game } : {}),
-    ...(ctx.callId ? { callId: ctx.callId } : {}),
-    // 有值才带键:缺失时消费方按"这行连不上"处理,伪造一个会让它连到错的地方。
-    ...(ctx.toolExecutionId ? { toolExecutionId: ctx.toolExecutionId } : {}),
+  };
+  return {
+    ...deliveryContext,
     perception: (kind, query) => perceptionQuery(ctx, kind, query),
+    ...(delivery
+      ? { delivery: { enrich: (claim) => delivery.enrich(claim, deliveryContext) } }
+      : {}),
   };
 }
 
@@ -346,6 +325,56 @@ function remember(ctx: BuiltinToolCtx, args: Record<string, unknown> | undefined
   return { ok: true, tier: w.tier, ...(w.game ? { game: w.game } : {}), file: w.file };
 }
 
+type NativeTodoStatus = 'pending' | 'in_progress' | 'completed';
+
+interface NativeTodoItem {
+  id?: string;
+  content: string;
+  status: NativeTodoStatus;
+  activeForm?: string;
+}
+
+function todoWrite(args: Record<string, unknown> | undefined): unknown {
+  if (!Array.isArray(args?.todos)) {
+    return { ok: false, error: 'todo_write: todos must be an array' };
+  }
+
+  const rawTodos = args.todos as unknown[];
+  const items: NativeTodoItem[] = [];
+  for (const rawTodo of rawTodos) {
+    if (!rawTodo || typeof rawTodo !== 'object' || Array.isArray(rawTodo)) {
+      return { ok: false, error: 'todo_write: each todo must be an object' };
+    }
+    const todo = rawTodo as Record<string, unknown>;
+    const status = todo.status;
+    if (status !== 'pending' && status !== 'in_progress' && status !== 'completed') {
+      return { ok: false, error: 'todo_write: status must be pending, in_progress, or completed' };
+    }
+    if (typeof todo.content !== 'string') {
+      return { ok: false, error: 'todo_write: content must be a string' };
+    }
+    items.push({
+      ...(todo.id !== undefined ? { id: String(todo.id) } : {}),
+      content: todo.content,
+      status,
+      ...(todo.activeForm !== undefined ? { activeForm: String(todo.activeForm) } : {}),
+    });
+  }
+
+  const counts = {
+    pending: items.filter((item) => item.status === 'pending').length,
+    in_progress: items.filter((item) => item.status === 'in_progress').length,
+    completed: items.filter((item) => item.status === 'completed').length,
+  };
+  if (counts.in_progress > 1) {
+    return {
+      ok: false,
+      error: `todo_write: exactly one item may be in_progress (got ${counts.in_progress}). Mark the previous item completed before starting the next.`,
+    };
+  }
+  return { ok: true, todos: items, counts };
+}
+
 /** 感知取数往返：发布 perception:query，由前端回传真实值并解开 Promise；
  * 超时 fail-soft 为 unavailable。UI 回灌额外受 lease 约束。 */
 async function perceptionQuery(
@@ -384,6 +413,8 @@ export async function runForgeaxBuiltinTool(
   switch (name) {
     case 'echo':
       return { text: `[forgeax_echo] ${String(args?.text ?? '')}` };
+    case 'todo_write':
+      return todoWrite(args);
     case 'memory_search':
       return searchMemory(memoryRef(ctx), String(args?.query ?? ''));
     case 'remember':
@@ -413,40 +444,8 @@ export async function runForgeaxBuiltinTool(
     }
     case 'ui_invoke': {
       const actionId = typeof args?.actionId === 'string' ? args.actionId : '';
-      const actionArgs = args?.args ?? {};
       const rejection = uiActionCatalogRejection(actionId);
       if (rejection) return rejection;
-      // 咽喉收口(2026-08-06,B3):有可见门且语义等价 → 沿人类路径可见执行。此前
-      // 改道只装在 /:sid/kernel-tool 路由,原生内核的 host-tool-bridge 整条绕开 ——
-      // 无头直调,屏幕什么都不发生。收口挪到能力实现层,与下方门注解同层:谁调
-      // runForgeaxBuiltinTool 都被盖到。改道任何异常 → 静默回落原路,原路闸口照常。
-      try {
-        const rerouted = await walkDoorInstead(
-          { actionId, args: actionArgs },
-          { runCtx: hostToolRunCtx(ctx) },
-        );
-        if (rerouted) return rerouted.result;
-      } catch (error: unknown) {
-        // fail-closed(2026-08-06 外审 MAJOR):此前是无条件 catch 回落。
-        // walkDoorInstead 在**派发之后**抛异常(relay 抛、settle 抛、任何意外)时,
-        // 回落到下面的无头 perceptionQuery 就是让同一个命令跑第二次。只有能证明
-        // 尚未派发的异常才允许回落;派发过的一律作终态。
-        const mayHaveDispatched = error instanceof DoorWalkDispatched
-          || (typeof error === 'object' && error !== null
-            && 'dispatched' in error && (error as { dispatched?: unknown }).dispatched === true);
-        if (mayHaveDispatched) {
-          return {
-            ok: false,
-            via: 'editor_ui_browse',
-            actionId,
-            error: {
-              code: 'DOOR_WALK_INDETERMINATE',
-              hint: '沿人类路径执行时中途出错,命令**可能已经执行**。不要重试这个动作、'
-                + '不要换无头路径再派一次 —— 那会让它跑两次。先 look/verify 核对实际状态再决定。',
-            },
-          };
-        }
-      }
       // catalog 已校验 action 存在；UI 侧按声明的 timeoutMs 执行。
       // A live lease + accepted manifest row is only an executor binding. With no binding,
       // cold-start dispatch must not wait for a UI timeout before trying the server surface.
@@ -466,18 +465,14 @@ export async function runForgeaxBuiltinTool(
           if (handler) {
             try {
               const res = await handler.run((args?.args ?? {}) as Record<string, unknown>, hostToolRunCtx(ctx));
-              return annotateUiInvokeResult(
-                res && typeof res === 'object' ? { ...res, executedVia: 'headless' } : res,
-                actionId,
-                actionArgs,
-              );
+              return res && typeof res === 'object' ? { ...res, executedVia: 'headless' } : res;
             } catch (e) {
               return { status: 'rejected', reason: `headless handler threw: ${(e as Error).message}` };
             }
           }
         }
       }
-      return annotateUiInvokeResult(out, actionId, actionArgs);
+      return out;
     }
     default:
       // 防御分支：调用方原则上已通过 isForgeaxBuiltinTool 校验。

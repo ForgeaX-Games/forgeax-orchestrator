@@ -56,6 +56,11 @@ export interface HookPayloadMap {
     turn: number;
     aborted: boolean;
     error?: string;
+    turnId?: string;
+    durationMs?: number;
+    waitingForInput?: boolean;
+    artifactResolutionExpected?: true;
+    schemaVersion?: number;
   };
   [Hook.ToolCall]: {
     name: string;

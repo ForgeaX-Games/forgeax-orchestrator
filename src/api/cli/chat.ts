@@ -61,6 +61,11 @@ import { commandCapabilities } from "../../capabilities/adapters";
 import { getSessionManager as getCapabilitySessionManager } from "../../core/session-manager";
 import { commonCapabilityRoots } from "../../capabilities/common-roots";
 import { listCommonMcpServers } from "../../capabilities/mcp-catalog";
+import {
+  appliedKernelMutationRecords,
+  captureKernelMutationIntents,
+  type KernelMutationIntent,
+} from "../../kernel/kernel-file-activity";
 
 interface ChatBody {
   message?: string;
@@ -411,6 +416,7 @@ export function createCliRouter() {
         }
       }
 
+      const turnStartedAt = Date.now();
       return streamSSE(c, async (sse) => {
         const ac = new AbortController();
         const sseStartedAt = Date.now();
@@ -419,14 +425,29 @@ export function createCliRouter() {
         c.req.raw.signal.addEventListener("abort", onAbort);
         const fold = newWireFoldState();
         // accumulate the turn for the WAL write in `finally`.
-        let asstText = "";
+        // Keep the post-tool conclusion separate from the ordered process
+        // slices. This lets refresh reproduce assistant text/tool/result order
+        // without duplicating the same text in the final assistant message.
+        let pendingAssistantText = "";
         let thinkingText = "";
+        let publicSummaryText = "";
+        const processEvents: Array<
+          | { kind: "assistant_text"; text: string }
+          | { kind: "public_summary"; text: string }
+          | { kind: "call"; callId: string; name: string; args: unknown }
+          | { kind: "result"; callId: string; ok: boolean; result?: unknown; error?: string }
+        > = [];
         let stopReason: "end_turn" | "tool_use" | "max_tokens" | "cancelled" = "end_turn";
         let usage: unknown;
         const toolEvents: Array<
           | { kind: "call"; callId: string; name: string; args: unknown }
           | { kind: "result"; callId: string; ok: boolean; result?: unknown; error?: string }
         > = [];
+        // Rented kernels execute local-capable tools in their own process, so
+        // those writes bypass Session's AgentFs recorder. Capture an intent at
+        // tool-call time and append applied evidence after a successful result
+        // before the artifact resolver runs.
+        const kernelMutationIntents = new Map<string, KernelMutationIntent[]>();
         // 内核 id 即 wire/账本的 providerId(claude-code / codex / forgeax-core)。
         // 在 try 外声明,让 finally 的账本转录也能拿到(刷新后据此还原来源 badge)。
         let providerId = "claude-code";
@@ -497,14 +518,58 @@ export function createCliRouter() {
                     sseTokenFirstSeen = true;
                     tt("sse.token-first", { ms: Date.now() - sseStartedAt, provider: providerId });
                   }
-                  asstText += out.text ?? "";
+                  pendingAssistantText += out.text ?? "";
                   break;
-                case "thinking": thinkingText += out.text ?? ""; break;
+                case "thinking": {
+                  if (out.visibility === "public_summary") {
+                    const text = out.text ?? "";
+                    publicSummaryText += text;
+                    const last = processEvents[processEvents.length - 1];
+                    if (last?.kind === "public_summary") last.text += text;
+                    else if (text) processEvents.push({ kind: "public_summary", text });
+                  } else {
+                    thinkingText += out.text ?? "";
+                  }
+                  break;
+                }
                 // 第 4 层 tool span —— 与 core/kernel-turn.ts 调同一个状态机(cli-kernel-trace)。
                 // 观测异常由该模块内部吞掉,这里不再包一层,免得两口的降级策略各写各的又走偏。
                 // (tool-result 的 onToolResult 在上面 writeSSE 之前已调,此处只落账本。)
-                case "tool-call": cliTrace?.onToolCall(out.callId, out.name); toolEvents.push({ kind: "call", callId: out.callId, name: out.name, args: out.args }); break;
-                case "tool-result": toolEvents.push({ kind: "result", callId: out.callId, ok: out.ok, result: out.result, error: out.error }); break;
+                case "tool-call": {
+                  if (pendingAssistantText.trim()) {
+                    processEvents.push({ kind: "assistant_text", text: pendingAssistantText });
+                    pendingAssistantText = "";
+                  }
+                  cliTrace?.onToolCall(out.callId, out.name);
+                  const event = { kind: "call" as const, callId: out.callId, name: out.name, args: out.args };
+                  if (persistSession) {
+                    const intents = captureKernelMutationIntents(
+                      out.name,
+                      out.args,
+                      persistSession.artifactProjectRoot(),
+                    );
+                    if (intents.length) kernelMutationIntents.set(out.callId, intents);
+                  }
+                  toolEvents.push(event);
+                  processEvents.push(event);
+                  break;
+                }
+                case "tool-result": {
+                  const event = { kind: "result" as const, callId: out.callId, ok: out.ok, result: out.result, error: out.error };
+                  if (out.ok && persistSession && persistAgent) {
+                    const intents = kernelMutationIntents.get(out.callId) ?? [];
+                    for (const record of appliedKernelMutationRecords(intents, {
+                      agentPath: persistAgent,
+                      toolCallId: out.callId,
+                    })) {
+                      persistSession.fileActivity.append(record);
+                    }
+                  }
+                  kernelMutationIntents.delete(out.callId);
+                  toolEvents.push(event);
+                  processEvents.push(event);
+                  break;
+                }
                 case "done": {
                   stopReason = out.stopReason; usage = out.usage;
                   // 缓存命中率打点(还原老 studio 的 cachedRatio,迁移遗失)。
@@ -567,12 +632,14 @@ export function createCliRouter() {
           // write, not via eventBus → no WS double-render against the SSE above.
           if (persistSession && persistAgent) {
             try {
-              transcribeKernelTurn(persistSession, persistAgent, {
+              const transcript = transcribeKernelTurn(persistSession, persistAgent, {
                 message,
                 ...(checkpointMsgId ? { msgId: checkpointMsgId } : {}),
                 contextText: turnReq.input.text,
-                asstText,
+                startedAt: turnStartedAt,
+                asstText: pendingAssistantText,
                 thinkingText,
+                publicSummaryText,
                 stopReason,
                 providerId,
                 ...(usage ? { usage } : {}),
@@ -581,9 +648,22 @@ export function createCliRouter() {
                   ? { attachments: turnReq.input.attachments as Array<Record<string, unknown>> }
                   : {}),
                 ...(turnReq.historyPlan ? { historyPlan: turnReq.historyPlan } : {}),
-                turnAttemptId,
                 toolEvents,
+                processEvents,
               });
+              if (transcript) {
+                await persistSession.resolveArtifactTurn({
+                  sid: persistSession.sid,
+                  agentId: persistAgent,
+                  projectRoot: persistSession.artifactProjectRoot(),
+                  ...(persistSession.config.defaultDir ? { game: persistSession.config.defaultDir } : {}),
+                  turnId: transcript.turnId,
+                  ...(checkpointMsgId ? { checkpointMsgId } : {}),
+                  startedAt: transcript.startedAt,
+                  settledAt: transcript.settledAt,
+                  ...(stopReason === "cancelled" ? { aborted: true } : {}),
+                });
+              }
             } catch (e) {
               console.warn(`[cli/chat] ledger write failed: ${(e as Error).message}`);
             }

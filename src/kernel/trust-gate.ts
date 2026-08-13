@@ -103,7 +103,9 @@ const SCOPED_CAPS: ReadonlySet<Capability> = new Set<Capability>(['write', 'dele
 /** 委派/编排原语:始终放行(即便 imported)——它们是编排面,本身不触达危险能力,
  *  危险面由**被委派子 agent 自己的** trustTier 在其调用时再行限流。显式 allowlist 也
  *  防止将来调能力策略时误伤。 */
-const ALWAYS_ALLOW = new Set(['delegate_to_subagent', 'list_subagents', 'list_agents']);
+/** Pure orchestration/reporting tools do not touch the workspace. Settings
+ * deny rules still run before this set, so an explicit user deny wins. */
+const ALWAYS_ALLOW = new Set(['delegate_to_subagent', 'list_subagents', 'list_agents', 'deliver_summary']);
 
 export interface TrustDecision {
   /** 向后兼容:`true` 当且仅当 `outcome==='allow'`。旧调用方只看此字段时 ask/deny 均 fail-closed。 */

@@ -60,6 +60,16 @@ export interface FileActivityRecord {
   isCreate?: boolean;
   /** Tool call id if recorder was invoked from a tool execute path. Optional. */
   toolCallId?: string;
+  /** Hash of the agent-written final bytes when cheaply available. */
+  hash?: string;
+  /** True when the agent operation removed the path. */
+  deleted?: boolean;
+  /** External CLI bridge turn identity. Native recorder records use the time window fallback. */
+  turnId?: string;
+  /** External CLI calls publish an intent row before execution for live UI,
+   * then an applied row with disk evidence after success. Artifact derivation
+   * must ignore intent-only rows so failed tools cannot create fake output. */
+  phase?: "intent" | "applied";
 }
 
 /** Append + read ledger. Lifetime tied to Session (constructed in Session ctor). */

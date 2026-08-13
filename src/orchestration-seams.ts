@@ -1,3 +1,6 @@
+import type { DeliverSummary, DeliverSummaryClaim } from '@forgeax/types/deliver-summary';
+import type { ArtifactResolvedPayload } from '@forgeax/types/artifact-summary';
+
 /** Orchestration seams — the injection registry the product shell uses to feed
  *  business-specific behavior into the (business-agnostic) orchestration layer.
  *
@@ -45,22 +48,43 @@ export interface SystemPromptComposer {
  *  编排层通用感知往返(EventBus→WS→UI→回灌)的绑定句柄——机制业务无关,shell 注入的
  *  工具(query_world/capture_frame)用它向浏览器里的真值源取数;UI 未连时 fail-soft
  *  返回 `{ unavailable }`。 */
-export interface HostToolRunCtx {
+export interface DeliveryContext {
   sid?: string;
   agentId: string;
   projectRoot: string;
-  /** 会话绑定的业务作用域 slug(studio 语境 = game)。 */
   game?: string;
-  /** 本轮工具调用 id —— 与工具审计账、agent 事件账本的 `hook:toolCall.payload.callId`
-   *  **同一个键**。产品壳的 host 工具据它把自己的旁账(如 ui-browse-metrics)连回主账。
-   *  2026-08-06 外审:这两份旁账此前只有 sid+agent+时间戳,跨账本只能靠时间猜。
-   *  缺失时消费方按"这行连不上"处理 —— 不要伪造。 */
-  callId?: string;
-  /** MCP shim 自铸的**这一次宿主执行**的 id。与 `callId` 语义不同:租用内核(经 MCP)这条
-   *  路上通常只有它(内核 callId 过不了 MCP),原生内核那条路上通常只有 callId。
-   *  消费方据**实际存在哪个键**判断这一行能连到链上的哪一层 —— 缺就是缺,不要伪造。 */
-  toolExecutionId?: string;
+}
+
+export interface HostToolRunCtx extends DeliveryContext {
   perception?: (kind: 'world' | 'frame', query?: unknown) => Promise<unknown>;
+  /** Optional correlation keys carried by the host audit and tool ledgers. */
+  callId?: string;
+  toolExecutionId?: string;
+  /** Narrow read-only seam for host-enriched delivery summaries. */
+  delivery?: DeliveryEnricher;
+}
+
+/** Orchestrator-owned delivery derivation. The implementation may read
+ * checkpoint/ledger state; product shells only provide the resulting seam. */
+export interface DeliveryEnricher {
+  enrich(claim: DeliverSummaryClaim, context?: DeliveryContext): Promise<DeliverSummary>;
+}
+
+/** Final-settle input for host-owned artifact derivation. */
+export interface ArtifactTurnContext extends DeliveryContext {
+  turnId: string;
+  checkpointMsgId?: string;
+  anchorSeq?: number;
+  startedAt: number;
+  settledAt: number;
+  aborted?: boolean;
+  error?: string;
+}
+
+export interface ArtifactResolver {
+  resolveTurn(context: ArtifactTurnContext): Promise<ArtifactResolvedPayload>;
+  /** Optional startup/reopen reconciliation hook. */
+  reconcile?(sid: string): Promise<void>;
 }
 
 /** A host-only tool spec the shell exposes to agents (list_games / query_world /
@@ -122,6 +146,13 @@ interface OrchestrationSeams {
   hostTools?: HostToolSpec[];
   hostUiActions?: HostUiActionHandler[];
   assetPathPolicy?: AssetPathPolicy;
+  delivery?: DeliveryEnricher;
+  artifactResolver?: ArtifactResolver;
+  /** Opt-in builtin tools the product enables. Builtins listed in
+   *  compose-turn-request's OPT_IN_BUILTIN_TOOLS are advertised ONLY when named
+   *  here, so a standalone / other-product consumer of the orchestration layer
+   *  does not inherit product-specific tools (e.g. task-flow `todo_write`). */
+  enabledBuiltinTools?: readonly string[];
 }
 
 let _seams: OrchestrationSeams = {};
@@ -142,6 +173,11 @@ export function getHostTools(): HostToolSpec[] {
   return _seams.hostTools ?? [];
 }
 
+/** Opt-in builtin tools the product enabled (empty set when none / standalone). */
+export function getEnabledBuiltinTools(): ReadonlySet<string> {
+  return new Set(_seams.enabledBuiltinTools ?? []);
+}
+
 /** 按名取 shell 注入的 host 工具(执行口用;undefined = 非 seam 工具)。 */
 export function getHostTool(name: string): HostToolSpec | undefined {
   return _seams.hostTools?.find((t) => t.name === name);
@@ -155,6 +191,15 @@ export function getHostUiAction(actionId: string): HostUiActionHandler | undefin
 /** The injected asset path policy, or undefined when none was injected. */
 export function getAssetPathPolicy(): AssetPathPolicy | undefined {
   return _seams.assetPathPolicy;
+}
+
+/** The injected delivery enricher, or undefined until round derivation lands. */
+export function getDeliveryEnricher(): DeliveryEnricher | undefined {
+  return _seams.delivery;
+}
+
+export function getArtifactResolver(): ArtifactResolver | undefined {
+  return _seams.artifactResolver;
 }
 
 /** Test-only — reset the registry between cases. */

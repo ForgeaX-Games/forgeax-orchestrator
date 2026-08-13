@@ -26,7 +26,7 @@ import { HistoryCoordinator } from '../history/coordinator';
 import { LedgerHistorySource, LedgerLaneStore } from '../history/ledger-history';
 import { renderHistoryPatch } from '../history/text-bridge';
 import { llmMessagesToTurnHistory } from './llm-history';
-import { getSystemPromptComposer, getHostTools } from '../orchestration-seams';
+import { getSystemPromptComposer, getHostTools, getEnabledBuiltinTools } from '../orchestration-seams';
 import {
   loadAgentRecord,
   composeStableMemory,
@@ -44,18 +44,69 @@ import { tt } from '../lib/turn-trace';
 import type { SkillRefLite } from '../soul/types';
 import uiBridgeContract from './ui-bridge-contract.json';
 import { NPC_TOOL_CONTRACTS } from '@forgeax/types/npc-tools';
+import askUserTool from '../../builtin/kits/workspace/tools/ask_user';
 
 /** P3(B npc_text):core npc_text builtin npc_textown trustTier npc_text
  *  `delivery:'local'`(forgeax-core npc_text)npc_textname npc_text core builtin npc_text,npc_text
  *  @forgeax/orchestrator `builtin/kits/workspace/tools/` npc_text(bash/npc_text/npc_text/npc_text)npc_text host
  *  npc_text(list_games/query_worldnpc_text)npc_text npc_text npc_text host npc_text */
-const LOCAL_CAPABLE_TOOLS = new Set<string>(['read_file', 'write_file', 'edit_file', 'grep', 'glob']);
+// File mutations intentionally stay host-delivered. The host AgentFs recorder
+// is the SSOT for causal file activity and Artifact cards; executing write/edit
+// inside a rented kernel bypasses that recorder and can produce a false
+// `no_change` settle. Read-only tools and todo_write remain safe to run local.
+const LOCAL_CAPABLE_TOOLS = new Set<string>(['read_file', 'grep', 'glob', 'todo_write']);
+
+/** P3(B 路径):core 有 builtin 实现的「安全类」工具集。own trustTier 下这些标
+ *  `delivery:'local'`(forgeax-core 内核本进程直跑)。name 与 core builtin 对齐,且
+ *  @forgeax/orchestrator `builtin/kits/workspace/tools/` 同名。危险类(bash/出网/删/凭据)与 host
+ *  专属工具(list_games/query_world…)不入此集 → 仍走 host 桥把闸。 */
+const TODO_WRITE_INPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    todos: {
+      type: 'array',
+      description: 'The full todo list (replaces the prior list).',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Stable id; keep it unchanged across updates for the same task.' },
+          content: { type: 'string', description: 'Imperative task description.' },
+          status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+          activeForm: { type: 'string', description: 'Present-continuous form shown while in_progress.' },
+        },
+        required: ['content', 'status'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['todos'],
+  additionalProperties: false,
+} as const;
 
 /** npc_text(npc_text ToolSpec)npc_text MCP server + `--allowedTools` npc_text
  *  `memory_search`/`remember`/`soul_create` = npc_text(R6)npc_text,npc_text = soul npc_text/npc_text soul-packnpc_text
  *  npc_text(list_games/query_world/capture_frame)**npc_text**npc_text
  *  npc_text HostToolSpec seam npc_text(npc_textA npc_text3 npc_text,P1-7 npc_text),cli npc_text */
+/** Builtins that are NOT generic — advertised only when the product opts in via
+ *  the `enabledBuiltinTools` seam. `todo_write` drives the product's task-flow
+ *  plan card, so it is off by default and the game product enables it; a
+ *  standalone / other-product consumer of the orchestration layer never sees it.
+ *  (The when-to-call and its coupling to the delivery card live in the product
+ *  system prompt, not here — this gate is advertisement only.) */
+const OPT_IN_BUILTIN_TOOLS = new Set<string>(['todo_write']);
+
 const FORGEAX_TOOLS = [
+  {
+    name: askUserTool.name,
+    description: askUserTool.description,
+    inputSchema: askUserTool.input_schema,
+  },
+  {
+    name: 'todo_write',
+    description:
+      'Create or replace the task plan for a multi-step request. Provide verb-led items and keep exactly one item in_progress, marking it completed when done; progress is tracked from these updates. (When to plan and how it is presented is defined by the product system prompt.)',
+    inputSchema: TODO_WRITE_INPUT_SCHEMA,
+  },
   {
     name: 'memory_search',
     description:
@@ -206,8 +257,14 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   //   (agent host-tools/kits)> record.tools(soul-pack tools/*.json)> extension skills>
   //   soul-pack skills。
   //   内置/host 工具在冲突时获胜,soul-pack 不能覆盖宿主真值工具。
-  const seen = new Set(FORGEAX_TOOLS.map((t) => t.name));
-  const tools: TurnRequest['tools'] = [...FORGEAX_TOOLS];
+  // Opt-in builtins (e.g. todo_write) are advertised only when the product
+  // enabled them via the seam; default off keeps the shared layer generic.
+  const enabledBuiltins = getEnabledBuiltinTools();
+  const activeForgeaxTools = FORGEAX_TOOLS.filter(
+    (t) => !OPT_IN_BUILTIN_TOOLS.has(t.name) || enabledBuiltins.has(t.name),
+  );
+  const seen = new Set(activeForgeaxTools.map((t) => t.name));
+  const tools: TurnRequest['tools'] = [...activeForgeaxTools];
   type ToolEntry = NonNullable<TurnRequest['tools']>[number];
   const pushDeduped = (cands: ReadonlyArray<{ name?: string }>) => {
     for (const t of cands) {

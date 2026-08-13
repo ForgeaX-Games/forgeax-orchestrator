@@ -196,6 +196,7 @@ export function wrapAgentFsWithRecorder(
       around(abs, "write", () => inner.writeBinarySync(path, data), () => ({
         agentPath, op: "write", path: abs,
         bytes: byteLen(data), isCreate,
+        ...(quickHash(data) ? { hash: quickHash(data)! } : {}),
       }));
     },
 
@@ -211,7 +212,7 @@ export function wrapAgentFsWithRecorder(
     unlinkSync(path) {
       const abs = inner.resolve(path);
       around(abs, "delete", () => inner.unlinkSync(path), () => ({
-        agentPath, op: "delete", path: abs,
+        agentPath, op: "delete", path: abs, deleted: true,
       }));
     },
 
@@ -226,7 +227,7 @@ export function wrapAgentFsWithRecorder(
     rmSync(path, opts?) {
       const abs = inner.resolve(path);
       around(abs, "delete", () => inner.rmSync(path, opts), () => ({
-        agentPath, op: "delete", path: abs,
+        agentPath, op: "delete", path: abs, deleted: true,
       }));
     },
 

@@ -55,7 +55,9 @@ describe('cursor-mapper', () => {
         tool_call: { shellToolCall: { args: { command: 'ls' } } },
       } as CursorRawEvent,
     ]);
-    expect(out).toEqual([{ kind: 'tool.call', callId: 'tc1', name: 'Bash', args: { command: 'ls' } }]);
+    expect(out).toEqual([
+      { kind: 'tool.call', callId: 'tc1', name: 'bash', rawName: 'Bash', args: { command: 'ls' } },
+    ]);
   });
 
   test('tool_call completed success → tool.result ok with stdout', () => {
@@ -67,7 +69,9 @@ describe('cursor-mapper', () => {
         tool_call: { shellToolCall: { result: { success: { stdout: 'file.txt' } } } },
       } as CursorRawEvent,
     ]);
-    expect(out).toEqual([{ kind: 'tool.result', callId: 'tc1', ok: true, result: 'file.txt' }]);
+    expect(out).toEqual([
+      { kind: 'tool.result', callId: 'tc1', name: 'bash', rawName: 'Bash', ok: true, result: 'file.txt' },
+    ]);
   });
 
   test('tool_call completed rejected → tool.result not ok with reason', () => {
@@ -79,7 +83,9 @@ describe('cursor-mapper', () => {
         tool_call: { editToolCall: { result: { rejected: { reason: 'denied' } } } },
       } as CursorRawEvent,
     ]);
-    expect(out).toEqual([{ kind: 'tool.result', callId: 'tc2', ok: false, error: 'denied' }]);
+    expect(out).toEqual([
+      { kind: 'tool.result', callId: 'tc2', name: 'edit_file', rawName: 'Edit', ok: false, error: 'denied' },
+    ]);
   });
 
   test('current MCP envelope preserves provider/tool name and content-array result', () => {
@@ -102,8 +108,8 @@ describe('cursor-mapper', () => {
       },
     ] as CursorRawEvent[]);
     expect(out).toEqual([
-      { kind: 'tool.call', callId: 'mcp1', name: 'mcp__fxt__echo', args: { providerIdentifier: 'fxt', toolName: 'echo', text: 'ignored' } },
-      { kind: 'tool.result', callId: 'mcp1', ok: true, result: '[forgeax_echo] CURSOR_OK' },
+      { kind: 'tool.call', callId: 'mcp1', name: 'echo', rawName: 'mcp__fxt__echo', args: { providerIdentifier: 'fxt', toolName: 'echo', text: 'ignored' } },
+      { kind: 'tool.result', callId: 'mcp1', name: 'echo', rawName: 'mcp__fxt__echo', ok: true, result: '[forgeax_echo] CURSOR_OK' },
     ]);
   });
 

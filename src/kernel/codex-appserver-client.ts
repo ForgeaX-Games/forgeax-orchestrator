@@ -150,7 +150,7 @@ export class CodexAppServerClient {
     // Handshake. clientInfo shape verified: { name, title|null, version }.
     await this.request('initialize', {
       clientInfo: { name: 'forgeax', title: 'forgeax-studio', version: '0.1.0' },
-      capabilities: null,
+      capabilities: { experimentalApi: true },
     });
     this.initialized = true;
   }
