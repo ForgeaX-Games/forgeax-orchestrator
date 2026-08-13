@@ -32,7 +32,7 @@ import { homedir, tmpdir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
 import type { ChatEvent } from '../cli-providers/types';
 import { defaultProjectRoot } from '@forgeax/platform-io';
-import { readProjectMcpServers } from './project-mcp';
+import { isProjectMcpToolName, readProjectMcpServers } from './project-mcp';
 
 const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
 
@@ -310,22 +310,14 @@ function buildFallbackArgs(models: TurnRequest['fallbackModels']): string[] {
   return list && list.length ? ['--fallback-model', list.join(',')] : [];
 }
 
-/**
- * hermetic npc_text argv npc_text **npc_text `trustTier === 'imported'`**(npc_text pack)npc_text:
- *   - `--strict-mcp-config`   npc_text `--mcp-config`(forgeax perm/fxt),npc_text operator npc_text/npc_text MCPnpc_text
- *   - `--setting-sources ''`  npc_text operator npc_text user/project/local settingsnpc_textCLAUDE.mdnpc_texthooks/skills/pluginsnpc_text
- * npc_text composeTurnRequest npc_text+npc_text,imported claude npc_text(npc_text/npc_text)npc_text
- * own/builtin(forge)**npc_text**(npc_text + npc_text operator npc_text)npc_text npc_textenv-scrub + cred-proxy
- * npc_text,npc_text**npc_text**,npc_text imported npc_text`--setting-sources ''` npc_text = npc_text
+/** Hermetic mode is a trust boundary, not a latency switch.
+ * Imported/untrusted packs must not inherit operator capabilities; own Studio
+ * turns must retain Claude's native MCP, plugin, skill, CLAUDE.md, hooks and
+ * settings so the external capability manager remains semantically intact.
  */
-function buildHermeticArgs(
-  trustTier: TurnRequest['trustTier'],
-  hasProjectMcp: boolean,
-): string[] {
+function buildHermeticArgs(trustTier: TurnRequest['trustTier']): string[] {
   if (trustTier === 'imported') return ['--strict-mcp-config', '--setting-sources', ''];
-  // Project MCP is mounted explicitly for this turn. Do not let Claude merge
-  // unrelated operator MCP configuration into the same tool namespace.
-  return hasProjectMcp ? ['--strict-mcp-config'] : [];
+  return [];
 }
 
 /**
@@ -388,8 +380,9 @@ export function buildCcArgs(
   // npc_text messagenpc_text
   const toolPolicyArgs = buildToolPolicyArgs(req.toolPolicy);
 
-  // hermetic npc_text(npc_text imported)+ npc_text + npc_text
-  const hermeticArgs = buildHermeticArgs(req.trustTier, req.tools.some((tool) => tool.name.startsWith('mcp__')));
+  // Hermetic flags apply only to imported/untrusted turns; they are not a
+  // global performance optimization and must not hide native capabilities.
+  const hermeticArgs = buildHermeticArgs(req.trustTier);
   const budgetArgs = buildBudgetArgs(req.budget);
   const fallbackArgs = buildFallbackArgs(req.fallbackModels);
 
@@ -402,15 +395,18 @@ export function buildCcArgs(
   const hookSettingsArgs = buildHookSettingsArgs(realSid, req.session.agentId?.trim() || 'forge', spKey);
 
   // npc_text(dynamicSuffix npc_text user npc_text,npc_text system prompt)npc_text
-  const message = sp.dynamicSuffix?.trim()
-    ? `${req.input.text}\n\n${sp.dynamicSuffix.trim()}`
-    : req.input.text;
+  const message = buildCcInput(req);
 
   return [
     '-p',
     '--output-format=stream-json',
     '--include-partial-messages',
     '--verbose',
+    // Claude moves only machine/session-specific sections of its default
+    // prompt into the first user payload. The native MCP/plugin/skill surface
+    // and the appended CLAUDE.md/system prompt remain enabled; this keeps the
+    // stable capability prefix reusable without disabling any capability.
+    '--exclude-dynamic-system-prompt-sections',
     '--permission-mode', toCcPermissionMode(permissionMode),
     ...hermeticArgs,
     ...hookSettingsArgs,
@@ -423,6 +419,28 @@ export function buildCcArgs(
     ...systemPromptArgs,
     message,
   ];
+}
+
+/** The exact user payload used by both one-shot and persistent stream-json turns. */
+export function buildCcInput(req: TurnRequest): string {
+  return req.systemPrompt.dynamicSuffix?.trim()
+    ? `${req.input.text}\n\n${req.systemPrompt.dynamicSuffix.trim()}`
+    : req.input.text;
+}
+
+/**
+ * Persistent variant of {@link buildCcArgs}. It keeps every capability,
+ * permission, MCP, plugin and settings flag, removes the one-shot positional
+ * message, and switches stdin to Claude's documented stream-json protocol.
+ */
+export function buildCcPersistentArgs(
+  req: TurnRequest,
+  projectRoot: string,
+  sessionArgs: string[],
+  permissionMode: PermissionMode = req.permissionMode ?? CC_DEFAULT_PERMISSION_MODE,
+): string[] {
+  const oneShot = buildCcArgs(req, projectRoot, sessionArgs, permissionMode);
+  return [...oneShot.slice(0, -1), '--input-format', 'stream-json'];
 }
 
 /** npc_text thread npc_text on-disk session npc_text(npc_text resume vs npc_text,npc_text)npc_text */
@@ -477,13 +495,22 @@ export function buildMcpArgs(req: TurnRequest, permSid: string, projectRoot = de
       FORGEAX_SID: req.hostSessionId?.trim() || permSid,
       FORGEAX_AGENT: req.session.agentId?.trim() || 'forge',
       FORGEAX_FXT_EXPOSE: req.tools.map((tool) => tool.name).join(','),
+      // Claude's own/default turns mount project MCP natively below. Imported
+      // turns keep the same tools in the fxt specs so the host trust gate is
+      // the only execution path. The fxt child itself never spawns project
+      // servers, preventing duplicate MCP processes in either case.
+      FORGEAX_DISABLE_PROJECT_MCP: '1',
     };
 
     // T-A host-tool npc_text:npc_text MCPnpc_textHTTP npc_text
     // npc_text fxt server(npc_text = echo + R6 memory_search/remember/soul_create + legacy
     // rented-CLI list_games/query_world/capture_frame npc_text mcp server npc_text,npc_text host-tool npc_text)npc_text
     const BUILTIN_FXT = new Set(['echo', 'list_games', 'memory_search', 'remember', 'soul_create', 'npc_wire', 'query_world', 'capture_frame']);
-    const bridged = req.tools.filter((t) => !BUILTIN_FXT.has(t.name));
+    const nativeProjectMcp = req.trustTier !== 'imported';
+    const bridged = req.tools.filter((t) =>
+      !BUILTIN_FXT.has(t.name)
+      && (!nativeProjectMcp || !isProjectMcpToolName(t.name, projectRoot)),
+    );
     if (bridged.length > 0) {
       try {
         const specsPath = resolvePath(tmpdir(), `forgeax-kernel-tools-${permSid || req.session.agentId || 'x'}.json`);
@@ -502,7 +529,7 @@ export function buildMcpArgs(req: TurnRequest, permSid: string, projectRoot = de
     const requestedProjectServers = new Set(
       req.tools
         .map((tool) => tool.name)
-        .filter((name) => name.startsWith('mcp__'))
+        .filter((name) => nativeProjectMcp && isProjectMcpToolName(name, projectRoot))
         .map((name) => name.slice('mcp__'.length).split('__', 1)[0]),
     );
     const projectServerKeys = new Map<string, string>();
@@ -524,7 +551,7 @@ export function buildMcpArgs(req: TurnRequest, permSid: string, projectRoot = de
       const separator = tool.name.indexOf('__', 'mcp__'.length);
       const serverName = separator >= 0 ? tool.name.slice('mcp__'.length, separator) : '';
       const configName = projectServerKeys.get(serverName) ?? serverName;
-      return serverName && mcpServers[configName] ? [fxtName, tool.name] : [fxtName];
+      return serverName && mcpServers[configName] ? [tool.name] : [fxtName];
     });
     flags.push('--allowedTools', ...allowedTools);
   }

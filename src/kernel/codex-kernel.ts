@@ -25,6 +25,7 @@ import type {
 } from '@forgeax/agent-runtime';
 import { CODEX_KERNEL_PROFILE } from './kernel-profile';
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
 import { runCapture } from '../lib/node-spawn';
@@ -52,7 +53,11 @@ import {
 import { clampMode } from './permission-config';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { evaluateSettingsRules, loadSettingsPermissionRules } from '../api/lib/permission-settings';
-import { CodexAppServerClient, type ServerRequest } from './codex-appserver-client';
+import {
+  CodexAppServerClient,
+  type CodexAppServerOptions,
+  type ServerRequest,
+} from './codex-appserver-client';
 import {
   AppServerUnavailable,
   KernelEventQueue,
@@ -68,9 +73,18 @@ import {
 import {
   assertCodexMcpSupported,
   buildCodexMcpOverrides,
+  CODEX_MCP_SERVER_KEY,
   CodexMcpError,
 } from './codex-mcp';
-import { codexHomeKey, codexHomeMutex, ensureCodexSessionHome } from './codex-session-home';
+import {
+  codexHomeKey,
+  codexHomeMutex,
+  codexNativeSourceFingerprint,
+  codexSessionNativeStdioMcpNames,
+  codexSessionHomeFingerprint,
+  ensureCodexSessionHome,
+} from './codex-session-home';
+import { CodexAppServerPool, type OwnedCodexAppServer } from './codex-appserver-pool';
 
 /** Emit a structured turn failure (the neutral spine has no codex_mcp_* code, so
  *  the machine code rides in the `protocol` message prefix). Keeps the B5
@@ -119,8 +133,17 @@ export class CodexKernel implements AgentKernel {
   private readonly threadIdMap = new Map<string, string>();
   /** threadId → codex app-server thread id(app-server 路径:thread/start 后记下,用于 thread/resume)。 */
   private readonly appThreadIdMap = new Map<string, string>();
+  /** A prewarmed thread is already loaded in this exact live app-server. Calling
+   *  thread/resume on it before its first turn fails because it has no persisted
+   *  rollout yet; retain the owner identity so the real turn uses it directly. */
+  private readonly appThreadOwnerMap = new Map<string, CodexAppServerClient>();
   /** callId → 在飞 turn 的 AbortController(供 openHandle().cancel 杀进程)。 */
   private static readonly inflight = new Map<string, AbortController>();
+  private static readonly appServerPool = new CodexAppServerPool();
+
+  static async closeAppServerPool(): Promise<void> {
+    await CodexKernel.appServerPool.closeAll();
+  }
 
   private binary(): Promise<string> {
     return (this.binaryPromise ??= resolveBinary({
@@ -201,6 +224,248 @@ export class CodexKernel implements AgentKernel {
     }
   }
 
+  private appServerFingerprint(req: TurnRequest, input: {
+    binary: string;
+    binaryVersion: string;
+    home: string;
+    env: Record<string, string>;
+    hooksActive: boolean;
+  }): string {
+    const env = Object.entries(input.env)
+      .filter(([name]) => name !== 'FORGEAX_TOOL_SPECS_FILE')
+      // Provider secrets affect process identity, but only their one-way digest
+      // is admitted to the outer process fingerprint.
+      .map(([name, value]) => [
+        name,
+        /KEY|TOKEN|AUTH/i.test(name)
+          ? createHash('sha256').update(value).digest('hex')
+          : value,
+      ] as const)
+      .sort(([a], [b]) => a.localeCompare(b));
+    return createHash('sha256').update(JSON.stringify({
+      binary: input.binary,
+      binaryVersion: input.binaryVersion,
+      home: input.home,
+      nativeSourceFingerprint: codexNativeSourceFingerprint(),
+      homeFingerprint: codexSessionHomeFingerprint(input.home),
+      hooksActive: input.hooksActive,
+      env,
+      tools: req.tools.map((tool) => ({
+        name: tool.name,
+        capabilityId: tool.capabilityId,
+        capabilityGeneration: tool.capabilityGeneration,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        delivery: tool.delivery,
+      })),
+      capabilityGeneration: req.capabilityGeneration,
+    })).digest('hex');
+  }
+
+  private async acquireAppServer(
+    req: TurnRequest,
+    handlers: Pick<CodexAppServerOptions, 'onServerRequest' | 'onNotification' | 'onExit'>,
+    signal?: AbortSignal,
+  ): Promise<{
+    homeKey: string;
+    home: string;
+    session: OwnedCodexAppServer;
+    reused: boolean;
+    nativeThreadInvalidated: boolean;
+    releaseHome(): void;
+  }> {
+    const binary = await this.binary();
+    const projectRoot = defaultProjectRoot();
+    const hooksActive = ensureCodexHooksConfig(projectRoot);
+    const env: Record<string, string> = {};
+    if (process.env.OPENAI_API_KEY) env.OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+    if (process.env.OPENAI_BASE_URL) env.OPENAI_BASE_URL = process.env.OPENAI_BASE_URL;
+    if (hooksActive) {
+      env.FORGEAX_SERVER_URL = `http://127.0.0.1:${process.env.FORGEAX_SERVER_PORT ?? '18900'}`;
+      env.FORGEAX_SID = req.hostSessionId?.trim() || req.session.threadId?.trim() || '';
+      env.FORGEAX_AGENT = req.session.agentId?.trim() || 'forge';
+      env.FORGEAX_KERNEL = 'codex';
+    }
+    const homeKey = codexHomeKey(req);
+    const releaseHome = await codexHomeMutex.acquire(homeKey);
+    let homeReleased = false;
+    const releaseHomeOnce = () => {
+      if (homeReleased) return;
+      homeReleased = true;
+      releaseHome();
+    };
+    let runtime: ForgeaxToolsRuntime | undefined;
+    try {
+      if (signal?.aborted) throw new Error('codex app-server admission cancelled');
+      runtime = await materializeForgeaxToolsRuntime(req, {
+        runtimeId: req.callId || req.hostSessionId || req.session.threadId || 'codex-appserver',
+      });
+      if (signal?.aborted) throw new Error('codex app-server admission cancelled');
+      if (runtime) Object.assign(env, runtime.env);
+      const globalArgs = buildCodexAppServerGlobalArgs(
+        hooksActive,
+        runtime ? buildCodexMcpOverrides(runtime) : [],
+      );
+      env.CODEX_HOME = await ensureCodexSessionHome(homeKey);
+      const fingerprint = this.appServerFingerprint(req, {
+        binary,
+        binaryVersion: await this.version(),
+        home: env.CODEX_HOME,
+        env,
+        hooksActive,
+      });
+      let candidateOwned = false;
+      const acquired = await CodexKernel.appServerPool.acquire(homeKey, fingerprint, async () => {
+        candidateOwned = true;
+        const client = new CodexAppServerClient({
+          binary,
+          cwd: projectRoot,
+          env,
+          globalArgs,
+          ...handlers,
+        });
+        try {
+          await client.ensureStarted();
+          return { client, cleanup: async () => { await runtime?.cleanup(); } };
+        } catch (error) {
+          // Spawn succeeded but initialize failed/timed out: the client has not
+          // entered the pool yet, so this callback is the only lifecycle owner.
+          await client.close();
+          throw error;
+        }
+      });
+      if (!candidateOwned) await runtime?.cleanup();
+      const logicalThreadId = req.session.threadId?.trim();
+      let nativeThreadInvalidated = false;
+      if (logicalThreadId && this.appThreadOwnerMap.has(logicalThreadId)
+        && this.appThreadOwnerMap.get(logicalThreadId) !== acquired.session.client) {
+        // A fingerprint change/crash replaced the process. Its in-memory
+        // thread id cannot be resumed in the new owner until Codex persisted a
+        // real turn, so discard both references and start a fresh exact thread.
+        this.appThreadIdMap.delete(logicalThreadId);
+        this.appThreadOwnerMap.delete(logicalThreadId);
+        // app-server was the authoritative owner once both mappings existed;
+        // an older exec id left from a migration must not become a fallback
+        // resume target after that owner disappears.
+        this.threadIdMap.delete(logicalThreadId);
+        nativeThreadInvalidated = true;
+      }
+      acquired.session.client.setTurnHandlers(handlers);
+      return {
+        homeKey,
+        home: env.CODEX_HOME,
+        ...acquired,
+        nativeThreadInvalidated,
+        releaseHome: releaseHomeOnce,
+      };
+    } catch (error) {
+      await runtime?.cleanup();
+      releaseHomeOnce();
+      throw error;
+    }
+  }
+
+  /**
+   * Start Codex's persistent control plane without a hidden model prompt. The
+   * real turn will reuse it only if the complete MCP/permission/config surface
+   * still has the same fingerprint.
+   */
+  async prewarm(req: TurnRequest): Promise<{ warmed: boolean; reused: boolean }> {
+    if (req.trustTier === 'imported') return { warmed: false, reused: false };
+    const tid = req.session.threadId?.trim();
+    // Prewarm never carries a host-history snapshot. If this logical session
+    // already belongs to exec, creating an app-server thread here would bind
+    // the next turn to an empty native conversation. Keep transport ownership
+    // with exec; a deliberate snapshot turn is the only safe migration point.
+    if (tid && this.threadIdMap.has(tid) && !this.appThreadIdMap.has(tid)) {
+      return { warmed: false, reused: false };
+    }
+    const owned = await this.acquireAppServer(req, {
+      onNotification: () => { /* no turn exists during warm-up */ },
+      onServerRequest: () => { throw new Error('codex prewarm received a server request without an active turn'); },
+      onExit: () => { /* the next acquire observes alive=false and replaces it */ },
+    });
+    try {
+      if (owned.nativeThreadInvalidated) {
+        // The current request was composed while the old native thread still
+        // existed. Prewarm has no history snapshot, so never create a blank
+        // replacement thread; both stale transport mappings were cleared by
+        // acquire and the next real compose will emit a snapshot.
+        return { warmed: false, reused: owned.reused };
+      }
+      if (tid && !this.appThreadIdMap.has(tid)) {
+        const permission = toCodexAppServerPermission(req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE);
+        const started = await this.startAppServerThread(owned.session.client, req, permission, owned.home);
+        const requiredFxtUnavailable = req.tools.length > 0
+          && [...started.readiness.pending, ...started.readiness.failed].includes(CODEX_MCP_SERVER_KEY);
+        if (started.threadId && !requiredFxtUnavailable) {
+          this.appThreadIdMap.set(tid, started.threadId);
+          this.appThreadOwnerMap.set(tid, owned.session.client);
+        }
+        if (!started.readiness.ready) {
+          // A warm endpoint must not claim success while a configured local
+          // capability is still absent. Keep the process/thread alive so a
+          // late server may recover naturally before the user's real turn.
+          return { warmed: false, reused: owned.reused };
+        }
+      }
+      if (tid && this.appThreadIdMap.has(tid)) {
+        // A valid app-server thread is now the sole native-history owner.
+        this.threadIdMap.delete(tid);
+      }
+      return { warmed: true, reused: owned.reused };
+    } finally {
+      CodexKernel.appServerPool.release(owned.homeKey, owned.session);
+      owned.releaseHome();
+    }
+  }
+
+  private async startAppServerThread(
+    client: CodexAppServerClient,
+    req: TurnRequest,
+    permission: ReturnType<typeof toCodexAppServerPermission>,
+    home: string,
+    signal?: AbortSignal,
+  ): Promise<{ threadId?: string; readiness: { ready: boolean; pending: string[]; failed: string[] } }> {
+    if (signal?.aborted) {
+      return { readiness: { ready: false, pending: [], failed: ['cancelled'] } };
+    }
+    const sp = req.systemPrompt;
+    const developerInstructions = sp.persona?.trim()
+      ? `${sp.charter}\n\n---\n\n## Persona\n\n${sp.persona.trim()}`
+      : sp.charter;
+    const model = req.model?.trim() || undefined;
+    const res = await client.request('thread/start', {
+      cwd: defaultProjectRoot(),
+      sandbox: permission.sandbox,
+      approvalPolicy: permission.approvalPolicy,
+      ...(developerInstructions?.trim() ? { developerInstructions } : {}),
+      ...(model ? { model } : {}),
+      ephemeral: false,
+    });
+    const threadId = res?.thread?.id;
+    if (!threadId) return { readiness: { ready: false, pending: ['thread/start'], failed: [] } };
+    if (signal?.aborted) {
+      return { threadId, readiness: { ready: false, pending: [], failed: ['cancelled'] } };
+    }
+    let readiness: { ready: boolean; pending: string[]; failed: string[] };
+    try {
+      readiness = await client.waitForThreadMcpServers(
+        threadId,
+        [...codexSessionNativeStdioMcpNames(home), ...(req.tools.length ? [CODEX_MCP_SERVER_KEY] : [])],
+        { signal },
+      );
+    } catch (error) {
+      if (!signal?.aborted) throw error;
+      readiness = { ready: false, pending: [], failed: ['cancelled'] };
+    }
+    if (!readiness.ready) {
+      // eslint-disable-next-line no-console
+      console.warn(`[codex] thread MCP warm-up incomplete; continuing with optional servers pending=[${readiness.pending.join(', ')}] failed=[${readiness.failed.join(', ')}]`);
+    }
+    return { threadId, readiness };
+  }
+
   /**
    * 一轮:**PRIMARY = app-server(有 per-tool 审批)**,起不来则回退到 **exec(无审批)**。
    *  - app-server 仅对 **非 imported** trust 启用 —— imported pack 走 exec 路径以保留凭据地板
@@ -209,6 +474,13 @@ export class CodexKernel implements AgentKernel {
    *  - fallback 必须在 yield 任何事件**之前**判定(AppServerUnavailable 在 ensureStarted 抛),
    *    否则会半截重跑。 */
   async *runTurn(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {
+    // Cancellation is a terminal user decision. It must win before binary,
+    // session-home, MCP materialization, pool admission or fallback work.
+    if (signal.aborted) {
+      yield { kind: 'turn.usage' };
+      yield { kind: 'turn.done', reason: 'cancelled' };
+      return;
+    }
     // 版本能力闸(plan §5.5):有工具轮但 codex 版本低于底线 → 明确失败,不静默丢工具。
     // 空工具轮任何版本放行。两条执行路径统一在此判定,fallback 也不会绕过。
     const hasTools = (req.tools?.length ?? 0) > 0;
@@ -225,21 +497,41 @@ export class CodexKernel implements AgentKernel {
     }
 
     if (req.trustTier !== 'imported') {
+      const tid = req.session.threadId?.trim();
+      const historyMode = (req as TurnRequest & { historyPlan?: { mode?: string } }).historyPlan?.mode;
+      const hadAppResume = Boolean(tid && this.appThreadIdMap.has(tid));
+      // Native thread identifiers are transport-specific. If this logical
+      // session already belongs to legacy exec and the composer emitted only
+      // a delta, switching to app-server would create a blank native thread
+      // and silently omit the earlier conversation. Keep the established
+      // transport until a snapshot can deliberately establish app-server.
+      if (historyMode !== 'snapshot' && tid && this.threadIdMap.has(tid) && !this.appThreadIdMap.has(tid)) {
+        yield* this.runTurnExec(req, signal);
+        return;
+      }
       try {
         yield* this.runTurnAppServer(req, signal);
         return;
       } catch (e) {
         if (!(e instanceof AppServerUnavailable)) throw e;
-        const tid = req.session.threadId?.trim();
         // App-server and exec keep different native thread identifiers. A
-        // delta prepared for an app-server thread must never be sent through a
-        // fresh exec chat; clear the stale resume reference and require the
-        // caller to retry, which composes a snapshot.
-        const historyMode = (req as TurnRequest & { historyPlan?: { mode?: string } }).historyPlan?.mode;
-        if (historyMode === 'delta' && tid && !this.threadIdMap.has(tid)) {
+        // non-snapshot request prepared for an app-server owner must never be
+        // sent through exec. Clear every stale owner and require a new compose,
+        // which now emits a complete snapshot.
+        const missingDeltaOwner = historyMode === 'delta' && tid && !this.threadIdMap.has(tid);
+        if (tid && ((historyMode !== 'snapshot' && hadAppResume) || missingDeltaOwner)) {
           this.appThreadIdMap.delete(tid);
+          this.appThreadOwnerMap.delete(tid);
+          this.threadIdMap.delete(tid);
           yield* historyResumeFailure('codex native session is unavailable; retry to synchronize a fresh history snapshot');
           return;
+        }
+        // A snapshot can safely rebuild on exec, but it must start a fresh exec
+        // thread. Resuming an older exec id would inject the full history twice.
+        if (historyMode === 'snapshot' && tid) {
+          this.appThreadIdMap.delete(tid);
+          this.appThreadOwnerMap.delete(tid);
+          this.threadIdMap.delete(tid);
         }
         // app-server transport 起不来 → 回退 exec。fallback **必须携带同一套 MCP 工具**
         // (exec 路径会重新 materialize runtime),禁止退化成「无工具继续回答」(plan §6.2)。
@@ -259,58 +551,14 @@ export class CodexKernel implements AgentKernel {
     else signal.addEventListener('abort', () => ac.abort(), { once: true });
     if (req.callId) CodexKernel.inflight.set(req.callId, ac);
 
-    const binary = await this.binary();
-    const projectRoot = defaultProjectRoot();
-    // settings.permissions 拦截面(046 楔子3):工作区静态 hooks.json(PreToolUse 全量
-    // 拦截,补 approval 只覆盖「codex 主动问」的缺口)。app-server 是 per-turn 进程
-    // (finally shutdown)→ FORGEAX_* 上下文经 env 注入安全,hook 脚本据此回调
-    // /:sid/hook-gate。用户自跑 codex 无 FORGEAX env → hook 零干预。
-    const hooksActive = ensureCodexHooksConfig(projectRoot);
-    const env: Record<string, string> = {};
-    if (process.env.OPENAI_API_KEY) env.OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    if (process.env.OPENAI_BASE_URL) env.OPENAI_BASE_URL = process.env.OPENAI_BASE_URL;
-    if (hooksActive) {
-      env.FORGEAX_SERVER_URL = `http://127.0.0.1:${process.env.FORGEAX_SERVER_PORT ?? '18900'}`;
-      env.FORGEAX_SID = req.hostSessionId?.trim() || req.session.threadId?.trim() || '';
-      env.FORGEAX_AGENT = req.session.agentId?.trim() || 'forge';
-      env.FORGEAX_KERNEL = 'codex';
-    }
-
-    // fxt MCP runtime(本轮工具)。materialize 失败 = fail-closed(plan §6.3),不回退 exec
-    // (exec 也会同样失败),直接结构化报错收尾。runtime.env(FORGEAX_* + specs + expose)
-    // 合并进 codex 进程 env → codex 起的 MCP 子进程继承(secrets/context 走 env 不走 argv)。
-    let runtime: ForgeaxToolsRuntime | undefined;
-    if ((req.tools?.length ?? 0) > 0) {
-      try {
-        runtime = await materializeForgeaxToolsRuntime(req, {
-          runtimeId: req.callId || req.hostSessionId || req.session.threadId || 'codex-appserver',
-        });
-      } catch (e) {
-        if (req.callId) CodexKernel.inflight.delete(req.callId);
-        yield* codexMcpFailure(`codex_mcp_materialize_failed: ${(e as Error).message}`);
-        return;
-      }
-    }
-    if (runtime) Object.assign(env, runtime.env);
-    const mcpOverrides = runtime ? buildCodexMcpOverrides(runtime) : [];
-    const globalArgs = buildCodexAppServerGlobalArgs(hooksActive, mcpOverrides);
-
-    // 稳定隔离 CODEX_HOME + keyed mutex(plan §8):同一逻辑 session 跨 turn 复用目录
-    // (thread resume 不丢),同 home 串行(防 SQLite lock / session 损坏)。
-    const homeKey = codexHomeKey(req);
-    const releaseHome = await codexHomeMutex.acquire(homeKey);
-    let homeReleased = false;
-    const releaseHomeOnce = () => { if (!homeReleased) { homeReleased = true; releaseHome(); } };
-    try {
-      env.CODEX_HOME = await ensureCodexSessionHome(homeKey);
-    } catch (e) {
-      releaseHomeOnce();
-      await runtime?.cleanup();
+    if (ac.signal.aborted) {
       if (req.callId) CodexKernel.inflight.delete(req.callId);
-      yield* codexMcpFailure(`codex_mcp_start_failed: session home unavailable: ${(e as Error).message}`);
+      yield { kind: 'turn.usage' };
+      yield { kind: 'turn.done', reason: 'cancelled' };
       return;
     }
 
+    const projectRoot = defaultProjectRoot();
     const queue = new KernelEventQueue();
     const notifState = createCodexNotifState();
     const permissionMode = req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE;
@@ -351,13 +599,7 @@ export class CodexKernel implements AgentKernel {
       return cls.v1 ? { decision: allow ? 'approved' : 'denied' } : { decision: allow ? 'accept' : 'decline' };
     };
 
-    const client = new CodexAppServerClient({
-      binary,
-      cwd: projectRoot,
-      env,
-      // globalArgs 注入在 `app-server` 子命令之前：默认关闭 Codex 原生多 Agent；
-      // hooksActive → --dangerously-bypass-hook-trust；有工具轮 → 注册本轮 fxt MCP。
-      globalArgs,
+    const handlers: Pick<CodexAppServerOptions, 'onServerRequest' | 'onNotification' | 'onExit'> = {
       onNotification: (m, params) => mapCodexNotification(m, params, notifState, queue),
       onServerRequest: handleServerRequest,
       onExit: (code, tail) => {
@@ -369,9 +611,18 @@ export class CodexKernel implements AgentKernel {
         }
         queue.end();
       },
-    });
+    };
 
+    let activeClient: CodexAppServerClient | undefined;
+    let activeCodexThreadId: string | undefined;
+    let activeCodexTurnId: string | undefined;
     const onAbort = () => {
+      if (activeClient && activeCodexThreadId && activeCodexTurnId) {
+        void activeClient.request('turn/interrupt', {
+          threadId: activeCodexThreadId,
+          turnId: activeCodexTurnId,
+        }, 5_000).catch(() => undefined);
+      }
       if (!notifState.ended) {
         queue.push({ kind: 'turn.done', reason: 'cancelled' });
         notifState.ended = true;
@@ -381,64 +632,68 @@ export class CodexKernel implements AgentKernel {
     if (ac.signal.aborted) onAbort();
     else ac.signal.addEventListener('abort', onAbort, { once: true });
 
-    // 起不来 → 抛 AppServerUnavailable(在 yield 任何事件前),让 runTurn 回退 exec。
-    // 回退前必须释放 home mutex 且清理本轮 runtime——exec fallback 会重新 acquire + materialize
-    // (携带同一套 MCP 工具),不能持锁/漏临时文件。
+    let pooled: Awaited<ReturnType<CodexKernel['acquireAppServer']>>;
     try {
-      await client.ensureStarted();
+      pooled = await this.acquireAppServer(req, handlers, ac.signal);
     } catch (e) {
       ac.signal.removeEventListener('abort', onAbort);
-      client.shutdown();
-      releaseHomeOnce();
-      await runtime?.cleanup();
       if (req.callId) CodexKernel.inflight.delete(req.callId);
+      if (ac.signal.aborted) {
+        yield { kind: 'turn.usage' };
+        yield { kind: 'turn.done', reason: 'cancelled' };
+        return;
+      }
       throw new AppServerUnavailable((e as Error).message);
     }
+    const client = pooled.session.client;
+    activeClient = client;
     this.options.onTransportSelected?.('app-server');
 
+    let reusable = false;
     try {
+      // The signal may have fired while queued on the session-home mutex. Stop
+      // before any thread/user RPC; the healthy warm process remains reusable.
+      if (ac.signal.aborted) {
+        yield { kind: 'turn.usage' };
+        yield { kind: 'turn.done', reason: 'cancelled' };
+        return;
+      }
       const tid = req.session.threadId?.trim();
+      const historyMode = (req as TurnRequest & { historyPlan?: { mode?: string } }).historyPlan?.mode;
+      if (pooled.nativeThreadInvalidated && historyMode !== 'snapshot') {
+        // The request has no complete history snapshot. A replacement process
+        // cannot rebuild the old native conversation from delta/none/undefined.
+        yield* historyResumeFailure('codex native process changed; retry to synchronize a fresh history snapshot');
+        return;
+      }
       let codexThreadId = tid ? this.appThreadIdMap.get(tid) : undefined;
-      const startFresh = async (): Promise<string | undefined> => {
-        // systemPrompt(charter+persona)由编排层 composeTurnRequest 提供;app-server
-        // 经 thread 的 developerInstructions 注入(不碰仓内 AGENTS.md)。模型同 exec:
-        // 经中立 TurnRequest.model 透传,不再走 CODEX_MODEL env 特例。
-        const sp = req.systemPrompt;
-        const developerInstructions = sp.persona?.trim()
-          ? `${sp.charter}\n\n---\n\n## Persona\n\n${sp.persona.trim()}`
-          : sp.charter;
-        const model = req.model?.trim() || undefined;
-        const res = await client.request('thread/start', {
-          cwd: projectRoot,
-          sandbox: appServerPermission.sandbox,
-          approvalPolicy: appServerPermission.approvalPolicy,
-          ...(developerInstructions?.trim() ? { developerInstructions } : {}),
-          ...(model ? { model } : {}),
-          ephemeral: false,
-        });
-        return res?.thread?.id;
+      const startFresh = async () => {
+        // systemPrompt/model/permission and MCP readiness use the exact same
+        // path as prewarm; no hidden prompt is sent in either case.
+        return this.startAppServerThread(client, req, appServerPermission, pooled.home, ac.signal);
       };
 
       if (codexThreadId) {
-        try {
-          await client.request('thread/resume', { threadId: codexThreadId });
-        } catch {
-          if (tid) this.appThreadIdMap.delete(tid);
-          yield* historyResumeFailure('codex native session resume failed; retry to synchronize a fresh history snapshot');
-          return;
+        if (!tid || this.appThreadOwnerMap.get(tid) !== client) {
+          try {
+            await client.request('thread/resume', { threadId: codexThreadId });
+          } catch {
+            if (tid) {
+              this.appThreadIdMap.delete(tid);
+              this.appThreadOwnerMap.delete(tid);
+            }
+            yield* historyResumeFailure('codex native session resume failed; retry to synchronize a fresh history snapshot');
+            return;
+          }
         }
       } else {
-        codexThreadId = await startFresh();
+        const started = await startFresh();
+        codexThreadId = started.threadId;
       }
-      if (codexThreadId && tid && !this.appThreadIdMap.has(tid)) {
-        this.appThreadIdMap.set(tid, codexThreadId);
-        yield {
-          kind: 'x.kernel.thread',
-          kernelId: 'codex',
-          threadId: tid,
-          kernelThreadId: codexThreadId,
-          transport: 'app-server',
-        };
+      if (ac.signal.aborted) {
+        yield { kind: 'turn.usage' };
+        yield { kind: 'turn.done', reason: 'cancelled' };
+        return;
       }
       if (!codexThreadId) {
         yield { kind: 'turn.usage' };
@@ -447,7 +702,58 @@ export class CodexKernel implements AgentKernel {
         return;
       }
 
-      await client.request('turn/start', {
+      // Required ForgeaX tools are an admission condition on every tool turn,
+      // including a reused native thread. A previous warm/turn may have seen
+      // fxt ready and a later startup retry may have failed or been cancelled;
+      // never submit a tool-less model turn from that stale thread.
+      if (req.tools.length > 0) {
+        let readiness: { ready: boolean; pending: string[]; failed: string[] };
+        try {
+          readiness = await client.waitForThreadMcpServers(
+            codexThreadId,
+            [CODEX_MCP_SERVER_KEY],
+            { signal: ac.signal },
+          );
+        } catch (error) {
+          if (!ac.signal.aborted) throw error;
+          yield { kind: 'turn.usage' };
+          yield { kind: 'turn.done', reason: 'cancelled' };
+          return;
+        }
+        if (!readiness.ready) {
+          yield* codexMcpFailure('codex_mcp_unavailable: required fxt server did not become ready; retry without losing tool capability');
+          return;
+        }
+      }
+      if (ac.signal.aborted) {
+        yield { kind: 'turn.usage' };
+        yield { kind: 'turn.done', reason: 'cancelled' };
+        return;
+      }
+      if (tid && !this.appThreadIdMap.has(tid)) {
+        this.appThreadIdMap.set(tid, codexThreadId);
+        this.appThreadOwnerMap.set(tid, client);
+        // Successful snapshot migration establishes one authoritative native
+        // owner. Never leave the pre-migration exec id available for fallback.
+        this.threadIdMap.delete(tid);
+        yield {
+          kind: 'x.kernel.thread',
+          kernelId: 'codex',
+          threadId: tid,
+          kernelThreadId: codexThreadId,
+          transport: 'app-server',
+        };
+      }
+
+      // Final admission boundary: no user message or tool side effect may be
+      // submitted after cancellation while thread start/resume/readiness was
+      // awaiting native work.
+      if (ac.signal.aborted) {
+        yield { kind: 'turn.usage' };
+        yield { kind: 'turn.done', reason: 'cancelled' };
+        return;
+      }
+      const turnStart = await client.request('turn/start', {
         threadId: codexThreadId,
         sandboxPolicy: { type: appServerPermission.sandbox === 'danger-full-access'
           ? 'dangerFullAccess'
@@ -455,16 +761,37 @@ export class CodexKernel implements AgentKernel {
         approvalPolicy: appServerPermission.approvalPolicy,
         input: buildCodexAppServerTurnInput(req),
       });
+      const codexTurnId = turnStart?.turn?.id ?? turnStart?.id;
+      activeCodexThreadId = codexThreadId;
+      activeCodexTurnId = codexTurnId;
+      if (ac.signal.aborted && codexTurnId) {
+        await client.request('turn/interrupt', { threadId: codexThreadId, turnId: codexTurnId }, 5_000).catch(() => undefined);
+      }
 
       for await (const ev of queue) {
+        // SSE and similar consumers close their iterator immediately after the
+        // terminal event. Record successful ownership before yielding it, or
+        // generator.return() jumps straight to finally and evicts a healthy
+        // process merely because the consumer obeyed the terminal contract.
+        if (ev.kind === 'turn.done') reusable = client.alive && !ac.signal.aborted;
         yield ev;
         if (ev.kind === 'turn.done') break;
       }
+      reusable = client.alive && !ac.signal.aborted;
     } finally {
       ac.signal.removeEventListener('abort', onAbort);
-      client.shutdown();
-      await runtime?.cleanup();
-      releaseHomeOnce();
+      if (reusable) {
+        // Do not retain callbacks that close over a completed turn while idle.
+        client.setTurnHandlers({
+          onNotification: () => { /* no active turn */ },
+          onServerRequest: () => { throw new Error('codex app-server request arrived without an active turn'); },
+          onExit: () => { /* the next acquire observes alive=false */ },
+        });
+        CodexKernel.appServerPool.release(pooled.homeKey, pooled.session);
+      } else {
+        await CodexKernel.appServerPool.evict(pooled.homeKey, pooled.session);
+      }
+      pooled.releaseHome();
       if (req.callId) CodexKernel.inflight.delete(req.callId);
     }
   }
@@ -506,7 +833,13 @@ export class CodexKernel implements AgentKernel {
       // (exec resume 不丢),同 home 串行。
       const homeKey = codexHomeKey(req);
       releaseHome = await codexHomeMutex.acquire(homeKey);
-      const codexHome = await ensureCodexSessionHome(homeKey);
+      // A legacy exec process must never overlap the warm app-server for the
+      // same CODEX_HOME. Finish the ownership handoff before spawning exec.
+      await CodexKernel.appServerPool.evict(homeKey);
+      this.appThreadIdMap.delete(req.session.threadId?.trim() || '');
+      const codexHome = await ensureCodexSessionHome(homeKey, {
+        nativeCapabilities: req.trustTier !== 'imported',
+      });
 
       // 凭据地板:imported → scrub。sidecar 路径(FORGEAX_SIDECAR=on)凭据由 sidecar cred-vault
       // 发 scoped token,本进程不跑 in-process cred-proxy 且剔真 key;非 sidecar 用 server 进程内代理。

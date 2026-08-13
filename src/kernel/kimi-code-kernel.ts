@@ -24,6 +24,7 @@ import {
   loadSettingsPermissionRules,
   ruleLabel,
 } from '../api/lib/permission-settings';
+import { checkKernelTool } from './trust-gate';
 import { RENTED_KERNEL_PROFILE } from './kernel-profile';
 import { KimiAcpAuthRequiredError, KimiAcpClient } from './kimi-acp-client';
 import { mapKimiAcpPromptResponse } from './kimi-acp-mapper';
@@ -31,7 +32,12 @@ import {
   materializeForgeaxToolsRuntime,
   type ForgeaxToolsRuntime,
 } from './mcp/forgeax-tools-runtime';
-import { readProjectMcpServers } from './project-mcp';
+import {
+  acquireProjectMcpNativeLease,
+  isProjectMcpToolName,
+  readProjectMcpServers,
+  type ProjectMcpNativeLease,
+} from './project-mcp';
 
 export const KIMI_CODE_DRIVER_LABEL = 'kimi-code · subscription runtime · no local cost';
 export const KIMI_CODE_FALLBACK_MODELS = [
@@ -209,9 +215,11 @@ export class KimiCodeKernel implements AgentKernel {
     const threadId = req.session.threadId?.trim();
     const previousSessionId = threadId ? this.threadToSession.get(threadId) : undefined;
     let runtime: ForgeaxToolsRuntime | undefined;
+    let nativeLease: ProjectMcpNativeLease | undefined;
     const events: KernelEvent[] = [];
     let wake: (() => void) | null = null;
     let ended = false;
+    let assistantOutputSeen = false;
     // Kimi's native ACP permission callback does not observe calls made by the
     // per-turn fxt MCP server. Resolve the supported posture before mounting
     // that server and carry it through its environment as a fail-closed gate.
@@ -227,6 +235,12 @@ export class KimiCodeKernel implements AgentKernel {
       );
     }
     const push = (event: KernelEvent) => {
+      if (
+        event.kind === 'message.delta'
+        || event.kind === 'thinking.delta'
+        || event.kind === 'tool.call'
+        || event.kind === 'tool.result'
+      ) assistantOutputSeen = true;
       events.push(event);
       if (wake) {
         const current = wake;
@@ -240,6 +254,7 @@ export class KimiCodeKernel implements AgentKernel {
         runtime = await materializeForgeaxToolsRuntime(req, {
           runtimeId: req.callId || req.hostSessionId || threadId || 'kimi-code',
           permissionMode: permissionMode === 'gated' ? 'gated' : 'unrestricted',
+          projectMcpMode: req.trustTier === 'imported' ? 'host' : 'native',
         });
       }
     } catch (error) {
@@ -249,6 +264,31 @@ export class KimiCodeKernel implements AgentKernel {
 
     const permissionRules = loadSettingsPermissionRules(projectRoot);
     const onPermission = async (call: PermissionCall): Promise<PermissionDecision> => {
+      // Native project MCP calls do not pass through /kernel-tool. Apply the
+      // same trust-tier gate here so own credential/delete tools still ask and
+      // settings/tier denies remain effective without disabling native MCP.
+      const nativeProjectTool = req.trustTier !== 'imported'
+        && isProjectMcpToolName(call.name, projectRoot);
+      if (nativeProjectTool) {
+        const decision = checkKernelTool(req.trustTier, call.name, {
+          args: call.args,
+          projectRoot,
+          ...(req.hostSessionId ? { sid: req.hostSessionId } : {}),
+          rules: permissionRules,
+        });
+        if (decision.outcome === 'deny') return { behavior: 'deny', message: decision.reason ?? 'denied by trust tier' };
+        if (decision.outcome === 'ask') {
+          return req.requestPermission
+            ? req.requestPermission(call)
+            : { behavior: 'deny', message: decision.reason ?? 'permission requires confirmation' };
+        }
+        if (permissionMode === 'gated') {
+          return req.requestPermission
+            ? req.requestPermission(call)
+            : { behavior: 'deny', message: 'permission requires confirmation, but no prompt is available' };
+        }
+        return { behavior: 'allow' };
+      }
       const verdict = evaluateSettingsRules(permissionRules, call.name, call.args);
       const plan = planKimiPermission(verdict?.behavior, permissionMode, !!req.requestPermission);
       if (plan === 'deny-by-rule') {
@@ -290,13 +330,18 @@ export class KimiCodeKernel implements AgentKernel {
     else signal.addEventListener('abort', onAbort, { once: true });
 
     try {
+      if (req.trustTier !== 'imported' && readProjectMcpServers(projectRoot).length > 0) {
+        nativeLease = await acquireProjectMcpNativeLease(projectRoot);
+      }
       // Keep fxt for the host bridge and mount project-local stdio servers as
       // native ACP MCP servers as well. Kimi's ACP implementation does not
       // reliably surface tools proxied behind another MCP server in its tool
       // catalog, so the project server must be visible at the ACP boundary.
       const mcpServers = [
         ...(runtime ? [toMcpServer(runtime)] : []),
-        ...toProjectMcpServers(projectRoot, (req.tools ?? []).map(({ name }) => name)),
+        ...(req.trustTier === 'imported'
+          ? []
+          : toProjectMcpServers(projectRoot, (req.tools ?? []).map(({ name }) => name))),
       ];
       let setup;
       try {
@@ -317,7 +362,26 @@ export class KimiCodeKernel implements AgentKernel {
       const responsePromise = client.prompt(promptText(req, previousSessionId === undefined));
       responsePromise.then(
         (response) => {
-          for (const event of mapKimiAcpPromptResponse(response)) push(event);
+          const mapped = mapKimiAcpPromptResponse(response);
+          if (!assistantOutputSeen && response.stopReason === 'end_turn') {
+            // A configured Kimi ACP session should emit at least one assistant
+            // or tool event. The installed CLI currently exits cleanly with an
+            // empty response when its provider catalog is empty; surfacing that
+            // as success makes the Studio look like it received a blank answer.
+            for (const event of mapped) {
+              if (event.kind === 'turn.usage') push(event);
+            }
+            push({
+              kind: 'error',
+              error: {
+                code: 'protocol',
+                message: 'Kimi ACP returned no assistant content; configure a Kimi provider or run `kimi login`.',
+              },
+            });
+            push({ kind: 'turn.done', reason: 'error' });
+          } else {
+            for (const event of mapped) push(event);
+          }
           ended = true;
           if (wake) { const current = wake; wake = null; current(); }
         },
@@ -363,6 +427,7 @@ export class KimiCodeKernel implements AgentKernel {
       client.shutdown();
       if (req.callId) KimiCodeKernel.inflight.delete(req.callId);
       await runtime?.cleanup();
+      await nativeLease?.release();
     }
   }
 
@@ -389,8 +454,7 @@ export class KimiCodeKernel implements AgentKernel {
       captureStderr: true,
     });
     const detail = (stdout || stderr).trim().split('\n')[0] ?? '';
-    if (code === 0) return { ok: true, kernelId: this.id, detail: detail || 'kimi ready' };
-    return {
+    if (code !== 0) return {
       ok: false,
       kernelId: this.id,
       detail: code == null
@@ -399,5 +463,40 @@ export class KimiCodeKernel implements AgentKernel {
           : 'kimi binary not on PATH (install: https://www.kimi.com/code/docs/kimi-code-cli/guides/getting-started.html)'
         : `kimi -h exit ${code}${detail ? `: ${detail}` : ''}`,
     };
+
+    // `kimi -h` only proves that the CLI is installed. An unconfigured
+    // installation can still start ACP and return an empty successful turn;
+    // require a non-empty provider/model catalog for an honest health result.
+    const catalog = await runCapture(binary, ['provider', 'list', '--json'], {
+      timeoutMs: 5000,
+      captureStderr: true,
+    });
+    if (catalog.code !== 0) {
+      const catalogDetail = (catalog.stderr || catalog.stdout).trim().split('\n')[0] ?? '';
+      return {
+        ok: false,
+        kernelId: this.id,
+        detail: `kimi provider catalog unavailable${catalogDetail ? `: ${catalogDetail}` : ''}`,
+      };
+    }
+    try {
+      const raw = JSON.parse(catalog.stdout) as { providers?: unknown; models?: unknown };
+      const providers = raw.providers && typeof raw.providers === 'object' && !Array.isArray(raw.providers)
+        ? Object.keys(raw.providers)
+        : [];
+      const models = raw.models && typeof raw.models === 'object' && !Array.isArray(raw.models)
+        ? Object.keys(raw.models)
+        : [];
+      if (providers.length === 0 && models.length === 0) {
+        return {
+          ok: false,
+          kernelId: this.id,
+          detail: 'kimi provider catalog is empty; configure a provider or run `kimi login`',
+        };
+      }
+    } catch {
+      return { ok: false, kernelId: this.id, detail: 'kimi provider list --json returned invalid JSON' };
+    }
+    return { ok: true, kernelId: this.id, detail: detail || 'kimi ready' };
   }
 }

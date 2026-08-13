@@ -57,6 +57,8 @@ import { clampMode } from './permission-config';
 import { buildCursorHomeWithoutUserMcp, disposeCursorHome } from './cursor-home';
 import { materializeForgeaxToolsRuntime, type ForgeaxToolsRuntime } from './mcp/forgeax-tools-runtime';
 import { materializeCursorToolsWorkspace, type CursorToolsWorkspace } from './cursor-tools-workspace';
+import { acquireProjectMcpNativeLease, hasProjectMcpServers, type ProjectMcpNativeLease } from './project-mcp';
+import { tt } from '../lib/turn-trace';
 
 export class CursorKernel implements AgentKernel {
   // id MUST match the UI's providerOverride for cursor (interface uses
@@ -104,6 +106,8 @@ export class CursorKernel implements AgentKernel {
   }
 
   async *runTurn(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {
+    const startedAt = Date.now();
+    tt('cursor.stage', { stage: 'run-start' });
     const ac = new AbortController();
     if (signal.aborted) ac.abort();
     else signal.addEventListener('abort', () => ac.abort(), { once: true });
@@ -114,36 +118,44 @@ export class CursorKernel implements AgentKernel {
     // 放在 finally,确保即使 turn 中途出错、只要已收到 system.init 也能续接。
     const tid = req.session.threadId?.trim();
     const state = createCursorMapperState();
-    // 加速(opt-in,默认关):仅当 FORGEAX_CURSOR_ISOLATE_MCP=1 时,用镜像 HOME 屏蔽用户个人
-    // 全局 `~/.cursor/mcp.json`(那些远程 MCP server 每轮握手 ~5s,与游戏开发无关)。默认/失败/
-    // Windows 返回 undefined → 退回真实 HOME(原有逻辑不变)。turn 结束 finally 清理。
+    // 默认保留用户 Cursor HOME 和原生 MCP；只有托管环境显式开启
+    // FORGEAX_CURSOR_ISOLATE_MCP=1 时才使用镜像 HOME。失败/Windows 仍优雅降级。
     let isoHome: string | undefined;
     let toolsRuntime: ForgeaxToolsRuntime | undefined;
     let toolsWorkspace: CursorToolsWorkspace | undefined;
+    let nativeLease: ProjectMcpNativeLease | undefined;
     try {
       const binary = await this.binary();
+      tt('cursor.stage', { stage: 'binary', ms: Date.now() - startedAt });
       const projectRoot = defaultProjectRoot();
+      if (req.trustTier !== 'imported' && hasProjectMcpServers(projectRoot)) {
+        nativeLease = await acquireProjectMcpNativeLease(projectRoot);
+      }
       // Cursor reads MCP servers only from `<workspace>/.cursor/mcp.json` and
       // cannot receive a dynamic config flag. Materialize an isolated workspace
       // for this exact turn instead of rewriting the user's project config.
       if ((req.tools?.length ?? 0) > 0) {
         toolsRuntime = await materializeForgeaxToolsRuntime(req, {
           runtimeId: req.callId || req.hostSessionId || tid || 'cursor',
+          projectMcpMode: req.trustTier === 'imported' ? 'host' : 'native',
         });
         if (!toolsRuntime) throw new Error('cursor tools turn did not materialize fxt runtime');
         toolsWorkspace = await materializeCursorToolsWorkspace(
           toolsRuntime,
           projectRoot,
           (req.tools ?? []).map(({ name }) => name),
+          { includeNativeProjectMcp: req.trustTier !== 'imported' },
         );
       }
       const executionRoot = toolsWorkspace?.root ?? projectRoot;
       isoHome = buildCursorHomeWithoutUserMcp();
+      tt('cursor.stage', { stage: 'cursor-home', isolated: Boolean(isoHome), ms: Date.now() - startedAt });
 
       // settings.permissions 拦截面(046 楔子3 = task 2e):工作区静态 .cursor/hooks.json
       // (beforeShellExecution/beforeMCPExecution → forgeax /:sid/hook-gate)。上下文经
       // per-turn spawn env 注入;用户自跑 cursor 无 FORGEAX env → hook 零干预。
       const hooksActive = ensureCursorHooksConfig(executionRoot);
+      tt('cursor.stage', { stage: 'hooks', active: hooksActive, ms: Date.now() - startedAt });
       const forgeaxHookEnv: Record<string, string> = hooksActive
         ? {
             FORGEAX_SERVER_URL: `http://127.0.0.1:${process.env.FORGEAX_SERVER_PORT ?? '18900'}`,
@@ -192,6 +204,7 @@ export class CursorKernel implements AgentKernel {
         toolsWorkspace ? { root: toolsWorkspace.root, projectRoot } : undefined,
         clamped.mode,
       );
+      tt('cursor.stage', { stage: 'args', args: args.length, promptBytes: Buffer.byteLength(message), ms: Date.now() - startedAt });
       const { lines, exit } = spawnJsonl<CursorRawEvent>({
         cmd: binary,
         args,
@@ -201,9 +214,15 @@ export class CursorKernel implements AgentKernel {
         stdin: message,
         ...(envOverride ? { envOverride } : {}),
       });
+      tt('cursor.stage', { stage: 'spawn-ready', ms: Date.now() - startedAt });
 
       try {
+        let rawFirst = false;
         for await (const raw of lines) {
+          if (!rawFirst) {
+            rawFirst = true;
+            tt('cursor.raw-first', { ms: Date.now() - startedAt });
+          }
           for (const ev of mapCursorEvent(raw, state)) yield ev;
         }
       } catch (streamErr) {
@@ -220,6 +239,7 @@ export class CursorKernel implements AgentKernel {
       }
 
       const exitInfo = await exit;
+      tt('cursor.stage', { stage: 'exit', code: exitInfo.code, ms: Date.now() - startedAt });
       // 兜底:进程退出但 mapper 从未发过终态。
       if (!state.doneEmitted) {
         if (exitInfo.code !== 0) {
@@ -245,6 +265,7 @@ export class CursorKernel implements AgentKernel {
       disposeCursorHome(isoHome);
       await toolsWorkspace?.cleanup();
       await toolsRuntime?.cleanup();
+      await nativeLease?.release();
       if (req.callId) CursorKernel.inflight.delete(req.callId);
     }
   }

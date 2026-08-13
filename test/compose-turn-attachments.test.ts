@@ -60,6 +60,7 @@ describe('composeTurnRequest selected-kernel policy', () => {
     expect(req.input.attachments).toBeUndefined();
     expect(req.input.text).toContain('/uploads/shot.png');
     expect(JSON.stringify(req)).not.toContain('QUJD');
+    expect(req.tools?.some((tool) => tool.name === 'memory_search')).toBe(true);
   });
 
   for (const kernelId of ['claude-code', 'cursor-agent', 'codebuddy', 'kimi-code']) {
@@ -154,6 +155,30 @@ describe('composeTurnRequest selected-kernel policy', () => {
       expect.objectContaining({ role: 'assistant', content: 'I can add that next' }),
     ]));
     expect(reopened.ledgers.has('forge')).toBe(true);
+  });
+
+  test('prewarm composes the real capability surface without mutating turn history', async () => {
+    const session = await getSessionManager().create({ displayName: 'prewarm' });
+    transcribeKernelTurn(session, 'forge', {
+      message: 'previous user turn', asstText: 'previous answer', thinkingText: '',
+      stopReason: 'end_turn', toolEvents: [],
+    });
+    const ledger = session.getOrCreateLedger('forge');
+    const before = await ledger.readAllEvents();
+    const req = await composeTurnRequest({
+      message: '',
+      agentId: 'forge',
+      sessionId: session.sid,
+      threadId: 'prewarm-thread',
+      kernel: kernel('prewarm-rented', RENTED_KERNEL_PROFILE),
+      prewarm: true,
+    });
+
+    expect(req.hostSessionId).toBe(session.sid);
+    expect(req.tools?.length).toBeGreaterThan(0);
+    expect(req.history).toBeUndefined();
+    expect(req.historyPlan).toBeUndefined();
+    expect(await ledger.readAllEvents()).toEqual(before);
   });
 
   test('native history uses the live agent ledger without rediscovering its session singleton', async () => {

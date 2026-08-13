@@ -50,12 +50,17 @@ export interface CliBridgeOptions {
   agentPath: string;
   /** Model name surfaced in `hook:turnStart`. */
   model: string;
+  /** Host-owned user event and checkpoint foreign key for legacy providers. */
+  message?: string;
+  msgId?: string;
 }
 
 export class CliEventBridge {
   private session: Session;
   private agentPath: string;
   private model: string;
+  private message?: string;
+  private msgId?: string;
 
   /** Accumulator for `token` events — claude-code-mapper streams text by
    *  small chunks; we collapse into one `hook:assistantMessage` at done. */
@@ -67,11 +72,26 @@ export class CliEventBridge {
     this.session = opts.session;
     this.agentPath = opts.agentPath;
     this.model = opts.model;
+    this.message = opts.message;
+    this.msgId = opts.msgId;
   }
 
   start(): void {
     this.startedAt = Date.now();
     this.turnIndex++;
+    if (this.message) {
+      this.session.eventBus.publish(
+        {
+          type: 'user_input',
+          ts: this.startedAt,
+          source: 'user',
+          to: this.agentPath,
+          handoff: 'turn',
+          payload: { content: this.message, ...(this.msgId ? { msgId: this.msgId } : {}) },
+        },
+        this.agentPath,
+      );
+    }
     this.session.eventBus.publish(
       {
         type: 'hook:turnStart',

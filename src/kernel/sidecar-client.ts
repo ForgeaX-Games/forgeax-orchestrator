@@ -126,6 +126,9 @@ export class SidecarClient {
 
   ping(): Promise<PingResult> { return this.request('ping') as Promise<PingResult>; }
   startSession(req: StartSessionReq): Promise<SessionGrant> { return this.request('startSession', req) as Promise<SessionGrant>; }
+  write(sessionId: string, data: string): Promise<void> {
+    return this.request('write', { sessionId, data }).then(() => undefined);
+  }
   cancel(callId: string): Promise<void> { return this.request('cancel', { callId }) as Promise<void>; }
   shutdownSession(sessionId: string): Promise<void> { return this.request('shutdownSession', { sessionId }) as Promise<void>; }
   /** 请整个 sidecar 进程优雅退出(reap 所有 session + 关 socket + exit)。用于凭据变更后

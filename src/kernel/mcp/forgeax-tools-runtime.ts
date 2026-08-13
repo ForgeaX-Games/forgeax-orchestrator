@@ -31,6 +31,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { defaultProjectRoot } from '@forgeax/platform-io';
+import { isProjectMcpToolName } from '../project-mcp';
 
 /** Tools the `fxt` MCP server implements locally (not host-bridged). Kept in
  *  sync with `forgeax-tools-server.mjs`'s builtin `TOOLS` map. Exported as the
@@ -74,6 +75,12 @@ export interface MaterializeOptions {
   disablePerception?: boolean;
   /** Drop the ui_* bridge tools from the server. */
   disableUiBridge?: boolean;
+  /**
+   * Project MCP execution path. `host` keeps canonical project tools in the
+   * fxt specs so they cross the server trust gate; `native` leaves those tools
+   * to the provider's native MCP config and removes them from fxt entirely.
+   */
+  projectMcpMode?: 'host' | 'native';
 }
 
 const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
@@ -118,13 +125,16 @@ export async function materializeForgeaxToolsRuntime(
 
   // Specs file carries EVERY ToolSpec of the turn (name/description/inputSchema);
   // the MCP server dedupes names it already implements as builtins. Written 0600.
-  const specs = (req.tools ?? []).map((t) => ({
+  const projectRoot = defaultProjectRoot();
+  const specs = (req.tools ?? [])
+    .filter((t) => options.projectMcpMode !== 'native' || !isProjectMcpToolName(t.name, projectRoot))
+    .map((t) => ({
     name: t.name,
     ...(t.capabilityId ? { capabilityId: t.capabilityId } : {}),
     ...(t.capabilityGeneration !== undefined ? { capabilityGeneration: t.capabilityGeneration } : {}),
     description: t.description ?? '',
     inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
-  }));
+    }));
 
   const cleanup = async (): Promise<void> => {
     try {
@@ -145,7 +155,7 @@ export async function materializeForgeaxToolsRuntime(
   }
 
   const env: Record<string, string> = {
-    FORGEAX_PROJECT_ROOT: defaultProjectRoot(),
+    FORGEAX_PROJECT_ROOT: projectRoot,
     FORGEAX_SOUL_AGENT: req.session.agentId?.trim() || 'default',
     FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
     // Real sid the UI listens on wins; synthetic thread id is only a fallback.
@@ -158,6 +168,10 @@ export async function materializeForgeaxToolsRuntime(
     ...(req.capabilityGeneration !== undefined
       ? { FORGEAX_CAPABILITY_GENERATION: String(req.capabilityGeneration) }
       : {}),
+    // The fxt child is never allowed to start project-local MCP itself. In
+    // `host` mode its specs are routed through /kernel-tool; in `native` mode
+    // the provider config owns the only project MCP process.
+    FORGEAX_DISABLE_PROJECT_MCP: '1',
   };
   if (options.disablePerception) env.FORGEAX_DISABLE_PERCEPTION = '1';
   if (options.disableUiBridge) env.FORGEAX_DISABLE_UI_BRIDGE = '1';
