@@ -41,7 +41,6 @@ import { CliEventBridge } from "../../observatory/cli-event-bridge";
 import { denyPermissionsForSession } from "../../core/permission-registry";
 // M1 内核路径(FORGEAX_KERNEL=kernel):chat → 内核契约 → wire,前端零改。
 import { composeTurnRequest } from "../../kernel/compose-turn-request";
-import { ProjectMcpNativeOwnershipBusyError } from "../../kernel/project-mcp";
 import { hostToolSpecsForAgent } from "../lib/host-tools-for-agent";
 import { resolveKernel, listAvailableKernels } from "../../kernel/resolve-kernel";
 import { toKernelErrorPayload } from "../../kernel/kernel-unavailable";
@@ -51,7 +50,6 @@ import { kernelEnabled } from "../../kernel/kernel-mode";
 import { transcribeKernelTurn } from "../../kernel/transcribe-turn";
 import { hostTelemetryEnabled } from "../../kernel/host-telemetry";
 import { startCliKernelTurn, unwrapMcpResultEnvelope, type CliKernelTurnTrace } from "../../kernel/cli-kernel-trace";
-import { deriveThreadId } from "../../lib/thread-id";
 import { tt, ttEnabled } from "../../lib/turn-trace";
 import { formatCacheHitRatio } from "../../lib/cache-ratio";
 import { getExtensionSnapshot } from "../../extensions/registry";
@@ -64,8 +62,6 @@ import { listCommonMcpServers } from "../../capabilities/mcp-catalog";
 
 interface ChatBody {
   message?: string;
-  /** Client message id used as the host-owned checkpoint foreign key. */
-  messageId?: string;
   agentId?: string;
   threadId?: string;
   sessionId?: string;
@@ -92,13 +88,6 @@ interface CancelBody {
   callId?: string;
   providerOverride?: string;
 }
-
-type PrewarmableKernel = AgentKernel & {
-  prewarm?: (req: import('@forgeax/agent-runtime').TurnRequest) => Promise<{
-    warmed: boolean;
-    reused: boolean;
-  }>;
-};
 
 const DEPRECATION_NOTICE = deprecation({
   sunset: "forgeax-v1.0",
@@ -171,12 +160,6 @@ export function createCliRouter() {
             subAgents: false,
             sessions: true,
             jsonlReplay: false,
-            checkpoint: {
-              mode: k.id === "forgeax-core" ? "native" : "host-compatible",
-              code: true,
-              conversation: true,
-              privateHistory: false,
-            },
           },
         };
       }));
@@ -217,64 +200,6 @@ export function createCliRouter() {
     }
   });
 
-  /**
-   * Warm an idle session-scoped CLI transport before the first user turn.
-   * This endpoint never sends a hidden model prompt: the kernel only starts
-   * its persistent process with the exact capability/permission surface that
-   * the following real turn will use. Kernels without that optional transport
-   * capability return a successful no-op so the UI remains kernel-agnostic.
-   */
-  r.post("/warm", async (c) => {
-    let raw: Record<string, unknown>;
-    try {
-      raw = (await c.req.json()) as Record<string, unknown>;
-    } catch {
-      return c.json({ ok: false, error: "invalid JSON body" }, 400);
-    }
-    const agentId = typeof raw.agentId === 'string' && raw.agentId.trim() ? raw.agentId.trim() : 'forge';
-    const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId.trim() : '';
-    const requestedThreadId = typeof raw.threadId === 'string' && raw.threadId.trim()
-      ? raw.threadId.trim()
-      : sessionId;
-    // The host session id is a routing/permission identity. The provider
-    // session identity is a separate SSOT and must include the agent, or two
-    // agents in one Studio session can resume the same native conversation.
-    const threadId = sessionId ? deriveThreadId(sessionId, agentId) : requestedThreadId;
-    if (!sessionId || !threadId) return c.json({ ok: false, error: 'sessionId and threadId are required' }, 400);
-    const providerOverride = typeof raw.providerOverride === 'string' ? raw.providerOverride.trim() : undefined;
-
-    let selectedKernel: AgentKernel;
-    try {
-      selectedKernel = resolveKernel(agentId, providerOverride);
-    } catch (error) {
-      return c.json({ ok: false, error: (error as Error).message }, 503);
-    }
-    const prewarm = (selectedKernel as PrewarmableKernel).prewarm;
-    if (typeof prewarm !== 'function') {
-      return c.json({ ok: true, kernelId: selectedKernel.id, warmed: false, reused: false, reason: 'kernel-does-not-support-prewarm' });
-    }
-
-    try {
-      const extraTools = hostToolSpecsForAgent(sessionId, agentId);
-      const turnReq = await composeTurnRequest({
-        // This text is never sent to the kernel. It only gives the composer a
-        // complete TurnRequest so prewarm uses the same native settings,
-        // MCP/plugin/skill catalog and permission hook as the real turn.
-        message: '',
-        prewarm: true,
-        agentId,
-        kernel: selectedKernel,
-        threadId,
-        sessionId,
-        ...(extraTools.length ? { extraTools } : {}),
-      });
-      const result = await prewarm.call(selectedKernel, turnReq);
-      return c.json({ ok: true, kernelId: selectedKernel.id, ...result });
-    } catch (error) {
-      return c.json({ ok: false, kernelId: selectedKernel.id, error: (error as Error).message }, 503);
-    }
-  });
-
   r.post("/chat", async (c) => {
     let body: ChatBody;
     try {
@@ -303,14 +228,6 @@ export function createCliRouter() {
       // 这是"哪条工具面对应真正执行的那一轮"的连接键。
       const turnAttemptId = randomUUID();
       const agentId = body.agentId ?? "default";
-      const sessionId = body.sessionId?.trim() || undefined;
-      // UI historically sent the raw Studio sid as threadId. Keep accepting
-      // that wire shape, but never use it as the provider-native key when a
-      // host session is present: the canonical key is (sid, agentId).
-      const threadId = sessionId ? deriveThreadId(sessionId, agentId) : body.threadId?.trim() || undefined;
-      const checkpointMsgId = body.sessionId
-        ? (typeof body.messageId === "string" && body.messageId.trim() ? body.messageId.trim() : randomUUID())
-        : undefined;
       // 该 agent 的插件 host-tools(exposedToAI + 命中 agent.json host-tools allow)→
       // extraTools 下发内核。conscious-agent 路径经 kits 桥自带这步;/api/cli/chat
       // (租用内核聊天入口)此前漏了它,导致 team + gen3d 等插件工具对 cbc/cc/codex
@@ -324,49 +241,27 @@ export function createCliRouter() {
         const payload = await toKernelErrorPayload(null, err);
         return c.json(payload, 503);
       }
-      const composeInput = {
-        message,
-        agentId,
-        turnAttemptId,
-        kernel: selectedKernel,
-        threadId,
-        sessionId,
-        callId,
-        ...(typeof body.model === 'string' && body.model.trim() ? { model: body.model.trim() } : {}),
-        ...(extraTools.length ? { extraTools } : {}),
-        ...(Array.isArray(body.attachments) && body.attachments.length ? { attachments: body.attachments } : {}),
-        ...(body.replyLanguage === "en" || body.replyLanguage === "zh" ? { replyLanguage: body.replyLanguage } : {}),
-      } satisfies Parameters<typeof composeTurnRequest>[0];
       let turnReq: Awaited<ReturnType<typeof composeTurnRequest>>;
-      let composeError: unknown;
-      // A host MCP pool may still be draining while a native Claude/Cursor
-      // transport hands ownership back. Retry that bounded transition once;
-      // never spin or resend the user's model turn.
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        try {
-          turnReq = await composeTurnRequest(composeInput);
-          composeError = undefined;
-          break;
-        } catch (error) {
-          composeError = error;
-          if (!(error instanceof ProjectMcpNativeOwnershipBusyError) || attempt !== 0) break;
-          await new Promise((resolve) => setTimeout(resolve, 250));
-        }
-      }
-      if (composeError !== undefined) {
-        const messageText = composeError instanceof Error ? composeError.message : String(composeError);
-        if (composeError instanceof ProjectMcpNativeOwnershipBusyError) {
-          return c.json({
-            code: 'project_mcp_native_busy',
-            message: 'Project MCP is switching ownership between host and native transports; retry this turn.',
-            retryable: true,
-            retryAfterMs: 250,
-          }, 409);
-        }
+      try {
+        turnReq = await composeTurnRequest({
+          message,
+          agentId,
+          turnAttemptId,
+          kernel: selectedKernel,
+          threadId: body.threadId,
+          sessionId: body.sessionId,
+          callId,
+          ...(typeof body.model === 'string' && body.model.trim() ? { model: body.model.trim() } : {}),
+          ...(extraTools.length ? { extraTools } : {}),
+          ...(Array.isArray(body.attachments) && body.attachments.length ? { attachments: body.attachments } : {}),
+          ...(body.replyLanguage === "en" || body.replyLanguage === "zh" ? { replyLanguage: body.replyLanguage } : {}),
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : String(error);
         if (messageText.includes('history_unavailable')) {
           return c.json({ code: 'history_unavailable', message: 'Unable to sync shared history; the turn was not sent.', retryable: true }, 409);
         }
-        throw composeError;
+        throw error;
       }
 
       // 历史持久化(host-owned,核心目标):内核每轮的 KernelEvent 流由编排层**转录**进
@@ -399,22 +294,10 @@ export function createCliRouter() {
         try { await getCheckpointManager().finalizePending(persistSession); } catch (e) {
           console.warn(`[cli/chat] finalizePending failed: ${(e as Error).message}`);
         }
-        if (checkpointMsgId) {
-          try {
-            await getCheckpointManager().snapshotForMessage(persistSession, checkpointMsgId, {
-              providerId: selectedKernel.id,
-              checkpointMode: selectedKernel.id === "forgeax-core" ? "native" : "host-compatible",
-            });
-          } catch (e) {
-            console.warn(`[cli/chat] checkpoint snapshot failed: ${(e as Error).message}`);
-          }
-        }
       }
 
       return streamSSE(c, async (sse) => {
         const ac = new AbortController();
-        const sseStartedAt = Date.now();
-        let sseTokenFirstSeen = false;
         const onAbort = () => ac.abort();
         c.req.raw.signal.addEventListener("abort", onAbort);
         const fold = newWireFoldState();
@@ -492,13 +375,7 @@ export function createCliRouter() {
               }
               await sse.writeSSE({ event: out.type, data: JSON.stringify(out) });
               switch (out.type) {
-                case "token":
-                  if (!sseTokenFirstSeen) {
-                    sseTokenFirstSeen = true;
-                    tt("sse.token-first", { ms: Date.now() - sseStartedAt, provider: providerId });
-                  }
-                  asstText += out.text ?? "";
-                  break;
+                case "token": asstText += out.text ?? ""; break;
                 case "thinking": thinkingText += out.text ?? ""; break;
                 // 第 4 层 tool span —— 与 core/kernel-turn.ts 调同一个状态机(cli-kernel-trace)。
                 // 观测异常由该模块内部吞掉,这里不再包一层,免得两口的降级策略各写各的又走偏。
@@ -538,8 +415,7 @@ export function createCliRouter() {
           // 单一翻译点:内核不可用(resolveKernel 抛 KernelUnavailableError,或 probe 判定
           // 内核 down)→ 友好 kernel_unavailable + 成因;真·运行时报错(网络/LLM/工具)→
           // 保留原样并标 turn_failed,不再被 catch-all 一律误标成 kernel_unavailable。
-          const retryCode = err && typeof err.code === 'string' ? err.code : undefined;
-          const payload = await toKernelErrorPayload(kernel, err, retryCode);
+          const payload = await toKernelErrorPayload(kernel, err);
           await sse.writeSSE({ event: "error", data: JSON.stringify({ ...payload, providerId }) });
         } finally {
           // span 必须在 finally 收口:抛异常/被 abort 时也要收。收不了口的 kernel.turn
@@ -569,7 +445,6 @@ export function createCliRouter() {
             try {
               transcribeKernelTurn(persistSession, persistAgent, {
                 message,
-                ...(checkpointMsgId ? { msgId: checkpointMsgId } : {}),
                 contextText: turnReq.input.text,
                 asstText,
                 thinkingText,
@@ -616,9 +491,6 @@ export function createCliRouter() {
       callId: typeof body.callId === "string" && body.callId.trim() ? body.callId.trim() : undefined,
       timeoutMs: typeof body.timeoutMs === "number" && body.timeoutMs > 0 ? body.timeoutMs : undefined,
     };
-    const legacyCheckpointMsgId = req.sessionId
-      ? (typeof body.messageId === "string" && body.messageId.trim() ? body.messageId.trim() : randomUUID())
-      : undefined;
 
     // Stamp the resolved provider on the response stream so the cancel route
     // (which only sees callId) can short-circuit when the registry shape
@@ -638,27 +510,11 @@ export function createCliRouter() {
         try { await getCheckpointManager().finalizePending(session); } catch (e) {
           console.warn(`[cli/chat] finalizePending failed: ${(e as Error).message}`);
         }
-        if (legacyCheckpointMsgId) {
-          try {
-            await getCheckpointManager().snapshotForMessage(session, legacyCheckpointMsgId, {
-              providerId: provider.id,
-              checkpointMode: "host-compatible",
-            });
-          } catch (e) {
-            console.warn(`[cli/chat] checkpoint snapshot failed: ${(e as Error).message}`);
-          }
-        }
         const node = session.tree.list().find((n) => n.display === req.agentId)
           ?? session.tree.list().find((n) => n.depth === 1)
           ?? null;
         const agentPath = node?.path ?? req.agentId;
-        bridge = new CliEventBridge({
-          session,
-          agentPath,
-          model: provider.id,
-          message,
-          ...(legacyCheckpointMsgId ? { msgId: legacyCheckpointMsgId } : {}),
-        });
+        bridge = new CliEventBridge({ session, agentPath, model: provider.id });
 
         // Per-agent model selection: the ModelPicker writes the user's choice to
         // `agent.json::models.model` (via the `set_agent_models` command). That

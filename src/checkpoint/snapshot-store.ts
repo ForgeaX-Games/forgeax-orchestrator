@@ -92,26 +92,7 @@ export interface Manifest {
   id: string;
   ts: number;
   files: Record<string, ManifestEntry>;  // key = 相对 targetDir 的 POSIX 路径
-  /** Schema version. Legacy manifests without this field are read as v1. */
-  version?: number;
   meta?: Record<string, unknown>;
-}
-
-export const CHECKPOINT_MANIFEST_VERSION = 1;
-
-export type ManifestLoadFailure =
-  | { kind: "missing"; detail: string }
-  | { kind: "invalid"; detail: string }
-  | { kind: "incompatible"; detail: string };
-
-export interface ManifestLoadResult {
-  manifest: Manifest | null;
-  failure?: ManifestLoadFailure;
-}
-
-export interface BlobIssue {
-  path: string;
-  hash: string;
 }
 
 export interface RestoreResult {
@@ -119,26 +100,6 @@ export interface RestoreResult {
   deleted: string[];
   /** 因 exclude(脏文件保留)被跳过的路径。 */
   skippedDirty: string[];
-  /** Restore is fail-closed when required content is unavailable. */
-  missingBlobs: BlobIssue[];
-  /** Restore is fail-closed when a CAS blob does not match its hash. */
-  corruptBlobs: BlobIssue[];
-}
-
-export interface GarbageCollectResult {
-  deletedManifests: string[];
-  deletedBlobs: string[];
-  retainedManifests: number;
-  retainedBlobs: number;
-}
-
-export interface GarbageCollectOptions {
-  /**
-   * Restrict deletion to manifests owned by this session. Checkpoint stores
-   * are shared by game slug, so a session-scoped GC must retain manifests from
-   * other sessions and legacy manifests with no owner metadata.
-   */
-  ownerSid: string;
 }
 
 /** 单个文件的变更明细。status 站在「回退到目标快照」的视角:
@@ -194,13 +155,7 @@ export class SnapshotStore {
     return this._locked(async () => {
       const files: Record<string, ManifestEntry> = {};
       await this._walk(targetDir, targetDir, files);
-      const manifest: Manifest = {
-        id: randomUUID(),
-        ts: Date.now(),
-        version: CHECKPOINT_MANIFEST_VERSION,
-        files,
-        meta,
-      };
+      const manifest: Manifest = { id: randomUUID(), ts: Date.now(), files, meta };
       await mkdir(this.manifestsDir, { recursive: true });
       // 先写临时名再 rename 的原子性在单机 jsonl 场景收益低;manifest 单文件直写。
       await writeFile(join(this.manifestsDir, `${manifest.id}.json`), JSON.stringify(manifest), "utf-8");
@@ -266,105 +221,18 @@ export class SnapshotStore {
 
   // ─── manifest io ─────────────────────────────────────────────────────────
 
-  loadManifestChecked(id: string): ManifestLoadResult {
-    if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
-      return { manifest: null, failure: { kind: "invalid", detail: `invalid manifest id: ${id}` } };
-    }
-    let raw: string;
+  loadManifest(id: string): Manifest | null {
     try {
-      raw = readFileSync(join(this.manifestsDir, `${id}.json`), "utf-8");
-    } catch {
-      return { manifest: null, failure: { kind: "missing", detail: `manifest missing: ${id}` } };
-    }
-    try {
-      const parsed = JSON.parse(raw) as Partial<Manifest>;
-      if (!parsed || typeof parsed !== "object") {
-        return { manifest: null, failure: { kind: "invalid", detail: `manifest is not an object: ${id}` } };
-      }
-      if (parsed.id !== id) {
-        return { manifest: null, failure: { kind: "invalid", detail: `manifest id mismatch: ${id}` } };
-      }
-      // Manifests written before versioning are the v1 schema. Unknown explicit
-      // versions are never accepted: silently treating a future schema as v1 can
-      // restore the wrong files.
-      const version = parsed.version === undefined ? CHECKPOINT_MANIFEST_VERSION : parsed.version;
-      if (version !== CHECKPOINT_MANIFEST_VERSION) {
-        return {
-          manifest: null,
-          failure: { kind: "incompatible", detail: `checkpoint manifest version ${String(version)} is incompatible (supported ${CHECKPOINT_MANIFEST_VERSION})` },
-        };
-      }
-      if (!Number.isFinite(parsed.ts) || !parsed.files || typeof parsed.files !== "object") {
-        return { manifest: null, failure: { kind: "invalid", detail: `manifest shape invalid: ${id}` } };
-      }
-      const files: Record<string, ManifestEntry> = {};
-      for (const [rel, rawEntry] of Object.entries(parsed.files)) {
-        if (!rel || rel.startsWith("/") || rel.split("/").some((part) => part === "..")) {
-          return { manifest: null, failure: { kind: "invalid", detail: `manifest path invalid: ${rel}` } };
-        }
-        const entry = rawEntry as Partial<ManifestEntry>;
-        if (
-          typeof entry.h !== "string" || !/^[a-f0-9]{64}$/.test(entry.h)
-          || typeof entry.size !== "number" || !Number.isFinite(entry.size) || entry.size < 0
-          || typeof entry.mode !== "number" || !Number.isFinite(entry.mode)
-        ) {
-          return { manifest: null, failure: { kind: "invalid", detail: `manifest entry invalid: ${rel}` } };
-        }
-        files[rel] = { h: entry.h, size: entry.size, mode: entry.mode };
-      }
-      const m: Manifest = {
-        id,
-        ts: parsed.ts as number,
-        version,
-        files,
-        ...(parsed.meta && typeof parsed.meta === "object" ? { meta: parsed.meta as Record<string, unknown> } : {}),
-      };
+      const m = JSON.parse(readFileSync(join(this.manifestsDir, `${id}.json`), "utf-8")) as Manifest;
       // 剪枝规则引入前拍的旧 manifest 可能已含根级 sessions/**:读取时剥离,
       // 否则 preview 对它们显示幻影差异,restore 会把陈旧会话状态写回盘。
       for (const rel of Object.keys(m.files)) {
         if (underIgnoredRoot(rel)) delete m.files[rel];
       }
-      return { manifest: m };
-    } catch (err) {
-      return { manifest: null, failure: { kind: "invalid", detail: `manifest JSON invalid: ${id}: ${(err as Error).message}` } };
+      return m;
+    } catch {
+      return null;
     }
-  }
-
-  loadManifest(id: string): Manifest | null {
-    return this.loadManifestChecked(id).manifest;
-  }
-
-  /** Verify every blob that a restore/preview may rely on. */
-  validateManifestBlobs(
-    manifest: Manifest,
-    opts: { exclude?: Set<string>; only?: Set<string> } = {},
-  ): Promise<{ missingBlobs: BlobIssue[]; corruptBlobs: BlobIssue[] }> {
-    return this._locked(() => this._validateManifestBlobs(manifest, opts));
-  }
-
-  private async _validateManifestBlobs(
-    manifest: Manifest,
-    opts: { exclude?: Set<string>; only?: Set<string> } = {},
-  ): Promise<{ missingBlobs: BlobIssue[]; corruptBlobs: BlobIssue[] }> {
-    const missingBlobs: BlobIssue[] = [];
-    const corruptBlobs: BlobIssue[] = [];
-    const seen = new Set<string>();
-    for (const [rel, entry] of Object.entries(manifest.files)) {
-      if (opts.only && !opts.only.has(rel)) continue;
-      if (opts.exclude?.has(rel)) continue;
-      if (seen.has(entry.h)) continue;
-      seen.add(entry.h);
-      const blob = this._blobPath(entry.h);
-      let content: Buffer;
-      try {
-        content = await readFile(blob);
-      } catch {
-        missingBlobs.push({ path: rel, hash: entry.h });
-        continue;
-      }
-      if (sha256(content) !== entry.h) corruptBlobs.push({ path: rel, hash: entry.h });
-    }
-    return { missingBlobs, corruptBlobs };
   }
 
   // ─── restore ─────────────────────────────────────────────────────────────
@@ -382,51 +250,18 @@ export class SnapshotStore {
       const written: string[] = [];
       const deleted: string[] = [];
       const skippedDirty: string[] = [];
-      const missingBlobs: BlobIssue[] = [];
-      const corruptBlobs: BlobIssue[] = [];
 
       const current: Record<string, ManifestEntry> = {};
       await this._walk(targetDir, targetDir, current);
 
-      const shouldConsider = (rel: string): boolean => {
-        if (opts.only && !opts.only.has(rel)) return false;
-        return !opts.exclude?.has(rel);
-      };
       const considered = (rel: string): boolean => {
         if (opts.only && !opts.only.has(rel)) return false;
         if (opts.exclude?.has(rel)) {
-          if (!skippedDirty.includes(rel)) skippedDirty.push(rel);
+          skippedDirty.push(rel);
           return false;
         }
         return true;
       };
-
-      // Preflight every required blob before touching the target directory. A
-      // restore that writes some files and silently skips another file is not a
-      // restore; it is a partial/corrupt state and must fail closed.
-      const requiredOnly = new Set<string>();
-      for (const [rel, entry] of Object.entries(manifest.files)) {
-        if (!shouldConsider(rel)) continue;
-        const cur = current[rel];
-        if (cur && cur.h === entry.h) continue;
-        requiredOnly.add(rel);
-      }
-      const verified = await this._validateManifestBlobs(manifest, { only: requiredOnly });
-      missingBlobs.push(...verified.missingBlobs);
-      corruptBlobs.push(...verified.corruptBlobs);
-      if (missingBlobs.length > 0 || corruptBlobs.length > 0) {
-        const detail = [
-          ...missingBlobs.map((x) => `missing blob ${x.hash} for ${x.path}`),
-          ...corruptBlobs.map((x) => `corrupt blob ${x.hash} for ${x.path}`),
-        ].join("; ");
-        process.stderr.write(`[checkpoint] restore aborted: ${detail}\n`);
-        for (const rel of Object.keys(manifest.files)) {
-          if (opts.exclude?.has(rel) && (!opts.only || opts.only.has(rel))) {
-            if (!skippedDirty.includes(rel)) skippedDirty.push(rel);
-          }
-        }
-        return { written, deleted, skippedDirty, missingBlobs, corruptBlobs };
-      }
 
       // 写回:目标里有、盘上缺失或内容不同
       for (const [rel, entry] of Object.entries(manifest.files)) {
@@ -435,6 +270,11 @@ export class SnapshotStore {
         if (cur && cur.h === entry.h) continue;
         const abs = join(targetDir, ...rel.split("/"));
         const blob = this._blobPath(entry.h);
+        if (!existsSync(blob)) {
+          // blob 丢失 —— 跳过该文件,留给 caller 上报;不让单文件损坏炸掉整次 restore
+          process.stderr.write(`[checkpoint] missing blob ${entry.h} for ${rel}, skipped\n`);
+          continue;
+        }
         await mkdir(dirname(abs), { recursive: true });
         await copyFile(blob, abs);
         try { await chmod(abs, entry.mode); } catch { /* 非关键 */ }
@@ -455,7 +295,7 @@ export class SnapshotStore {
         } catch { /* 已不存在 */ }
       }
 
-      return { written, deleted, skippedDirty, missingBlobs, corruptBlobs };
+      return { written, deleted, skippedDirty };
     });
   }
 
@@ -471,87 +311,6 @@ export class SnapshotStore {
       }
       d = dirname(d);
     }
-  }
-
-  /** Delete CAS objects that are not reachable from active checkpoint state. */
-  collectGarbage(
-    reachableManifestIds: Set<string>,
-    options: GarbageCollectOptions,
-  ): Promise<GarbageCollectResult> {
-    return this._locked(async () => {
-      const deletedManifests: string[] = [];
-      const deletedBlobs: string[] = [];
-      const reachableBlobs = new Set<string>();
-      let retainedManifests = 0;
-      let blobCleanupSafe = true;
-
-      let manifestFiles: string[] = [];
-      try {
-        manifestFiles = (await readdir(this.manifestsDir)).filter((name) => name.endsWith(".json"));
-      } catch { /* empty store */ }
-      for (const file of manifestFiles) {
-        const id = file.slice(0, -5);
-        const reachable = reachableManifestIds.has(id);
-        const loaded = this.loadManifestChecked(id);
-        if (!reachable) {
-          const owner = loaded.manifest?.meta && typeof loaded.manifest.meta.sid === "string"
-            ? loaded.manifest.meta.sid
-            : undefined;
-          // A shared game store can contain checkpoints from several sessions.
-          // Only delete a valid manifest explicitly owned by this session;
-          // unknown/legacy/invalid manifests are retained conservatively.
-          if (owner !== options.ownerSid) {
-            retainedManifests++;
-            if (!loaded.manifest) blobCleanupSafe = false;
-            else for (const entry of Object.values(loaded.manifest.files)) reachableBlobs.add(entry.h);
-            continue;
-          }
-        }
-        if (!reachable) {
-          try {
-            await unlink(join(this.manifestsDir, file));
-            deletedManifests.push(id);
-          } catch { /* concurrent cleanup */ }
-          continue;
-        }
-        retainedManifests++;
-        if (!loaded.manifest) {
-          // A live but unreadable manifest may still reference blobs we cannot
-          // enumerate. Do not delete any blob while that reference is unknown.
-          blobCleanupSafe = false;
-          continue;
-        }
-        for (const entry of Object.values(loaded.manifest.files)) reachableBlobs.add(entry.h);
-      }
-
-      // A live manifest may have disappeared between index reconstruction and
-      // this scan. Its blob reachability is unknowable, so preserve the CAS
-      // contents rather than turning a diagnostic condition into data loss.
-      for (const id of reachableManifestIds) {
-        if (!manifestFiles.includes(`${id}.json`)) blobCleanupSafe = false;
-      }
-
-      let blobBuckets: string[] = [];
-      try { blobBuckets = await readdir(this.blobsDir); } catch { /* empty store */ }
-      if (blobCleanupSafe) {
-        for (const bucket of blobBuckets) {
-          const bucketDir = join(this.blobsDir, bucket);
-          let files: string[];
-          try { files = await readdir(bucketDir); } catch { continue; }
-          for (const file of files) {
-            if (reachableBlobs.has(file)) continue;
-            try {
-              await unlink(join(bucketDir, file));
-              deletedBlobs.push(file);
-            } catch { /* concurrent cleanup */ }
-          }
-          try {
-            if ((await readdir(bucketDir)).length === 0) await rmdir(bucketDir);
-          } catch { /* best effort */ }
-        }
-      }
-      return { deletedManifests, deletedBlobs, retainedManifests, retainedBlobs: reachableBlobs.size };
-    });
   }
 
   // ─── diff ────────────────────────────────────────────────────────────────

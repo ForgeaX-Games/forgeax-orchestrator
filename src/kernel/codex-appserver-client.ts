@@ -51,12 +51,6 @@ export interface CodexAppServerOptions {
   onExit?: (code: number | null, stderrTail: string) => void;
 }
 
-export interface McpReadinessResult {
-  ready: boolean;
-  pending: string[];
-  failed: string[];
-}
-
 export class CodexAppServerClient {
   private proc: ChildProcessWithoutNullStreams | null = null;
   private buf = '';
@@ -65,23 +59,8 @@ export class CodexAppServerClient {
   private stderrTail = '';
   private initialized = false;
   private starting: Promise<void> | null = null;
-  private exitPromise: Promise<void> = Promise.resolve();
-  private resolveExit: (() => void) | null = null;
-  private readonly mcpStartupByThread = new Map<string, Map<string, string>>();
 
   constructor(private readonly opts: CodexAppServerOptions) {}
-
-  /**
-   * A persistent app-server serves many turns, while notification queues and
-   * permission callbacks are turn-scoped. Swap only those callbacks; process
-   * configuration (cwd/env/globalArgs) remains immutable and is guarded by the
-   * outer pool fingerprint.
-   */
-  setTurnHandlers(handlers: Pick<CodexAppServerOptions, 'onServerRequest' | 'onNotification' | 'onExit'>): void {
-    this.opts.onServerRequest = handlers.onServerRequest;
-    this.opts.onNotification = handlers.onNotification;
-    this.opts.onExit = handlers.onExit;
-  }
 
   get alive(): boolean {
     return this.proc != null && this.proc.exitCode == null && !this.proc.killed;
@@ -92,15 +71,7 @@ export class CodexAppServerClient {
   async ensureStarted(): Promise<void> {
     if (this.alive && this.initialized) return;
     if (this.starting) return this.starting;
-    this.starting = this._start()
-      .catch(async (error) => {
-        // A successful spawn followed by initialize error/timeout still leaves
-        // a live child. The client itself owns that half-started process until
-        // ensureStarted resolves, so reclaim it here for every caller.
-        await this.close();
-        throw error;
-      })
-      .finally(() => { this.starting = null; });
+    this.starting = this._start().finally(() => { this.starting = null; });
     return this.starting;
   }
 
@@ -111,22 +82,9 @@ export class CodexAppServerClient {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.proc = proc;
-    this.exitPromise = new Promise<void>((resolve) => { this.resolveExit = resolve; });
     this.initialized = false;
     this.buf = '';
     this.stderrTail = '';
-    let settled = false;
-
-    const settle = (error: Error, code: number | null): void => {
-      if (settled) return;
-      settled = true;
-      this.initialized = false;
-      for (const [, pending] of this.pending) pending.reject(error);
-      this.pending.clear();
-      try { this.opts.onExit?.(code, this.stderrTail.split('\n').filter(Boolean).slice(-3).join(' | ')); } catch { /* ignore */ }
-      this.resolveExit?.();
-      this.resolveExit = null;
-    };
 
     proc.stdout.setEncoding('utf8');
     proc.stdout.on('data', (chunk: string) => this._onStdout(chunk));
@@ -141,11 +99,14 @@ export class CodexAppServerClient {
     proc.stdin.on('error', () => { /* EPIPE — app-server gone; exit handler handles it */ });
     proc.stdout.on('error', () => { /* swallow — exit handler handles it */ });
     proc.stderr.on('error', () => { /* swallow — exit handler handles it */ });
-    proc.on('error', (error) => {
-      if (this.proc === proc) this.proc = null;
-      settle(new Error(`codex app-server spawn failed: ${error.message}`), null);
+    proc.on('exit', (code) => {
+      this.initialized = false;
+      // Reject every in-flight request so callers don't hang forever.
+      const err = new Error(`codex app-server exited (code=${code})`);
+      for (const [, p] of this.pending) p.reject(err);
+      this.pending.clear();
+      try { this.opts.onExit?.(code, this.stderrTail.split('\n').filter(Boolean).slice(-3).join(' | ')); } catch { /* ignore */ }
     });
-    proc.on('exit', (code) => settle(new Error(`codex app-server exited (code=${code})`), code));
 
     // Handshake. clientInfo shape verified: { name, title|null, version }.
     await this.request('initialize', {
@@ -186,16 +147,6 @@ export class CodexAppServerClient {
     }
     // Notification (no id).
     if (typeof msg.method === 'string') {
-      if (msg.method === 'mcpServer/startupStatus/updated') {
-        const threadId = typeof msg.params?.threadId === 'string' ? msg.params.threadId : '';
-        const name = typeof msg.params?.name === 'string' ? msg.params.name : '';
-        const status = typeof msg.params?.status === 'string' ? msg.params.status : '';
-        if (threadId && name && status) {
-          const states = this.mcpStartupByThread.get(threadId) ?? new Map<string, string>();
-          states.set(name, status);
-          this.mcpStartupByThread.set(threadId, states);
-        }
-      }
       try { this.opts.onNotification(msg.method, msg.params); } catch { /* never let a handler break the read loop */ }
     }
   }
@@ -210,29 +161,12 @@ export class CodexAppServerClient {
   }
 
   /** Send a request and await its response. Rejects if the process dies. */
-  request(method: string, params: unknown, timeoutMs = 30_000): Promise<any> {
+  request(method: string, params: unknown): Promise<any> {
     if (!this.proc || this.proc.exitCode != null) {
       return Promise.reject(new Error('codex app-server not running'));
     }
     const id = this.nextId++;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const promise = new Promise<any>((resolve, reject) => {
-      this.pending.set(id, {
-        resolve: (value) => {
-          if (timer) clearTimeout(timer);
-          resolve(value);
-        },
-        reject: (error) => {
-          if (timer) clearTimeout(timer);
-          reject(error);
-        },
-      });
-      timer = setTimeout(() => {
-        if (!this.pending.delete(id)) return;
-        reject(new Error(`codex app-server ${method} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      timer.unref?.();
-    });
+    const promise = new Promise<any>((resolve, reject) => this.pending.set(id, { resolve, reject }));
     this._send({ jsonrpc: '2.0', id, method, params });
     return promise;
   }
@@ -240,48 +174,6 @@ export class CodexAppServerClient {
   /** Fire-and-forget notification to the server. */
   notify(method: string, params: unknown): void {
     this._send({ jsonrpc: '2.0', method, params });
-  }
-
-  /**
-   * `initialize` acknowledges the app-server before optional native stdio MCPs
-   * necessarily finish starting. A thread created in that gap snapshots an
-   * incomplete tool catalog for the turn. Wait a bounded interval for the
-   * configured local servers (plus ForgeaX's required `fxt`) to report the
-   * thread-scoped `ready` startup state; failure remains optional Codex
-   * behavior after the deadline.
-   */
-  async waitForThreadMcpServers(
-    threadId: string,
-    names: readonly string[],
-    options: { timeoutMs?: number; pollMs?: number; signal?: AbortSignal } = {},
-  ): Promise<McpReadinessResult> {
-    const expected = [...new Set(names.filter(Boolean))];
-    if (expected.length === 0) return { ready: true, pending: [], failed: [] };
-    const timeoutMs = Math.max(0, options.timeoutMs ?? 30_000);
-    const pollMs = Math.max(10, options.pollMs ?? 250);
-    const deadline = Date.now() + timeoutMs;
-    let pending = expected;
-    let failed: string[] = [];
-
-    do {
-      if (options.signal?.aborted) throw new Error('codex MCP readiness cancelled');
-      if (!this.alive) throw new Error('codex app-server exited during MCP readiness');
-      const states = this.mcpStartupByThread.get(threadId);
-      // Codex may publish `cancelled` for an interrupted startup attempt and
-      // then retry the same configured server on this thread. Only `failed`
-      // is terminal; treating `cancelled` as terminal moves that retry back
-      // onto the user's first turn and can snapshot an incomplete tool set.
-      failed = expected.filter((name) => states?.get(name) === 'failed');
-      pending = expected.filter((name) => {
-        const state = states?.get(name);
-        return state !== 'ready' && state !== 'failed';
-      });
-      if (pending.length === 0) return { ready: failed.length === 0, pending: [], failed };
-      const waitMs = Math.min(pollMs, Math.max(0, deadline - Date.now()));
-      if (waitMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
-    } while (Date.now() < deadline);
-
-    return { ready: false, pending, failed };
   }
 
   private _send(obj: unknown): void {
@@ -296,27 +188,6 @@ export class CodexAppServerClient {
   shutdown(): void {
     try { this.proc?.kill('SIGTERM'); } catch { /* ignore */ }
     this.proc = null;
-    this.initialized = false;
-  }
-
-  /** Wait for process exit so pool replacement never overlaps one CODEX_HOME. */
-  async close(): Promise<void> {
-    const proc = this.proc;
-    if (!proc) return;
-    const exit = this.exitPromise;
-    try { proc.kill('SIGTERM'); } catch { /* already gone */ }
-    await Promise.race([
-      exit,
-      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
-    ]);
-    if (proc.exitCode == null) {
-      try { proc.kill('SIGKILL'); } catch { /* already gone */ }
-      await Promise.race([
-        exit,
-        new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
-      ]);
-    }
-    if (this.proc === proc) this.proc = null;
     this.initialized = false;
   }
 }

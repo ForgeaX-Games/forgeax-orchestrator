@@ -30,7 +30,7 @@ import { tt } from '../lib/turn-trace';
 import { appendToolAudit } from './tool-audit';
 import { shouldDelegateHostToolConfirmation } from './host-tool-confirmation';
 import { runSkillKernelTool } from '../skills/kernel-tool-bridge';
-import { createProjectMcpBridge, isProjectMcpToolName } from './project-mcp';
+import { createProjectMcpBridge } from './project-mcp';
 
 /** 与原生内核约定的 host 工具执行签名(结构化,不 import 内核包的类型)。
  *  `agentId` = 本轮真实发起工具的 agent(委派轮里即被委派方,如 mochi);缺省回落 defaultAgentPath。
@@ -155,7 +155,6 @@ export function makeInProcessExecuteTool(
       //   capture_frame,P1-7)走 `HostToolSpec.run`;③其余查 agent 的 kit 注册表。
       //   schema 都由 compose-turn-request 出墙。
       const seamTool = getHostTool(name);
-      const configuredProjectMcp = isProjectMcpToolName(name, projectRoot);
       const builtinCtx = {
         projectRoot,
         agentId: agentPath,
@@ -179,13 +178,6 @@ export function makeInProcessExecuteTool(
             : name.startsWith('mcp__')
               ? await (async () => {
                   const projectResult = await projectMcp.callIfKnown(name, args);
-                  if (configuredProjectMcp && projectResult === undefined) {
-                    // A configured project-MCP namespace is an explicit
-                    // execution domain. Never let a stale schema or a
-                    // missing remote tool fall through to a same-named
-                    // ordinary ToolRegistry entry.
-                    throw new Error(`project_mcp_tool_not_found: ${name}`);
-                  }
                   return projectResult === undefined
                     ? await _executeTool(name, (args ?? {}) as Record<string, unknown>, agent.agentContext.tools.list(), agent.agentContext)
                     : projectResult;

@@ -10,7 +10,6 @@ import { initSessionManager, resetSessionManager } from '../src/core/session-man
 import { getEventBus, _resetEventBusForTests } from '../src/events/bus';
 import { initPathManager, resetPathManager } from '../src/fs/path-manager';
 import { markHostToolDefinition } from '../src/kernel/host-tool-confirmation';
-import { resetProjectMcpPoolForTests } from '../src/kernel/project-mcp';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { mergeManifests } from '../src/extensions/merger';
 import { _resetSnapshotForTests, _setSnapshotForTests } from '../src/extensions/registry';
@@ -229,48 +228,5 @@ describe('POST /:sid/kernel-tool Host confirmation delegation', () => {
     expect(json.ok).toBe(false);
     expect(outerCards).toBe(1);
     expect(innerCards).toBe(0);
-  });
-
-  test('host-routed project MCP goes through the pooled bridge instead of ToolRegistry lookup', async () => {
-    const script = join(root, 'project-mcp-fixture.mjs');
-    const mode = join(root, 'project-mcp-mode');
-    mkdirSync(join(root, '.forgeax'), { recursive: true });
-    writeFileSync(mode, 'read', 'utf8');
-    writeFileSync(script, `
-const { readFileSync } = await import('node:fs');
-let buffer = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (chunk) => {
-  buffer += String(chunk);
-  let newline;
-  while ((newline = buffer.indexOf('\\n')) >= 0) {
-    const line = buffer.slice(0, newline).trim();
-    buffer = buffer.slice(newline + 1);
-    if (!line) continue;
-    const request = JSON.parse(line);
-    if (request.method === 'initialize') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { capabilities: {} } }) + '\\n');
-    if (request.method === 'tools/list') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: readFileSync(process.env.FX_MCP_MODE, 'utf8').trim(), inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
-    if (request.method === 'tools/call') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { content: [{ type: 'text', text: 'project-ok' }] } }) + '\\n');
-  }
-});
-`, 'utf8');
-    writeFileSync(join(root, '.forgeax', 'mcp.json'), JSON.stringify({
-      mcpServers: { project: { command: process.execPath, args: [script], env: { FX_MCP_MODE: mode } } },
-    }), 'utf8');
-    resetProjectMcpPoolForTests();
-    const json = await postTool('mcp__project__read');
-    expect(json.ok).toBe(true);
-    expect(json.result).toBe('project-ok');
-    expect(outerCards).toBe(0);
-    expect(innerCards).toBe(0);
-    writeFileSync(mode, 'other', 'utf8');
-    writeFileSync(join(root, '.forgeax', 'mcp.json'), JSON.stringify({
-      mcpServers: { project: { command: process.execPath, args: [script], env: { FX_MCP_MODE: mode }, version: 2 } },
-    }), 'utf8');
-    const stale = await postTool('mcp__project__read');
-    expect(stale.ok).toBe(false);
-    expect(stale.code).toBe('project_mcp_tool_not_found');
-    expect(String(stale.error)).toContain('project MCP tool not found');
-    resetProjectMcpPoolForTests();
   });
 });

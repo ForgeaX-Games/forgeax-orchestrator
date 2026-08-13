@@ -18,16 +18,10 @@ export interface CursorToolsWorkspace {
   cleanup(): Promise<void>;
 }
 
-export interface CursorToolsWorkspaceOptions {
-  /** Imported turns use the host trust gate instead of native project MCP. */
-  includeNativeProjectMcp?: boolean;
-}
-
 export async function materializeCursorToolsWorkspace(
   runtime: ForgeaxToolsRuntime,
   projectRoot: string,
   requestedTools: readonly string[],
-  options: CursorToolsWorkspaceOptions = {},
 ): Promise<CursorToolsWorkspace> {
   const root = await mkdtemp(join(tmpdir(), 'forgeax-cursor-tools-'));
   const cursorDir = join(root, '.cursor');
@@ -38,18 +32,16 @@ export async function materializeCursorToolsWorkspace(
         .filter((name) => name.startsWith('mcp__'))
         .map((name) => name.slice('mcp__'.length).split('__', 1)[0]),
     );
-    const projectServers = options.includeNativeProjectMcp === false
-      ? {}
-      : Object.fromEntries(
-          readProjectMcpServers(projectRoot)
-            .filter((server) => requestedProjectServers.has(server.name.replace(/[^a-zA-Z0-9_-]/g, '_')))
-            .filter((server) => server.name !== 'fxt')
-            .map(({ name, config }) => [name, {
-              command: config.command,
-              args: config.args,
-              ...(config.env ? { env: config.env } : {}),
-            }]),
-        );
+    const projectServers = Object.fromEntries(
+      readProjectMcpServers(projectRoot)
+        .filter((server) => requestedProjectServers.has(server.name.replace(/[^a-zA-Z0-9_-]/g, '_')))
+        .filter((server) => server.name !== 'fxt')
+        .map(({ name, config }) => [name, {
+          command: config.command,
+          args: config.args,
+          ...(config.env ? { env: config.env } : {}),
+        }]),
+    );
     await writeFile(
       join(cursorDir, 'mcp.json'),
       JSON.stringify(

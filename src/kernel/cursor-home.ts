@@ -18,15 +18,18 @@
  * 返回 `undefined`,调用方退回真实 `$HOME`(优雅降级——绝不为提速而丢登录)。仅
  * darwin/linux(Windows 默认无 symlink 权限 + 配置路径不同 → 直接跳过,退回现状)。
  *
- * **默认关闭**:屏蔽用户全局 MCP 会改变 Cursor 原生能力，不能作为默认性能开关。
- * 如需针对明确的托管环境隔离，显式设置 `FORGEAX_CURSOR_ISOLATE_MCP=1`(或
- * true/yes/on)；清掉该 env 或设置为 0/false/off 即保持原有真实 `$HOME`。
+ * **默认关闭(opt-in)**:本加速会改变 cursor 看到的 HOME,虽实测保住登录,但耦合了
+ * 「cursor auth 经 homedir/keychain 取」这一假设——未来 cursor 改 auth 存储有让登录失效
+ * 的尾部风险。故默认**不启用、保持原有逻辑**(真实 `$HOME`),仅当显式设置
+ * `FORGEAX_CURSOR_ISOLATE_MCP=1`(或 true/yes/on)时才镜像。万一启用后出问题,清掉该 env
+ * 即刻退回原状,无需改代码/发版。
  */
 import { mkdtempSync, mkdirSync, readdirSync, symlinkSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 
-/** 仅显式真值启用镜像；缺省保持原有真实 HOME。 */
+/** opt-in 开关:仅当 `FORGEAX_CURSOR_ISOLATE_MCP` 显式为真值时才启用镜像 HOME。
+ *  缺省(未设/其它值)→ false → 保持原有逻辑(真实 `$HOME`)。 */
 function isolateEnabled(): boolean {
   return /^(1|true|yes|on)$/i.test(process.env.FORGEAX_CURSOR_ISOLATE_MCP?.trim() ?? '');
 }
@@ -38,8 +41,8 @@ function isHiddenMcpConfig(name: string): boolean {
 
 /**
  * 构建一个镜像 HOME(屏蔽 `~/.cursor/mcp.json`)。成功返回新临时目录路径(调用方设为子进程
- * `HOME` 并在 turn 结束后 `disposeCursorHome` 清理);**失败/不支持平台返回 `undefined`**
- * → 调用方退回真实 `$HOME`(原有逻辑)。仅显式 `FORGEAX_CURSOR_ISOLATE_MCP=1` 时真正镜像。
+ * `HOME` 并在 turn 结束后 `disposeCursorHome` 清理);**默认/失败/不支持平台返回 `undefined`**
+ * → 调用方退回真实 `$HOME`(原有逻辑)。仅当 `FORGEAX_CURSOR_ISOLATE_MCP=1` 时才真正镜像。
  */
 export function buildCursorHomeWithoutUserMcp(): string | undefined {
   if (!isolateEnabled()) return undefined;

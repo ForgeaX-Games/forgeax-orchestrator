@@ -52,7 +52,6 @@ import { evaluateSettingsRules, loadSettingsPermissionRules, ruleLabel } from '.
 import { shouldDelegateHostToolConfirmation } from '../kernel/host-tool-confirmation';
 import { resolveKernel } from '../kernel/resolve-kernel';
 import { orchestrationProfileOf } from '../kernel/kernel-profile';
-import { createProjectMcpBridge, isProjectMcpToolName } from '../kernel/project-mcp';
 import { prepareUserAttachmentPayload } from '../message/materialize-user-attachments';
 import { resolve as resolvePath, basename, join } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
@@ -82,11 +81,6 @@ function sessionCreateBody(raw: unknown): CreateSessionBody | null {
 
 export function createSessionsRouter() {
   const r = new Hono();
-  // Host-routed project MCP calls share the orchestrator's pooled clients with
-  // compose-time discovery and the in-process core bridge. Native providers
-  // never reach this handle; it exists to give rented/host paths the same
-  // trust-gated execution semantics without spawning a second MCP child.
-  const projectMcp = createProjectMcpBridge(defaultProjectRoot());
 
   r.get('/', (c) => {
     const sm = getSessionManager();
@@ -407,24 +401,7 @@ export function createSessionsRouter() {
       return c.json({ error: 'session not found' }, 404);
     }
     const cpm = getCheckpointManager();
-    return c.json({
-      checkpoints: cpm.list(session),
-      pending: cpm.pendingOf(session),
-      diagnostics: cpm.diagnosticsOf(session),
-    });
-  });
-
-  r.post('/:sid/checkpoints/gc', async (c) => {
-    const sm = getSessionManager();
-    let session: Session;
-    try {
-      session = await sm.open(c.req.param('sid'));
-    } catch {
-      return c.json({ error: 'session not found' }, 404);
-    }
-    const result = await getCheckpointManager().collectGarbage(session);
-    if ('error' in result) return c.json({ error: result.error }, result.status as 409);
-    return c.json(result);
+    return c.json({ checkpoints: cpm.list(session), pending: cpm.pendingOf(session) });
   });
 
   r.post('/:sid/rewind/preview', async (c) => {
@@ -618,27 +595,11 @@ export function createSessionsRouter() {
         eventBus: session.eventBus,
         sid,
       };
-      const isConfiguredProjectMcp = isProjectMcpToolName(toolName, projectRoot);
-      let out: unknown;
-      if (isConfiguredProjectMcp) {
-        const projectResult = await projectMcp.callIfKnown(toolName, args);
-        // A canonical project-MCP namespace must never fall through to the
-        // ordinary ToolRegistry when the remote tool disappeared. Failing
-        // closed here prevents a stale schema from dispatching a same-named
-        // plugin/skill implementation by accident.
-        if (projectResult === undefined) {
-          const error = `project MCP tool not found: ${toolName}`;
-          appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: false, error, durationMs: Date.now() - start, ts: start });
-          return c.json({ ok: false, code: 'project_mcp_tool_not_found', error });
-        }
-        out = projectResult;
-      } else if (isForgeaxBuiltinTool(toolName)) {
-        out = await runForgeaxBuiltinTool(toolName, args, builtinCtx);
-      } else if (seamTool?.run) {
-        out = await seamTool.run(args, hostToolRunCtx(builtinCtx));
-      } else {
-        out = await executeTool(toolName, args, agent.agentContext.tools.list(), agent.agentContext);
-      }
+      const out = isForgeaxBuiltinTool(toolName)
+        ? await runForgeaxBuiltinTool(toolName, args, builtinCtx)
+        : seamTool?.run
+          ? await seamTool.run(args, hostToolRunCtx(builtinCtx))
+          : await executeTool(toolName, args, agent.agentContext.tools.list(), agent.agentContext);
       if (out && typeof out === 'object' && !Array.isArray(out) && 'error' in out) {
         const rawErr = (out as { error: unknown }).error;
         const errMsg = typeof rawErr === 'string' ? rawErr
@@ -764,12 +725,10 @@ export function createSessionsRouter() {
   // 薄 hook 脚本(kernel/hooks/*.mjs)在内核**自己进程内的内置工具**执行前同步 HTTP
   // 回调到这里 —— 这是墙B(外部内核内置工具自执行,forgeax 旁观 stream-json 只能事后
   // 观察)的唯一拦截面。host-routed 工具(mcp__fxt__*)不经此(hook 脚本跳过),它们
-  // 在 /:sid/kernel-tool 的 trust-gate 把闸,不双卡；原生 project MCP 工具则在同一
-  // endpoint 复用 trust-gate，因为它们由 Claude/Cursor 的原生 MCP 进程直接执行。
+  // 在 /:sid/kernel-tool 的 trust-gate 把闸,不双卡。
   //
-  // 决策 = 原生 project MCP 先走 trust-tier + settings 规则；其余内置工具走
-  // settings.permissions 规则(内核内置工具跑在子进程,tier 政策管不到,规则是唯一声明
-  // 面):deny → 即拒;ask → 弹卡阻塞交人;allow → 直放;
+  // 决策 = settings.permissions 规则(不含 tier 基线——内核内置工具跑在子进程,tier
+  // 政策管不到,规则是唯一声明面):deny → 即拒;ask → 弹卡阻塞交人;allow → 直放;
   // 未命中 → 'none'(hook 脚本零输出,内核走自己的默认权限流,零行为变化)。
   // fail-safe:session 不在 → 'none'(不因编排面缺位把内核整轮卡死;deny 规则仍由
   // 各内核 sandbox/approval 基线兜,§9)。
@@ -783,8 +742,20 @@ export function createSessionsRouter() {
     const input = body.input && typeof body.input === 'object' ? body.input : {};
     if (!toolName) return c.json({ decision: 'none', reason: 'toolName required' });
 
-    const projectRoot = defaultProjectRoot();
-    const rules = loadSettingsPermissionRules(projectRoot);
+    const verdict = evaluateSettingsRules(loadSettingsPermissionRules(), toolName, input);
+    if (!verdict) return c.json({ decision: 'none' });
+
+    const label = ruleLabel(verdict.rule);
+    if (verdict.behavior === 'deny' || verdict.behavior === 'allow') {
+      const allow = verdict.behavior === 'allow';
+      appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow, ...(allow ? {} : { error: `denied by rule ${label}` }), durationMs: Date.now() - start, ts: start });
+      return c.json({ decision: verdict.behavior, reason: `${verdict.behavior} by rule ${label}` });
+    }
+
+    // ask:弹卡阻塞交人(与 permission-request 同一张卡/同一 WS 通道)。session 不在
+    // (headless / 会话已收 / session-manager 未起)→ 无处弹卡,fail-closed deny(用户
+    // 显式要求 ask 的操作,不能因没人可问而静默放行)。peek 包 try:管理器未初始化时
+    // 不 500,按无 session 走 fail-closed。
     let session: Session | undefined;
     try {
       // peek 返回 Session | null；收成 undefined 以匹配局部声明 + catch 兜底。
@@ -792,60 +763,16 @@ export function createSessionsRouter() {
     } catch {
       session = undefined;
     }
-    let activeGame: string | undefined;
-    try { activeGame = session?.config?.defaultDir ?? getPathManager().resolveScope(); } catch { /* fail-closed in the trust gate */ }
-    let decision: ReturnType<typeof checkKernelTool>;
-    if (isProjectMcpToolName(toolName, projectRoot)) {
-      // Native project MCP tools do not pass through /kernel-tool. Apply the
-      // same trust-tier policy here so own credential/delete operations still
-      // ask and settings/tier denies remain effective.
-      let trustTier: 'own' | 'imported' = 'imported';
-      try {
-        trustTier = (await loadAgentRecord(agent, { projectRoot })).trustTier;
-      } catch {
-        /* fail-closed: unknown agent stays imported */
-      }
-      decision = checkKernelTool(trustTier, toolName, {
-        args: input,
-        projectRoot,
-        ...(activeGame ? { activeGame } : {}),
-        sid,
-        rules,
-      });
-    } else {
-      // Non-MCP native CLI tools retain the existing settings-only hook
-      // contract; their provider owns the native permission posture.
-      const verdict = evaluateSettingsRules(rules, toolName, input);
-      if (!verdict) return c.json({ decision: 'none' });
-      if (verdict.behavior === 'deny' || verdict.behavior === 'allow') {
-        const allow = verdict.behavior === 'allow';
-        appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow, ...(allow ? {} : { error: `denied by rule ${ruleLabel(verdict.rule)}` }), durationMs: Date.now() - start, ts: start });
-        return c.json({ decision: verdict.behavior, reason: `${verdict.behavior} by rule ${ruleLabel(verdict.rule)}` });
-      }
-      decision = { allow: false, outcome: 'ask', reason: `confirm (rule ${ruleLabel(verdict.rule)}): ${toolName}` };
-    }
-    if (decision.outcome === 'deny') {
-      appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow: false, error: decision.reason ?? 'denied by trust tier', durationMs: Date.now() - start, ts: start });
-      return c.json({ decision: 'deny', reason: decision.reason ?? 'denied by trust tier' });
-    }
-    if (decision.outcome === 'allow') {
-      appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow: true, durationMs: Date.now() - start, ts: start });
-      return c.json({ decision: 'allow', ...(decision.reason ? { reason: decision.reason } : {}) });
-    }
-
-    // ask:弹卡阻塞交人(与 permission-request 同一张卡/同一 WS 通道)。session 不在
-    // (headless / 会话已收 / session-manager 未起)→ 无处弹卡,fail-closed deny(用户
-    // 显式要求 ask 的操作,不能因没人可问而静默放行)。
     if (!session) {
-      appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow: false, error: `${decision.reason ?? 'permission required'} with no live session (fail-closed)`, durationMs: Date.now() - start, ts: start });
-      return c.json({ decision: 'deny', reason: `${decision.reason ?? 'permission required'}, but no live session to ask (fail-closed)` });
+      appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow: false, error: `ask rule ${label} with no live session (fail-closed)`, durationMs: Date.now() - start, ts: start });
+      return c.json({ decision: 'deny', reason: `ask by rule ${label}, but no live session to ask (fail-closed)` });
     }
     const command = typeof (input as Record<string, unknown>).command === 'string'
       ? ((input as Record<string, unknown>).command as string)
       : '';
     const { allow } = await askViaPermissionCard(session, { sid, agent, toolName, command, input });
     appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow, ...(allow ? {} : { error: 'denied by user' }), durationMs: Date.now() - start, ts: start });
-    return c.json({ decision: allow ? 'allow' : 'deny', reason: allow ? 'user approved' : 'denied by user' });
+    return c.json({ decision: allow ? 'allow' : 'deny', reason: allow ? `user approved (rule ${label})` : `denied by user (rule ${label})` });
   });
 
   // POST /:sid/permission-reply —— 前端审批卡上点「允许/拒绝」后调用,解开上面

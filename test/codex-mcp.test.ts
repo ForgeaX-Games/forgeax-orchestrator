@@ -4,15 +4,14 @@
  *   - TOML serializer(转义 / 数组 / 绝对路径 / 无 shell 拼接)
  *   - buildCodexMcpOverrides argv 形状(required/enabled_tools/approve/timeouts)
  *   - 版本能力闸(低版本 + 非空 tools 明确失败;空 tools 放行;解析)
- *   - config 校验(缺失 / 原生 MCP 并存 / allowlist 不一致)
+ *   - config 校验(缺失 / 污染 / allowlist 不一致)
  *   - runtime materializer(唯一目录 / 0600 specs / cleanup 幂等 / hostSessionId 优先)
  *   - keyed mutex(同 home 串行,不同 home 并行)
  *   - forgeax-tools-server.mjs 进程级双层 allowlist(list + call,未曝光/未知 → not_found)
  */
 import { describe, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, statSync, writeFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import type { TurnRequest } from '@forgeax/agent-runtime';
 import {
@@ -32,12 +31,8 @@ import {
 import {
   KeyedMutex,
   codexHomeKey,
-  codexNativeStdioMcpNames,
-  codexNativeSourceFingerprint,
   codexProjectTrustHeader,
   hasProjectTrust,
-  sanitizeImportedCodexConfig,
-  sanitizeCodexConfig,
 } from '../src/kernel/codex-session-home';
 
 const SERVER = resolvePath(import.meta.dir, '../src/kernel/mcp/forgeax-tools-server.mjs');
@@ -171,8 +166,13 @@ describe('codex-mcp — validateCodexMcpConfig', () => {
     }
   });
 
-  test('user-authored native MCP servers remain available beside fxt', () => {
-    expect(() => validateCodexMcpConfig({ servers: ['fxt', 'user-native'] }, ['a'])).not.toThrow();
+  test('extra MCP server → contaminated', () => {
+    try {
+      validateCodexMcpConfig({ servers: ['fxt', 'evil'] }, ['a']);
+      throw new Error('nope');
+    } catch (e) {
+      expect((e as CodexMcpError).code).toBe('codex_mcp_contaminated');
+    }
   });
 
   test('enabled_tools mismatch → config_mismatch', () => {
@@ -248,135 +248,6 @@ describe('forgeax-tools-runtime — materialize', () => {
 // ─── keyed mutex + home key ──────────────────────────────────────────
 
 describe('codex-session-home — keyed mutex', () => {
-  test('native MCP/plugin/hook configuration is preserved verbatim', () => {
-    const config = [
-      '[mcp_servers.user-native]',
-      'command = "native-mcp"',
-      '[plugins."browser@example"]',
-      'enabled = true',
-      '[hooks.state]',
-      'enabled = true',
-    ].join('\n');
-    expect(sanitizeCodexConfig(config)).toBe(config);
-  });
-
-  test('native stdio MCP discovery waits only for enabled top-level command servers', () => {
-    const config = [
-      '[mcp_servers.node_repl]',
-      'command = "node"',
-      '[mcp_servers.node_repl.env]',
-      'TOKEN = "secret"',
-      '[mcp_servers."forgeax"]',
-      'command = "bun"',
-      '[mcp_servers.disabled]',
-      'command = "disabled"',
-      'enabled = false',
-      '[mcp_servers.remote]',
-      'url = "https://example.invalid/mcp"',
-      '[plugins.demo]',
-      'enabled = true',
-    ].join('\n');
-    expect(codexNativeStdioMcpNames(config)).toEqual(['node_repl', 'forgeax']);
-  });
-
-  test('imported config retains provider preferences but removes native capability tables', () => {
-    const config = [
-      'model = "gpt-5.6-sol"',
-      '[model_providers.openai]',
-      'name = "OpenAI"',
-      '[mcp_servers.native]',
-      'command = "dangerous"',
-      '[plugins.demo]',
-      'enabled = true',
-      '[hooks.state]',
-      'trusted_hash = "secret"',
-      '[projects."/safe"]',
-      'trust_level = "trusted"',
-    ].join('\n');
-    const imported = sanitizeImportedCodexConfig(config);
-    expect(imported).toContain('model = "gpt-5.6-sol"');
-    expect(imported).toContain('[model_providers.openai]');
-    expect(imported).toContain('[projects."/safe"]');
-    expect(imported).not.toContain('mcp_servers');
-    expect(imported).not.toContain('[plugins.');
-    expect(imported).not.toContain('[hooks.');
-  });
-
-  test('native capability fingerprint follows authored edits but ignores Codex runtime markers', () => {
-    const priorHome = process.env.CODEX_HOME;
-    const home = mkdtempSync(resolvePath(tmpdir(), 'codex-native-fingerprint-'));
-    process.env.CODEX_HOME = home;
-    try {
-      mkdirSync(resolvePath(home, 'skills', 'demo'), { recursive: true });
-      mkdirSync(resolvePath(home, 'plugins', 'cache', 'demo'), { recursive: true });
-      const skill = resolvePath(home, 'skills', 'demo', 'SKILL.md');
-      const plugin = resolvePath(home, 'plugins', 'cache', 'demo', 'plugin.json');
-      const runtimeMarker = resolvePath(home, 'plugins', 'cache', 'demo', '.codex-remote-plugin-install.json');
-      writeFileSync(skill, 'one');
-      writeFileSync(plugin, '{"version":1}');
-      const first = codexNativeSourceFingerprint();
-      writeFileSync(runtimeMarker, '{"remote_plugin_id":"first"}');
-      const runtimeCreated = codexNativeSourceFingerprint();
-      writeFileSync(runtimeMarker, '{"remote_plugin_id":"replaced-with-a-different-value"}');
-      const runtimeRewritten = codexNativeSourceFingerprint();
-      writeFileSync(skill, 'two-two');
-      const second = codexNativeSourceFingerprint();
-      writeFileSync(plugin, '{"version":22}');
-      const third = codexNativeSourceFingerprint();
-      expect(runtimeCreated).toBe(first);
-      expect(runtimeRewritten).toBe(first);
-      expect(second).not.toBe(first);
-      expect(third).not.toBe(second);
-    } finally {
-      if (priorHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = priorHome;
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
-
-  test('native capability fingerprint follows symlink targets without following cycles or runtime markers', () => {
-    const priorHome = process.env.CODEX_HOME;
-    const home = mkdtempSync(resolvePath(tmpdir(), 'codex-native-link-fingerprint-'));
-    const targets = mkdtempSync(resolvePath(tmpdir(), 'codex-native-link-targets-'));
-    process.env.CODEX_HOME = home;
-    try {
-      const skillTarget = resolvePath(targets, 'skill');
-      const pluginTarget = resolvePath(targets, 'plugin');
-      mkdirSync(skillTarget, { recursive: true });
-      mkdirSync(pluginTarget, { recursive: true });
-      mkdirSync(resolvePath(home, 'skills'), { recursive: true });
-      mkdirSync(resolvePath(home, 'plugins'), { recursive: true });
-      const skill = resolvePath(skillTarget, 'SKILL.md');
-      const plugin = resolvePath(pluginTarget, 'plugin.json');
-      const runtimeMarker = resolvePath(pluginTarget, '.codex-remote-plugin-install.json');
-      writeFileSync(skill, 'version-one');
-      writeFileSync(plugin, '{"version":1}');
-      symlinkSync(skillTarget, resolvePath(home, 'skills', 'linked-skill'));
-      symlinkSync(pluginTarget, resolvePath(home, 'plugins', 'linked-plugin'));
-      symlinkSync(skillTarget, resolvePath(skillTarget, 'cycle'));
-
-      const first = codexNativeSourceFingerprint();
-      writeFileSync(runtimeMarker, '{"remote_plugin_id":"first"}');
-      const runtimeCreated = codexNativeSourceFingerprint();
-      writeFileSync(runtimeMarker, '{"remote_plugin_id":"atomically-replaced-value"}');
-      const runtimeRewritten = codexNativeSourceFingerprint();
-      writeFileSync(skill, 'version-two-with-different-size');
-      const skillChanged = codexNativeSourceFingerprint();
-      writeFileSync(plugin, '{"version":22}');
-      const pluginChanged = codexNativeSourceFingerprint();
-
-      expect(runtimeCreated).toBe(first);
-      expect(runtimeRewritten).toBe(first);
-      expect(skillChanged).not.toBe(first);
-      expect(pluginChanged).not.toBe(skillChanged);
-    } finally {
-      if (priorHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = priorHome;
-      rmSync(home, { recursive: true, force: true });
-      rmSync(targets, { recursive: true, force: true });
-    }
-  });
-
   test('Windows project trust headers escape backslashes and match case-insensitively', () => {
     const root = 'E:\\LightBox_Develop\\tmp\\forgeax-studio';
     expect(codexProjectTrustHeader(root)).toBe('[projects."E:\\\\LightBox_Develop\\\\tmp\\\\forgeax-studio"]');
@@ -594,33 +465,6 @@ describe('forgeax-tools-server — double allowlist (process-level)', () => {
       expect(call.result.content?.[0]?.text).toContain('bridge unavailable');
     } finally {
       srv.close();
-    }
-  });
-
-  test('gated host-bridged spec reaches the host gate instead of being pre-denied by fxt', async () => {
-    const { mkdtempSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
-    const dir = mkdtempSync(join(tmpdir(), 'fxt-gated-bridge-'));
-    const specsFile = join(dir, 'specs.json');
-    writeFileSync(
-      specsFile,
-      JSON.stringify([{ name: 'host_tool', description: 'x', inputSchema: { type: 'object', properties: {} } }]),
-    );
-    const srv = spawnServer({
-      FORGEAX_FXT_EXPOSE: 'host_tool',
-      FORGEAX_TOOL_SPECS_FILE: specsFile,
-      FORGEAX_KERNEL_PERMISSION_MODE: 'gated',
-    });
-    try {
-      await srv.rpc('initialize', { protocolVersion: '2024-11-05' });
-      const result = await srv.rpc('tools/call', { name: 'host_tool', arguments: {} });
-      expect(result.result.isError).toBe(true);
-      expect(result.result.content[0].text).toContain('bridge unavailable');
-      expect(result.result.content[0].text).not.toContain('active kernel posture is gated');
-    } finally {
-      srv.close();
-      rmSync(dir, { recursive: true, force: true });
     }
   });
 

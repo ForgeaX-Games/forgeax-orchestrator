@@ -6,11 +6,9 @@
  * 本文件钉住 cc-profile 的 argv 翻译,防回归。所有 CC-ism 锁在 cc-profile。
  */
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import type { TurnRequest, ComposedPrompt } from '@forgeax/agent-runtime/contract';
-import { buildCcArgs, buildCcInput, buildCcPersistentArgs } from '../src/kernel/cc-profile';
+import { buildCcArgs } from '../src/kernel/cc-profile';
 
 const ROOT = tmpdir();
 
@@ -140,7 +138,7 @@ describe('cc-profile — fallback-model', () => {
   });
 });
 
-describe('cc-profile — hermetic 隔离', () => {
+describe('cc-profile — hermetic 隔离(仅 imported)', () => {
   test("trustTier:'imported' ⇒ --strict-mcp-config + --setting-sources ''", () => {
     const args = buildCcArgs(req({ trustTier: 'imported' }), ROOT, []);
     expect(args).toContain('--strict-mcp-config');
@@ -149,89 +147,15 @@ describe('cc-profile — hermetic 隔离', () => {
     expect(args[i + 1]).toBe(''); // 空值 = 加载零来源(真二进制已验接受)
   });
 
-  test("trustTier:'own' ⇒ 保留 Claude 原生设置和能力来源", () => {
+  test("trustTier:'own' ⇒ 不隔离(零回归)", () => {
     const args = buildCcArgs(req({ trustTier: 'own' }), ROOT, []);
     expect(args).not.toContain('--strict-mcp-config');
     expect(args).not.toContain('--setting-sources');
   });
 
-  test('缺省 trustTier ⇒ 保留 Claude 原生设置和能力来源', () => {
+  test('缺省 trustTier ⇒ 不隔离', () => {
     const args = buildCcArgs(req(), ROOT, []);
     expect(args).not.toContain('--strict-mcp-config');
     expect(args).not.toContain('--setting-sources');
-  });
-
-  test('own/default turns keep the cache-stable dynamic-section optimization without dropping native sources', () => {
-    const args = buildCcArgs(req(), ROOT, []);
-    expect(args).toContain('--exclude-dynamic-system-prompt-sections');
-    expect(args).toContain('--append-system-prompt-file');
-    expect(args).not.toContain('--strict-mcp-config');
-    expect(args).not.toContain('--setting-sources');
-  });
-});
-
-describe('cc-profile — persistent stream-json', () => {
-  test('keeps capability flags, removes the one-shot message, and preserves the exact input payload', () => {
-    const input = req({ input: { text: 'FIRST' }, systemPrompt: { dynamicSuffix: 'LANG=zh' } });
-    const args = buildCcPersistentArgs(input, ROOT, ['--session-id', '11111111-1111-4111-8111-111111111111']);
-    expect(args).toContain('--input-format');
-    expect(args[args.indexOf('--input-format') + 1]).toBe('stream-json');
-    expect(args).not.toContain('FIRST');
-    expect(buildCcInput(input)).toBe('FIRST\n\nLANG=zh');
-  });
-});
-
-describe('cc-profile — project MCP execution path', () => {
-  function projectRoot(): string {
-    const root = mkdtempSync(join(tmpdir(), 'forgeax-cc-project-mcp-'));
-    mkdirSync(join(root, '.forgeax'));
-    writeFileSync(join(root, '.forgeax', 'mcp.json'), JSON.stringify({
-      mcpServers: { project: { command: process.execPath, args: ['fixture.mjs'] } },
-    }));
-    return root;
-  }
-
-  test('own turns expose project MCP natively once and omit it from fxt specs', () => {
-    const root = projectRoot();
-    try {
-      const request = req({
-        trustTier: 'own',
-        tools: [
-          { name: 'mcp__project__read', description: 'read', inputSchema: { type: 'object' } },
-          { name: 'memory_search', description: 'memory', inputSchema: { type: 'object' } },
-        ],
-      });
-      const args = buildCcArgs(request, root, []);
-      const configPath = args[args.indexOf('--mcp-config') + 1];
-      const config = JSON.parse(readFileSync(configPath, 'utf8'));
-      const fxtEnv = config.mcpServers.fxt.env;
-      expect(config.mcpServers.project.command).toBe(process.execPath);
-      expect(fxtEnv.FORGEAX_TOOL_SPECS_FILE).toBeUndefined();
-      expect(args).toContain('mcp__project__read');
-      expect(args).not.toContain('mcp__fxt__mcp__project__read');
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test('imported turns route project MCP through fxt/host and do not mount it natively', () => {
-    const root = projectRoot();
-    try {
-      const request = req({
-        trustTier: 'imported',
-        tools: [{ name: 'mcp__project__read', description: 'read', inputSchema: { type: 'object' } }],
-      });
-      const args = buildCcArgs(request, root, []);
-      const configPath = args[args.indexOf('--mcp-config') + 1];
-      const config = JSON.parse(readFileSync(configPath, 'utf8'));
-      const fxtEnv = config.mcpServers.fxt.env;
-      const specs = JSON.parse(readFileSync(fxtEnv.FORGEAX_TOOL_SPECS_FILE, 'utf8'));
-      expect(config.mcpServers.project).toBeUndefined();
-      expect(specs.map((tool: { name: string }) => tool.name)).toEqual(['mcp__project__read']);
-      expect(args).toContain('mcp__fxt__mcp__project__read');
-      expect(args).not.toContain('mcp__project__read');
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
   });
 });

@@ -18,9 +18,7 @@
  * **未** abort 的回归用例同样经接缝断言仍为 error。
  */
 import { test, expect, describe } from 'bun:test';
-import { randomUUID } from 'node:crypto';
 import type { KernelEvent } from '@forgeax/agent-runtime';
-import type { TurnRequest } from '@forgeax/agent-runtime';
 import {
   createClaudeMapperState,
   flushClaudeMapper,
@@ -30,8 +28,6 @@ import {
   createCodexMapperState,
   flushCodexMapper,
 } from '../src/kernel/codex-mapper';
-import { ClaudeCodeKernel } from '../src/kernel/claude-code-kernel';
-import { CodexKernel } from '../src/kernel/codex-kernel';
 
 // ── claude-code:exit 处 abort 分支与本组合逐字同构 ──────────────────────
 // claude-code-kernel.ts:
@@ -55,47 +51,6 @@ function ccErrorTerminal(code: number, tail: string): KernelEvent[] {
 }
 
 describe('claude-code kernel — abort 收口 turn.done{cancelled}', () => {
-  test('persistent eligible 的 pre-abort 经真实 runTurn 正常收口且不触碰 binary', async () => {
-    const previousPool = process.env.FORGEAX_CLAUDE_CLI_POOL;
-    const previousSidecar = process.env.FORGEAX_SIDECAR;
-    const previousBinary = process.env.ANTHROPIC_CLI_PATH;
-    process.env.FORGEAX_CLAUDE_CLI_POOL = '1';
-    process.env.FORGEAX_SIDECAR = 'off';
-    // 若 pre-abort 继续进入 binary/session 路径，这个不可执行路径会让测试
-    // 直接失败；正常实现必须在任何外部副作用之前返回 cancelled terminal。
-    process.env.ANTHROPIC_CLI_PATH = '/forgeax-test/must-not-spawn-claude';
-
-    const req: TurnRequest = {
-      session: { threadId: randomUUID(), agentId: 'forge' },
-      hostSessionId: `pre-abort-${randomUUID()}`,
-      input: { text: 'MUST_NOT_SEND' },
-      systemPrompt: { charter: '', persona: '', mode: 'replace' },
-      tools: [],
-      budget: {},
-      trustTier: 'own',
-    };
-    const controller = new AbortController();
-    controller.abort();
-    const events: KernelEvent[] = [];
-    try {
-      for await (const event of new ClaudeCodeKernel().runTurn(req, controller.signal)) events.push(event);
-    } finally {
-      if (previousPool === undefined) delete process.env.FORGEAX_CLAUDE_CLI_POOL;
-      else process.env.FORGEAX_CLAUDE_CLI_POOL = previousPool;
-      if (previousSidecar === undefined) delete process.env.FORGEAX_SIDECAR;
-      else process.env.FORGEAX_SIDECAR = previousSidecar;
-      if (previousBinary === undefined) delete process.env.ANTHROPIC_CLI_PATH;
-      else process.env.ANTHROPIC_CLI_PATH = previousBinary;
-    }
-
-    expect(events).toEqual([
-      { kind: 'turn.usage' },
-      { kind: 'turn.done', reason: 'cancelled' },
-    ]);
-    expect(events.some((event) => event.kind === 'error')).toBe(false);
-    expect(events.some((event) => event.kind === 'tool.call')).toBe(false);
-  });
-
   test('被 abort → 最后一个事件是 turn.done{reason:cancelled}(非 error)', () => {
     const evs = ccAbortTerminal();
     const last = evs[evs.length - 1]!;
@@ -129,27 +84,6 @@ describe('claude-code kernel — abort 收口 turn.done{cancelled}', () => {
 });
 
 describe('codex kernel(exec fallback)— abort 收口 turn.done{cancelled}', () => {
-  test('真实 runTurn pre-abort 在 binary/MCP/pool 前零副作用收口', async () => {
-    let binaryTouched = false;
-    process.env.CODEX_CLI_PATH = '/definitely/not/a/real/codex';
-    const kernel = new CodexKernel({ onTransportSelected: () => { binaryTouched = true; } });
-    const ac = new AbortController();
-    ac.abort();
-    const events = [];
-    for await (const event of kernel.runTurn({
-      session: { threadId: 'pre-abort', agentId: 'forge' },
-      hostSessionId: 'pre-abort',
-      input: { text: 'must not be sent' },
-      systemPrompt: { charter: 'c', persona: '' },
-      tools: [{ name: 'echo' }],
-      budget: {},
-      trustTier: 'own',
-    }, ac.signal)) events.push(event);
-    delete process.env.CODEX_CLI_PATH;
-    expect(binaryTouched).toBe(false);
-    expect(events).toEqual([{ kind: 'turn.usage' }, { kind: 'turn.done', reason: 'cancelled' }]);
-  });
-
   test('被 abort(aborted=true)→ 最后一个事件是 turn.done{reason:cancelled}', () => {
     const state = createCodexMapperState();
     // codex-kernel.ts:flushCodexMapper(state, exitInfo, ac.signal.aborted)

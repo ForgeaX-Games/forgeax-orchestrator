@@ -2,38 +2,28 @@
  * codex-session-home — a stable, ISOLATED `CODEX_HOME` per logical agent session,
  * plus a keyed mutex serializing access to each home.
  *
- * Why isolate (plan §8.1): Codex keeps its config, auth, sessions, SQLite and
- * logs under `CODEX_HOME`. Sharing the user's `~/.codex` would contend on those
- * mutable stores. Each logical session therefore gets its own directory under
- * the orchestrator's user dir, while authored native capabilities are preserved
- * through a verbatim config copy and links to the user's capability directories.
+ * Why isolate (plan §8.1): Codex keeps its config, auth, sessions, SQLite, logs
+ * and skills under `CODEX_HOME`. Sharing the user's `~/.codex` would let a turn
+ * inherit global MCP servers / hooks / plugins (contaminating the exact-per-turn
+ * tool set) and contend on the user's SQLite. So each logical session gets its
+ * own directory under the orchestrator's user dir.
  *
  * Why STABLE (not per-turn): a fresh dir every turn would lose Codex thread state,
  * so `exec resume` / `thread/resume` could not restore context. The directory is
  * reused across turns of the same logical session.
  *
- * Auth: subscription auth lives in `auth.json`; refresh it into the isolated
- * home so a logged-in Codex keeps working. API-key auth still flows via env
- * (OPENAI_API_KEY) and needs no file.
+ * Auth: we do NOT copy the user's `config.toml` (that's the whole point — a clean
+ * config with no inherited MCP). But subscription auth lives in `auth.json`; we
+ * copy it read-only into the isolated home on first use so a logged-in Codex keeps
+ * working without leaking the rest of the global config. API-key auth still flows
+ * via env (OPENAI_API_KEY) and needs no file.
  *
  * Concurrency (plan §8.2): one Codex process per home at a time. `codexHomeMutex`
  * is a keyed mutex; callers acquire before spawn and release in `finally`.
  * Different logical sessions run in parallel; the same home is strictly serial.
  */
 import type { TurnRequest } from '@forgeax/agent-runtime';
-import { createHash } from 'node:crypto';
-import {
-  copyFileSync,
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  readlinkSync,
-  realpathSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { chmod } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join, resolve as resolvePath } from 'node:path';
@@ -71,102 +61,33 @@ function userCodexHome(): string {
 }
 
 /**
- * Keep the user's authored native Codex capability configuration intact. The
- * session still has an isolated SQLite/history home, while native MCP, plugins,
- * hooks, marketplaces, models and project trust are loaded exactly as the user
- * configured them. ForgeaX adds its scoped `fxt` MCP through command-line
- * overrides; capability isolation comes from the process fingerprint and the
- * fxt double allowlist, not by deleting native functionality.
+ * Strip the pollution vectors (`[mcp_servers.*]`, `[hooks.*]`, `[plugins.*]`
+ * tables + any top-level `mcp_servers =` assignment) from a Codex `config.toml`
+ * while PRESERVING everything else — most importantly `model` / `model_provider`
+ * / `[model_providers.*]` (base_url / wire_api / auth mode) and project trust.
+ *
+ * This is the crux of §8.1 isolation done right: a fully-empty home would drop
+ * the user's custom model endpoint (breaking auth), while a verbatim copy would
+ * re-inherit global MCP/hooks (breaking the exact-per-turn tool set). We keep the
+ * provider config and drop only the MCP/hook/plugin surface (we register `fxt`
+ * ourselves via `-c` overrides).
  */
 export function sanitizeCodexConfig(raw: string): string {
-  return raw;
-}
-
-/** Keep provider/model/UI preferences for imported turns, but remove every
- * user-authored native capability table. Imported content must not inherit a
- * local MCP, plugin, hook or marketplace that bypasses the host trust gate. */
-export function sanitizeImportedCodexConfig(raw: string): string {
-  const blocked = /^(?:mcp_servers|plugins|hooks|plugin_marketplaces)(?:\.|$)/;
-  let omit = false;
-  const kept: string[] = [];
+  const out: string[] = [];
+  let skipping = false;
   for (const line of raw.split(/\r?\n/)) {
-    const section = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/);
-    if (section) omit = blocked.test(section[1]?.trim() ?? '');
-    if (!omit) kept.push(line);
-  }
-  return kept.join('\n');
-}
-
-/**
- * Enabled native stdio MCPs whose startup must settle before a thread snapshots
- * the tool catalog. HTTP MCPs are intentionally excluded: authentication or an
- * unreachable remote must not turn app-server warm-up into an unbounded gate.
- *
- * This is a deliberately narrow TOML reader rather than a second config parser:
- * it recognizes only exact top-level `[mcp_servers.<name>]` tables and the two
- * scalar fields needed for admission (`command`, `enabled`). Nested `.env` /
- * `.http_headers` tables cannot be mistaken for servers.
- */
-export function codexNativeStdioMcpNames(config: string): string[] {
-  const found = new Map<string, { command: boolean; enabled: boolean }>();
-  let current: { name: string; command: boolean; enabled: boolean } | undefined;
-  const commit = (): void => {
-    if (current?.command && current.enabled) found.set(current.name, current);
-  };
-
-  for (const line of config.split(/\r?\n/)) {
-    const section = line.match(/^\s*\[mcp_servers\.(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([A-Za-z0-9_-]+))\]\s*(?:#.*)?$/);
-    if (section) {
-      commit();
-      let name = section[3] ?? section[2] ?? section[1] ?? '';
-      if (section[1] !== undefined) {
-        try { name = JSON.parse(`"${section[1]}"`) as string; } catch { name = section[1]; }
-      }
-      current = { name, command: false, enabled: true };
+    const header = /^\s*\[\[?\s*([^\]]*?)\s*\]\]?\s*$/.exec(line);
+    if (header) {
+      const name = header[1];
+      skipping = /^mcp_servers(\.|$)/.test(name) || /^hooks(\.|$)/.test(name) || /^plugins(\.|$)/.test(name);
+      if (!skipping) out.push(line);
       continue;
     }
-    if (/^\s*\[/.test(line)) {
-      commit();
-      current = undefined;
-      continue;
-    }
-    if (!current) continue;
-    if (/^\s*command\s*=/.test(line)) current.command = true;
-    if (/^\s*enabled\s*=\s*false\s*(?:#.*)?$/i.test(line)) current.enabled = false;
+    if (skipping) continue;
+    if (/^\s*mcp_servers\s*=/.test(line)) continue; // top-level inline table
+    out.push(line);
   }
-  commit();
-  return [...found.keys()];
-}
-
-export function codexSessionNativeStdioMcpNames(dir: string): string[] {
-  try {
-    const names = codexNativeStdioMcpNames(readFileSync(join(dir, 'config.toml'), 'utf8'));
-    // Installed plugins are represented to Codex through this native gateway.
-    // Waiting for it preserves plugin/skill/app capabilities without having to
-    // reinterpret every plugin manifest in ForgeaX.
-    if (existsSync(join(dir, 'plugins'))) names.push('codex_apps');
-    return [...new Set(names)];
-  } catch {
-    return [];
-  }
-}
-
-const NATIVE_CAPABILITY_DIRS = ['skills', 'rules', 'plugins', 'vendor_imports'];
-
-function refreshNativeCapabilityOverlay(sourceHome: string, sessionHome: string): void {
-  for (const name of NATIVE_CAPABILITY_DIRS) {
-    const source = join(sourceHome, name);
-    const destination = join(sessionHome, name);
-    if (!existsSync(source) || existsSync(destination)) continue;
-    try {
-      // A 300MB plugin cache must not be copied into every logical session.
-      // The isolated home owns mutable history/SQLite; user-managed native
-      // capability assets stay single-source and are visible through links.
-      symlinkSync(source, destination, 'dir');
-    } catch {
-      /* best-effort: config and ForgeaX fxt still remain usable */
-    }
-  }
+  return out.join('\n');
 }
 
 function normalizedProjectPath(value: string): string {
@@ -196,48 +117,37 @@ export function hasProjectTrust(cfg: string, projectRoot: string): boolean {
 /**
  * Ensure the isolated `CODEX_HOME` directory for `key` exists and return its
  * absolute path. Seeds it with:
- *   - current `auth.json` so API-key/subscription auth works;
- *   - current `config.toml`, including native MCP/hooks/plugins, plus project trust;
- *   - links to user-managed native capability directories, avoiding per-session copies.
+ *   - `auth.json` (copied read-only, first use only) so API-key/subscription auth works;
+ *   - a SANITIZED `config.toml` (provider/trust preserved, MCP/hooks/plugins stripped),
+ *     rewritten each call so provider settings stay fresh, with the current project
+ *     root marked trusted (headless exec must not block on a trust prompt).
  */
-export async function ensureCodexSessionHome(
-  key: string,
-  options: { nativeCapabilities?: boolean } = {},
-): Promise<string> {
-  const nativeCapabilities = options.nativeCapabilities !== false;
-  const parts = key.split('/').map((p) => seg(p, 'x'));
-  if (!nativeCapabilities) parts.push('imported-hermetic');
-  const dir = join(resolveUserDir(), 'codex', ...parts);
+export async function ensureCodexSessionHome(key: string): Promise<string> {
+  const dir = join(resolveUserDir(), 'codex', ...key.split('/').map((p) => seg(p, 'x')));
   mkdirSync(dir, { recursive: true });
   mkdirSync(join(dir, 'sessions'), { recursive: true });
 
   const src = userCodexHome();
-  if (nativeCapabilities) refreshNativeCapabilityOverlay(src, dir);
 
   const authDest = join(dir, 'auth.json');
-  const authSrc = join(src, 'auth.json');
-  if (existsSync(authSrc)) {
-    try {
-      const sourceAuth = readFileSync(authSrc);
-      const destinationAuth = existsSync(authDest) ? readFileSync(authDest) : undefined;
-      if (!destinationAuth || !sourceAuth.equals(destinationAuth)) {
+  if (!existsSync(authDest)) {
+    const authSrc = join(src, 'auth.json');
+    if (existsSync(authSrc)) {
+      try {
         copyFileSync(authSrc, authDest);
         await chmod(authDest, 0o600);
+      } catch {
+        /* best-effort: fall back to env auth (OPENAI_API_KEY) if copy fails */
       }
-    } catch {
-      /* best-effort: fall back to env auth (OPENAI_API_KEY) if copy fails */
     }
   }
 
-  // Current native config + trust for the current cwd (overwritten each call).
+  // Sanitized provider config + trust for the current cwd (overwritten each call).
   const projectRoot = defaultProjectRoot();
   let cfg = '';
   try {
     const cfgSrc = join(src, 'config.toml');
-    if (existsSync(cfgSrc)) {
-      const raw = readFileSync(cfgSrc, 'utf8');
-      cfg = nativeCapabilities ? sanitizeCodexConfig(raw) : sanitizeImportedCodexConfig(raw);
-    }
+    if (existsSync(cfgSrc)) cfg = sanitizeCodexConfig(readFileSync(cfgSrc, 'utf8'));
   } catch {
     cfg = '';
   }
@@ -250,93 +160,6 @@ export async function ensureCodexSessionHome(
     /* best-effort: without config the turn may fall back to default provider */
   }
   return dir;
-}
-
-/**
- * Process-start inputs from the isolated home. Credential bytes are reduced to
- * a one-way digest so even a same-size/same-mtime login refresh invalidates the
- * process without putting the secret itself in diagnostics.
- */
-export function codexSessionHomeFingerprint(dir: string): string {
-  let config = '';
-  try { config = readFileSync(join(dir, 'config.toml'), 'utf8'); } catch { /* missing */ }
-  let authStamp = 'missing';
-  try {
-    authStamp = createHash('sha256').update(readFileSync(join(dir, 'auth.json'))).digest('hex');
-  } catch { /* missing */ }
-  return createHash('sha256').update([
-    process.env.FORGEAX_CODEX_NATIVE_FINGERPRINT?.trim() ?? '',
-    config,
-    authStamp,
-  ].join('\n')).digest('hex');
-}
-
-/** User-authored native sources observed before refreshing the session overlay. */
-export function codexNativeSourceFingerprint(): string {
-  const sourceHome = userCodexHome();
-  const stamps: string[] = [];
-  const activeDirectories = new Set<string>();
-  const maxDepth = 64;
-  const maxEntries = 50_000;
-  let entries = 0;
-  let limitStamped = false;
-  const stamp = (path: string, relative = '', depth = 0): void => {
-    if (depth > maxDepth || entries >= maxEntries) {
-      if (!limitStamped) {
-        stamps.push(`limit:${depth > maxDepth ? 'depth' : 'entries'}`);
-        limitStamped = true;
-      }
-      return;
-    }
-    entries += 1;
-    try {
-      const stat = lstatSync(path);
-      if (stat.isSymbolicLink()) {
-        stamps.push(`${relative || path}:link:${stat.mode}:${readlinkSync(path)}`);
-        // Capability managers commonly install skills/plugins as links into a
-        // cache. Fingerprint the resolved content as well as the link itself so
-        // an in-place target update replaces the warm app-server owner.
-        const target = realpathSync(path);
-        stamp(target, `${relative || path}:target`, depth + 1);
-        return;
-      }
-      if (!stat.isDirectory()) {
-        stamps.push(`${relative || path}:file:${stat.mode}:${stat.size}:${stat.mtimeMs}`);
-        return;
-      }
-      const realDirectory = realpathSync(path);
-      if (activeDirectories.has(realDirectory)) {
-        stamps.push(`${relative || path}:cycle`);
-        return;
-      }
-      // A directory mtime changes when Codex atomically replaces an ignored
-      // runtime marker. Child entries already fingerprint every authored input,
-      // so the directory's own mutable metadata is intentionally excluded.
-      stamps.push(`${relative || path}:dir:${stat.mode}`);
-      activeDirectories.add(realDirectory);
-      try {
-        for (const child of readdirSync(path).sort()) {
-          // Runtime sockets/staging are process outputs, not authored capability
-          // inputs. This applies equally inside a symlinked capability tree.
-          if (
-            child === '.plugin-appserver'
-            || child === '.remote-plugin-install-staging'
-            || child === '.codex-remote-plugin-install.json'
-          ) continue;
-          stamp(join(path, child), relative ? `${relative}/${child}` : child, depth + 1);
-        }
-      } finally {
-        activeDirectories.delete(realDirectory);
-      }
-    } catch { stamps.push(`${relative || path}:missing`); }
-  };
-  stamp(join(sourceHome, 'config.toml'));
-  stamp(join(sourceHome, 'auth.json'));
-  for (const name of NATIVE_CAPABILITY_DIRS) stamp(join(sourceHome, name));
-  return createHash('sha256').update([
-    process.env.FORGEAX_CODEX_NATIVE_FINGERPRINT?.trim() ?? '',
-    ...stamps,
-  ].join('\n')).digest('hex');
 }
 
 /**

@@ -132,10 +132,8 @@ function bridgeToolResult(r, content) {
   };
 }
 
-/** Direct project-MCP clients have no ACP approval callback. A gated native
- * project path must therefore fail closed instead of silently becoming
- * unrestricted. Host-bridged specs are different: their call enters the
- * server's /kernel-tool trust/approval gate, so they must not be denied here. */
+/** The fxt MCP process has no ACP approval callback. A gated Kimi turn must
+ * therefore fail closed here instead of silently becoming unrestricted. */
 function permissionDenied(name) {
   return {
     isError: true,
@@ -405,10 +403,6 @@ function refreshBridgedByName() {
 // fxt path). The process is itself per-turn, so keeping one client per server
 // avoids a second initialize/list handshake for every tool call.
 function readProjectMcpServers() {
-  // Project-local MCP has one authoritative execution path per provider:
-  // native providers mount it themselves; host-routed providers call the
-  // server-side pooled bridge. The fxt shim must never spawn a second copy.
-  if (process.env.FORGEAX_DISABLE_PROJECT_MCP === '1') return [];
   for (const path of [join(PROJECT_ROOT, '.forgeax/mcp.json'), join(PROJECT_ROOT, '.mcp.json'), join(PROJECT_ROOT, 'mcp.json')]) {
     if (!existsSync(path)) continue;
     try {
@@ -575,9 +569,7 @@ async function currentTools() {
         description: t.description ?? '',
         inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
         async run(args) {
-          // The host route is the authoritative trust/approval gate for this
-          // tool. Applying the Kimi posture again in this MCP shim would cut
-          // off imported agents before their host permission policy runs.
+          if (KERNEL_PERMISSION_MODE === 'gated') return permissionDenied(t.name);
           return bridgeToolResult(await bridgeCall(t.name, args));
         },
       });
