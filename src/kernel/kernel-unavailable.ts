@@ -141,6 +141,8 @@ export interface KernelErrorPayload {
   code: string;
   kernelId?: string;
   reason?: KernelUnavailableReason;
+  retryable?: boolean;
+  retryAfterMs?: number;
 }
 
 /**
@@ -201,5 +203,14 @@ export async function toKernelErrorPayload(
     }
   }
   // Kernel is healthy (or unknown): a real runtime error, NOT a missing kernel.
-  return { type: 'error', message: rawMessage, code: rawCode ?? 'turn_failed' };
+  const structured = raw as { retryable?: unknown; retryAfterMs?: unknown } | null;
+  return {
+    type: 'error',
+    message: rawMessage,
+    code: rawCode ?? 'turn_failed',
+    ...(structured?.retryable === true ? { retryable: true } : {}),
+    ...(typeof structured?.retryAfterMs === 'number' && Number.isFinite(structured.retryAfterMs)
+      ? { retryAfterMs: structured.retryAfterMs }
+      : {}),
+  };
 }

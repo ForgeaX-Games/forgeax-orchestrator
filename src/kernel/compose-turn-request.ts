@@ -39,7 +39,8 @@ import { firstClassUiToolSpecs } from '../api/lib/ui-manifest-registry';
 import { getExtensionSnapshot } from '../extensions/registry';
 import { projectToolSpecs } from '../capabilities/projection';
 import { skillToolSpecs } from '../skills/tool-specs';
-import { discoverProjectMcpTools } from './project-mcp';
+import { discoverProjectMcpTools, projectMcpExecutionMode } from './project-mcp';
+import { tt } from '../lib/turn-trace';
 import type { SkillRefLite } from '../soul/types';
 import uiBridgeContract from './ui-bridge-contract.json';
 import { NPC_TOOL_CONTRACTS } from '@forgeax/types/npc-tools';
@@ -113,6 +114,11 @@ export interface ComposeInput {
   historyBlackboard?: BlackboardAPI;
   /** UI 直传的模型覆盖(优先);否则从 agent.json 解析。 */
   model?: string;
+  /** Build a capability-complete transport warm-up without mutating history,
+   * manifests, perception queues, or life-event state. The returned request
+   * still carries the real host session id and exact tool/permission surface,
+   * but it is never sent as a model turn. */
+  prewarm?: boolean;
   /** npc_text agent npc_text host-tools(kits/toolRegistry)npc_text npc_text MCP npc_text(T-A)npc_text */
   extraTools?: TurnRequest['tools'];
   /** npc_text(contract `InputMessage.attachments`):
@@ -137,6 +143,10 @@ function replyLanguageDirective(lang: 'en' | 'zh'): string {
 }
 
 export async function composeTurnRequest(input: ComposeInput): Promise<TurnRequest> {
+  const composeStartedAt = Date.now();
+  const stage = (name: string, startedAt: number) => {
+    tt('compose.stage', { stage: name, ms: Date.now() - startedAt, totalMs: Date.now() - composeStartedAt });
+  };
   const projectRoot = defaultProjectRoot();
   // charter / environment / note npc_text composer npc_text(npc_textA npc_text3.2)npc_text
   // npc_text(standalone game-agnostic cli)npc_text composer npc_text npc_text npc_text
@@ -158,19 +168,21 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   //  - persona(stable npc_text)= soul persona + identity/traits + MEMORY.md npc_text
   //  - dynamicSuffix(user npc_text,npc_textbusts cache)= npc_text game npc_text episodes npc_text
   //  - trustTier npc_text = npc_text(pass-through npc_text enforcement)
+  let stageStartedAt = Date.now();
   const record = await loadAgentRecord(input.agentId, { projectRoot, game: scopeSlug });
+  stage('agent-record', stageStartedAt);
   const stableMem = composeStableMemory(record.memory);
   const persona = [record.persona, stableMem].filter((s) => s && s.trim()).join('\n\n---\n\n');
   // dynamicSuffix(npc_text bust npc_text)= npc_text episodes npc_text,npc_text(npc_text)npc_text
   // npc_text:npc_text episodes=0,episodic npc_text npc_text1npc_text
   const episodic = composeEpisodicRecall(record.memory);
   const rebirth = composeReincarnationNotice(record.memory);
-  if (rebirth && scopeSlug) {
+  if (rebirth && scopeSlug && !input.prewarm) {
     emitLifeEvent({ kind: 'rebirth.projected', agentId: input.agentId, into: scopeSlug, at: Date.now() });
   }
   // 运行期错误感知回灌(M8):上一轮后游戏运行期 console/preview error 排空进本轮 user 后缀,
   // 让 agent 看见自己写的代码在引擎里真实报的错(轮间注入,不进 system prompt)。
-  const notes = drainPerceptionNotes(input.sessionId);
+  const notes = input.prewarm ? [] : drainPerceptionNotes(input.sessionId);
   const runtimeFeedback = notes.length
     ? `# Runtime feedback from the game preview (console npc_text newest last)\n${notes
         .map((n) => `- [${n.level}] ${n.text}`)
@@ -178,12 +190,13 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     : '';
   const replyLang = input.replyLanguage ? replyLanguageDirective(input.replyLanguage) : '';
   let dynamicSuffix = [rebirth, episodic, runtimeFeedback, replyLang].filter((s) => s && s.trim()).join('\n\n---\n\n');
-
   // 模型 + 级联回退:UI 显式覆盖(input.model)是所选内核的模型。否则 agent.json
   // 的模型只属于 Forgeax Core；不能把 Claude provider 名透传给 Codex/Cursor 等
-  // 独立订阅 runtime，否则会在模型 API 前被拒绝。租用内核未显式指定时使用其
-  // 本地 CLI 当前选择的模型。
+  // 独立订阅 runtime，否则会在模型 API 前被拒绝。warm 与当前真实 CLI 请求都不
+  // 传显式 model，因此两者仍然使用同一个 provider-native pool key。
+  stageStartedAt = Date.now();
   const agentModels = input.model ? undefined : await resolveAgentModels(input.sessionId, input.agentId);
+  stage('model-resolve', stageStartedAt);
   const model = input.model ?? (input.kernel.id === 'forgeax-core' ? agentModels?.model : undefined);
   const fallbackModels = input.model ? undefined : (input.kernel.id === 'forgeax-core' ? agentModels?.fallbackModels : undefined);
 
@@ -212,10 +225,16 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   pushDeduped(firstClassUiToolSpecs(input.sessionId));
   pushDeduped(input.extraTools ?? []);
   // Project MCP is discovered once at the turn boundary so every kernel gets
-  // the same canonical names and schemas. Provider-specific adapters then
-  // decide whether to mount the server natively or use the fxt bridge.
-  pushDeduped(await discoverProjectMcpTools(projectRoot));
+  // the same canonical names and schemas. Native providers only need a
+  // schema-only discovery; host-routed providers retain the pooled clients
+  // for /kernel-tool execution. Keeping this mode decision here prevents a
+  // native provider and the host bridge from spawning the same project server.
+  stageStartedAt = Date.now();
+  const projectMcpMode = projectMcpExecutionMode(input.kernel.id, record.trustTier);
+  pushDeduped(await discoverProjectMcpTools(projectRoot, { retainPool: projectMcpMode === 'host' }));
+  stage('project-mcp', stageStartedAt);
   // R2/C1:npc_text soul-packnpc_text tools(npc_text ToolSpec[])npc_text
+  stageStartedAt = Date.now();
   pushDeduped(record.tools ?? []);
   // Extension skills are runnable through the host bridge. Add only this
   // executable catalog kind: command/MCP/memory entries remain discovery data
@@ -249,7 +268,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   // 不出来 —— 两套账本都没记它。只记名字与投递方式,不序列化 schema(每轮都写会
   // 把账本撑爆)。纯观测:任何失败都吞掉,绝不影响这一轮。
   try {
-    if (input.sessionId) {
+    if (input.sessionId && !input.prewarm) {
       const session = getSessionManager().peek(input.sessionId);
       if (session) {
         const manifestLedger = session.getOrCreateLedger(input.agentId);
@@ -283,11 +302,13 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
       }
     }
   } catch { /* 观测通道绝不影响主流程 */ }
+  stage('tool-manifest', stageStartedAt);
 
   const profile = orchestrationProfileOf(input.kernel);
   let preparedHistory: RuntimePreparedHistory | undefined;
   // Shared history is prepared by one coordinator for both native and rented kernels.
-  if (input.sessionId) {
+  if (input.sessionId && !input.prewarm) {
+    stageStartedAt = Date.now();
     try {
       const session = getSessionManager().peek(input.sessionId);
       const ledger = session?.getOrCreateLedger(input.agentId);
@@ -332,10 +353,12 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
       // Do not silently execute a rented kernel without the history it was meant to receive.
       if (input.sessionId && input.kernel.id !== 'forgeax-core') throw error;
     }
+    stage('history', stageStartedAt);
   }
 
   // Host-owned history is a kernel-owned capability, not an environment/kernel-id guess.
-  const history = profile.historyIntake === 'structured'
+  stageStartedAt = Date.now();
+  const history = !input.prewarm && profile.historyIntake === 'structured'
     ? await materializeNativeHistory(
         input.sessionId,
         input.agentId,
@@ -344,12 +367,14 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
         input.historyBlackboard,
       )
     : undefined;
+  stage('native-history', stageStartedAt);
 
   // 该内核的 standing 权限档(设置页写的项目级配置);未配过 → undefined = 走内核默认档。
   const standingMode = standingModeFor(String(input.kernel.id), projectRoot);
 
   // Every attachment is materialized. Native kinds remain path-only references; unsupported
   // kinds become path notes. This keeps base64 off the sidecar wire and durable history.
+  stageStartedAt = Date.now();
   let uploadBase = projectRoot;
   try {
     if (input.sessionId) uploadBase = getPathManager().session(input.sessionId).root();
@@ -359,6 +384,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     resolvePath(uploadBase, 'uploads'),
     profile.nativeAttachmentKinds,
   );
+  stage('attachments', stageStartedAt);
   // Native EventBus ingress may already have appended the durable path note.
   // Re-materialization is idempotent; avoid duplicating model-visible context.
   const retainedPaths = (uploads.attachments ?? [])
@@ -370,6 +396,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     ? `${input.message}\n\n${uploads.note}`
     : input.message;
 
+  tt('compose.done', { totalMs: Date.now() - composeStartedAt, tools: deliveredTools.length, history: history?.length ?? 0 });
   return {
     session: { threadId: input.threadId ?? '', agentId: input.agentId },
     callId: input.callId,

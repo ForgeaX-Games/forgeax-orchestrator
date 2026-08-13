@@ -15,7 +15,13 @@ import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { getPathManager } from "../fs/path-manager";
 import type { Session } from "../core/session";
 import type { Event } from "../core/types";
-import { SnapshotStore, type DiffStats, type Manifest } from "./snapshot-store";
+import {
+  SnapshotStore,
+  type DiffStats,
+  type GarbageCollectResult,
+  type Manifest,
+  type RestoreResult,
+} from "./snapshot-store";
 import { REWIND_BOUNDARY, REWIND_CANCEL } from "./rewind-mask";
 
 export type RewindMode = "both" | "conversation" | "code";
@@ -25,6 +31,8 @@ interface MessageRecord {
   msgId: string;
   ts: number;
   manifestId: string | null; // null = 该消息时刻无游戏目录 / 快照失败
+  providerId?: string;
+  checkpointMode?: "native" | "host-compatible";
 }
 
 interface RewindRecord {
@@ -65,6 +73,45 @@ export interface PendingRewind {
   overwrite: { safetyManifestId: string; files: string[] } | null;
 }
 
+export interface CheckpointDiagnostic {
+  kind: "invalid-index";
+  line: number;
+  detail: string;
+}
+
+export interface CheckpointListEntry {
+  msgId: string;
+  ts: number;
+  hasCode: boolean;
+  expired: boolean;
+  providerId?: string;
+  checkpointMode?: "native" | "host-compatible";
+}
+
+const DEFAULT_CHECKPOINT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+function checkpointMaxAgeMs(): number {
+  const configured = process.env.FORGEAX_CHECKPOINT_MAX_AGE_MS?.trim();
+  if (!configured) return DEFAULT_CHECKPOINT_MAX_AGE_MS;
+  const raw = Number(configured);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_CHECKPOINT_MAX_AGE_MS;
+}
+
+function checkpointExpired(ts: number): boolean {
+  return Date.now() - ts > checkpointMaxAgeMs();
+}
+
+function restoreFailure(prefix: string, result: RestoreResult): { error: string; status: number } | null {
+  if (result.missingBlobs.length === 0 && result.corruptBlobs.length === 0) return null;
+  const missing = result.missingBlobs.map((x) => `${x.path} (${x.hash})`).join(", ");
+  const corrupt = result.corruptBlobs.map((x) => `${x.path} (${x.hash})`).join(", ");
+  const detail = [
+    missing ? `missing blob: ${missing}` : "",
+    corrupt ? `corrupt blob: ${corrupt}` : "",
+  ].filter(Boolean).join("; ");
+  return { error: `${prefix}: restore aborted; ${detail}`, status: 410 };
+}
+
 class SessionCheckpoints {
   readonly messages = new Map<string, MessageRecord>();
   readonly order: string[] = []; // msgId 时间序
@@ -82,6 +129,7 @@ class SessionCheckpoints {
     overwrite: { safetyManifestId: string; files: string[] } | null;
   } | null = null;
   loaded = false;
+  readonly diagnostics: CheckpointDiagnostic[] = [];
   lock: Promise<unknown> = Promise.resolve();
 
   constructor(
@@ -150,12 +198,21 @@ export class CheckpointManager {
     const rewinds = new Map<string, RewindRecord>();
     const status = new Map<string, StatusRecord["status"]>();
     const overwrites = new Map<string, OverwriteRecord | null>();
-    for (const line of raw.split("\n")) {
+    for (const [lineIndex, line] of raw.split("\n").entries()) {
       if (!line.trim()) continue;
       let rec: CheckpointJsonlRecord;
       try {
         rec = JSON.parse(line) as CheckpointJsonlRecord;
-      } catch {
+      } catch (err) {
+        const detail = `invalid JSON ignored: ${(err as Error).message}`;
+        sc.diagnostics.push({ kind: "invalid-index", line: lineIndex + 1, detail });
+        process.stderr.write(`[checkpoint] ${sc.sid}/checkpoints.jsonl:${lineIndex + 1}: ${detail}\n`);
+        continue;
+      }
+      if (!rec || typeof rec !== "object" || typeof (rec as { kind?: unknown }).kind !== "string") {
+        const detail = "invalid checkpoint record ignored";
+        sc.diagnostics.push({ kind: "invalid-index", line: lineIndex + 1, detail });
+        process.stderr.write(`[checkpoint] ${sc.sid}/checkpoints.jsonl:${lineIndex + 1}: ${detail}\n`);
         continue;
       }
       if (rec.kind === "message") {
@@ -211,7 +268,11 @@ export class CheckpointManager {
    *  代码回退能力);纯会话(无游戏目录)记录 manifestId=null,会话回退仍可用。
    *  async 快照后必须进 per-session 锁:否则 walk 可与同 session 的 rewind/restore
    *  交错,把半 restore 的盘面拍成 manifest。 */
-  snapshotForMessage(session: Session, msgId: string): Promise<void> {
+  snapshotForMessage(
+    session: Session,
+    msgId: string,
+    meta: { providerId?: string; checkpointMode?: "native" | "host-compatible" } = {},
+  ): Promise<void> {
     const sc = this.ensure(session);
     return this.withLock(sc, async () => {
       let manifestId: string | null = null;
@@ -225,7 +286,14 @@ export class CheckpointManager {
           return; // 连索引都不记 —— UI 不出回退入口
         }
       }
-      const rec: MessageRecord = { kind: "message", msgId, ts: Date.now(), manifestId };
+      const rec: MessageRecord = {
+        kind: "message",
+        msgId,
+        ts: Date.now(),
+        manifestId,
+        ...(meta.providerId ? { providerId: meta.providerId } : {}),
+        ...(meta.checkpointMode ? { checkpointMode: meta.checkpointMode } : {}),
+      };
       try {
         this.record(sc, rec);
       } catch (err) {
@@ -239,11 +307,18 @@ export class CheckpointManager {
 
   // ─── queries ─────────────────────────────────────────────────────────────
 
-  list(session: Session): Array<{ msgId: string; ts: number; hasCode: boolean }> {
+  list(session: Session): CheckpointListEntry[] {
     const sc = this.ensure(session);
     return sc.order.map((msgId) => {
       const r = sc.messages.get(msgId)!;
-      return { msgId, ts: r.ts, hasCode: r.manifestId !== null };
+      return {
+        msgId,
+        ts: r.ts,
+        hasCode: r.manifestId !== null,
+        expired: checkpointExpired(r.ts),
+        ...(r.providerId ? { providerId: r.providerId } : {}),
+        ...(r.checkpointMode ? { checkpointMode: r.checkpointMode } : {}),
+      };
     });
   }
 
@@ -251,17 +326,45 @@ export class CheckpointManager {
     return this.ensure(session).pending;
   }
 
+  diagnosticsOf(session: Session): CheckpointDiagnostic[] {
+    return [...this.ensure(session).diagnostics];
+  }
+
+  private manifestFor(sc: SessionCheckpoints, manifestId: string):
+    | { manifest: Manifest }
+    | { error: string; status: number } {
+    if (!sc.store) return { error: "no code checkpoint store", status: 409 };
+    const loaded = sc.store.loadManifestChecked(manifestId);
+    if (loaded.manifest) return { manifest: loaded.manifest };
+    if (loaded.failure?.kind === "incompatible") return { error: loaded.failure.detail, status: 409 };
+    if (loaded.failure?.kind === "invalid") return { error: loaded.failure.detail, status: 422 };
+    return { error: loaded.failure?.detail ?? `manifest missing: ${manifestId}`, status: 410 };
+  }
+
+  private async validateManifest(
+    sc: SessionCheckpoints,
+    manifest: Manifest,
+    prefix: string,
+  ): Promise<{ error: string; status: number } | null> {
+    if (!sc.store) return { error: "no code checkpoint store", status: 409 };
+    const result = await sc.store.validateManifestBlobs(manifest);
+    return restoreFailure(prefix, { written: [], deleted: [], skippedDirty: [], ...result });
+  }
+
   /** 确认弹窗的 diff 预览。 */
   async preview(session: Session, msgId: string): Promise<DiffStats | { error: string; status: number }> {
     const sc = this.ensure(session);
     const rec = sc.messages.get(msgId);
     if (!rec) return { error: `unknown msgId: ${msgId}`, status: 404 };
+    if (checkpointExpired(rec.ts)) return { error: `checkpoint expired for ${msgId}`, status: 410 };
     if (!rec.manifestId || !sc.store || !sc.gameDir) {
       return { filesChanged: [], insertions: 0, deletions: 0, binaryOrLarge: 0, files: [] };
     }
-    const manifest = sc.store.loadManifest(rec.manifestId);
-    if (!manifest) return { error: `manifest missing for ${msgId}`, status: 410 };
-    return sc.store.diffStats(sc.gameDir, manifest);
+    const loaded = this.manifestFor(sc, rec.manifestId);
+    if ("error" in loaded) return loaded;
+    const invalidBlobs = await this.validateManifest(sc, loaded.manifest, `checkpoint ${msgId}`);
+    if (invalidBlobs) return invalidBlobs;
+    return sc.store.diffStats(sc.gameDir, loaded.manifest);
   }
 
   // ─── restore-class operations(全部走 per-session 锁)──────────────────
@@ -282,8 +385,18 @@ export class CheckpointManager {
     return this.withLock(sc, async () => {
       const rec = sc.messages.get(msgId);
       if (!rec) return { error: `unknown msgId: ${msgId}`, status: 404 };
+      if (checkpointExpired(rec.ts)) return { error: `checkpoint expired for ${msgId}`, status: 410 };
       if (mode !== "conversation" && !rec.manifestId) {
         return { error: `msgId ${msgId} has no code checkpoint`, status: 409 };
+      }
+
+      let target: Manifest | null = null;
+      if (mode !== "conversation" && rec.manifestId) {
+        const loaded = this.manifestFor(sc, rec.manifestId);
+        if ("error" in loaded) return loaded;
+        const invalidBlobs = await this.validateManifest(sc, loaded.manifest, `checkpoint ${msgId}`);
+        if (invalidBlobs) return invalidBlobs;
+        target = loaded.manifest;
       }
 
       // 是否"挂起态内再回退"。手改防护(keptDirty)只对这种场景生效。在 cancel
@@ -328,10 +441,11 @@ export class CheckpointManager {
       let keptDirty: string[] = [];
       const boundaryId = randomUUID();
       if (mode !== "conversation" && sc.store && sc.gameDir && rec.manifestId) {
-        const target = sc.store.loadManifest(rec.manifestId);
         if (!target) return { error: `manifest missing for ${msgId}`, status: 410 };
         const dirty = wasPending ? await this.dirtySet(sc) : new Set<string>();
         const res = await sc.store.restore(sc.gameDir, target, { exclude: dirty });
+        const failed = restoreFailure(`checkpoint ${msgId}`, res);
+        if (failed) return failed;
         filesChanged = [...res.written, ...res.deleted];
         keptDirty = res.skippedDirty;
         sc.lastRestoreManifestId = rec.manifestId;
@@ -373,10 +487,14 @@ export class CheckpointManager {
       const pending = sc.pending;
       let keptDirty: string[] = [];
       if (pending.preManifestId && sc.store && sc.gameDir) {
-        const pre = sc.store.loadManifest(pending.preManifestId);
-        if (!pre) return { error: `pre-rewind manifest missing`, status: 410 };
+        const loaded = this.manifestFor(sc, pending.preManifestId);
+        if ("error" in loaded) return { error: `pre-rewind: ${loaded.error}`, status: loaded.status };
+        const invalidBlobs = await this.validateManifest(sc, loaded.manifest, "pre-rewind");
+        if (invalidBlobs) return invalidBlobs;
         const dirty = await this.dirtySet(sc);
-        const res = await sc.store.restore(sc.gameDir, pre, { exclude: dirty });
+        const res = await sc.store.restore(sc.gameDir, loaded.manifest, { exclude: dirty });
+        const failed = restoreFailure("pre-rewind", res);
+        if (failed) return failed;
         keptDirty = res.skippedDirty;
         sc.lastRestoreManifestId = pending.preManifestId;
         sc.lastOp = {
@@ -417,6 +535,10 @@ export class CheckpointManager {
       }
       if (op.keptDirty.length === 0) return { files: [] };
       const files = new Set(op.keptDirty);
+      const targetLoaded = this.manifestFor(sc, op.restoreTargetManifestId);
+      if ("error" in targetLoaded) return { error: targetLoaded.error, status: targetLoaded.status };
+      const invalidTarget = await this.validateManifest(sc, targetLoaded.manifest, "restore target");
+      if (invalidTarget) return invalidTarget;
       // safety 快照(第 1 层):同步成功后才触盘,失败整体中止
       let safetyManifestId: string;
       try {
@@ -424,9 +546,9 @@ export class CheckpointManager {
       } catch (err) {
         return { error: `safety snapshot failed, aborted: ${(err as Error).message}`, status: 500 };
       }
-      const target = sc.store.loadManifest(op.restoreTargetManifestId);
-      if (!target) return { error: "restore target manifest missing", status: 410 };
-      await sc.store.restore(sc.gameDir, target, { only: files });
+      const res = await sc.store.restore(sc.gameDir, targetLoaded.manifest, { only: files });
+      const failed = restoreFailure("restore target", res);
+      if (failed) return failed;
       const fileList = [...files];
       this.record(sc, { kind: "overwrite", boundaryId, safetyManifestId, files: fileList, ts: Date.now() });
       op.overwrite = { safetyManifestId, files: fileList };
@@ -452,10 +574,14 @@ export class CheckpointManager {
         return { error: `no overwrite to undo for ${boundaryId}`, status: 409 };
       }
       if (!sc.store || !sc.gameDir) return { error: "no code store", status: 409 };
-      const safety = sc.store.loadManifest(op.overwrite.safetyManifestId);
-      if (!safety) return { error: "safety manifest missing", status: 410 };
+      const loaded = this.manifestFor(sc, op.overwrite.safetyManifestId);
+      if ("error" in loaded) return { error: `safety manifest: ${loaded.error}`, status: loaded.status };
+      const invalidSafety = await this.validateManifest(sc, loaded.manifest, "safety manifest");
+      if (invalidSafety) return invalidSafety;
       const files = new Set(op.overwrite.files);
-      await sc.store.restore(sc.gameDir, safety, { only: files });
+      const res = await sc.store.restore(sc.gameDir, loaded.manifest, { only: files });
+      const failed = restoreFailure("safety manifest", res);
+      if (failed) return failed;
       this.record(sc, { kind: "overwrite-undo", boundaryId, ts: Date.now() });
       op.keptDirty = op.overwrite.files;
       op.overwrite = null;
@@ -481,6 +607,24 @@ export class CheckpointManager {
       this.record(sc, { kind: "rewind-status", boundaryId, status: "finalized", ts: Date.now() });
       sc.pending = null;
       this.notify(session, "rewind:finalized", { boundaryId, targetMsgId, mode });
+    });
+  }
+
+  /** Remove unreferenced manifests/blobs while retaining all active rewind data. */
+  collectGarbage(session: Session): Promise<GarbageCollectResult | { error: string; status: number }> {
+    const sc = this.ensure(session);
+    return this.withLock(sc, async () => {
+      if (!sc.store) return { error: "no code checkpoint store", status: 409 };
+      const reachable = new Set<string>();
+      for (const rec of sc.messages.values()) {
+        if (rec.manifestId) reachable.add(rec.manifestId);
+      }
+      if (sc.pending?.preManifestId) reachable.add(sc.pending.preManifestId);
+      if (sc.pending?.overwrite?.safetyManifestId) reachable.add(sc.pending.overwrite.safetyManifestId);
+      if (sc.lastRestoreManifestId) reachable.add(sc.lastRestoreManifestId);
+      if (sc.lastOp?.restoreTargetManifestId) reachable.add(sc.lastOp.restoreTargetManifestId);
+      if (sc.lastOp?.overwrite?.safetyManifestId) reachable.add(sc.lastOp.overwrite.safetyManifestId);
+      return sc.store.collectGarbage(reachable, { ownerSid: sc.sid });
     });
   }
 

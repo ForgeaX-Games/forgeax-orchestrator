@@ -29,7 +29,6 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
 import { defaultProjectRoot } from '@forgeax/platform-io';
-import { readProjectMcpServers } from './project-mcp';
 // 复用 cc-profile 的稳定件(cbc 与 cc 完全一致):线事件→KernelEvent 映射、
 // permission-mode 枚举翻译、跨进程权限闸 registry。单一来源,避免 drift。
 import {
@@ -237,12 +236,17 @@ export function buildCbcMcpArgs(req: TurnRequest, permSid: string, projectRoot =
   if (tools.length === 0) return [];
 
   const env: Record<string, string> = {
-    FORGEAX_PROJECT_ROOT: defaultProjectRoot(),
+    FORGEAX_PROJECT_ROOT: projectRoot,
     FORGEAX_SOUL_AGENT: req.session.agentId?.trim() || 'default',
     FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
     FORGEAX_SID: req.hostSessionId?.trim() || permSid,
     FORGEAX_AGENT: req.session.agentId?.trim() || 'forge',
     FORGEAX_FXT_EXPOSE: tools.map((tool) => tool.name).join(','),
+    // a peer agent CLI has no reliable per-tool hook/approval callback for native
+    // MCP. Keep project MCP on the host route for every trust tier so the
+    // canonical server trust gate remains in force and no second child is
+    // mounted beside the pooled bridge.
+    FORGEAX_DISABLE_PROJECT_MCP: '1',
     // 让 fxt server 也从 tools/list 里剔除感知工具(双保险:模型既看不到也调不动)。
     FORGEAX_DISABLE_PERCEPTION: '1',
   };
@@ -267,39 +271,11 @@ export function buildCbcMcpArgs(req: TurnRequest, permSid: string, projectRoot =
       env,
     },
   };
-  // a peer agent CLI's ToolSearch does not reliably surface nested fxt names. Mount
-  // requested project stdio servers natively so their canonical MCP names are
-  // available without a second discovery round-trip.
-  const requestedProjectServers = new Set(
-    tools
-      .map((tool) => tool.name)
-      .filter((name) => name.startsWith('mcp__'))
-      .map((name) => name.slice('mcp__'.length).split('__', 1)[0]),
-  );
-  const projectServerKeys = new Map<string, string>();
-  for (const server of readProjectMcpServers(projectRoot)) {
-    const normalizedServer = server.name.replace(/[^a-zA-Z0-9_-]/g, '_');
-    if (!requestedProjectServers.has(normalizedServer) || mcpServers[server.name]) continue;
-    mcpServers[server.name] = {
-      command: server.config.command,
-      args: server.config.args,
-      ...(server.config.env ? { env: server.config.env } : {}),
-    };
-    projectServerKeys.set(normalizedServer, server.name);
-  }
-
   try {
     const cfgPath = resolvePath(tmpdir(), `forgeax-cbc-mcp-${permSid || req.session.agentId || 'x'}.json`);
     writeFileSync(cfgPath, JSON.stringify({ mcpServers }));
     // 编排层显式放行声明的工具 → headless 不卡审批(= 权限归编排层)。感知工具已剔除。
-    const allowedTools = tools.flatMap((tool) => {
-      const fxtName = `mcp__fxt__${tool.name}`;
-      if (!tool.name.startsWith('mcp__')) return [fxtName];
-      const separator = tool.name.indexOf('__', 'mcp__'.length);
-      const serverName = separator >= 0 ? tool.name.slice('mcp__'.length, separator) : '';
-      const configName = projectServerKeys.get(serverName) ?? serverName;
-      return serverName && mcpServers[configName] ? [fxtName, tool.name] : [fxtName];
-    });
+    const allowedTools = tools.map((tool) => `mcp__fxt__${tool.name}`);
     return ['--mcp-config', cfgPath, '--allowedTools', ...allowedTools];
   } catch {
     return [];

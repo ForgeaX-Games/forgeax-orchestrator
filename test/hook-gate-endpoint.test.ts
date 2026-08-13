@@ -81,6 +81,20 @@ describe('POST /:sid/hook-gate', () => {
     expect(json.decision).toBe('none');
   });
 
+  test('native project MCP credential tool uses the trust gate instead of settings-only passthrough', async () => {
+    writeFileSync(
+      join(project, '.forgeax', 'mcp.json'),
+      JSON.stringify({ mcpServers: { project: { command: process.execPath, args: ['fixture.mjs'] } } }),
+    );
+    const { json } = await postHookGate({
+      kernel: 'claude-code',
+      toolName: 'mcp__project__get_secret',
+      input: {},
+    });
+    expect(json.decision).toBe('deny');
+    expect(json.reason).toContain('credential');
+  });
+
   test('ask 规则 + 无活 session → fail-closed deny(不能静默放行用户显式要求 ask 的操作)', async () => {
     const { json } = await postHookGate({ kernel: 'codex', toolName: 'Bash', input: { command: 'git push origin main' } });
     expect(json.decision).toBe('deny');

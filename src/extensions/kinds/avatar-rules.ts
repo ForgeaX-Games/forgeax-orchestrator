@@ -101,7 +101,8 @@ export function loadAvatarRules(
   const rootDir = assetRoot();
   const avatarDir = dirname(abs);
   // 把 file 字段 (相对 avatar dir 的裸文件名 e.g. "01_期待.webm")
-  // 转成 URL: /api/files/raw?path=<assetRoot-relative>.
+  // 转成 URL: /api/files/raw?path=<assetRoot-relative>. 同名 `.desktop.mov`
+  // 若存在也注入 state, 供不能可靠合成透明 VP9 的 macOS WKWebView 使用.
   const states: Record<string, AgentAvatarState> = {};
   for (const r of tableRows) {
     if (!r.state || !r.url) continue;
@@ -112,6 +113,7 @@ export function loadAvatarRules(
       continue;
     }
     let urlPath: string;
+    let desktopUrl: string | undefined;
     try {
       // /api/files/raw 路径白名单是 `packages/**` (resolveSafePath +
       // resolveReadPath fallback). assetRoot() 本身就是 packages/, 所以拼
@@ -125,6 +127,15 @@ export function loadAvatarRules(
       const stv = statSync(filePath);
       const ver = `${stv.size}-${Math.floor(stv.mtimeMs)}`;
       urlPath = `/api/files/raw?path=${encodeURIComponent(queryPath)}&v=${ver}`;
+
+      const desktopPath = filePath.replace(/\.[^.]+$/, '.desktop.mov');
+      if (existsSync(desktopPath)) {
+        const desktopRelFromRoot = relative(rootDir, desktopPath);
+        const desktopQueryPath = `packages/${desktopRelFromRoot}`;
+        const desktopStat = statSync(desktopPath);
+        const desktopVer = `${desktopStat.size}-${Math.floor(desktopStat.mtimeMs)}`;
+        desktopUrl = `/api/files/raw?path=${encodeURIComponent(desktopQueryPath)}&v=${desktopVer}`;
+      }
     } catch {
       issues.push(`${abs}: cannot compute URL for ${filePath}`);
       continue;
@@ -132,6 +143,7 @@ export function loadAvatarRules(
     states[r.state] = {
       state: r.state,
       url: urlPath,
+      ...(desktopUrl ? { desktopUrl } : {}),
       loop: r.loop ?? true,
       fadeInMs: r.fadeInMs ?? 0,
       ...(r.onEnd ? { onEnd: r.onEnd } : {}),

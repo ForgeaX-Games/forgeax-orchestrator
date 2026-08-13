@@ -171,9 +171,10 @@ export function buildCodexMcpOverrides(runtime: ForgeaxToolsRuntime): string[] {
 // ─── post-start config validation (best-effort) ──────────────────────
 
 /**
- * Validate that a started Codex process actually registered exactly our `fxt`
- * server with exactly this turn's `enabled_tools`, and no unexpected extra MCP
- * servers leaked in from a polluted config (plan §8.3).
+ * Validate that a started Codex process registered our scoped `fxt` server with
+ * exactly this turn's `enabled_tools`. User-authored native MCP servers are
+ * deliberately allowed; ForgeaX's per-turn authority remains constrained by
+ * the fxt server-side allowlist.
  *
  * Tolerant by design: the app-server RPC used to introspect config is still
  * evolving upstream, so an UNAVAILABLE introspection channel (method not found /
@@ -194,13 +195,6 @@ export function validateCodexMcpConfig(
       throw new CodexMcpError(
         'codex_mcp_config_mismatch',
         `codex did not register the '${CODEX_MCP_SERVER_KEY}' MCP server (saw: [${servers.join(', ')}])`,
-      );
-    }
-    const extra = servers.filter((s) => s !== CODEX_MCP_SERVER_KEY);
-    if (extra.length > 0) {
-      throw new CodexMcpError(
-        'codex_mcp_contaminated',
-        `codex has unexpected MCP servers beyond '${CODEX_MCP_SERVER_KEY}': [${extra.join(', ')}]`,
       );
     }
   }

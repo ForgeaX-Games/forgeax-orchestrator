@@ -34,7 +34,18 @@ import { issueToken, revokeToken } from './cred-proxy';
 import { sidecarSpawnJsonl, materializeEnv, stripModelKeys } from './sidecar-spawn';
 import { ensureSidecar } from './sidecar-singleton';
 import { sidecarEnabled } from './kernel-mode';
+import {
+  ClaudeSessionPool,
+  ClaudeSessionPoolBusyError,
+  ClaudeSessionCancelledError,
+  claudeNativeSourceFingerprint,
+  claudeSessionEligible,
+  claudeSessionPoolEnabled,
+  type ClaudeSessionTransport,
+} from './claude-session-pool';
+import { createDirectClaudeTransport, createSidecarClaudeTransport } from './claude-session-transport';
 import { resolveBinary } from '../cli-providers/shared/resolve-binary';
+import { tt } from '../lib/turn-trace';
 import {
   createClaudeMapperState,
   flushClaudeMapper,
@@ -44,6 +55,8 @@ import {
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import {
   buildCcArgs,
+  buildCcInput,
+  buildCcPersistentArgs,
   buildSessionArgs,
   chatEventToKernel,
   ccSessionExists,
@@ -55,6 +68,85 @@ import {
   registerTurnGate,
   releaseTurnGate,
 } from './cc-profile';
+import {
+  acquireProjectMcpNativeLease,
+  isProjectMcpToolName,
+  ProjectMcpNativeOwnershipBusyError,
+  projectMcpConfigFingerprint,
+} from './project-mcp';
+
+interface NativeHandoffController {
+  request(): Promise<boolean>;
+  bind(handler: () => Promise<boolean>): void;
+  fail(): void;
+}
+
+function createNativeHandoffController(): NativeHandoffController {
+  let handler: (() => Promise<boolean>) | undefined;
+  let failed = false;
+  let resolveReady!: () => void;
+  const ready = new Promise<void>((resolve) => { resolveReady = resolve; });
+  return {
+    async request() {
+      if (!handler && !failed) await ready;
+      return handler ? handler() : false;
+    },
+    bind(next) {
+      if (failed) return;
+      handler = next;
+      resolveReady();
+    },
+    fail() {
+      failed = true;
+      resolveReady();
+    },
+  };
+}
+
+async function createNativeOwnedClaudeTransport(
+  projectRoot: string,
+  ownsProjectMcp: boolean,
+  factory: () => Promise<ClaudeSessionTransport>,
+  handoff: NativeHandoffController,
+): Promise<ClaudeSessionTransport> {
+  const lease = ownsProjectMcp
+    ? await acquireProjectMcpNativeLease(projectRoot, { onHandoffRequested: () => handoff.request() })
+    : undefined;
+  let released = false;
+  const release = async (): Promise<void> => {
+    if (released) return;
+    released = true;
+    await lease?.release();
+  };
+  try {
+    const transport = await factory();
+    return {
+      pid: transport.pid,
+      write: (data) => transport.write(data),
+      onData: (cb) => transport.onData(cb),
+      onExit: (cb) => transport.onExit((info) => {
+        handoff.fail();
+        void release();
+        cb(info);
+      }),
+      close: async () => {
+        try {
+          await transport.close();
+        } finally {
+          // The pool can close a freshly-created transport before the caller
+          // gets a chance to bind the session handoff callback. Wake any
+          // owner already waiting in that narrow construction window.
+          handoff.fail();
+          await release();
+        }
+      },
+    };
+  } catch (error) {
+    handoff.fail();
+    await release();
+    throw error;
+  }
+}
 
 export class ClaudeCodeKernel implements AgentKernel {
   readonly id = 'claude-code';
@@ -87,6 +179,72 @@ export class ClaudeCodeKernel implements AgentKernel {
   private readonly startedThreadIds = new Set<string>();
   /** callId → 在飞 turn 的 AbortController(供 openHandle().cancel 杀进程)。 */
   private static readonly inflight = new Map<string, AbortController>();
+  private static readonly sessionPool = new ClaudeSessionPool<ClaudeRawEvent>();
+
+  static async closeSessionPool(): Promise<void> {
+    await ClaudeCodeKernel.sessionPool.closeAll();
+  }
+
+  /**
+   * Start the persistent transport for a real own session without sending a
+   * model turn. The UI calls this while the session is idle, so Claude can
+   * load its native MCP/plugin/skill/settings surface before the first user
+   * message arrives. This is deliberately an optional kernel capability; it
+   * does not alter the TurnRequest or bypass any trust/permission boundary.
+   */
+  async prewarm(req: TurnRequest): Promise<{ warmed: boolean; reused: boolean }> {
+    if (!claudeSessionPoolEnabled() || !claudeSessionEligible(req) || !req.session.threadId?.trim()) {
+      return { warmed: false, reused: false };
+    }
+
+    const projectRoot = defaultProjectRoot();
+    const ownsProjectMcp = req.trustTier !== 'imported'
+      && req.tools.some((tool) => isProjectMcpToolName(tool.name, projectRoot));
+    const binary = await this.binary();
+    // Do not mark the thread as started until a real user turn has completed:
+    // a prewarm process has not written a Claude transcript yet, so a later
+    // cold fallback must still be allowed to use `--session-id`.
+    const sessionPlan = buildSessionArgs(req.session.threadId, projectRoot, this.startedThreadIds);
+    if (!sessionPlan.threadId) return { warmed: false, reused: false };
+    const persistentArgs = buildCcPersistentArgs(req, projectRoot, sessionPlan.args, this.permissionModeFor(req));
+    const useSidecar = sidecarEnabled();
+    const sidecar = useSidecar ? await ensureSidecar() : undefined;
+    const sidecarBaseId = req.hostSessionId || req.session.threadId || req.session.agentId || 'kernel';
+    const poolSessionId = `claude-pool-${sessionPlan.threadId}`;
+    const poolKey = this.sessionPoolKey(req, projectRoot);
+    const handoff = createNativeHandoffController();
+    const acquired = await ClaudeCodeKernel.sessionPool.acquire(poolSessionId, poolKey, async () => {
+      if (useSidecar) {
+        return createNativeOwnedClaudeTransport(projectRoot, ownsProjectMcp, () => createSidecarClaudeTransport(sidecar!, {
+          sessionId: poolSessionId,
+          agentId: req.session.agentId || 'forge',
+          trustTier: req.trustTier ?? 'own',
+          callId: sidecarBaseId,
+          ...(req.budget ? { budget: req.budget } : {}),
+          kernel: {
+            kind: 'claude-code', credential: 'sidecar-managed', cmd: binary,
+            args: persistentArgs, cwd: projectRoot,
+            env: stripModelKeys(materializeEnv()),
+          },
+        }), handoff);
+      }
+      return createNativeOwnedClaudeTransport(projectRoot, ownsProjectMcp, async () =>
+        createDirectClaudeTransport({ cmd: binary, args: persistentArgs, cwd: projectRoot }), handoff);
+    });
+    if (!acquired.reused) handoff.bind(() => acquired.session.requestHandoff());
+    // Claude's stream-json control plane can initialize commands, skills and
+    // MCP/plugin discovery without a model/user turn. Await it here so the HTTP
+    // warm endpoint means "native capability plane ready", not merely "child
+    // process spawned"; no hidden prompt is written to the transcript.
+    try {
+      await acquired.session.initialize();
+    } catch (error) {
+      await acquired.session.close();
+      throw error;
+    }
+    tt('cc.prewarm', { threadId: sessionPlan.threadId, reused: acquired.reused, pid: acquired.session.pid });
+    return { warmed: true, reused: acquired.reused };
+  }
 
   private binary(): Promise<string> {
     return (this.binaryPromise ??= resolveBinary({
@@ -100,10 +258,19 @@ export class ClaudeCodeKernel implements AgentKernel {
   }
 
   async *runTurn(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {
+    // Match the cold-process cancellation contract before doing any binary,
+    // credential, sidecar, native capability, or persistent-session work.
+    // In particular, a pre-aborted warm turn must not surface the pool's
+    // internal cancellation sentinel as a public API error.
+    if (signal.aborted) {
+      const state = createClaudeMapperState();
+      for (const ev of flushClaudeMapper(state, 'cancelled')) yield* chatEventToKernel(ev);
+      return;
+    }
+
     // 内部 AbortController:外部 signal 或 openHandle(callId).cancel 任一触发都中断。
     const ac = new AbortController();
-    if (signal.aborted) ac.abort();
-    else signal.addEventListener('abort', () => ac.abort(), { once: true });
+    signal.addEventListener('abort', () => ac.abort(), { once: true });
     if (req.callId) ClaudeCodeKernel.inflight.set(req.callId, ac);
 
     // 权限闸(B-4):若编排层提供了中立 `requestPermission`,把它登记进 in-process gate
@@ -113,9 +280,14 @@ export class ClaudeCodeKernel implements AgentKernel {
 
     let credToken: string | undefined;
     try {
+      const kernelStartedAt = Date.now();
       const binary = await this.binary();
       const projectRoot = defaultProjectRoot();
-      const args = this.buildArgs(req, projectRoot);
+      const sessionPlan = this.buildSessionPlan(req, projectRoot);
+      const ownsProjectMcp = req.trustTier !== 'imported'
+        && req.tools.some((tool) => isProjectMcpToolName(tool.name, projectRoot));
+      const args = buildCcArgs(req, projectRoot, sessionPlan.args, this.permissionModeFor(req));
+      const persistentArgs = buildCcPersistentArgs(req, projectRoot, sessionPlan.args, this.permissionModeFor(req));
 
       // 凭据地板:imported → scrub 非必要宿主密钥。模型 key 处理分两路:
       //  - sidecar 路径(FORGEAX_SIDECAR=on):凭据由 **sidecar cred-vault** 发 scoped token,
@@ -135,8 +307,20 @@ export class ClaudeCodeKernel implements AgentKernel {
         }
       }
       const sidecarBaseId = req.callId || req.hostSessionId || req.session.threadId || req.session.agentId || 'kernel';
-      const { lines, exit } = useSidecar
-        ? sidecarSpawnJsonl<ClaudeRawEvent>(await ensureSidecar(), {
+      const sidecar = useSidecar ? await ensureSidecar() : undefined;
+      tt('cc.spawn-ready', { sidecar: useSidecar, ms: Date.now() - kernelStartedAt, args: args.length });
+      const persistentEligible = claudeSessionPoolEnabled()
+        && Boolean(sessionPlan.threadId)
+        && claudeSessionEligible(req);
+      let lines: AsyncIterable<ClaudeRawEvent>;
+      let exit: Promise<{ code: number; stderr: string }>;
+      const spawnCold = async () => {
+        const lease = claudeSessionEligible(req) && ownsProjectMcp
+          ? await acquireProjectMcpNativeLease(projectRoot)
+          : undefined;
+        try {
+          const spawned = useSidecar
+            ? sidecarSpawnJsonl<ClaudeRawEvent>(sidecar!, {
             sessionId: sidecarBaseId,
             agentId: req.session.agentId || 'forge',
             trustTier: req.trustTier ?? 'own',
@@ -144,19 +328,90 @@ export class ClaudeCodeKernel implements AgentKernel {
             ...(req.budget ? { budget: req.budget } : {}),
             // credential='sidecar-managed' → sidecar 发 scoped token 注入;此处剔除真模型 key 不外发。
             kernel: { kind: 'claude-code', credential: 'sidecar-managed', cmd: binary, args, cwd: projectRoot, env: stripModelKeys(materializeEnv(envOverride)) },
-          }, ac.signal)
-        : spawnJsonl<ClaudeRawEvent>({
-            cmd: binary,
-            args,
-            cwd: projectRoot,
-            signal: ac.signal,
-            ...(envOverride ? { envOverride } : {}),
+            }, ac.signal)
+            : spawnJsonl<ClaudeRawEvent>({
+                cmd: binary,
+                args,
+                cwd: projectRoot,
+                signal: ac.signal,
+                ...(envOverride ? { envOverride } : {}),
+              });
+          if (lease) void spawned.exit.finally(() => lease.release());
+          return spawned;
+        } catch (error) {
+          await lease?.release();
+          throw error;
+        }
+      };
+      if (persistentEligible) {
+        try {
+          const poolKey = this.sessionPoolKey(req, projectRoot);
+          const poolSessionId = `claude-pool-${sessionPlan.threadId}`;
+          const handoff = createNativeHandoffController();
+          const acquired = await ClaudeCodeKernel.sessionPool.acquire(poolSessionId, poolKey, async () => {
+            if (useSidecar) {
+              return createNativeOwnedClaudeTransport(projectRoot, ownsProjectMcp, () => createSidecarClaudeTransport(sidecar!, {
+                sessionId: poolSessionId,
+                agentId: req.session.agentId || 'forge',
+                trustTier: req.trustTier ?? 'own',
+                callId: poolSessionId,
+                ...(req.budget ? { budget: req.budget } : {}),
+                // credential='sidecar-managed' → sidecar 发 scoped token 注入;此处剔除真模型 key 不外发。
+                kernel: {
+                  kind: 'claude-code', credential: 'sidecar-managed', cmd: binary,
+                  args: persistentArgs, cwd: projectRoot,
+                  env: stripModelKeys(materializeEnv(envOverride)),
+                },
+              }), handoff);
+            }
+              return createNativeOwnedClaudeTransport(projectRoot, ownsProjectMcp, async () =>
+                createDirectClaudeTransport({ cmd: binary, args: persistentArgs, cwd: projectRoot, ...(envOverride ? { envOverride } : {}) }), handoff);
           });
+          if (!acquired.reused) handoff.bind(() => acquired.session.requestHandoff());
+          tt('cc.session-mode', { mode: 'persistent-stream-json', reused: acquired.reused, pid: acquired.session.pid });
+          const turn = await acquired.session.execute(buildCcInput(req), ac.signal);
+          lines = turn.lines;
+          exit = turn.exit;
+        } catch (error) {
+          if (error instanceof ClaudeSessionCancelledError) {
+            const cancelled = createClaudeMapperState();
+            for (const ev of flushClaudeMapper(cancelled, 'cancelled')) yield* chatEventToKernel(ev);
+            return;
+          }
+          if (
+            error instanceof ProjectMcpNativeOwnershipBusyError
+            || error instanceof ClaudeSessionPoolBusyError
+          ) {
+            throw error;
+          }
+          // Pool setup is an optimization. A spawn/sidecar write failure must
+          // retain the old complete one-shot path for this turn.
+          tt('cc.pool-fallback', { error: (error as Error).message });
+          const oneShot = await spawnCold();
+          lines = oneShot.lines;
+          exit = oneShot.exit;
+        }
+      } else {
+        const oneShot = await spawnCold();
+        lines = oneShot.lines;
+        exit = oneShot.exit;
+      }
 
       const state = createClaudeMapperState();
+      const streamStartedAt = Date.now();
+      let rawFirstSeen = false;
+      let tokenFirstSeen = false;
       try {
         for await (const raw of lines) {
+          if (!rawFirstSeen) {
+            rawFirstSeen = true;
+            tt('cc.raw-first', { ms: Date.now() - streamStartedAt });
+          }
           for (const ev of mapClaudeEvent(raw, state)) {
+            if (!tokenFirstSeen && (ev.type === 'token' || ev.type === 'thinking')) {
+              tokenFirstSeen = true;
+              tt('cc.token-first', { ms: Date.now() - streamStartedAt, kind: ev.type });
+            }
             yield* chatEventToKernel(ev);
           }
         }
@@ -198,11 +453,43 @@ export class ClaudeCodeKernel implements AgentKernel {
    *  RPC,用户/宿主一旦配过 standing 档,mid-turn 的 setPermissionMode 就永远失效
    *  (例如 plan 只读闸切不进去)。故最近的显式动作优先。 */
   private buildArgs(req: TurnRequest, projectRoot: string): string[] {
+    const session = this.buildSessionPlan(req, projectRoot);
+    return buildCcArgs(req, projectRoot, session.args, this.permissionModeFor(req));
+  }
+
+  private buildSessionPlan(req: TurnRequest, projectRoot: string): { args: string[]; threadId?: string } {
     const tid = req.session.threadId?.trim();
     const session = buildSessionArgs(tid, projectRoot, this.startedThreadIds);
     if (session.threadId) this.startedThreadIds.add(session.threadId);
+    return session;
+  }
+
+  private permissionModeFor(req: TurnRequest): PermissionMode {
     const pendingMode = req.callId ? ClaudeCodeKernel.pendingPermissionMode.get(req.callId) : undefined;
-    return buildCcArgs(req, projectRoot, session.args, pendingMode ?? req.permissionMode);
+    return pendingMode ?? req.permissionMode ?? CC_DEFAULT_PERMISSION_MODE;
+  }
+
+  private sessionPoolKey(req: TurnRequest, projectRoot: string): string {
+    return JSON.stringify({
+      projectRoot,
+      nativeSources: claudeNativeSourceFingerprint(projectRoot),
+      projectMcp: projectMcpConfigFingerprint(projectRoot),
+      threadId: req.session.threadId,
+      hostSessionId: req.hostSessionId,
+      agentId: req.session.agentId,
+      trustTier: req.trustTier,
+      permissionMode: this.permissionModeFor(req),
+      model: req.model,
+      fallbackModels: req.fallbackModels,
+      systemPrompt: {
+        charter: req.systemPrompt.charter,
+        persona: req.systemPrompt.persona,
+        mode: req.systemPrompt.mode,
+      },
+      tools: req.tools,
+      toolPolicy: req.toolPolicy,
+      budget: req.budget,
+    });
   }
 
   /** callId → 下一轮 spawn 要用的**中立**档位(由 setPermissionMode 原样存入)。

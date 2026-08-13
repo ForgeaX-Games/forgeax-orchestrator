@@ -25,6 +25,8 @@ import { randomUUID } from "node:crypto";
 export interface KernelTurnRecord {
   /** 本轮用户输入文本(渲染 user 气泡)。 */
   message: string;
+  /** Host-owned checkpoint foreign key, shared with the UI user bubble. */
+  msgId?: string;
   /** Model-visible user context. Defaults to message; may include durable attachment path notes. */
   contextText?: string;
   /** Path-only attachments retained for UI refresh + model history (no base64). */
@@ -119,6 +121,7 @@ export function transcribeKernelTurn(session: Session, agentPath: string, rec: K
     payload: {
       content: rec.message,
       llmMessage: { role: "user", content: [{ type: "text", text: rec.contextText ?? rec.message }] },
+      ...(rec.msgId ? { msgId: rec.msgId } : {}),
       ...(durableAtts.length ? { attachments: durableAtts } : {}),
       tsSource: TS_SOURCE,
     },
