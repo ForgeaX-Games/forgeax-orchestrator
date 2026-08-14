@@ -27,6 +27,13 @@ describe('maskKey()', () => {
     // The masked form must not leak the middle.
     expect(m).not.toContain('xxxx');
   });
+  test('DeepSeek-shaped key is masked without exposing the middle', () => {
+    const key = ['dsk', 'test', 'key'].join('-') + '-' + 'x'.repeat(32) + '-tail';
+    const masked = maskKey(key);
+    expect(masked).toBe('dsk-********tail');
+    expect(masked).not.toContain('xxxx');
+    expect(masked).not.toContain(key);
+  });
   test('output is deterministic + idempotent for the same input', () => {
     expect(maskKey('aaaa-mid-bbbb')).toBe(maskKey('aaaa-mid-bbbb'));
   });

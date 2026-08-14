@@ -69,6 +69,9 @@ describe('describeKernelUnavailable — 友好文案带 id + 成因 + 修复指�
     const kimi = describeKernelUnavailable('kimi-code', 'not-logged-in');
     expect(kimi).toContain('kimi login');
     expect(kimi).toContain('https://www.kimi.com/code/docs/kimi-code-cli/guides/getting-started.html');
+    const dsh = describeKernelUnavailable('deepseek-harness', 'not-installed');
+    expect(dsh).toContain('@deepseek-ai/dsh');
+    expect(dsh).toContain('https://github.com/deepseek-ai/deepseek-harness');
   });
   test('unknown-id 带可用清单', () => {
     const m = describeKernelUnavailable('bogus', 'unknown-id', 'claude-code, codex');

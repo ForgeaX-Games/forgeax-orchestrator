@@ -83,6 +83,10 @@ const FIX_HINTS: Record<string, { install?: string; login?: string; docs?: strin
     login: '运行 `kimi login` 完成登录',
     docs: 'https://www.kimi.com/code/docs/kimi-code-cli/guides/getting-started.html',
   },
+  'deepseek-harness': {
+    install: '安装 @deepseek-ai/dsh 并确保 dsh 在 PATH 中',
+    docs: 'https://github.com/deepseek-ai/deepseek-harness',
+  },
   'forgeax-core': {},
 };
 

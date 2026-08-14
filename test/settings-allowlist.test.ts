@@ -35,6 +35,7 @@ describe('PUT /api/settings/env — SAFE_ENV_KEYS allowlist', () => {
     expect(j.allowed).toContain('FORGEAX_MODEL');
     expect(j.allowed).toContain('ARK_IMAGE_KEY');
     expect(j.allowed).toContain('DEEPSEEK_API_KEY');
+    expect(j.allowed).toContain('DEEPSEEK_BASE_URL');
     // workspace upload: token + repo + branch are all writable (2026-07-09)
     expect(j.allowed).toContain('FORGEAX_UPLOAD_GITHUB_TOKEN');
     expect(j.allowed).toContain('FORGEAX_UPLOAD_BRANCH');

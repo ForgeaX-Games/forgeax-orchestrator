@@ -39,6 +39,18 @@ describe('resolveKernel — providerOverride 优先于全局 env', () => {
     expect(resolveKernel('forge', 'kimi-code').id).toBe('kimi-code');
   });
 
+  test('显式 deepseek-harness 命中 truthful final-only 内核', () => {
+    const kernel = resolveKernel('forge', 'deepseek-harness');
+    expect(kernel.id).toBe('deepseek-harness');
+    expect(kernel.capabilities).toEqual({
+      streaming: false,
+      thinking: false,
+      toolCalls: false,
+      midTurnInject: false,
+      forkExtract: false,
+    });
+  });
+
   test('无显式 → 回落全局 env', () => {
     process.env.FORGEAX_KERNEL_IMPL = 'codex';
     expect(resolveKernel('forge').id).toBe('codex');

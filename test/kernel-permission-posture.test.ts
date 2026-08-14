@@ -35,6 +35,11 @@ import { planKimiPermission } from '../src/kernel/kimi-code-kernel';
 import { listKernelPermissionCaps } from '../src/kernel/permission-catalog';
 import { listAvailableKernels } from '../src/kernel/resolve-kernel';
 import {
+  DEEPSEEK_HARNESS_DEFAULT_PERMISSION_MODE,
+  DEEPSEEK_HARNESS_SUPPORTED_PERMISSION_MODES,
+  toDeepSeekHarnessPermission,
+} from '../src/kernel/deepseek-harness-profile';
+import {
   DEFAULT_KERNEL_PERMISSION_MODE,
   clampMode,
   coercePerKernelModes,
@@ -210,6 +215,26 @@ describe('表达不了的档位:降级而非假装', () => {
   });
 });
 
+describe('deepseek-harness 权限姿态:只声明公开 headless 能兑现的两档', () => {
+  test('registered capabilities are exactly autoEdits/unrestricted with safe default', () => {
+    const kernel = listAvailableKernels().find((item) => item.id === 'deepseek-harness');
+    expect(kernel).toBeDefined();
+    expect([...DEEPSEEK_HARNESS_SUPPORTED_PERMISSION_MODES]).toEqual(['autoEdits', 'unrestricted']);
+    expect(DEEPSEEK_HARNESS_DEFAULT_PERMISSION_MODE).toBe('autoEdits');
+    expect(kernel!.permissionCapabilities).toEqual({
+      supported: DEEPSEEK_HARNESS_SUPPORTED_PERMISSION_MODES,
+      defaultMode: 'autoEdits',
+    });
+  });
+
+  test('maps only supported modes and rejects planning/gated', () => {
+    expect(toDeepSeekHarnessPermission('autoEdits')).toBe('workspace-write');
+    expect(toDeepSeekHarnessPermission('unrestricted')).toBe('danger-full-access');
+    expect(() => toDeepSeekHarnessPermission('planning')).toThrow('does not support');
+    expect(() => toDeepSeekHarnessPermission('gated')).toThrow('does not support');
+  });
+});
+
 describe('forgeax-core(原生):档位必须过得了 unix-socket 白名单', () => {
   // 真机核查时发现:toWire 是白名单式序列化,原来漏了 permissionMode → sidecar 侧虽然会
   // applyMode,但永远收不到档位 = 原生内核的权限设置静默失效。这条钉住它。
@@ -254,7 +279,7 @@ describe('catalog 必须覆盖全部已注册内核(漏了会静默不出现在�
     const registered = listAvailableKernels();
     expect(registered.every((kernel) => kernel.permissionCapabilities)).toBe(true);
     const listed = new Set(listKernelPermissionCaps(mkdtempSync(resolve(tmpdir(), 'fx-cat-'))).map((k) => k.id));
-    for (const id of ['claude-code', 'codebuddy', 'codex', 'cursor-agent', 'kimi-code']) {
+    for (const id of ['claude-code', 'codebuddy', 'codex', 'cursor-agent', 'kimi-code', 'deepseek-harness']) {
       expect(listed.has(id)).toBe(true);
     }
   });
