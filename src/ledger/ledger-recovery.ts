@@ -10,8 +10,8 @@
  *    turnEnd，卡死的 `isStreaming: true` 自动 clear（reload 重启后第一次 attach
  *    就把这件事做完，不必再让前端做 stale-turn 检测）。
  *
- *  调用时机：Session/Scheduler 把某 agent attach 上来时，构造 ConsciousAgent
- *  之前调一遍 —— 那一刻 ledger 已就绪，eventBus observer (ledger-persistence /
+ *  调用时机：Session bootstrap 某个 resident 时，在 RuntimeAgentHost
+ *  初始化前调一遍 —— 那一刻 ledger 已就绪，eventBus observer (ledger-persistence /
  *  WS hub) 也已挂上，publish 一条 turnEnd 既写 WAL（observer 路径）又广播到
  *  WS 客户端，无需双写。 */
 

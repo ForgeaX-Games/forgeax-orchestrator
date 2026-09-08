@@ -31,6 +31,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { createMcpDispatcher, serveStdio } from '../../mcp/protocol.mjs';
+import { contentPartsToMcpContent, hostResultToMcpContent } from './mcp-media-content.mjs';
 import {
   classifyAndWrite,
   searchMemory,
@@ -101,15 +102,26 @@ async function bridgeCall(toolName, args) {
     const res = await fetch(`${SERVER_URL}/api/sessions/${encodeURIComponent(BRIDGE_SID)}/kernel-tool`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ agentPath: BRIDGE_AGENT, toolName, args: args ?? {}, ...(toolExecutionId ? { toolExecutionId } : {}) }),
+      body: JSON.stringify({
+        agentPath: BRIDGE_AGENT,
+        toolName,
+        args: args ?? {},
+        responseFormat: 'mcp-content-v1',
+        ...(toolExecutionId ? { toolExecutionId } : {}),
+      }),
       ...(ac ? { signal: ac.signal } : {}),
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body?.ok === false) {
       return { isError: true, text: String(body?.error ?? `bridge HTTP ${res.status}`), toolExecutionId };
     }
-    const r = body.result;
-    return { isError: false, text: typeof r === 'string' ? r : JSON.stringify(r ?? ''), toolExecutionId };
+    const content = await hostResultToMcpContent(body.result);
+    // the reference agent CLI 2.1.226 chooses structuredContent as the model-visible tool
+    // result when an MCP response contains both content and structuredContent.
+    // Preserve the host value in the same ForgeaX-owned envelope as the trace
+    // key; otherwise the model sees only toolExecutionId and cannot consume the
+    // result that the host actually returned.
+    return { isError: false, content, structuredResult: body.result, toolExecutionId };
   } catch (e) {
     const msg = ac?.signal.aborted ? `bridge timeout after ${BRIDGE_TIMEOUT_MS}ms (tool ${toolName})` : `bridge transport error: ${e?.message ?? e}`;
     return { isError: true, text: msg, toolExecutionId };
@@ -122,15 +134,53 @@ async function bridgeCall(toolName, args) {
  *  「带 content 数组的对象」原样透传,回裸字符串会把 structuredContent 连同连接键一起丢掉。 */
 function bridgeToolResult(r, content) {
   return {
-    content: content ?? [{ type: 'text', text: r.text }],
+    content: content ?? r.content ?? [{ type: 'text', text: r.text ?? '' }],
     // 自铸内容收进 `forgeax` 命名空间:① 第三方 MCP server 的 structuredContent 里绝不会有
     // 这个键,消费方据此**确定性**区分"我们自造的信封"与"别人的业务结果",不靠数键个数
     // (上一版按形状剥,把第三方业务结果剥成了纯文本 —— 2026-08-06 外审 MAJOR-1);
-    // ② 以后要加字段(版本 / 耗时)一律加在里面,消费端判据不用跟着改,形状不被冻死。
+    // ② 以后要加字段(版本 / 耗时)一律加在里面,消费端判据不用跟着改,形状不被冻死;
+    // ③ the reference agent CLI 在 content 与 structuredContent 并存时只把后者交给模型,
+    // 所以同一次 host 返回值也必须在这个信封里。content 仍保留给标准 MCP 客户端,
+    // 结构化副本只是跨客户端的可见性兼容,不是第二次执行。
     // 铸不出 id 时不写空键 —— 消费方据键的有无判断能不能 join。
-    ...(r.toolExecutionId ? { structuredContent: { forgeax: { toolExecutionId: r.toolExecutionId } } } : {}),
+    ...(r.toolExecutionId ? {
+      structuredContent: {
+        forgeax: {
+          toolExecutionId: r.toolExecutionId,
+          ...(Object.prototype.hasOwnProperty.call(r, 'structuredResult') ? { result: r.structuredResult } : {}),
+        },
+      },
+    } : {}),
     ...(r.isError ? { isError: true } : {}),
   };
+}
+
+/**
+ * ui_screenshot historically returned a JSON-encoded ContentPart[] string.
+ * hostResultToMcpContent now wraps that legacy string in one text block, so
+ * inspect that narrow shape before treating the result as ordinary text.
+ * New native content arrays and plain text remain unchanged.
+ */
+function parseUiScreenshotParts(r) {
+  if (Array.isArray(r?.content)) {
+    if (r.content.length === 1 && r.content[0]?.type === 'text' && typeof r.content[0].text === 'string') {
+      try {
+        const parsed = JSON.parse(r.content[0].text);
+        if (Array.isArray(parsed)) return parsed;
+      } catch {
+        /* Plain text is the ordinary fallback. */
+      }
+    }
+    return r.content;
+  }
+  if (typeof r?.text === 'string') {
+    try {
+      return JSON.parse(r.text);
+    } catch {
+      return r.text;
+    }
+  }
+  return undefined;
 }
 
 /** Direct project-MCP clients have no ACP approval callback. A gated native
@@ -328,17 +378,14 @@ for (const spec of UI_CONTRACT.tools ?? []) {
         const r = await bridgeCall('ui_screenshot', args ?? {});
         if (r.isError) return bridgeToolResult(r);
         try {
-          const parts = JSON.parse(r.text);
+          const parts = parseUiScreenshotParts(r);
           // 守卫不绑定 image 在数组中的位置(§2.5:勿硬编码生产端形状),只认「存在一枚
           // 带 string data 的 image part」;下方 map 逐项按 p.type 处理,与顺序无关。
           if (Array.isArray(parts) && parts.some((p) => p?.type === 'image' && typeof p?.data === 'string')) {
             // 连接键仍走 bridgeToolResult 这唯一一处拼装(只换 content)—— 在这里手抄一份
             // structuredContent 就是第二份事实源,本工作流已经因此栽过四次。
-            return bridgeToolResult(r, parts.map((p) =>
-              p.type === 'image'
-                ? { type: 'image', data: p.data, mimeType: p.mimeType ?? 'image/png' }
-                : { type: 'text', text: String(p.text ?? '') },
-            ));
+            const content = contentPartsToMcpContent(parts);
+            if (content) return bridgeToolResult(r, content);
           }
         } catch {
           /* 非 JSON → 按文本透传 */

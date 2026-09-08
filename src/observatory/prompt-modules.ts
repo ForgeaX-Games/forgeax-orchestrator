@@ -4,12 +4,12 @@
  *  reason about cache efficiency, scope, and persona influence. The
  *  observatory expects a tree of modules → child sections.
  *
- *  Module layering (matches what `claude-code` provider actually sends):
+ *  Module layering:
  *  1. `forgeax_intro`              — preamble of FORGEAX_SYSTEM_PROMPT (everything before the first `## ` heading)
  *  2. each `## heading` block      — material conventions / ECS recipes / workflow / error self-help …
  *  3. `active_game`                — appended only when `buildSystemPrompt(slug)` had a slug
- *  4. `persona`                    — `composeSystemPrompt().persona`, second-level split by `# heading`
- *  5. `skill:<id>` (each)          — `composeSystemPrompt().skillSections`, same H1-split
+ *  4. `persona`                    — live Runtime 的 ResolvedAgentComposition，
+ *                                    或独立旧 CLI inspector 的 legacy composition
  *
  *  forgeax-native agents (no claude-code provider in front) only have
  *  layers 4-5 — pass `includeForgeaxScaffold: false` and the slicer
@@ -156,6 +156,12 @@ export interface InspectOptions {
   /** When false, only persona + skills are included (forgeax-native agents
    *  that don't go through the claude-code provider). Default true. */
   includeForgeaxScaffold?: boolean;
+  /** Runtime Turn 已经解析好的宿主 charter/environment/note。 */
+  resolvedScaffold?: string;
+  /** Runtime 已解析的唯一模型可见内容。传入后不得再按 agentId 走 legacy loader。 */
+  resolvedPersona?: string;
+  /** Runtime composition 中来自 dynamic Kit slots 的当轮内容。 */
+  resolvedDynamicPrompt?: string;
 }
 
 /** Compose + slice the full system prompt for one agent.
@@ -166,18 +172,32 @@ export async function inspectAgentPrompt(
   agentId: string,
   opts: InspectOptions = {},
 ): Promise<PromptInspection | null> {
-  const composed = await composeSystemPrompt(agentId);
-  if (!composed) return null;
+  const hasResolvedPersona = Object.prototype.hasOwnProperty.call(opts, 'resolvedPersona');
+  const composed = hasResolvedPersona ? null : await composeSystemPrompt(agentId);
+  if (!hasResolvedPersona && !composed) return null;
 
-  const includeScaffold = opts.includeForgeaxScaffold !== false;
-  const scaffold = includeScaffold ? buildSystemPrompt(opts.activeSlug) : '';
+  const hasResolvedScaffold = Object.prototype.hasOwnProperty.call(
+    opts,
+    'resolvedScaffold',
+  );
+  const includeScaffold =
+    hasResolvedScaffold || opts.includeForgeaxScaffold !== false;
+  const scaffold = hasResolvedScaffold
+    ? opts.resolvedScaffold ?? ''
+    : includeScaffold
+      ? buildSystemPrompt(opts.activeSlug)
+      : '';
 
-  // Reproduce exactly what claude-code sends to the model so token
-  // accounting matches the wire payload (see claude-code.ts:401).
-  const personaText = composed.text.trim();
-  const raw = scaffold && personaText
+  // Runtime inspection consumes the same ResolvedAgentComposition as the turn.
+  // The legacy compose path remains exclusive to the standalone CLI inspector.
+  const personaText = (hasResolvedPersona ? opts.resolvedPersona ?? '' : composed!.text).trim();
+  const stableRaw = scaffold && personaText
     ? `${scaffold}\n\n---\n\n## Persona\n\n${personaText}`
     : (scaffold || personaText);
+  const dynamicText = opts.resolvedDynamicPrompt?.trim() ?? '';
+  const raw = stableRaw && dynamicText
+    ? `${stableRaw}\n\n---\n\n## Dynamic context\n\n${dynamicText}`
+    : (stableRaw || dynamicText);
   const totalChars = raw.length;
 
   const modules: ContextBlock[] = [];
@@ -187,12 +207,22 @@ export async function inspectAgentPrompt(
     modules.push(...sliceForgeaxScaffold(scaffold, totalChars));
   }
 
-  // 2) persona + skills (composeSystemPrompt result)
-  if (composed.persona && composed.persona.trim().length > 0) {
-    modules.push(makeTopLevel('persona', 'persona', composed.persona, totalChars));
+  // 2) Runtime content is intentionally kept as one resolved module: splitting
+  // it by its historical source would re-introduce a second loading model.
+  if (hasResolvedPersona && personaText) {
+    modules.push(makeTopLevel('persona', 'persona', personaText, totalChars));
+  } else if (composed) {
+    if (composed.persona && composed.persona.trim().length > 0) {
+      modules.push(makeTopLevel('persona', 'persona', composed.persona, totalChars));
+    }
+    for (const sec of composed.skillSections) {
+      modules.push(makeTopLevel(`skill:${sec.skillId}`, `skill:${sec.skillId}`, sec.body, totalChars));
+    }
   }
-  for (const sec of composed.skillSections) {
-    modules.push(makeTopLevel(`skill:${sec.skillId}`, `skill:${sec.skillId}`, sec.body, totalChars));
+  if (dynamicText) {
+    modules.push(
+      makeTopLevel('dynamic_context', 'dynamic_context', dynamicText, totalChars),
+    );
   }
 
   return {
@@ -200,6 +230,6 @@ export async function inspectAgentPrompt(
     charCount: totalChars,
     estimatedTokens: estimateTokens(raw),
     modules,
-    warnings: composed.warnings,
+    warnings: composed?.warnings ?? [],
   };
 }

@@ -338,6 +338,36 @@ describe('ui_screenshot 往返 — dataUrl → ContentPart 图像块(P3)', () =>
   });
 });
 
+describe('ui_snapshot — ActionCatalog 前置条件注解', () => {
+  test('真实 perception 往返给长尾 action 注入目录事实,无声明的行原样保留', async () => {
+    const lease = leaseFor(SID);
+    const originalPanelRow = { id: 'panel.toggle_sidebar', title: '折叠/展开侧栏', available: true };
+    const ctx = {
+      projectRoot: '/tmp',
+      agentId: 'forge',
+      sid: SID,
+      eventBus: replyingBus({
+        actions: [
+          { id: 'overlay.open', title: '打开浮层', available: true },
+          originalPanelRow,
+        ],
+        state: {},
+      }, lease),
+    };
+
+    const out = await runForgeaxBuiltinTool('ui_snapshot', {}, ctx) as {
+      actions: Array<Record<string, unknown>>;
+    };
+    expect(out.actions[0]).toMatchObject({
+      id: 'overlay.open',
+      preconditions: [
+        'The requested id must identify an overlay currently registered by the product shell.',
+      ],
+    });
+    expect(out.actions[1]).toEqual(originalPanelRow);
+  });
+});
+
 describe('ui-bridge-contract — 契约单源与产品中立', () => {
   test('三个工具在契约里且 schema 齐全', () => {
     const names = uiBridgeContract.tools.map((t) => t.name).sort();
@@ -395,7 +425,7 @@ describe('P1-9 一等工具化 — firstClass 派生与反解', () => {
   test('真冷启动:catalog firstClass 派生 role.* ToolSpec 并可反解,无需 manifest seed', () => {
     const specs = firstClassUiToolSpecs(SID);
     const names = specs.map((s) => s.name);
-    expect(specs).toHaveLength(14);
+    expect(specs).toHaveLength(12);
     expect(names).toContain('ui_act_role_create');
     expect(names).toContain('ui_act_role_list');
     expect(names).toContain('ui_act_game_switch');
@@ -403,7 +433,13 @@ describe('P1-9 一等工具化 — firstClass 派生与反解', () => {
     const roleCreate = specs.find((s) => s.name === 'ui_act_role_create')!;
     expect(roleCreate.description).toContain('创建新角色');
     expect(roleCreate.description).toMatch(/ui_snapshot/);
+    expect(roleCreate.description).toContain(
+      'Preconditions (state facts, not operation order):\n'
+        + '- The requested id must not already exist in the role roster.',
+    );
     expect(roleCreate.inputSchema).toMatchObject({ required: ['id', 'persona'] });
+    expect(specs.find((s) => s.name === 'ui_act_console_read')?.description)
+      .not.toContain('Preconditions (state facts, not operation order):');
     expect(resolveFirstClassUiTool(SID, 'ui_act_role_create')).toEqual({ actionId: 'role.create' });
     expect(resolveFirstClassUiTool(SID, 'ui_act_role_list')).toEqual({ actionId: 'role.list' });
     expect(resolveFirstClassUiTool(SID, 'ui_act_game_switch')).toEqual({ actionId: 'game.switch' });

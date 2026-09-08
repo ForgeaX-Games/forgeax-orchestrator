@@ -18,13 +18,13 @@
  *      don't re-import.
  *
  * Permission gating: callers from the AI side (`caller.kind='ai'`) require
- * `entry.exposedToAI === true`. Other caller kinds (user/skill/workbench/cli)
+ * `entry.exposedToAI === true`. Other caller kinds (user/skill/page/cli)
  * are allowed for any registered tool — finer-grained permission lands in
  * Phase D6 (trust-decision panel) when the trust model is wired.
  */
 import { getExtensionSnapshot } from '../extensions/registry';
 import type { ToolEntry } from '../extensions/kinds';
-import type { ToolCall, ToolResult, ImageGen } from '@forgeax/types';
+import type { ToolResult, ImageGen } from '@forgeax/types';
 import { realpathSync, statSync } from 'node:fs';
 import { basename, isAbsolute, relative, sep } from 'node:path';
 import { getEventBus } from '../events/bus';
@@ -36,13 +36,15 @@ import { getPathManager } from '../fs/path-manager';
 import { getHostAuthoring, type HostAuthoring } from './host-authoring';
 import {
   createScopedExtensionCapabilities,
+  type ExtensionCaller,
+  type ExtensionToolCall,
   type ScopedExtensionCapabilities,
 } from './extension-capabilities';
 
 export type ToolHandler = (
   args: unknown,
   ctx: {
-    caller: ToolCall['caller'];
+    caller: ExtensionCaller;
     toolId: string;
     /** GAP 5 — env keys allow-listed by the plugin's manifest `requestedEnv`.
      *  Handlers MUST NOT touch `process.env` directly; this is the only
@@ -98,18 +100,31 @@ async function loadHandlerModule(backendPath: string): Promise<HandlerModule | n
   let mod: Record<string, unknown>;
   try {
     mod = (await import(backendPath)) as Record<string, unknown>;
-  } catch {
+  } catch (error) {
+    console.error(
+      `[tools/registry] failed to import backend ${backendPath}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`,
+    );
     return null;
   }
-  // Accept default export, `tools` named export, or the whole module
-  // namespace. Whatever shape ships, we treat it as Record<id,fn>.
-  const candidate =
-    (mod.default && typeof mod.default === 'object' ? mod.default : null) ??
-    (mod.tools && typeof mod.tools === 'object' ? mod.tools : null) ??
-    mod;
+  // Accept a direct default tool map, a named `tools` export, the
+  // extension-host-compatible `default: { tools: {...} }` wrapper, or the
+  // whole module namespace. A dual-ABI extension can expose Orchestrator
+  // `(args, ctx)` handlers directly and Host `(context, args)` handlers under
+  // `default.tools`; never let the nested Host map replace a direct handler.
+  const defaultExport =
+    (mod.default && typeof mod.default === 'object' && !Array.isArray(mod.default)
+      ? mod.default
+      : null) as Record<string, unknown> | null;
+  const defaultTools = defaultExport?.tools;
   const out: HandlerModule = {};
-  for (const [k, v] of Object.entries(candidate as Record<string, unknown>)) {
-    if (typeof v === 'function') out[k] = v as ToolHandler;
+  const addHandlers = (candidate: unknown) => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return;
+    for (const [k, v] of Object.entries(candidate as Record<string, unknown>)) {
+      if (typeof v === 'function' && !Object.hasOwn(out, k)) out[k] = v as ToolHandler;
+    }
+  };
+  for (const candidate of [defaultExport, mod.tools, defaultTools, mod]) {
+    addHandlers(candidate);
   }
   moduleCache.set(backendPath, out);
   return out;
@@ -142,7 +157,7 @@ export interface ToolDispatchError {
  *          -> timeout (default 30s) -> confirm-timeout
  *
  * token = confirm-${toolId}-${epoch}-${random6}; filters on it before resolving.
- * User-driven callers (caller.kind='user'|'workbench'|'cli'|'skill') bypass
+ * User-driven callers (caller.kind='user'|'page'|'cli'|'skill') bypass
  * this gate — only caller.kind='ai' is gated (C-3).
  * --------------------------------------------------------------------------*/
 
@@ -156,7 +171,7 @@ interface ConfirmAckPayload {
 
 async function awaitConfirm(
   entry: ToolEntry,
-  req: ToolCall,
+  req: ExtensionToolCall,
 ): Promise<{ ok: true } | { ok: false; code: 'confirm-timeout' | 'user-rejected' | 'confirm-emit-failed'; error: string }> {
   const bus = getEventBus();
   const timeoutMs = Number(process.env.FORGEAX_TOOL_CONFIRM_TIMEOUT_MS ?? CONFIRM_TIMEOUT_MS);
@@ -235,7 +250,7 @@ export function _resetConfirmsForTests(): void {
  * slug wins; the workspace active game is the fallback. Only fills when args is
  * a plain object whose `slug` is absent/empty, so an explicit caller slug wins.
  */
-function resolveSessionGame(req: ToolCall): string | undefined {
+function resolveSessionGame(req: ExtensionToolCall): string | undefined {
   const sid = req.caller.sessionId ?? req.caller.threadId;
   if (!sid) return undefined;
   try {
@@ -252,7 +267,7 @@ function resolveSessionGame(req: ToolCall): string | undefined {
  *  both paths additionally rejects symlinks outside the games root (or into a
  *  nested non-game directory) while retaining aliases to another direct child
  *  game. No `.forgeax/games` path is constructed here. */
-function resolveArgsGame(req: ToolCall): string | undefined {
+function resolveArgsGame(req: ExtensionToolCall): string | undefined {
   if (typeof req.args !== 'object' || !req.args || Array.isArray(req.args)) return undefined;
   const gameSlug = (req.args as Record<string, unknown>).gameSlug;
   if (typeof gameSlug !== 'string' || !gameSlug) return undefined;
@@ -281,7 +296,7 @@ function resolveArgsGame(req: ToolCall): string | undefined {
   }
 }
 
-function injectScopeSlugIfMissing(req: ToolCall, sessionGame?: string): void {
+function injectScopeSlugIfMissing(req: ExtensionToolCall, sessionGame?: string): void {
   if (typeof req.args !== 'object' || !req.args || Array.isArray(req.args)) return;
   if (!/^(gen3d|aiasset):/.test(req.toolId)) return;
   const args = req.args as Record<string, unknown>;
@@ -297,7 +312,7 @@ function injectScopeSlugIfMissing(req: ToolCall, sessionGame?: string): void {
   if (slug) args.slug = slug;
 }
 
-export async function callTool(req: ToolCall): Promise<ToolResult> {
+export async function callTool(req: ExtensionToolCall): Promise<ToolResult> {
   const bus = getEventBus();
   const threadId = req.caller.threadId;
   // Doc 07 §TopBar Pause — when AI-actor is paused, short-circuit before
@@ -421,6 +436,8 @@ export interface ToolDescriptor {
   extensionId: string;
   description?: string;
   exposedToAI: boolean;
+  defaultAgentAllow?: boolean;
+  pinned?: boolean;
   /** Three-value enum: 'always' | 'destructive' | 'never' | undefined.
    *  Undefined means not set (same semantics as 'never'). */
   requireConfirm?: 'always' | 'destructive' | 'never';
@@ -440,6 +457,8 @@ function describeTool(t: ToolEntry): ToolDescriptor {
     extensionId: t.extensionId,
     description: t.description,
     exposedToAI: t.exposedToAI,
+    defaultAgentAllow: t.defaultAgentAllow,
+    pinned: t.pinned,
     requireConfirm: t.requireConfirm,
     confirmMessage: t.confirmMessage,
     hasHandler: !!t.backendPath,

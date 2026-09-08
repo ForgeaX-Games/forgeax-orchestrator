@@ -9,6 +9,25 @@
 
 import { describe, expect, test } from "bun:test";
 import { delegationGuard } from "../builtin/kits/agent_manage/tools/delegate_to_subagent";
+import { RuntimeTree } from "../src/runtime/runtime-tree";
+import type { AgentInstance } from "../src/runtime/types";
+
+function runtimeNode(
+  instanceId: string,
+  parentInstanceId: string | null,
+  lifetime: "resident" | "ephemeral",
+  residentPath?: string,
+): AgentInstance {
+  return {
+    sid: "sid-guard",
+    instanceId,
+    runtimeEpochId: `epoch-${instanceId}`,
+    templateRef: `template-${instanceId}`,
+    parentInstanceId,
+    lifetime,
+    ...(residentPath ? { residentPath } : {}),
+  } as AgentInstance;
+}
 
 describe("delegationGuard", () => {
   test("target busy: target already has a pending delegation → block", () => {
@@ -99,5 +118,62 @@ describe("delegationGuard", () => {
     });
     expect(result.block).toBe(true);
     expect(result.reason).toMatch(/too many concurrent/);
+  });
+
+  test("real RuntimeTree ancestry blocks an ephemeral grandchild delegating to its resident ancestor", () => {
+    const tree = new RuntimeTree("sid-guard");
+    tree.insert(runtimeNode("resident-root", null, "resident", "root"));
+    tree.insert(runtimeNode("ephemeral-child", "resident-root", "ephemeral"));
+    tree.insert(runtimeNode("ephemeral-grandchild", "ephemeral-child", "ephemeral"));
+
+    const result = delegationGuard({
+      delegations: new Map(),
+      delegator: "ephemeral-grandchild",
+      target: "root",
+      tree,
+      delegatorInstanceId: "ephemeral-grandchild",
+      targetInstanceId: "resident-root",
+    });
+
+    expect(result.block).toBe(true);
+    expect(result.reason).toMatch(/cycle detected/);
+  });
+
+  test("real instance identity wins over a legacy address prefix", () => {
+    const tree = new RuntimeTree("sid-guard");
+    tree.insert(runtimeNode("actual-target", null, "resident", "root"));
+    tree.insert(runtimeNode("other-root", null, "resident", "other"));
+    tree.insert(runtimeNode("other-child", "other-root", "ephemeral"));
+
+    const result = delegationGuard({
+      delegations: new Map(),
+      delegator: "root/child",
+      target: "root",
+      tree,
+      delegatorInstanceId: "other-child",
+      targetInstanceId: "actual-target",
+    });
+
+    expect(result.block).toBe(false);
+  });
+
+  test("malformed RuntimeTree topology blocks real-identity delegation", () => {
+    const tree = new RuntimeTree("sid-guard");
+    tree.insert(runtimeNode("a", null, "resident", "a"));
+    tree.insert(runtimeNode("b", "a", "ephemeral"));
+    tree.insert(runtimeNode("unrelated", null, "resident", "unrelated"));
+    (tree.get("a") as { parentInstanceId: string | null }).parentInstanceId = "b";
+
+    const result = delegationGuard({
+      delegations: new Map(),
+      delegator: "a/child",
+      target: "unrelated",
+      tree,
+      delegatorInstanceId: "b",
+      targetInstanceId: "unrelated",
+    });
+
+    expect(result.block).toBe(true);
+    expect(result.reason).toMatch(/invalid RuntimeTree topology/);
   });
 });

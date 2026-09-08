@@ -22,12 +22,9 @@ export const RENTED_KERNEL_PROFILE: KernelOrchestrationProfile = Object.freeze({
   historyIntake: 'text-bridge',
 });
 
-/**
- * Codex accepts images as durable local-file inputs. Keep this separate from
- * the generic rented profile: the other rented CLIs do not have the same
- * path-based image contract, and passing an inline base64 payload to them is
- * both unsupported and needlessly large.
- */
+/** Codex keeps a native lane and can resume it when the concrete kernel has
+ * already observed the thread. Kept as a profile constant so callers do not
+ * branch on the implementation class. */
 export const CODEX_KERNEL_PROFILE: KernelOrchestrationProfile = Object.freeze({
   nativeAttachmentKinds: ['image'] as NativeAttachmentKind[],
   hostOwnedHistory: false,
@@ -41,20 +38,15 @@ export const NATIVE_KERNEL_PROFILE: KernelOrchestrationProfile = Object.freeze({
 });
 
 type ProfiledKernel = AgentKernel & { readonly orchestrationProfile?: KernelOrchestrationProfile };
-type ResumeAwareKernel = AgentKernel & { readonly hasNativeHistoryResume?: (threadId: string) => boolean };
 
 /** Unknown/older kernels degrade to text-only rented semantics. */
 export function orchestrationProfileOf(kernel: AgentKernel): KernelOrchestrationProfile {
   return (kernel as ProfiledKernel).orchestrationProfile ?? RENTED_KERNEL_PROFILE;
 }
 
-/**
- * A text-bridge kernel may retain a private chat and resume it on the next
- * process invocation. Only that concrete, live resume reference authorizes a
- * delta: a missing reference (including after a server restart) requires a
- * fresh authoritative snapshot.
- */
 export function hasNativeHistoryResume(kernel: AgentKernel, threadId?: string): boolean {
-  const tid = threadId?.trim();
-  return Boolean(tid && (kernel as ResumeAwareKernel).hasNativeHistoryResume?.(tid));
+  const candidate = kernel as AgentKernel & {
+    hasNativeHistoryResume?: (id: string) => boolean;
+  };
+  return Boolean(threadId && candidate.hasNativeHistoryResume?.(threadId));
 }

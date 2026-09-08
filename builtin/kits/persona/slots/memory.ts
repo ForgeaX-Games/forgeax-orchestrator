@@ -5,9 +5,7 @@
  *     会从 plugin manifest 把 memoryDir 写到 `<sid>/agents/<path>/agent.json`。
  *     这里只读 agent.json，不再回过去查 plugin registry —— 与 persona slot
  *     保持对称。
- *   - 路径解析顺序：绝对路径 → projectRoot 相对 →（兜底）marketplace 根相对，
- *     和 persona 完全一致；marketplace 根 fallback 让旧 manifest 里 `./memory/`
- *     这种相对项也能解到。
+ *   - 路径解析顺序：绝对路径 → projectRoot 相对，与 persona 完全一致。
  *   - 目录里所有 *.md 文件按文件名排序拼成一个 SystemBlock；每段以 `## <basename>`
  *     起头，方便 LLM 在引用记忆时点出来源。空目录 / 读不到 → 静默返回空串。
  *   - cacheHint='stable' + STATIC_CORE：长期记忆和 persona 同档，理应进 stable
@@ -27,29 +25,12 @@ import {
   type MemLang,
 } from "../../../../src/agents/memory-locale";
 
-function findMarketplaceRoot(): string | null {
-  const root = defaultProjectRoot();
-  const candidates = [
-    resolve(root, "packages/marketplace"),
-    resolve(root, "../packages/marketplace"),
-    resolve(root, "../../packages/marketplace"),
-    resolve(root, "marketplace"),
-    resolve(root, "../marketplace"),
-  ];
-  return candidates.find((p) => existsSync(join(p, "manifest.json"))) ?? null;
-}
-
 function resolveMemoryDir(raw: string): string | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   if (isAbsolute(trimmed)) return existsSync(trimmed) ? trimmed : null;
   const projectAbs = resolve(defaultProjectRoot(), trimmed);
   if (existsSync(projectAbs)) return projectAbs;
-  const mp = findMarketplaceRoot();
-  if (mp) {
-    const mpAbs = resolve(mp, trimmed);
-    if (existsSync(mpAbs)) return mpAbs;
-  }
   return null;
 }
 

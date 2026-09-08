@@ -131,6 +131,18 @@ export class ProjectMcpNativeOwnershipBusyError extends Error {
   }
 }
 
+/** A configured project-MCP namespace must not fall back to a stale local kit.
+ * Keep the machine-readable code on the error so HTTP and in-process callers
+ * can preserve the same fail-closed contract. */
+export class ProjectMcpToolNotFoundError extends Error {
+  readonly code = 'project_mcp_tool_not_found';
+
+  constructor(toolName: string) {
+    super(`project MCP tool not found: ${toolName}`);
+    this.name = 'ProjectMcpToolNotFoundError';
+  }
+}
+
 async function settledWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<{ timedOut: boolean; value?: T }> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<{ timedOut: true }>((resolveTimeout) => {

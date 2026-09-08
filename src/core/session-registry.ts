@@ -3,11 +3,8 @@
  *
  * 这里对类只做 `import type`(配合 .dependency-cruiser.cjs 的
  * `tsPreCompilationDeps: false` ⇒ 类型边不计入依赖图),因此 kernel 层
- * (`kernel/compose-turn-request.ts`)可经此读取单例,而**不会**经
- * `session-manager.ts` 把 `ConsciousAgent` 拉进来,从而断开运行时环:
- *
- *   conscious-agent → kernel-turn → compose-turn-request → session-manager
- *                                                          → conscious-agent
+ * (`kernel/compose-turn-request.ts`)可经此读取单例,而不会经
+ * `session-manager.ts` 拉入具体 runtime host，避免运行时环。
  *
  * 单例的写入(`new SessionManager`)仍留在 `session-manager.ts`(它持有类本体),
  * 经 `setSessionManager` 注册;`session-manager.ts` 亦 re-export `getSessionManager`

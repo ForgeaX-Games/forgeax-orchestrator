@@ -48,6 +48,15 @@ export async function executeTool(
     const validationError = await tool.validateInput(args, ctx);
     if (validationError) return { error: validationError };
   }
+  // Cancellation can arrive while the Host is still initializing Kit
+  // registries. Do not enter a tool after its one-shot abort event has already
+  // fired; many tools correctly listen for abort but cannot observe a past
+  // event unless this boundary checks first.
+  if (ctx.signal.aborted) {
+    return {
+      error: String(ctx.signal.reason ?? `Tool "${name}" was cancelled`),
+    };
+  }
 
   console.debug(`tool:${name}(${JSON.stringify(args).slice(0, 120)})`);
 

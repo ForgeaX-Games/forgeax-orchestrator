@@ -36,6 +36,7 @@ import { deepMerge } from "../utils/deep-merge";
 import { AGENT_DEFAULTS } from "../defaults/agent-json";
 import type {
   KitDescriptor,
+  KitIdentity,
   KitKind,
   KitSource,
   KitsConfig,
@@ -74,6 +75,10 @@ export async function discoverKitPackages(
   // Step 1: winning source per kit name. Iterate sources in order; later wins.
   const winner = new Map<string, KitSource>();
   for (const source of sources) {
+    if (source.packageName) {
+      winner.set(source.packageName, source);
+      continue;
+    }
     let entries: import("node:fs").Dirent[];
     try {
       entries = await readdir(source.dir, { withFileTypes: true });
@@ -90,7 +95,8 @@ export async function discoverKitPackages(
   // Step 2: scan winning layer's {kind}/ only.
   const out: KitDescriptor[] = [];
   for (const [pkg, source] of winner) {
-    const kindDir = join(source.dir, pkg, kind);
+    const packageRoot = source.packageName ? source.dir : join(source.dir, pkg);
+    const kindDir = join(packageRoot, kind);
     let entries: import("node:fs").Dirent[];
     try {
       entries = await readdir(kindDir, { withFileTypes: true });
@@ -106,6 +112,7 @@ export async function discoverKitPackages(
         kind,
         path: join(kindDir, e.name),
         layer: source.id,
+        packageRoot,
       });
     }
   }
@@ -180,7 +187,7 @@ function wrapWithVisibilityCondition<T extends CapabilityBase>(
   }) as NonNullable<T["condition"]>;
 }
 
-function matchesToken(d: KitDescriptor, token: string): boolean {
+function matchesToken(d: KitIdentity, token: string): boolean {
   if (token.startsWith("#")) return d.pkg === token.slice(1);
   if (token.includes("/")) {
     const parts = token.split("/");
@@ -198,22 +205,38 @@ function matchesToken(d: KitDescriptor, token: string): boolean {
 export abstract class BaseKitLoader<TFactory, TInstance> {
 
   /** Build the 4-layer source list for a (sid, agentPath). `redirected` opt
-   *  comes from `agent.json.kitRedirect` —— absolute or relative-to-agentDir. */
+   *  comes from runtime config and is relative to the frozen template root. */
   static buildSources(
     pm: PathManagerAPI,
     sid: string,
     agentPath: string,
     redirected?: string,
+    templateRoot?: string,
+    kitSources: AgentContext["kitSources"] = [],
   ): KitSource[] {
     const agentLayer = pm.session(sid).agent(agentPath);
+    const localRoot = templateRoot ?? agentLayer.root();
     const localDir = redirected
-      ? (isAbsolute(redirected) ? redirected : resolve(agentLayer.root(), redirected))
-      : agentLayer.resourceDir("kits");
+      ? (isAbsolute(redirected) ? redirected : resolve(localRoot, redirected))
+      : join(localRoot, "kits");
+    const explicit = kitSources.map((kit): KitSource => {
+      if (kit.source.kind !== "directory") {
+        throw new Error(
+          `Kit '${kit.id}' requires a directory SourceRef, got ${kit.source.kind}`,
+        );
+      }
+      return {
+        id: "agent",
+        dir: kit.source.path,
+        packageName: kit.id,
+      };
+    });
     return [
       { id: "builtin", dir: pm.builtin().resourceDir("kits") },
       { id: "user",    dir: pm.user().resourceDir("kits") },
       { id: "session", dir: pm.session(sid).resourceDir("kits") },
       { id: "agent",   dir: localDir },
+      ...explicit,
     ];
   }
 
@@ -296,10 +319,18 @@ export abstract class BaseKitLoader<TFactory, TInstance> {
   protected async _loadInternal(ctx: AgentContext): Promise<Map<string, TInstance>> {
     const sid = sessionIdFromCtx(ctx);
     const redirect = (ctx.getAgentJson().kitRedirect ?? "").trim() || undefined;
-    const sources = BaseKitLoader.buildSources(getPathManager(), sid, ctx.agentPath, redirect);
+    const sources = BaseKitLoader.buildSources(
+      getPathManager(),
+      sid,
+      ctx.agentPath,
+      redirect,
+      ctx.templateRoot,
+      ctx.kitSources,
+    );
     const descriptors = await discoverKitPackages(sources, this.kind);
 
     const registry = new Map<string, TInstance>();
+    let loadFailed = false;
     const collectedConfigDefaults: { pkg: string; defaults: Record<string, Record<string, unknown>> }[] = [];
     const collectedAgentDefaults: Record<string, unknown>[] = [];
 
@@ -308,9 +339,7 @@ export abstract class BaseKitLoader<TFactory, TInstance> {
     const pkgCondFns = new Map<string, KitConditionFn | null>();
     for (const d of descriptors) {
       if (pkgCondFns.has(d.pkg)) continue;
-      const source = sources.find((s) => s.id === d.layer);
-      if (!source) { pkgCondFns.set(d.pkg, null); continue; }
-      const condPath = join(source.dir, d.pkg, "condition.ts");
+      const condPath = join(d.packageRoot, "condition.ts");
       const { fn, configDefaults, agentDefaults } = await importKitCondition(condPath);
       pkgCondFns.set(d.pkg, fn);
       if (configDefaults) collectedConfigDefaults.push({ pkg: d.pkg, defaults: configDefaults });
@@ -345,8 +374,15 @@ export abstract class BaseKitLoader<TFactory, TInstance> {
           registry.set(qName, instance);
         });
       } catch (err: any) {
+        loadFailed = true;
         process.stderr.write(`[BaseKitLoader] failed to load "${qName}": ${err?.message ?? err}\n`);
       }
+    }
+
+    if (this._hasLoadedOnce && loadFailed) {
+      throw new Error(
+        `Kit ${this.kind} revision rejected; keeping last-known-good registry`,
+      );
     }
 
     if (!this._hasLoadedOnce) {
@@ -359,8 +395,14 @@ export abstract class BaseKitLoader<TFactory, TInstance> {
   /** Visibility predicate driven by `KitsConfig` (enable/disable tokens +
    *  user/session layer switches). Pure helper — exposed so subclasses can
    *  re-evaluate per-turn without a full reload. builtin / agent layers
-   *  always default-visible; user / session opt-in via `kits.user/session`. */
-  static isVisibleByConfig(d: KitDescriptor, config: KitsConfig): boolean {
+   *  always default-visible; user / session opt-in via `kits.user/session`.
+   *
+   *  Takes only the identity fields it actually reads (`KitIdentity`), so a
+   *  caller that knows a capability's kit identity statically — e.g. the kernel
+   *  turn composer deciding whether to *advertise* a kit tool it will later
+   *  execute through the host bridge — can reuse this one predicate instead of
+   *  re-implementing the token grammar. */
+  static isVisibleByConfig(d: KitIdentity, config: KitsConfig): boolean {
     let selected: boolean;
     if (d.layer === "builtin" || d.layer === "agent") {
       selected = true;
@@ -424,6 +466,10 @@ export abstract class BaseKitLoader<TFactory, TInstance> {
     if (!dirty) return;
 
     const sid = sessionIdFromCtx(ctx);
+    if (ctx.runtimeManaged) {
+      ctx.applyAgentDefaults?.(newKeys);
+      return;
+    }
     const agentJsonPath = getPathManager().session(sid).agent(ctx.agentPath).agentJson();
     let onDisk: Record<string, unknown> = {};
     try { onDisk = JSON.parse(await readFile(agentJsonPath, "utf-8")); } catch { /* missing → 用 in-memory 兜底 */ }
@@ -434,13 +480,8 @@ export abstract class BaseKitLoader<TFactory, TInstance> {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Pull sid out of agentDir —— AgentContext doesn't carry sid directly to
- *  avoid plumbing it through every kit. `<userRoot>/sessions/<sid>/...` ->
- *  splits on `/sessions/` and takes the next segment. */
 function sessionIdFromCtx(ctx: AgentContext): string {
-  const m = ctx.agentDir.match(/[\\/]sessions[\\/]([^\\/]+)[\\/]/);
-  if (!m) throw new Error(`[BaseKitLoader] cannot extract sid from agentDir '${ctx.agentDir}'`);
-  return m[1];
+  return ctx.sid;
 }
 
 export const __kits_internal__ = { qualifiedName, matchesToken };

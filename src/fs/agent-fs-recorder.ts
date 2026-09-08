@@ -76,7 +76,7 @@ function byteLen(content: string | Uint8Array): number {
  *      that bypass writeText (eg apply_patch's own `writeBinary`). Cast
  *      to `FsWithRecorder` to use it.
  *
- *  Wrap is per-agent, constructed in BaseAgent ctor so each agent's
+ *  Wrap is per-instance, constructed in RuntimeAgentHost so each agent's
  *  recorder carries its own `agentPath` —— no caller needs to pass agent
  *  identity at write time. */
 export interface FsWithRecorder extends AgentFsAPI {

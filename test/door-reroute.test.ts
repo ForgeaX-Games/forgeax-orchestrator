@@ -10,7 +10,7 @@
  *     runForgeaxBuiltinTool('ui_invoke') 在能力实现层改道走 editor_ui_browse;
  *  ② 原生内核口:makeInProcessExecuteTool(host-tool-bridge)注入最小假协作方,
  *     同一改道在 bridge 路径上同样生效 —— 回退本修复(收口挪层)即红。 */
-import { describe, expect, it, beforeAll, afterAll, afterEach } from 'bun:test';
+import { describe, expect, it, beforeAll, afterAll, afterEach, beforeEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -28,12 +28,9 @@ const defaultBrowseRespond = (): unknown => ({ ok: true, path: ['window', '聊�
 let browseRespond: (args: Record<string, unknown>) => unknown = defaultBrowseRespond;
 let root: string;
 
-beforeAll(async () => {
-  root = mkdtempSync(join(tmpdir(), 'fx-door-reroute-'));
-  resetPathManager();
-  initPathManager({ userRoot: root });
-  buildActionCatalog(); // door 对账消费真实构建产物,不吃手搓 fact
+function installDoorSeam(): void {
   initOrchestrationSeams({
+    enabledBuiltinTools: ['ui_invoke'],
     hostTools: [{
       name: 'editor_ui_browse',
       description: 'test double',
@@ -44,6 +41,13 @@ beforeAll(async () => {
       },
     } as never],
   });
+}
+
+beforeAll(async () => {
+  root = mkdtempSync(join(tmpdir(), 'fx-door-reroute-'));
+  resetPathManager();
+  initPathManager({ userRoot: root });
+  buildActionCatalog(); // door 对账消费真实构建产物,不吃手搓 fact
   const app = new Hono();
   app.route('/api/bus', createBusRouter());
   // 真实投影:panel.toggle_chatpanel 的菜单门(与 action-door.test 同一形状,但走真 bus)。
@@ -56,7 +60,13 @@ beforeAll(async () => {
   });
 });
 
-afterEach(() => { browseRespond = defaultBrowseRespond; browseCalls.length = 0; });
+beforeEach(installDoorSeam);
+
+afterEach(() => {
+  resetOrchestrationSeams();
+  browseRespond = defaultBrowseRespond;
+  browseCalls.length = 0;
+});
 
 afterAll(() => {
   resetOrchestrationSeams();

@@ -12,11 +12,11 @@
 // Media externalization (async writeFile) happens INSIDE the queued task,
 // before the JSON line is appended, so the on-disk order matches enqueue order.
 //
-// BACKPRESSURE: enqueue is fire-and-forget but bounded. If the pending queue
-// grows past HIGH_WATER (slow disk / huge burst), we drop the OLDEST pending
-// task and bump a dropped counter (logged), rather than growing unbounded and
-// OOM-ing. The ledger is a best-effort diagnostic log; losing the oldest few
-// frames under extreme pressure is preferable to unbounded memory.
+// BACKPRESSURE: enqueue is fire-and-forget but bounded. If the pending
+// best-effort queue is already at HIGH_WATER (slow disk / huge burst), we
+// cancel the OLDEST still-queued best-effort task and bump a dropped counter
+// so the NEWEST frame is kept — recent diagnostic/conversation frames matter
+// more under pathological load. Required tasks are never cancelled.
 //
 // FLUSH ON EXIT: all writers register in a module-level set; flushAllLedgerWriters()
 // awaits every pending queue so the SIGTERM/SIGINT path (main.ts) can drain
@@ -27,6 +27,15 @@ import { appendFile, writeFile, mkdir } from "node:fs/promises";
 const HIGH_WATER = 10_000;
 
 type Task = () => Promise<void>;
+export type EventDurability = "required" | "best-effort";
+
+interface QueuedTask {
+  readonly run: Task;
+  readonly durability: EventDurability;
+  cancelled: boolean;
+  resolve?: () => void;
+  reject?: (error: unknown) => void;
+}
 
 const _allWriters = new Set<AsyncLedgerWriter>();
 
@@ -47,42 +56,87 @@ export async function writeMediaFile(dir: string, filePath: string, data: Buffer
 export class AsyncLedgerWriter {
   /** Serial promise chain — every enqueued task awaits the previous one. */
   private _tail: Promise<void> = Promise.resolve();
-  /** Pending (not yet run) tasks, in order. Drained head-first by the chain. */
-  private _queue: Array<{ run: Task; cancelled: boolean }> = [];
+  /** Pending (not yet started) tasks, in order. Drained head-first by the chain. */
+  private _queue: QueuedTask[] = [];
   /** Tasks dropped under backpressure since construction. */
   private _dropped = 0;
+  private readonly highWater: number;
 
-  constructor(private readonly label: string) {
+  constructor(
+    private readonly label: string,
+    opts: { highWater?: number } = {},
+  ) {
+    this.highWater = opts.highWater ?? HIGH_WATER;
+    if (!Number.isInteger(this.highWater) || this.highWater < 1) {
+      throw new Error("AsyncLedgerWriter highWater must be a positive integer");
+    }
     _allWriters.add(this);
   }
 
   /**
    * Run an async task as part of the serial chain. Tasks execute strictly in
-   * enqueue order; returns immediately (does not await the I/O).
+   * enqueue order. Best-effort returns immediately; required awaits I/O and
+   * propagates write errors.
    */
-  enqueueTask(task: Task): void {
-    const entry = { run: task, cancelled: false };
-    // Backpressure: evict oldest pending tasks if the queue is too deep.
-    while (this._queue.length >= HIGH_WATER) {
-      const victim = this._queue.shift();
-      if (victim && !victim.cancelled) {
+  enqueueTask(
+    task: Task,
+    durability: EventDurability = "best-effort",
+  ): Promise<void> {
+    if (durability === "best-effort") {
+      while (this.queuedBestEffortCount() >= this.highWater) {
+        const victim = this._queue.find(
+          (entry) => entry.durability === "best-effort" && !entry.cancelled,
+        );
+        if (!victim) break;
         victim.cancelled = true;
         this._dropped++;
         if (this._dropped % 1000 === 1) {
-          try { process.stderr.write(`[ledger:${this.label}] backpressure — dropped ${this._dropped} oldest events\n`); } catch {}
+          try {
+            process.stderr.write(
+              `[ledger:${this.label}] backpressure — dropped ${this._dropped} oldest best-effort events\n`,
+            );
+          } catch {}
         }
       }
+    }
+
+    const entry: QueuedTask = {
+      run: task,
+      durability,
+      cancelled: false,
+    };
+    let requiredPromise: Promise<void> | undefined;
+    if (durability === "required") {
+      requiredPromise = new Promise<void>((resolve, reject) => {
+        entry.resolve = resolve;
+        entry.reject = reject;
+      });
     }
     this._queue.push(entry);
     this._tail = this._tail.then(async () => {
       const head = this._queue.shift();
-      if (!head || head.cancelled) return;
+      if (!head || head.cancelled) {
+        head?.resolve?.();
+        return;
+      }
       try {
         await head.run();
+        head.resolve?.();
       } catch (err) {
-        try { process.stderr.write(`[ledger:${this.label}] write failed: ${err instanceof Error ? err.message : String(err)}\n`); } catch {}
+        if (head.durability === "required") {
+          head.reject?.(err);
+          return;
+        }
+        try {
+          process.stderr.write(
+            `[ledger:${this.label}] write failed: ${
+              err instanceof Error ? err.message : String(err)
+            }\n`,
+          );
+        } catch {}
       }
     });
+    return requiredPromise ?? Promise.resolve();
   }
 
   /** Await all currently-pending writes. */
@@ -90,11 +144,19 @@ export class AsyncLedgerWriter {
     await this._tail;
   }
 
-  get pending(): number { return this._queue.length; }
+  get pending(): number {
+    return this._queue.filter((entry) => !entry.cancelled).length;
+  }
   get dropped(): number { return this._dropped; }
 
   dispose(): void {
     _allWriters.delete(this);
+  }
+
+  private queuedBestEffortCount(): number {
+    return this._queue.filter(
+      (entry) => entry.durability === "best-effort" && !entry.cancelled,
+    ).length;
   }
 }
 

@@ -13,6 +13,7 @@ import {
   composeSystemPrompt,
   listAgents,
   lookupAgent,
+  resolvePersonaForAgent,
   resolveSkill,
 } from '../src/agents/loader';
 import { loadAgentRecord } from '../src/soul';
@@ -93,6 +94,7 @@ describe('AgentLoader', () => {
     const record = await loadAgentRecord('poly', { projectRoot: TMP });
     expect(record.source).toBe('marketplace');
     expect(record.trustTier).toBe('imported');
+    expect((await resolvePersonaForAgent('poly'))?.trustTier).toBe('imported');
   });
 
   it('treats host-bundled builtin extension agents as own souls', async () => {
@@ -115,6 +117,7 @@ describe('AgentLoader', () => {
     const record = await loadAgentRecord('bundled-poly', { projectRoot: TMP });
     expect(record.source).toBe('builtin');
     expect(record.trustTier).toBe('own');
+    expect((await resolvePersonaForAgent('bundled-poly'))?.trustTier).toBe('own');
   });
 
   it('composeSystemPrompt concatenates persona + prompt-skill body', async () => {

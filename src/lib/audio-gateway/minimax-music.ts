@@ -1,4 +1,4 @@
-// Direct MiniMax Music generation — host-side gateway for wb-reel BGM.
+// Direct MiniMax Music generation — host-side gateway for reel BGM.
 //
 // 为什么 host 侧直连（2026-06）：
 //   · LiteLLM 代理这把 key 没有 lyria3 / 任何音乐模型（全 401）。

@@ -77,6 +77,18 @@ export function eventToSessionMessage(event: Event): LLMMessage | null {
   }
 
   const p = (event.payload ?? {}) as Record<string, unknown>;
+  if (event.type === "agent_command" && typeof p.toolName === "string" && p.toolName.trim()) {
+    const args = p.args && typeof p.args === "object"
+      ? JSON.stringify(p.args)
+      : "{}";
+    return {
+      role: "user",
+      content: sanitizeParts(normalizeContent(
+        `[agent_command] Run tool ${p.toolName.trim()} with arguments ${args}`,
+      )),
+      ts: event.ts || Date.now(),
+    };
+  }
   if (!p.content && !p.visual_display && !p.warning && !p.error) return null;
 
   const fallback = (() => {

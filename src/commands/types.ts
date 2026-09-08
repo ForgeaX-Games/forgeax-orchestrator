@@ -27,9 +27,9 @@ export interface CommandModule {
   execute?(name: string, args: string[], ctx: CallContext): Promise<unknown>;
 }
 
-/** Module ctx —— 等价于 agenteam ref 的 `{ scheduler, instanceDir, requestingAgentId }`。
+/** Module ctx —— 命令层的 SessionManager/PathManager 请求上下文。
  *  forgeax 的对应物：`{ sm, paths, sessionId?, requestingAgentId? }`。
- *  - `sm` ≈ scheduler 那一层全局服务句柄（管 sessions）
+ *  - `sm` 是管理 sessions 的进程级服务句柄
  *  - `paths` ≈ instanceDir（路径解析根；这里给整个 PathManager）
  *  - `sessionId?` ≈ 不必命中（list_sessions / ping 之类全局命令不需要）；命中后模块自己
  *    决定要不要 `await ctx.sm.open(sessionId)` 拿 Session 实例（**不像旧版的

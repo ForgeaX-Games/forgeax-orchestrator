@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { KernelEvent, TurnRequest } from '@forgeax/agent-runtime';
 import { CodexKernel } from '../src/kernel/codex-kernel';
+import { HISTORY_RESYNC_REQUIRED_MESSAGE } from '../src/kernel/history-resync';
 import { deriveThreadId } from '../src/lib/thread-id';
 
 const dirs: string[] = [];
@@ -32,7 +33,7 @@ function fixture(): { log: string; control: string } {
   dirs.push(dir);
   const home = join(dir, 'home');
   mkdirSync(home);
-  writeFileSync(join(home, 'config.toml'), 'model = "fixture"\n');
+  writeFileSync(join(home, 'config.toml'), 'model = "fixture"\nmodel_reasoning_effort = "max"\n');
   const log = join(dir, 'calls.log');
   const control = join(dir, 'control.txt');
   writeFileSync(log, '');
@@ -45,6 +46,7 @@ const log = process.env.FAKE_CODEX_LOG;
 const control = process.env.FAKE_CODEX_CONTROL;
 const emit = (value) => console.log(JSON.stringify(value));
 const mode = () => { try { return readFileSync(control, 'utf8').trim(); } catch { return ''; } };
+let activeTurn = false;
 if (process.argv.includes('exec')) {
   appendFileSync(log, 'exec\\n');
   appendFileSync(log, 'exec-args:' + JSON.stringify(process.argv.slice(2)) + '\\n');
@@ -61,6 +63,9 @@ for await (const line of console) {
     if (mode() === 'initialize-fail') emit({ jsonrpc: '2.0', id: req.id, error: { code: -32000, message: 'fixture initialize failure' } });
     else emit({ jsonrpc: '2.0', id: req.id, result: { userAgent: 'fixture' } });
   }
+  else if (req.method === 'model/list') {
+    emit({ jsonrpc: '2.0', id: req.id, result: { data: [{ id: 'selected-fixture', model: 'selected-fixture', defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ reasoningEffort: 'medium', description: 'fixture' }] }] } });
+  }
   else if (req.method === 'thread/start') {
     if (mode() === 'thread/start') await Bun.sleep(250);
     emit({ jsonrpc: '2.0', id: req.id, result: { thread: { id: 'fixture-thread' } } });
@@ -72,8 +77,24 @@ for await (const line of console) {
     if (mode() === 'thread/resume') await Bun.sleep(250);
     emit({ jsonrpc: '2.0', id: req.id, result: { thread: { id: 'fixture-thread' } } });
   } else if (req.method === 'turn/start') {
+    appendFileSync(log, 'turn-params:' + JSON.stringify(req.params) + '\\n');
     emit({ jsonrpc: '2.0', id: req.id, result: { turn: { id: 'fixture-turn' } } });
-    emit({ method: 'turn/completed', params: { threadId: 'fixture-thread', turn: { id: 'fixture-turn', status: 'completed' } } });
+    if (mode() === 'turn') {
+      activeTurn = true;
+      appendFileSync(log, 'turn-active\\n');
+      setTimeout(() => {
+        if (!activeTurn) return;
+        activeTurn = false;
+        emit({ method: 'turn/completed', params: { threadId: 'fixture-thread', turn: { id: 'fixture-turn', status: 'completed' } } });
+      }, 1_000);
+    } else {
+      emit({ method: 'turn/completed', params: { threadId: 'fixture-thread', turn: { id: 'fixture-turn', status: 'completed' } } });
+    }
+  } else if (req.method === 'turn/interrupt') {
+    activeTurn = false;
+    appendFileSync(log, 'turn/interrupt\\n');
+    emit({ jsonrpc: '2.0', id: req.id, result: {} });
+    emit({ method: 'turn/completed', params: { threadId: 'fixture-thread', turn: { id: 'fixture-turn', status: 'interrupted' } } });
   }
 }
 `);
@@ -98,7 +119,7 @@ function req(sessionId: string): TurnRequest {
 }
 
 async function waitFor(log: string, marker: string): Promise<void> {
-  for (let i = 0; i < 200; i += 1) {
+  for (let i = 0; i < 1_000; i += 1) {
     if (readFileSync(log, 'utf8').split('\n').includes(marker)) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
@@ -168,7 +189,7 @@ describe('Codex app-server cancellation admission', () => {
     expect(readFileSync(fx.log, 'utf8').match(/^turn\/start$/gm)).toBeNull();
     expect(events.find((event) => event.kind === 'error')).toEqual({
       kind: 'error',
-      error: { code: 'protocol', message: 'codex native process changed; retry to synchronize a fresh history snapshot' },
+      error: { code: 'protocol', message: HISTORY_RESYNC_REQUIRED_MESSAGE },
     });
     expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'error' });
   });
@@ -302,7 +323,7 @@ describe('Codex app-server cancellation admission', () => {
     expect(readFileSync(fx.log, 'utf8').match(/^turn\/start$/gm)).toBeNull();
     expect(events.find((event) => event.kind === 'error')).toEqual({
       kind: 'error',
-      error: { code: 'protocol', message: 'codex native process changed; retry to synchronize a fresh history snapshot' },
+      error: { code: 'protocol', message: HISTORY_RESYNC_REQUIRED_MESSAGE },
     });
     expect((kernel as any).threadIdMap.has(tid)).toBe(false);
     expect((kernel as any).appThreadIdMap.has(tid)).toBe(false);
@@ -342,6 +363,29 @@ describe('Codex app-server cancellation admission', () => {
     expect(args).not.toContain('exec-before-snapshot');
     expect((kernel as any).threadIdMap.get(tid)).toBe('fixture-exec-thread');
     expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'stop' });
+  });
+
+  test('abort after turn/start interrupts a reused app-server owner', async () => {
+    const fx = fixture();
+    const sessionId = randomUUID();
+    const request = req(sessionId);
+    request.tools = [];
+    const kernel = new CodexKernel();
+    expect((await kernel.prewarm(request)).warmed).toBe(true);
+    writeFileSync(fx.control, 'turn');
+
+    const controller = new AbortController();
+    const events: KernelEvent[] = [];
+    const consuming = (async () => {
+      for await (const event of kernel.runTurn(request, controller.signal)) events.push(event);
+    })();
+    await waitFor(fx.log, 'turn-active');
+    controller.abort();
+    await consuming;
+    await waitFor(fx.log, 'turn/interrupt');
+
+    expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'cancelled' });
+    await CodexKernel.closeAppServerPool();
   });
 
   test('reused app-server thread with failed fxt never submits turn/start', async () => {
@@ -400,4 +444,43 @@ describe('Codex app-server cancellation admission', () => {
     expect(after.match(/^turn\/start$/gm)).toHaveLength(1);
     expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'stop' });
   });
+});
+
+
+test('selected model sends advertised medium on the ordinary app-server turn, preserving user config', async () => {
+  const fx = fixture();
+  const original = readFileSync(join(process.env.CODEX_HOME!, 'config.toml'), 'utf8');
+  const request = req(randomUUID());
+  request.model = 'selected-fixture';
+  request.tools = [];
+  const events: KernelEvent[] = [];
+  for await (const event of new CodexKernel().runTurn(request, new AbortController().signal)) events.push(event);
+  const line = readFileSync(fx.log, 'utf8').split('\n').find((item) => item.startsWith('turn-params:'))!;
+  expect(JSON.parse(line.slice('turn-params:'.length)).effort).toBe('medium');
+  expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'stop' });
+  expect(readFileSync(join(process.env.CODEX_HOME!, 'config.toml'), 'utf8')).toBe(original);
+});
+
+test('selected model uses the same resolved effort for an established exec owner', async () => {
+  const fx = fixture();
+  const request = req(randomUUID());
+  request.model = 'selected-fixture';
+  request.tools = [];
+  (request as any).historyPlan = { mode: 'delta' };
+  const kernel = new CodexKernel();
+  (kernel as any).threadIdMap.set(request.session.threadId, 'existing-exec-thread');
+  for await (const _ of kernel.runTurn(request, new AbortController().signal)) {}
+  const line = readFileSync(fx.log, 'utf8').split('\n').find((item) => item.startsWith('exec-args:'))!;
+  expect(JSON.parse(line.slice('exec-args:'.length))).toContain('model_reasoning_effort="medium"');
+});
+
+
+test('unadvertised selected model fails before a turn with a valid kernel error', async () => {
+  const fx = fixture(); const request = req(randomUUID()); request.model = 'missing-fixture'; request.tools = [];
+  const events: KernelEvent[] = [];
+  for await (const event of new CodexKernel().runTurn(request, new AbortController().signal)) events.push(event);
+  expect(events.map((event) => event.kind)).toEqual(['turn.usage', 'error', 'turn.done']);
+  expect(events[1]).toMatchObject({ kind: 'error', error: { code: 'protocol' } });
+  expect(readFileSync(fx.log, 'utf8')).not.toContain('turn/start');
+  expect(readFileSync(fx.log, 'utf8')).not.toContain('exec\n');
 });

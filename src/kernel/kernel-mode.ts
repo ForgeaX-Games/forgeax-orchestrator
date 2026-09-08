@@ -2,11 +2,15 @@
  * kernelEnabled —— sessions/cli 主对话是否走**内核 + sidecar 整套栈**。
  *
  * **ship-gate 已翻:全局默认 = 内核 + sidecar**(sidecar 经 `sidecarEnabled()` 耦合默认同开)。
- * 三道前置闸已通:① 测试预载默认 cli(套件耐默认开);② 权限卡真 sid + 核心 parity(矩阵见
- * ship-gate-parity-matrix.md);③ R3-02 kernel-only 擦 key(`FORGEAX_KERNEL_ONLY=1`)。多模态图片
- * 输入当前为 UI 占位(非实流)→ 不构成回归;模型级联回退/逐工具 e2e 列 P2 backlog。
  *
- * 逃生回旧 in-process 路径:`FORGEAX_KERNEL=cli`(或 `=off`)/ `FORGEAX_NO_KERNEL=1` /
+ * NOTE (runtime refactor 2026-07): Session 主对话路径 (`RuntimeAgentHost` /
+ * `runKernelTurn`) 已是 kernel-only。`FORGEAX_KERNEL=cli` / `.forgeax/use-cli`
+ * 仍影响 **CLI bridge / rented provider** 与部分测试夹具,但不再把
+ * `POST /:sid/messages` 送回已删除的 in-process `runAgentLoop` /
+ * ConsciousAgent。需要旧 in-process 行为时只能改代码/回退版本,不能靠这个 env。
+ *
+ * 历史逃生开关(仍被本函数识别,供 CLI/测试消费):
+ * `FORGEAX_KERNEL=cli`(或 `=off`)/ `FORGEAX_NO_KERNEL=1` /
  * `<projectRoot>/.forgeax/use-cli` 文件(部署级)。
  */
 import { existsSync } from 'node:fs';
@@ -29,4 +33,9 @@ export function kernelEnabled(projectRoot?: string): boolean {
 /** sidecar 是否启用(与内核耦合,默认 ON;`FORGEAX_SIDECAR=off` 逃生回内核直 spawn)。 */
 export function sidecarEnabled(): boolean {
   return (process.env.FORGEAX_SIDECAR ?? '').trim() !== 'off';
+}
+
+/** True only when both the kernel stack and its sidecar are enabled. */
+export function kernelStackGuarded(projectRoot?: string): boolean {
+  return kernelEnabled(projectRoot) && sidecarEnabled();
 }

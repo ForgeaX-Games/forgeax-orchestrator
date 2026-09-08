@@ -5,7 +5,7 @@ import type {
   CapabilityOrigin,
   CapabilitySnapshot,
   CapabilityTrustTier,
-  ExtensionManifest,
+  ExtensionManifestV2,
 } from '@forgeax/types';
 import type { ExtensionOrigin } from '../extensions/scanner';
 import type { MergedManifest } from '../extensions/merger';
@@ -27,11 +27,20 @@ interface DeclaredCapability {
 }
 
 function trustForOrigin(origin: ExtensionOrigin): CapabilityTrustTier {
-  return origin === 'builtin' ? 'own' : 'imported';
+  // npm-declared embedded extensions are product-pinned first-party, same
+  // trust tier as host-bundled builtin.
+  return origin === 'builtin' || origin === 'npm' ? 'own' : 'imported';
 }
 
 function originFor(origin: ExtensionOrigin): CapabilityOrigin {
-  return origin;
+  // CapabilityOrigin (a @forgeax/types contract) predates the npm origin and
+  // is still the 3-value union; collapse npm→builtin here since both are
+  // first-party for provenance purposes. (Widening CapabilityOrigin to carry
+  // 'npm' is tracked as follow-up debt in the single-domain consolidation.)
+  if (origin === 'npm') return 'builtin';
+  // Externally-owned dev adapters are project-scoped imported capabilities in
+  // the older three-origin public capability contract.
+  return origin === 'dev' ? 'project' : origin;
 }
 
 function defaultIsolation(kind: CapabilityKind, metadata?: Record<string, unknown>): CapabilityIsolation {
@@ -50,13 +59,13 @@ function defaultIsolation(kind: CapabilityKind, metadata?: Record<string, unknow
   };
 }
 
-function declaredFromManifest(manifest: ExtensionManifest): DeclaredCapability[] {
-  const provides = manifest.provides as Record<string, unknown>;
+function declaredFromManifest(manifest: ExtensionManifestV2): DeclaredCapability[] {
+  const contributes = manifest.contributes as Record<string, unknown>;
   const out: DeclaredCapability[] = [
     { id: manifest.id, kind: 'extension' },
   ];
   for (const key of ['commands', 'mcp', 'memory'] as const) {
-    const raw = provides[key];
+    const raw = contributes[key];
     if (!Array.isArray(raw)) continue;
     for (const item of raw) {
       if (!item || typeof item !== 'object') continue;
@@ -74,7 +83,7 @@ function descriptor(
   declared: DeclaredCapability,
   generation: number,
 ): CapabilityDescriptor {
-  const manifest = merged.manifest;
+  const manifest = merged.normalizedManifest;
   const metadata = declared.metadata;
   const requiresRestart =
     declared.kind === 'mcp' &&
@@ -89,7 +98,7 @@ function descriptor(
     origin: originFor(merged.origin),
     originPath: merged.originPath,
     shadowedBy: merged.shadowedBy.map((shadowed) => ({
-      origin: shadowed.origin,
+      origin: originFor(shadowed.origin),
       originPath: shadowed.originPath,
     })),
     trustTier: trustForOrigin(merged.origin),
@@ -98,7 +107,7 @@ function descriptor(
     lifecycle: {
       state: 'ready',
       reloadable: manifest.hot ?? true,
-      requiresRestart: requiresRestart || declared.kind === 'extension' && manifest.kind === 'cli-provider',
+      requiresRestart: requiresRestart || declared.kind === 'extension' && Boolean(manifest.contributes.cliProviders?.length),
     },
     isolation: defaultIsolation(declared.kind, metadata),
     generation,
@@ -113,13 +122,13 @@ function addKindEntries(
   kind: 'skill' | 'tool',
   generation: number,
 ): void {
-  const byExtension = new Map(manifests.map((merged) => [merged.manifest.id, merged]));
+  const byExtension = new Map(manifests.map((merged) => [merged.normalizedManifest.id, merged]));
   for (const merged of manifests) {
     const entries = kind === 'skill'
-      ? (merged.manifest.provides as { skills?: Array<{ id: string; description?: unknown }> }).skills ?? []
-      : (merged.manifest.provides as { tools?: Array<{ id: string; description?: unknown }> }).tools ?? [];
+      ? merged.normalizedManifest.contributes.skills ?? []
+      : merged.normalizedManifest.contributes.tools ?? [];
     for (const entry of entries) {
-      const source = byExtension.get(merged.manifest.id);
+      const source = byExtension.get(merged.normalizedManifest.id);
       if (!source) continue;
       out.push(
         descriptor(source, {
@@ -135,7 +144,7 @@ function addKindEntries(
 export function buildCapabilitySnapshot(input: CapabilityRegistryInput): CapabilitySnapshot {
   const capabilities: CapabilityDescriptor[] = [];
   for (const merged of input.manifests) {
-    for (const declared of declaredFromManifest(merged.manifest)) {
+    for (const declared of declaredFromManifest(merged.normalizedManifest)) {
       capabilities.push(descriptor(merged, declared, input.generation));
     }
   }

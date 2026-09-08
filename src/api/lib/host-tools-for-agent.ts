@@ -15,19 +15,26 @@
  * `<sid>/agents/<agentId>/agent.json`。LLM 可见名同样把 `:`/`.` → `_`。
  */
 import { readFileSync } from 'node:fs';
-import { listTools, type ToolDescriptor } from '../../tools/registry';
 import { getPathManager } from '../../fs/path-manager';
-import { listWorkbenchAgentTools } from '../../workbench/agent-tools';
+import { resolveHostToolAllow } from '../../tools/host-tool-allow';
+import { selectAgentHostToolDescriptors } from '../../tools/agent-host-tool-surface';
+import {
+  readAgentKitsConfig,
+  visibleAgentManagementToolsFromConfig,
+  type AgentManagementToolName,
+} from '../../kits/agent-management-visibility';
+export {
+  AGENT_MANAGEMENT_TOOL_NAMES,
+  visibleAgentManagementToolsFromConfig,
+} from '../../kits/agent-management-visibility';
+import delegateToSubagent from '../../../builtin/kits/agent_manage/tools/delegate_to_subagent';
+import listSubagents from '../../../builtin/kits/agent_manage/tools/list_subagents';
+import type { ToolDefinition } from '../../core/types';
 
 export interface HostToolSpec {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
-}
-
-function globToRegExp(token: string): RegExp {
-  const escaped = token.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-  return new RegExp(`^${escaped}$`);
 }
 
 /** ToolDescriptor.argsSchema(内联对象 或 schema 文件绝对路径)→ JSONSchema 对象。 */
@@ -53,59 +60,89 @@ function toInputSchema(argsSchema: unknown): Record<string, unknown> {
   return { type: 'object', properties: {} };
 }
 
-interface AgentJsonShape {
-  kits?: { config?: { ['host-tools']?: { allow?: unknown; deny?: unknown } } };
+const AGENT_MANAGEMENT_TOOLS = [delegateToSubagent, listSubagents] as const;
+
+/** Return the host-graph copy of an agent-management tool.
+ *
+ * Desktop kits are shipped as independently bundled runtime assets. Their
+ * tool objects are valid declarations, but stateful execution must not run
+ * through that bundle: doing so would read a second `session-registry`
+ * module instance and report "SessionManager not initialized" even though
+ * the host process has a live manager. Both HTTP and in-process bridges use
+ * this resolver so execution stays in the host's shared module graph. */
+export function canonicalAgentManagementTool(
+  name: AgentManagementToolName,
+): ToolDefinition | undefined {
+  return AGENT_MANAGEMENT_TOOLS.find((tool) => tool.name === name);
 }
 
-function readAgentAllowDeny(sid: string | undefined, agentId: string): { allow: string[]; deny: string[] } {
-  if (!sid) return { allow: [], deny: [] };
+function readAgentAllowDeny(sid: string | undefined, agentId: string): {
+  allow: string[];
+  deny: string[];
+  visibleAgentManagementTools: AgentManagementToolName[];
+} {
+  // Rented kernels execute host tools through a session-scoped HTTP bridge.
+  // Without the sid (or without an authoritative agent config), advertising
+  // agent-management tools would create capabilities that the fxt process
+  // cannot actually run.
+  if (!sid) return { allow: [], deny: [], visibleAgentManagementTools: [] };
   try {
-    const p = getPathManager().session(sid).agent(agentId).agentJson();
-    const j = JSON.parse(readFileSync(p, 'utf-8')) as AgentJsonShape;
-    const cfg = j.kits?.config?.['host-tools'] ?? {};
+    const kits = readAgentKitsConfig(sid, agentId);
+    if (!kits) return { allow: [], deny: [], visibleAgentManagementTools: [] };
+    const cfg = kits.config?.['host-tools'] ?? {};
     const allow = Array.isArray(cfg.allow) ? cfg.allow.filter((x): x is string => typeof x === 'string') : [];
     const deny = Array.isArray(cfg.deny) ? cfg.deny.filter((x): x is string => typeof x === 'string') : [];
-    return { allow, deny };
+    return {
+      allow,
+      deny,
+      visibleAgentManagementTools: visibleAgentManagementToolsFromConfig(kits),
+    };
   } catch {
-    return { allow: [], deny: [] };
+    return { allow: [], deny: [], visibleAgentManagementTools: [] };
   }
 }
 
-/** 该 agent 应下发给内核的 host 工具(ToolSpec)。allow 为空 → 空集(opt-in 缺省)。 */
-export function hostToolSpecsForAgent(sid: string | undefined, agentId: string): HostToolSpec[] {
-  const { allow, deny } = readAgentAllowDeny(sid, agentId);
-  if (allow.length === 0) return [];
-  const allowRes = allow.map(globToRegExp);
-  const denyRes = deny.map(globToRegExp);
-  let descriptors: ToolDescriptor[];
+export interface HostToolSurface {
+  /** Merged host specs, including any extension-owned duplicate wire names. */
+  specs: HostToolSpec[];
+  /** Visibility of the canonical builtin agent_manage descriptors only. */
+  visibleAgentManagementTools: AgentManagementToolName[];
+}
+
+/** Resolve the complete host surface once so specs and canonical visibility
+ * are read from the same `(sid, agentId)` config snapshot. */
+export function hostToolSurfaceForAgent(sid: string | undefined, agentId: string): HostToolSurface {
+  const { allow: sessionAllow, deny, visibleAgentManagementTools } = readAgentAllowDeny(sid, agentId);
+  const allow = resolveHostToolAllow(agentId, sessionAllow);
+  const visibleNames = new Set<string>(visibleAgentManagementTools);
+  const agentManagement: HostToolSpec[] = AGENT_MANAGEMENT_TOOLS
+    .filter((tool) => visibleNames.has(tool.name))
+    .map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.input_schema,
+    }));
+  if (allow.length === 0) return { specs: agentManagement, visibleAgentManagementTools };
+  let descriptors: ReturnType<typeof selectAgentHostToolDescriptors>;
   try {
-    descriptors = listTools();
+    descriptors = selectAgentHostToolDescriptors(agentId, sessionAllow, deny);
   } catch {
     descriptors = [];
   }
-  const legacy = descriptors
-    .filter(
-      (d) =>
-        d.exposedToAI &&
-        d.hasHandler &&
-        allowRes.some((re) => re.test(d.id)) &&
-        !denyRes.some((re) => re.test(d.id)),
-    )
+  const host = descriptors
     .map((d) => ({
       name: d.id.replace(/[^a-zA-Z0-9_-]/g, '_'),
       description: d.description ?? d.id,
       inputSchema: toInputSchema(d.argsSchema),
     }));
-  const shared = listWorkbenchAgentTools()
-    .filter(
-      (d) =>
-        allowRes.some((re) => re.test(d.id))
-        && !denyRes.some((re) => re.test(d.id)),
-    )
-    .map((d) => ({
-      name: d.id.replace(/[^a-zA-Z0-9_-]/g, '_'),
-      description: d.description ?? d.id,
-      inputSchema: d.inputSchema,
-    }));
-  return [...legacy, ...shared];
+  return {
+    specs: [...agentManagement, ...host],
+    visibleAgentManagementTools,
+  };
+}
+
+/** 该 agent 应下发给内核的 host 工具(ToolSpec)。无权威 sid/config → 空集；
+ * agent_manage 是内置能力，只有确认未被禁用时才补入。 */
+export function hostToolSpecsForAgent(sid: string | undefined, agentId: string): HostToolSpec[] {
+  return hostToolSurfaceForAgent(sid, agentId).specs;
 }

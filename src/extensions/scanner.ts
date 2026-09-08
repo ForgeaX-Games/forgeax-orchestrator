@@ -12,21 +12,29 @@
 import { existsSync, statSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { renameSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { normalizeManifest, parseAnyManifest } from '@forgeax/types';
-import type { ExtensionManifest, ExtensionManifestV2 } from '@forgeax/types';
+import type { AnyExtensionManifest, ExtensionManifestV2 } from '@forgeax/types';
+import { parseExtensionPackageManifest } from '@forgeax/toolkit/contracts';
 import { defaultProjectRoot } from '@forgeax/platform-io';
-import { assetRoot } from '@forgeax/platform-io';
 
-export type ExtensionOrigin = 'builtin' | 'user' | 'project';
+export type ExtensionOrigin = 'builtin' | 'npm' | 'user' | 'project' | 'dev';
+
+export interface DevExtensionRuntime {
+  registrationId?: string;
+  moduleUrl: string;
+  allowedOrigin?: string;
+  mode: 'dev' | 'installed';
+}
 
 export interface ScannedManifest {
   origin: ExtensionOrigin;
   originPath: string;
-  manifest: ExtensionManifest;
+  manifest: AnyExtensionManifest;
   /** Canonical capability-shaped projection consumed by new hosts. */
-  normalizedManifest?: ExtensionManifestV2;
+  normalizedManifest: ExtensionManifestV2;
+  runtime?: DevExtensionRuntime;
 }
 
 export interface ScanError {
@@ -40,20 +48,52 @@ export interface ScanResult {
   errors: ScanError[];
 }
 
-const LEGACY_EXTENSION_ID_MIGRATIONS = new Map<string, string>([
-  ['@forgeax/wb-game-video', '@forgeax-extension/wb-game-video'],
+/** One-way compatibility boundary for installed directories created before
+ * canonical extension IDs. Keep these legacy keys until the on-disk migration
+ * window closes; new manifests and runtime identities must use the values. */
+export const LEGACY_EXTENSION_SLUG_MIGRATIONS = new Map<string, string>([
+  ['wb-agent-persona', 'agent-persona'], ['wb-ai-asset', 'ai-asset'],
+  ['wb-anim', 'anim'], ['wb-asset-canvas', 'asset-canvas'],
+  ['wb-balance', 'balance'], ['wb-bgm', 'bgm'], ['wb-character', 'character'],
+  ['wb-code', 'code'], ['wb-diffusion-renderer', 'diffusion-renderer'],
+  ['video-game', 'video-game'], ['wb-gen3d', 'gen3d'], ['wb-items', 'items'],
+  ['wb-look', 'look'], ['wb-lowpoly-obj', 'lowpoly-obj'],
+  ['wb-narrative', 'narrative'], ['wb-observatory', 'agent-monitor'],
+  ['wb-plugin-author', 'plugin-author'], ['wb-reel', 'reel'], ['wb-skill', 'skill'],
+  ['wb-team-forge', 'team-forge'], ['wb-ui', 'ui'],
+  ['wb-2d-scene-asset-generator', '2d-scene-asset-generator'],
+  ['wb-3d-lowpoly', '3d-lowpoly'], ['wb-scene-generator', 'scene-generator'],
 ]);
 
 function canonicalExtensionId(id: string): string {
-  if (id.startsWith('@forgeax-plugin/')) {
-    return id.replace('@forgeax-plugin/', '@forgeax-extension/');
-  }
-  return LEGACY_EXTENSION_ID_MIGRATIONS.get(id) ?? id;
+  const scoped = id.startsWith('@forgeax-plugin/')
+    ? id.replace('@forgeax-plugin/', '@forgeax-extension/')
+    : id.startsWith('@forgeax/')
+      ? id.replace('@forgeax/', '@forgeax-extension/')
+      : id;
+  const prefix = '@forgeax-extension/';
+  if (!scoped.startsWith(prefix)) return scoped;
+  const slug = scoped.slice(prefix.length);
+  return `${prefix}${LEGACY_EXTENSION_SLUG_MIGRATIONS.get(slug) ?? slug}`;
 }
 
-/** Resolve the canonical root directory for each origin.
+/** Rename installed extension directories once. Existing canonical installs
+ * win; rerunning after migration is a no-op. */
+function migrateLegacyExtensionIdentities(root: string): void {
+  for (const [legacySlug, slug] of LEGACY_EXTENSION_SLUG_MIGRATIONS) {
+    const legacy = join(root, legacySlug);
+    const current = join(root, slug);
+    try {
+      if (safeIsDir(legacy) && !existsSync(current)) renameSync(legacy, current);
+    } catch (error) {
+      console.warn(`[extensions/scanner] identity migration failed (${legacy}): ${(error as Error).message}`);
+    }
+  }
+}
+
+/** Resolve the canonical root directory for each mutable origin.
  *
- *  builtin: `<repo>/packages/marketplace/extensions`
+ *  builtin: no implicit filesystem root; product packages arrive through npm
  *  user: `~/.forgeax/extensions`
  *  project: `<projectRoot>/.forgeax/extensions`
  *
@@ -79,43 +119,23 @@ function migrateLegacyExtensionDir(base: string): void {
 }
 
 export function defaultExtensionRoots(opts?: { repoRoot?: string; projectRoot?: string }): Record<ExtensionOrigin, string | null> {
-  const repoRoot = opts?.repoRoot ?? findRepoRoot();
   const projectRoot = opts?.projectRoot ?? defaultProjectRoot();
   migrateLegacyExtensionDir(homedir());
   if (projectRoot) migrateLegacyExtensionDir(projectRoot);
   const candidates = (paths: string[]) => paths.find((p) => safeIsDir(p)) ?? null;
   return {
-    // builtin (host-bundled marketplace). assetRoot() resolves to `packages/` in dev
-    // and `<Resources>/resources/` in the packaged .app, so this single
-    // candidate covers both — crucial because findRepoRoot() can't locate a
-    // `packages/marketplace` in the bundle (marketplace lives at
-    // resources/marketplace) and would otherwise yield 0 plugins.
-    builtin: candidates([
-      resolve(assetRoot(), 'marketplace/extensions'),
-      ...(repoRoot
-        ? [
-            resolve(repoRoot, 'packages/marketplace/extensions'),
-            resolve(repoRoot, 'marketplace/extensions'),
-          ]
-        : []),
-    ]),
+    // Product-owned extensions are resolved from exact npm dependencies by
+    // the product composition. Marketplace is a catalog, not a source root.
+    builtin: null,
+    // npm-declared extensions are resolved by the product composition root.
+    // Keeping the slot in the origin record makes the scanner contract
+    // explicit while avoiding a package-manager-specific lookup here.
+    npm: null,
     user: candidates([resolve(homedir(), '.forgeax/extensions')]),
     project: projectRoot ? candidates([resolve(projectRoot, '.forgeax/extensions')]) : null,
+    // Dev adapters are loaded only from the explicit registration index.
+    dev: null,
   };
-}
-
-/** Best-effort repo root finder: walks up from this file until it sees
- *  a directory with `packages/marketplace`. Allows the scanner to work
- *  when invoked from any CWD. */
-function findRepoRoot(): string | null {
-  let dir = resolve(import.meta.dirname, '..', '..', '..', '..');
-  for (let i = 0; i < 4; i += 1) {
-    if (safeIsDir(join(dir, 'packages', 'marketplace'))) return dir;
-    const up = resolve(dir, '..');
-    if (up === dir) break;
-    dir = up;
-  }
-  return null;
 }
 
 function safeIsDir(p: string): boolean {
@@ -128,6 +148,7 @@ function safeIsDir(p: string): boolean {
 
 async function scanExtensionOrigin(origin: ExtensionOrigin, root: string): Promise<ScanResult> {
   const out: ScanResult = { found: [], errors: [] };
+  migrateLegacyExtensionIdentities(root);
   // Async + withFileTypes — kills the per-entry statSync probe for "is this a
   // directory?" and the readdir itself stops blocking the event loop. The
   // existsSync on manifestPath is also gone; we just try-readFile and let
@@ -156,7 +177,32 @@ async function scanExtensionOrigin(origin: ExtensionOrigin, root: string): Promi
     }
     try {
       const json = JSON.parse(raw);
-      const parsed = parseAnyManifest(json);
+      const packagePath = join(extensionDir, 'package.json');
+      let parsed = parseAnyManifest(json);
+      if (existsSync(packagePath)) {
+        const packageJson = JSON.parse(await readFile(packagePath, 'utf8')) as { forgeaxExtension?: unknown };
+        if (packageJson.forgeaxExtension !== undefined) {
+          const extensionPackage = parseExtensionPackageManifest(packageJson, json);
+          const modulePath = resolve(extensionDir, extensionPackage.module);
+          if (!existsSync(modulePath)) {
+            out.errors.push({ origin, originPath: manifestPath, reason: `extension artifact module is missing: ${extensionPackage.module}` });
+            continue;
+          }
+          const nativeManifest = extensionPackage.manifest as unknown as AnyExtensionManifest;
+          const extensionSlug = extensionPackage.manifest.id.slice(extensionPackage.manifest.id.lastIndexOf('/') + 1);
+          out.found.push({
+            origin,
+            originPath: manifestPath,
+            manifest: nativeManifest,
+            normalizedManifest: nativeManifest as unknown as ExtensionManifestV2,
+            runtime: {
+              moduleUrl: `/extensions/${encodeURIComponent(extensionSlug)}/${extensionPackage.module.slice(2)}`,
+              mode: 'installed',
+            },
+          });
+          continue;
+        }
+      }
       if (!parsed.ok || !parsed.manifest) {
         const reason = parsed.error
           ? parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
@@ -191,72 +237,12 @@ async function scanExtensionOrigin(origin: ExtensionOrigin, root: string): Promi
         continue;
       }
       const normalizedManifest = normalizeManifest(parsed.manifest);
-      // Existing kind loaders are being retired independently. Until then they
-      // receive a lossless-enough compatibility projection while every new UI
-      // consumer reads normalizedManifest. The compatibility object is never
-      // persisted and is created only at this scanner boundary.
-      const manifest = parsed.manifest.schemaVersion === 1
-        ? parsed.manifest
-        : legacyProjection(normalizedManifest);
-      out.found.push({ origin, originPath: manifestPath, manifest, normalizedManifest });
+      out.found.push({ origin, originPath: manifestPath, manifest: parsed.manifest, normalizedManifest });
     } catch (e) {
       out.errors.push({ origin, originPath: manifestPath, reason: (e as Error).message });
     }
   }
   return out;
-}
-
-function legacyProjection(manifest: ExtensionManifestV2): ExtensionManifest {
-  const firstPage = manifest.contributes.pages?.[0];
-  const firstAgent = manifest.contributes.agents?.[0];
-  const firstSkill = manifest.contributes.skills?.[0];
-  const firstTool = manifest.contributes.tools?.[0];
-  const common = {
-    ...manifest,
-    schemaVersion: 1 as const,
-    entry: manifest.entry,
-  };
-  delete (common as { contributes?: unknown }).contributes;
-  delete (common as { categories?: unknown }).categories;
-  if (firstPage) {
-    const launcher = manifest.contributes.activities?.find((activity) =>
-      activity.pageType?.extension === 'self' && activity.pageType.id === firstPage.id,
-    );
-    return {
-      ...common,
-      kind: 'workbench',
-      provides: {
-        workbench: {
-          id: firstPage.id,
-          icon: launcher?.icon ?? firstPage.icon,
-          position: launcher?.order,
-          hidden: !launcher,
-          ...(firstPage.matchProduces ? { matchProduces: firstPage.matchProduces } : {}),
-          ...(firstPage.preferredAgent ? { preferredAgent: firstPage.preferredAgent } : {}),
-        },
-        agents: manifest.contributes.agents,
-        skills: manifest.contributes.skills,
-        tools: manifest.contributes.tools,
-        events: manifest.contributes.events,
-        surfaces: manifest.contributes.surfaces,
-        commands: manifest.contributes.commands,
-        mcp: manifest.contributes.mcp,
-        memory: manifest.contributes.memory,
-      },
-    } as ExtensionManifest;
-  }
-  if (firstAgent) return { ...common, kind: 'agent', provides: { agent: firstAgent } } as ExtensionManifest;
-  if (firstSkill) return { ...common, kind: 'skill', provides: { skills: [firstSkill] } } as ExtensionManifest;
-  if (firstTool) return { ...common, kind: 'tool', provides: { tools: [firstTool] } } as ExtensionManifest;
-  const provider = manifest.contributes.cliProviders?.[0];
-  if (provider) return { ...common, kind: 'cli-provider', provides: { cliProvider: provider } } as ExtensionManifest;
-  const binding = manifest.contributes.modelBindings?.[0];
-  if (binding) return { ...common, kind: 'model-binding', provides: { modelBinding: binding } } as ExtensionManifest;
-  return {
-    ...common,
-    kind: 'workbench',
-    provides: { workbench: { id: 'extension', hidden: true } },
-  } as ExtensionManifest;
 }
 
 /** Doc 14 §4 spike — Safe Boot: when `FORGEAX_SAFE_BOOT=1`, skip user+project
@@ -282,6 +268,7 @@ export function isProduction(env: NodeJS.ProcessEnv = process.env): boolean {
  *  scanning builtin only. */
 export async function scanAllExtensionOrigins(
   roots?: Partial<Record<ExtensionOrigin, string | null>>,
+  npmExtensionDirs: readonly string[] = [],
 ): Promise<ScanResult> {
   const resolved = { ...defaultExtensionRoots(), ...(roots ?? {}) };
   const merged: ScanResult = { found: [], errors: [] };
@@ -291,6 +278,18 @@ export async function scanAllExtensionOrigins(
     const root = resolved[origin];
     if (!root) continue;
     const r = await scanExtensionOrigin(origin, root);
+    merged.found.push(...r.found);
+    merged.errors.push(...r.errors);
+  }
+  for (const extensionDir of npmExtensionDirs) {
+    const manifestPath = join(extensionDir, 'forgeax-extension.json');
+    if (existsSync(manifestPath)) {
+      const r = await scanExtensionOrigin('npm', dirname(extensionDir));
+      merged.found.push(...r.found.filter((entry) => entry.originPath === manifestPath));
+      merged.errors.push(...r.errors.filter((error) => error.originPath === manifestPath));
+      continue;
+    }
+    const r = await scanExtensionOrigin('npm', extensionDir);
     merged.found.push(...r.found);
     merged.errors.push(...r.errors);
   }

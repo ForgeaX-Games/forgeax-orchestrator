@@ -6,7 +6,7 @@
  *  permission-request 的规则前置(deny 免卡直拒)。弹卡路径需要活 session + 前端回执,
  *  属 e2e 面(docs/testing.md),不在此仿。 */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Hono } from 'hono';
@@ -81,10 +81,30 @@ describe('POST /:sid/hook-gate', () => {
     expect(json.decision).toBe('none');
   });
 
-  test('native project MCP credential tool uses the trust gate instead of settings-only passthrough', async () => {
+  test('native project MCP without a live agent grant is denied', async () => {
     writeFileSync(
       join(project, '.forgeax', 'mcp.json'),
       JSON.stringify({ mcpServers: { project: { command: process.execPath, args: ['fixture.mjs'] } } }),
+    );
+    const { json } = await postHookGate({
+      kernel: 'claude-code',
+      toolName: 'mcp__project__read_profile',
+      input: {},
+    });
+    expect(json.decision).toBe('deny');
+    expect(json.reason).toContain('not granted');
+  });
+
+  test('native project MCP credential deny is fail-closed and does not call the server', async () => {
+    const sentinel = join(project, 'native-mcp-called');
+    const fixture = join(project, 'native-mcp-fixture.mjs');
+    writeFileSync(fixture, `
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(${JSON.stringify(sentinel)}, 'called');
+    `);
+    writeFileSync(
+      join(project, '.forgeax', 'mcp.json'),
+      JSON.stringify({ mcpServers: { project: { command: process.execPath, args: [fixture] } } }),
     );
     const { json } = await postHookGate({
       kernel: 'claude-code',
@@ -92,7 +112,8 @@ describe('POST /:sid/hook-gate', () => {
       input: {},
     });
     expect(json.decision).toBe('deny');
-    expect(json.reason).toContain('credential');
+    expect(json.reason).toContain('not granted');
+    expect(existsSync(sentinel)).toBe(false);
   });
 
   test('ask 规则 + 无活 session → fail-closed deny(不能静默放行用户显式要求 ask 的操作)', async () => {

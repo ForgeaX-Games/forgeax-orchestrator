@@ -14,10 +14,10 @@ import { callTool, listTools } from '../tools/registry';
 import { getEventBus } from '../events/bus';
 import { getPathManager } from '../fs/path-manager';
 import {
-  callWorkbenchTool,
-  hasWorkbenchAgentTool,
-  listWorkbenchAgentTools,
-} from '../workbench/agent-tools';
+  callExtensionTool,
+  hasExtensionAgentTool,
+  listExtensionAgentTools,
+} from '../extension-host/agent-tools';
 
 /** D-8: body schema for POST /api/tools/confirm */
 const ConfirmBodySchema = z.object({
@@ -32,9 +32,9 @@ export function createToolsRouter() {
   r.get('/', (c) => c.json({
     tools: [
       ...listTools(),
-      ...listWorkbenchAgentTools().map((tool) => ({
+      ...listExtensionAgentTools().map((tool) => ({
         id: tool.id,
-        extensionId: '@forgeax/workbench-host',
+        extensionId: '@forgeax/extension-host',
         description: tool.description,
         exposedToAI: true,
         hasHandler: true,
@@ -60,11 +60,23 @@ export function createToolsRouter() {
         400,
       );
     }
-    if (hasWorkbenchAgentTool(parsed.data.toolId)) {
+    // AI callers must use the orchestrator registry whenever the product has
+    // a registered handler for this id.  That path owns exposedToAI,
+    // requireConfirm, pause, and the session-scoped slug injection.  Falling
+    // straight through to the shared Extension Host would otherwise bypass
+    // the human billing gate for Gen3D aliases that are projected by both
+    // registries.  Extension-host-only tools still use the shared host below.
+    if (
+      parsed.data.caller.kind === 'ai'
+      && listTools().some((tool) => tool.id === parsed.data.toolId && tool.hasHandler)
+    ) {
+      return c.json(await callTool(parsed.data));
+    }
+    if (hasExtensionAgentTool(parsed.data.toolId)) {
       try {
         const gameId = getPathManager().resolveScope();
         if (!gameId) throw new Error('No active game is available');
-        const result = await callWorkbenchTool({
+        const result = await callExtensionTool({
           caller: parsed.data.caller.kind === 'ai' ? 'ai' : 'ui',
           gameId,
           toolId: parsed.data.toolId,
@@ -72,10 +84,13 @@ export function createToolsRouter() {
         });
         return c.json({ ok: true, result });
       } catch (error) {
+        const code = error && typeof error === 'object' && typeof (error as { code?: unknown }).code === 'string'
+          ? (error as { code: string }).code
+          : 'invoke_error';
         return c.json({
           ok: false,
           error: (error as Error).message,
-          code: 'invoke_error',
+          code,
         });
       }
     }

@@ -1,5 +1,5 @@
 // ark-video gateway — host-side direct integration with Volcengine Ark's
-// Seedance video API (`/contents/generations/tasks`). Used by wb-reel (互动影游)
+// Seedance video API (`/contents/generations/tasks`). Used by reel (互动影游)
 // so the ARK key never reaches the browser bundle.
 //
 // WHY this exists alongside litellm-video (2026-06 root-cause):

@@ -6,22 +6,19 @@
  *
  *   1. Active in this session — already scaffolded under <sid>/agents/, can
  *      receive a `delegate_to_subagent` call right now.
- *   2. Available to spawn — discovered from the plugin registry +
- *      marketplace manifest; first delegate call auto-scaffolds them.
+ *   2. Available to spawn — discovered from the extension registry; first
+ *      delegate call auto-scaffolds them.
  *
  *  Self is filtered out (an agent never appears in its own roster).
  *  cacheHint=dynamic because the active set changes as the user spawns
  *  new tabs across the session.
  */
 
-import { readFileSync, existsSync } from "node:fs";
-import { resolve, join } from "node:path";
 import type { ContextSlot } from "../../../../src/kits/slot/types";
 import { SlotPriority } from "../../../../src/kits/slot/types";
 import type { AgentContext } from "../../../../src/core/types";
 import { listAgents } from "../../../../src/agents/loader";
 import { getExtensionSnapshot } from "../../../../src/extensions/registry";
-import { defaultProjectRoot } from '@forgeax/platform-io';
 import { readUninstalledAgentIds } from '@forgeax/platform-io';
 import { pickI18n } from "@forgeax/types";
 
@@ -31,39 +28,6 @@ interface RosterRow {
   role: string;
   description: string;
   active: boolean;
-}
-
-function findMarketplaceRoot(): string | null {
-  const root = defaultProjectRoot();
-  const candidates = [
-    resolve(root, "packages/marketplace"),
-    resolve(root, "../packages/marketplace"),
-    resolve(root, "../../packages/marketplace"),
-    resolve(root, "marketplace"),
-    resolve(root, "../marketplace"),
-  ];
-  return candidates.find((p) => existsSync(join(p, "manifest.json"))) ?? null;
-}
-
-interface MarketplaceAgent {
-  id: string;
-  role?: string;
-  displayName?: { zh?: string; en?: string };
-  description?: { zh?: string; en?: string };
-  card?: { name?: { zh?: string; en?: string } };
-}
-
-function readMarketplaceAgents(): MarketplaceAgent[] {
-  const mp = findMarketplaceRoot();
-  if (!mp) return [];
-  const path = join(mp, "manifest.json");
-  try {
-    const raw = readFileSync(path, "utf-8");
-    const parsed = JSON.parse(raw) as { agents?: MarketplaceAgent[] };
-    return parsed.agents ?? [];
-  } catch {
-    return [];
-  }
 }
 
 export function buildRoster(ctx: AgentContext): RosterRow[] {
@@ -103,7 +67,7 @@ export function buildRoster(ctx: AgentContext): RosterRow[] {
     if (d) descByPluginId.set(m.manifest.id, d.length > 260 ? `${d.slice(0, 257)}…` : d);
   }
 
-  // 2) Plugin agents (marketplace plugins under packages/marketplace/extensions).
+  // 2) Extension-provided agents from installed package roots.
   for (const entry of listAgents()) {
     const id = entry.definition.id;
     if (id === selfId || seen.has(id)) continue;
@@ -118,23 +82,7 @@ export function buildRoster(ctx: AgentContext): RosterRow[] {
     });
   }
 
-  // 3) Legacy marketplace.json peers (kotone, iro, tsumugi, cc-coder, forge,
-  //    iori, suzu) — registered via marketplace manifest, not yet a plugin.
-  for (const a of readMarketplaceAgents()) {
-    const id = a.id;
-    if (!id || id === selfId || seen.has(id)) continue;
-    if (uninstalled.has(id) && !activeIds.has(id)) continue;
-    seen.add(id);
-    rows.push({
-      id,
-      displayName: a.card?.name?.zh ?? a.displayName?.zh ?? a.displayName?.en ?? id,
-      role: a.role ?? "peer",
-      description: a.description?.zh ?? a.description?.en ?? "",
-      active: activeIds.has(id),
-    });
-  }
-
-  // 4) Active in tree but not registered anywhere (rare — a hand-scaffolded
+  // 3) Active in tree but not registered anywhere (rare — a hand-scaffolded
   //    agent dir). Surface so delegation still works.
   for (const id of activeIds) {
     if (seen.has(id)) continue;

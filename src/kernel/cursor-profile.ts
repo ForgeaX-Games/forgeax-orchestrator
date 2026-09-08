@@ -28,6 +28,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import { resolveBinary } from '../cli-providers/shared/resolve-binary';
 import { runCapture } from '../lib/node-spawn';
+import { buildKernelTask } from './kernel-context';
 
 // ─── 模型目录(cursor-isms) ──────────────────────────────────────────
 // cursor 是四个 rented 内核里唯一有平坦 list 命令的(`cursor-agent
@@ -189,11 +190,9 @@ export function buildCursorArgs(
 ): { args: string[]; message: string } {
   const isFirstTurn = !cursorChatId;
 
-  // dynamicSuffix(当轮记忆/感知)以 user 后缀拼在任务后。
+  // 新私有会话 bootstrap 宿主选择的上下文；resume 不重复灌入。
   const sp = req.systemPrompt;
-  const task = sp.dynamicSuffix?.trim()
-    ? `${req.input.text}\n\n${sp.dynamicSuffix.trim()}`
-    : req.input.text;
+  const task = buildKernelTask(req, isFirstTurn);
 
   // systemPrompt 注入:cursor 无 --append-system-prompt。首轮把 charter+persona
   // 作「指令」前置;后续轮经 --resume 继承,不再前置。

@@ -22,11 +22,10 @@ import type { ArtifactResolvedPayload } from '@forgeax/types/artifact-summary';
 
 /** Single injected composer for the system-prompt building blocks. Replaces a
  *  loose `Array<contributor>` deliberately (§3.2): the composer OWNS the content
- *  of each piece so the four consumers (compose-turn-request, the claude-code
- *  spawn kernel, and the native-agent game_charter / environment slots) can never
- *  drift from one SSOT. Granular methods (rather than one concatenated string)
- *  because the native-agent slots inject `charter` and `environment` as SEPARATE
- *  prompt slots, while compose-turn-request concatenates all three.
+ *  of each piece so compose-turn-request and the standalone legacy CLI surface
+ *  cannot drift from one SSOT. Granular methods (rather than one concatenated
+ *  string) preserve the stable charter / scoped environment / active-game
+ *  boundaries while the unified Runtime composition concatenates all three.
  *
  *  Cache contract: `charter()` is the byte-STABLE prefix (depends only on ports,
  *  fixed at composer construction) — same bytes every turn, so it anchors the
@@ -38,7 +37,7 @@ export interface SystemPromptComposer {
   charter(): string;
   /** The active-game scoping note for a slug ('' when no active game). */
   activeGameNote(slug: string | undefined): string;
-  /** The `# Environment` section (paths / game info / workbench plugins /
+  /** The `# Environment` section (paths / game info / page plugins /
    *  skills). Mirrors the historical renderEnvironmentText opts so each caller
    *  passes exactly what it always did (byte-identical). */
   environment(opts: { cwd: string; projectRoot?: string; slug?: string | null }): string;
@@ -59,6 +58,7 @@ export interface HostToolRunCtx extends DeliveryContext {
   perception?: (kind: 'world' | 'frame', query?: unknown) => Promise<unknown>;
   /** Optional correlation keys carried by the host audit and tool ledgers. */
   callId?: string;
+  turnCallId?: string;
   toolExecutionId?: string;
   /** Narrow read-only seam for host-enriched delivery summaries. */
   delivery?: DeliveryEnricher;
@@ -141,6 +141,24 @@ export interface UiAssetCleanup {
   inspectUiAssetCanvas(dataUrl: string): Promise<UiAssetCanvasReport>;
 }
 
+/** Upload destination defaults — the shared repo + shared write credential are
+ *  PRODUCT policy (which org repo every workspace lands in, and the token that
+ *  lets it happen out of the box), so the product shell owns them and injects
+ *  them here. The orchestration layer's upload mechanism reads them through
+ *  `getUploadDefaults()` instead of hard-coding either (the token used to be a
+ *  compiled constant inside upload/config.ts — a credential living in the
+ *  business-agnostic base). env overrides (`FORGEAX_UPLOAD_*`) still win at
+ *  resolve time; absent seam + absent env ⇒ upload is simply unconfigured on
+ *  this build (graceful, §9). The token is never logged / committed / persisted. */
+export interface UploadDefaults {
+  /** `owner/repo` of the shared destination, e.g. `ForgeaX-Games/Forgeax-Data`. */
+  repo?: string;
+  /** The shared write credential. Never persisted / committed / logged. */
+  token?: string;
+  /** Default branch (usually `main`). */
+  branch?: string;
+}
+
 interface OrchestrationSeams {
   systemPromptComposer?: SystemPromptComposer;
   hostTools?: HostToolSpec[];
@@ -148,11 +166,16 @@ interface OrchestrationSeams {
   assetPathPolicy?: AssetPathPolicy;
   delivery?: DeliveryEnricher;
   artifactResolver?: ArtifactResolver;
-  /** Opt-in builtin tools the product enables. Builtins listed in
-   *  compose-turn-request's OPT_IN_BUILTIN_TOOLS are advertised ONLY when named
-   *  here, so a standalone / other-product consumer of the orchestration layer
-   *  does not inherit product-specific tools (e.g. task-flow `todo_write`). */
+  /** Opt-in builtin tools — the ONLY advertisement gate for every builtin in
+   *  compose-turn-request's FORGEAX_TOOLS (task flow, digital-life memory, UI
+   *  bridge, sub-agent delegation, ask_user). A builtin not named here is never
+   *  advertised on any kernel path (rented-kernel fxt MCP injection and
+   *  forgeax-core host execution alike), so a standalone / other-product
+   *  consumer of the orchestration layer inherits none of them by default.
+   *  Names must come from `FORGEAX_BUILTIN_TOOL_NAMES` (exported at the package
+   *  root) — the roster derived from FORGEAX_TOOLS itself. */
   enabledBuiltinTools?: readonly string[];
+  uploadDefaults?: UploadDefaults;
 }
 
 let _seams: OrchestrationSeams = {};
@@ -200,6 +223,13 @@ export function getDeliveryEnricher(): DeliveryEnricher | undefined {
 
 export function getArtifactResolver(): ArtifactResolver | undefined {
   return _seams.artifactResolver;
+}
+
+/** The product shell's upload destination defaults (shared repo + shared write
+ *  token), or undefined when none was injected (standalone build → upload
+ *  unconfigured unless the operator sets `FORGEAX_UPLOAD_*`). */
+export function getUploadDefaults(): UploadDefaults | undefined {
+  return _seams.uploadDefaults;
 }
 
 /** Test-only — reset the registry between cases. */

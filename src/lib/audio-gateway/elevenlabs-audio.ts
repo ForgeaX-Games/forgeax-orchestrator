@@ -1,7 +1,7 @@
 // ElevenLabs host-side audio generation gateway.
 //
 // The browser never receives the API key. ForgeaX server routes call these
-// helpers and return the generated binary as base64 to the workbench.
+// helpers and return the generated binary as base64 to the page.
 // Official endpoints:
 //   POST /v1/sound-generation  -> binary audio
 //   POST /v1/music             -> binary audio

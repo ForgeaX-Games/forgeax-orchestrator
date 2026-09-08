@@ -30,7 +30,7 @@ import { RENTED_KERNEL_PROFILE } from './kernel-profile';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
-import { runCapture, which } from '../lib/node-spawn';
+import { runCapture } from '../lib/node-spawn';
 import { spawnJsonl, scrubbedSecretEnv } from '../cli-providers/shared/subprocess-jsonl';
 import { resolveBinary } from '../cli-providers/shared/resolve-binary';
 import {
@@ -43,13 +43,14 @@ import { defaultProjectRoot } from '@forgeax/platform-io';
 import {
   buildCbcArgs,
   buildCbcSessionArgs,
-  cbcSessionExists,
+  CBC_DEFAULT_PERMISSION_MODE,
+  CBC_SUPPORTED_PERMISSION_MODES,
   chatEventToKernel,
   CODEBUDDY_DRIVER_LABEL,
   CODEBUDDY_FALLBACK_MODELS,
-  CBC_DEFAULT_PERMISSION_MODE,
-  CBC_SUPPORTED_PERMISSION_MODES,
   probeStreamJsonModels,
+  toCbcPermissionMode,
+  type CbcPermissionMode,
 } from './cbc-profile';
 
 export class CbcKernel implements AgentKernel {
@@ -84,17 +85,13 @@ export class CbcKernel implements AgentKernel {
   /** callId → 在飞 turn 的 AbortController(供 openHandle().cancel 杀进程)。 */
   private static readonly inflight = new Map<string, AbortController>();
   /** callId → 下一轮 spawn 要用的 permission-mode(headless 无 mid-turn 通道,只影响下一轮)。 */
-  private static readonly pendingPermissionMode = new Map<string, PermissionMode>();
+  private static readonly pendingPermissionMode = new Map<string, CbcPermissionMode>();
 
   private binary(): Promise<string> {
     return (this.binaryPromise ??= resolveBinary({
       envVarName: 'CODEBUDDY_CLI_PATH',
       defaultBinary: 'codebuddy',
     }));
-  }
-
-  hasNativeHistoryResume(threadId: string): boolean {
-    return this.startedThreadIds.has(threadId) || cbcSessionExists(defaultProjectRoot(), threadId);
   }
 
   async *runTurn(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {
@@ -157,14 +154,19 @@ export class CbcKernel implements AgentKernel {
     }
   }
 
-  /** 从中立 TurnRequest 拼 `codebuddy -p` argv —— 委托给 cbc-profile。
-   *  档位解析同 cc:pending(控制面,最近的活动作) ?? req.permissionMode(standing 配置) ?? 默认档。 */
+  /** 从中立 TurnRequest 拼 `codebuddy -p` argv —— 委托给 cbc-profile。 */
   private buildArgs(req: TurnRequest, projectRoot: string): string[] {
     const tid = req.session.threadId?.trim();
     const session = buildCbcSessionArgs(tid, projectRoot, this.startedThreadIds);
     if (session.threadId) this.startedThreadIds.add(session.threadId);
     const pendingMode = req.callId ? CbcKernel.pendingPermissionMode.get(req.callId) : undefined;
-    return buildCbcArgs(req, projectRoot, session.args, pendingMode ?? req.permissionMode);
+    return buildCbcArgs(
+      req,
+      projectRoot,
+      session.args,
+      pendingMode,
+      session.fresh,
+    );
   }
 
   openHandle(callId: string): TurnHandle {
@@ -174,8 +176,7 @@ export class CbcKernel implements AgentKernel {
     return {
       async setPermissionMode(mode: PermissionMode): Promise<void> {
         // headless `codebuddy -p` 一次性 spawn,无 mid-turn control 通道 → 只能影响**下一轮**。
-        // 存中立档位,翻方言在 cbc-profile 出口(单点)。
-        CbcKernel.pendingPermissionMode.set(callId, mode);
+        CbcKernel.pendingPermissionMode.set(callId, toCbcPermissionMode(mode));
       },
       async setModel(): Promise<void> {},
       interrupt: kill,
@@ -186,21 +187,15 @@ export class CbcKernel implements AgentKernel {
   async probe(): Promise<KernelHealth> {
     try {
       const binary = await this.binary();
+      const { stdout, code } = await runCapture(binary, ['--version']);
+      const out = stdout.trim().split('\n')[0] ?? '';
       // cbc 自管登录:凭据落 ~/.codebuddy(.credentials.json / ~/.codebuddy.json)。
       const loggedIn =
         existsSync(resolvePath(homedir(), '.codebuddy', '.credentials.json')) ||
         existsSync(resolvePath(homedir(), '.codebuddy.json'));
-      const resolvedBinary = which(binary);
-      const installed = resolvedBinary !== null;
-      return installed && loggedIn
-        ? { ok: true, kernelId: this.id, detail: `${resolvedBinary} ready (version command unsupported)` }
-        : {
-          ok: false,
-          kernelId: this.id,
-          detail: !installed
-            ? 'codebuddy binary not on PATH (install a peer agent CLI)'
-            : 'codebuddy login missing (run `codebuddy`)',
-        };
+      return code === 0 && loggedIn
+        ? { ok: true, kernelId: this.id, detail: out || 'codebuddy ready' }
+        : { ok: false, kernelId: this.id, detail: !loggedIn ? 'codebuddy login missing (run `codebuddy`)' : `codebuddy --version exit ${code}` };
     } catch (e) {
       return { ok: false, kernelId: this.id, detail: (e as Error).message };
     }

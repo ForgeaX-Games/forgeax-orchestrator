@@ -122,18 +122,17 @@ describe('Tool kind loader', () => {
     expect(kinds.tools.find((t) => t.toolId === 'demo.private')!.exposedToAI).toBe(false);
   });
 
-  it('extracts tools from a kind=workbench/agent/skill manifest too', async () => {
-    mkmanifest('user', 'wb-x', {
-      id: '@x/wb-x',
-      kind: 'workbench',
-      displayName: { zh: 'wb', en: 'wb' },
-      provides: {
-        workbench: { id: 'wb-x', position: 1 },
-        tools: [{ id: 'wb-x.refresh' }],
+  it('extracts tools from a v2 Page extension manifest too', async () => {
+    mkmanifest('user', 'page-x', {
+      schemaVersion: 2,
+      id: '@x/page-x',
+      displayName: { zh: 'page', en: 'page' },
+      contributes: {
+        tools: [{ id: 'page-x.refresh' }],
       },
     });
     const kinds = await reloadFromTmp();
-    expect(kinds.tools.map((t) => t.toolId)).toContain('wb-x.refresh');
+    expect(kinds.tools.map((t) => t.toolId)).toContain('page-x.refresh');
   });
 
   it('flags duplicate tool ids inside the same plugin', async () => {
@@ -217,6 +216,58 @@ describe('callTool dispatch', () => {
       caller: { kind: 'ai' },
     });
     expect(r).toEqual({ ok: true, result: 7 });
+  });
+
+  it('unwraps an extension-host-compatible default tools wrapper', async () => {
+    const dir = mkmanifest('user', 'wrapped', {
+      id: '@x/wrapped',
+      kind: 'tool',
+      displayName: { zh: 'w', en: 'w' },
+      entry: { backend: './handlers.mjs' },
+      provides: { tools: [{ id: 'w.echo', exposedToAI: true }] },
+    });
+    writeFileSync(
+      join(dir, 'handlers.mjs'),
+      `export default { tools: { 'w.echo': async (args) => args.value } };\n`,
+      'utf-8',
+    );
+    await reloadFromTmp();
+    const r = await callTool({
+      toolId: 'w.echo',
+      args: { value: 'wrapped-ok' },
+      caller: { kind: 'ai' },
+    });
+    expect(r).toEqual({ ok: true, result: 'wrapped-ok' });
+  });
+
+  it('prefers direct Orchestrator handlers when a default export also carries Host handlers', async () => {
+    const dir = mkmanifest('user', 'dual-abi', {
+      id: '@x/dual-abi',
+      kind: 'tool',
+      displayName: { zh: 'dual', en: 'dual' },
+      entry: { backend: './handlers.mjs' },
+      provides: { tools: [{ id: 'dual.echo', exposedToAI: true }] },
+    });
+    writeFileSync(
+      join(dir, 'handlers.mjs'),
+      `const orchestratorTools = { 'dual.echo': async (args, ctx) => ({ abi: 'orchestrator', value: args.value, projectRoot: ctx.projectRoot }) };
+const hostTools = { 'dual.echo': async (context, args) => ({ abi: 'host', value: args.value, gameRoot: context.gameRoot }) };
+export default Object.assign({}, orchestratorTools, { tools: hostTools });\n`,
+      'utf-8',
+    );
+    await reloadFromTmp();
+    const r = await callTool({
+      toolId: 'dual.echo',
+      args: { value: 'direct-ok' },
+      caller: { kind: 'ai' },
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.result).toEqual({
+      abi: 'orchestrator',
+      value: 'direct-ok',
+      projectRoot: expect.any(String),
+    });
   });
 
   it('surfaces handler exception as invoke_error', async () => {
@@ -609,13 +660,17 @@ describe('confirm gate bypass (w6)', () => {
     expect(confirmSeen).toBe(false);
   });
 
-  it('workbench caller with destructive bypasses confirm gate (AC-09)', async () => {
+  it('extension caller with destructive bypasses confirm gate (AC-09)', async () => {
     await makeBypassTool('w6wb.t', 'w6-wb', 'destructive');
     await reloadFromTmp();
     const bus = getEventBus();
     let confirmSeen = false;
     bus.subscribe('tool.confirm-required', () => { confirmSeen = true; });
-    const r = await callTool({ toolId: 'w6wb.t', args: {}, caller: { kind: 'workbench' } });
+    const r = await callTool({
+      toolId: 'w6wb.t',
+      args: {},
+      caller: { kind: 'extension', extensionId: '@test/extension', instanceId: 'test-instance' },
+    });
     expect(r).toEqual({ ok: true, result: 'ran' });
     expect(confirmSeen).toBe(false);
   });

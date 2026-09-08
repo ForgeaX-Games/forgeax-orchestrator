@@ -36,6 +36,7 @@ import { resolve as resolvePath } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { composeSystemPrompt } from '../../agents/loader';
 import { getSystemPromptComposer } from '../../orchestration-seams';
+import { resolvePermissionServerLaunch } from '../mcp/permission-server-entry';
 
 // The game-authoring charter + active-game note now come from the injected
 // product-shell composer (Stage A §3.2) — the orchestration layer no longer
@@ -296,12 +297,14 @@ export class ClaudeCodeProvider implements CliProvider {
     if (permSid) {
       try {
         const serverPort = process.env.FORGEAX_SERVER_PORT ?? '18900';
-        const mcpServerPath = resolvePath(import.meta.dirname, '../mcp/permission-server.mjs');
+        const permissionServer = resolvePermissionServerLaunch(
+          resolvePath(import.meta.dirname, '../mcp/permission-server.mjs'),
+        );
         const mcpConfig = {
           mcpServers: {
             forgeax: {
-              command: process.execPath, // the node/bun running the server — has fetch + stdio
-              args: [mcpServerPath],
+              command: permissionServer.command,
+              args: [permissionServer.entry],
               env: {
                 FORGEAX_SERVER_URL: `http://127.0.0.1:${serverPort}`,
                 FORGEAX_SID: permSid,

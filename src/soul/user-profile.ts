@@ -10,7 +10,7 @@
  *
  * 写入是**按 key 去重 upsert**(确定性,无需二次 LLM reconcile):每条画像带一个
  * `<!-- k:<slug> -->` 标记,同 key 覆盖、新 key 追加。auto-extract 自动捕捉,
- * 用户也可在 Workbench「长期记忆」里手动编辑(会被下次 upsert 尊重)。
+ * 用户也可在 Page「长期记忆」里手动编辑(会被下次 upsert 尊重)。
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';

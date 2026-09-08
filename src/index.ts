@@ -80,6 +80,27 @@ export {
   type Vec2,
 } from '@forgeax/types/npc-protocol';
 export { HEADLESS_ACTION_GRANDFATHER_IDS } from './kernel/action-catalog';
+export {
+  redactSecretsInText,
+  scanBufferForSecrets,
+  scanContentForSecrets,
+  sensitiveEnvLiterals,
+  walkUploadTree,
+  type RedactedEgressText,
+  type SecretHit,
+  type UploadFile,
+  type WalkOptions,
+  type WalkResult,
+} from './upload/manifest';
+export {
+  githubAuthHeader,
+  githubRemoteUrl,
+  pushFilesToPath,
+  type GitPathUploadFile,
+  type PushFilesToPathParams,
+  type PushFilesToPathResult,
+} from './upload/git-uploader';
+export { FORGEAX_BUILTIN_TOOL_NAMES } from './kernel/compose-turn-request';
 
 // Boot / lifecycle helpers used by product shells.
 export { initPathManager } from './fs/path-manager';
@@ -88,6 +109,7 @@ export { initSessionManager, getSessionManager } from './core/session-manager';
 export { bootCliProviders } from './cli-providers';
 export { reloadExtensions } from './extensions/registry';
 export { getExtensionSnapshot } from './extensions/registry';
+export { configureNpmExtensionDirs } from './extensions/registry';
 export { buildCapabilitySnapshot, findCapabilities } from './capabilities/catalog';
 export { commandCapabilities } from './capabilities/adapters';
 export { projectToolSpecs } from './capabilities/projection';
@@ -103,6 +125,8 @@ export { redactHistoryEntries } from './history/redactor';
 export {
   createScopedExtensionCapabilities,
   getExtensionCapabilityControl,
+  type ExtensionCaller,
+  type ExtensionToolCall,
   type ScopedExtensionCapabilities,
   type ExtensionCapabilityControl,
   type ExtensionCapabilityInvocationContext,
@@ -112,9 +136,41 @@ export {
 
 // WS + watcher primitives the shell wires into Bun.serve.
 export { WsHub, createWsHandler, type WsClientData } from './ws';
-export { FsWatcher, type AssetDiskChangedEvent, type FileChangeEvent, type FsWatcherEvent } from './api/lib/watcher';
+export {
+  FsWatcher,
+  type AssetDiskChangedEvent,
+  type FileChangeEvent,
+  type FsWatcherEvent,
+  type FsWatcherOptions,
+  type FsWatcherState,
+  type FsWatcherStatus,
+} from './api/lib/watcher';
 
 // Path helpers.
 export { defaultProjectRoot } from '@forgeax/platform-io';
 export { friendlyPath } from '@forgeax/platform-io';
 export { mp, interfaceDist } from '@forgeax/platform-io';
+
+// Root-surface completion (P6 / P7): assembly wiring points the product shell
+// consumes directly. These promote pre-existing internal modules to the root
+// `@forgeax/orchestrator` export so server stops reaching into their concrete
+// paths. Additive only — see plan-strategy D-6 / D-7 and a3-port-mapping P6/P7.
+
+// P6 — session bootstrap (api/lib/session-create).
+export { ensureSessionWithBootstrap } from './api/lib/session-create';
+// P6 — surface bus dispatch (api/bus).
+export { dispatchToSurface, dispatchAndWait, getSurfaceSnapshot, listSurfaces } from './api/bus';
+// P6 — event bus accessor (events/bus).
+export { getEventBus } from './events/bus';
+// P6 — builtin blackboard variable keys (defaults/blackboard-vars).
+export { BLACKBOARD_KEYS } from './defaults/blackboard-vars';
+// P6 — agent naming (api/lib/agent-naming).
+export { computeAgentNaming, pickPersonName, type AgentNaming } from './api/lib/agent-naming';
+// P6 — engine symlink repoint (api/lib/engine-symlink). Export promotion only;
+// its Rule 8 hardcoded-path debt is tracked as A4 and NOT repaid in this loop.
+export { repointEngineForgeaXSymlink } from './api/lib/engine-symlink';
+// P7 — host runtime wiring that lands on the root surface by nearest-fit
+// (tools/registry, terminal/manager, ledger/file-activity-ledger).
+export { callTool } from './tools/registry';
+export { getTerminalManager } from './terminal/manager';
+export type { FileActivityRecord } from './ledger/file-activity-ledger';

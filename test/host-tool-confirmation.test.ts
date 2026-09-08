@@ -82,7 +82,10 @@ describe('Host ToolRegistry confirmation delegation', () => {
     const registry = new ToolRegistry();
     const source = hostToolBridge({
       agentPath: 'market-agent',
-      agentDir: join(TMP, 'sessions', 'sid', 'agents', 'market-agent'),
+      runtimeStateRoot: join(TMP, 'sessions', 'sid', 'runtime-state', 'agents', 'market-agent'),
+      runtimeEpochId: 'epoch_test',
+      instanceId: 'instance_test',
+      sid: 'sid',
       getAgentJson: () => ({
         kits: { config: { 'host-tools': { allow: ['aiasset:*'] } } },
       }),

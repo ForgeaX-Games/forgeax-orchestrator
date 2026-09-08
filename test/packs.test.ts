@@ -11,17 +11,42 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { exportPack, closureFrom } from '../src/packs/exporter';
-import { inspectPack, installPack } from '../src/packs/importer';
+import {
+  disableInstalledExtension,
+  enableInstalledExtension,
+  inspectPack,
+  installPack,
+  removeInstalledExtension,
+} from '../src/packs/importer';
+import { readInstalled } from '../src/packs/ledger';
+import { createPacksRouter } from '../src/api/packs';
 import { _setSnapshotForTests, _resetSnapshotForTests, type ExtensionSnapshot } from '../src/extensions/registry';
+import { normalizeManifest } from '@forgeax/types';
+import type { MergedManifest } from '../src/extensions/merger';
 
 const TMP = `/tmp/forgeax-packs-${process.pid}`;
+const ORIGINAL_PROJECT_ROOT = process.env.FORGEAX_PROJECT_ROOT;
+
+function snapshotManifest(
+  manifest: MergedManifest['manifest'],
+  origin: MergedManifest['origin'],
+  originPath: string,
+): MergedManifest {
+  return {
+    manifest,
+    normalizedManifest: normalizeManifest(manifest),
+    origin,
+    originPath,
+    shadowedBy: [],
+  };
+}
 
 function emptySnapshot(): ExtensionSnapshot {
   return {
     generation: 0,
     loadedAt: 0,
     manifests: [],
-    kinds: { workbench: [], agents: [], skills: [], cliProviders: [], modelBindings: [], tools: [], issues: [] },
+    kinds: { agents: [], skills: [], cliProviders: [], modelBindings: [], tools: [], issues: [] },
     scanErrors: [],
     mergeIssues: [],
   };
@@ -59,6 +84,8 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(TMP, { recursive: true, force: true });
   _resetSnapshotForTests();
+  if (ORIGINAL_PROJECT_ROOT === undefined) delete process.env.FORGEAX_PROJECT_ROOT;
+  else process.env.FORGEAX_PROJECT_ROOT = ORIGINAL_PROJECT_ROOT;
 });
 
 describe('packs exporter', () => {
@@ -186,9 +213,7 @@ describe('packs importer', () => {
     // Seed the snapshot with an older copy of the same id at user.
     const seeded: ExtensionSnapshot = {
       ...emptySnapshot(),
-      manifests: [
-        {
-          manifest: {
+      manifests: [snapshotManifest({
             schemaVersion: 1,
             id: '@me/conflicty',
             version: '0.1.0',
@@ -198,13 +223,8 @@ describe('packs importer', () => {
             provides: { tools: [{ id: '@me/conflicty:t' }] },
             entry: { backend: './h.ts' },
             compatibleWith: { 'forgeax-bus': '^1.0.0' },
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          } as any,
-          origin: 'user',
-          originPath: '/tmp/seed',
-          shadowedBy: [],
-        },
-      ],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any, 'user', '/tmp/seed')],
     };
     _setSnapshotForTests(seeded);
 
@@ -325,6 +345,78 @@ describe('packs importer', () => {
     expect(existsSync(join(destRoot, '.forgeax/extensions/overwriteable/forgeax-extension.json'))).toBe(true);
   });
 
+  it('upgrades an installed extension atomically and records the enabled lifecycle state', async () => {
+    const src = join(TMP, 'src', 'upgradeable');
+    const out = join(TMP, 'upgrade-v1.fxpack');
+    const destRoot = join(TMP, 'dest');
+    writeMinimalPlugin(src, '@me/upgradeable', '1.0.0');
+    await exportPack({
+      type: 'single',
+      plugins: [{ id: '@me/upgradeable', srcDir: src }],
+      outPath: out,
+      bundleMeta: { id: '@me/upgradeable', version: '1.0.0', title: { en: 'Upgrade' } },
+    });
+    expect((await installPack({ zipPath: out, destRoot, destinationOrigin: 'project' })).ok).toBe(true);
+
+    rmSync(src, { recursive: true, force: true });
+    writeMinimalPlugin(src, '@me/upgradeable', '2.0.0');
+    writeFileSync(join(src, 'NEW'), 'v2');
+    const v2 = join(TMP, 'upgrade-v2.fxpack');
+    await exportPack({
+      type: 'single',
+      plugins: [{ id: '@me/upgradeable', srcDir: src }],
+      outPath: v2,
+      bundleMeta: { id: '@me/upgradeable', version: '2.0.0', title: { en: 'Upgrade' } },
+    });
+    expect((await installPack({
+      zipPath: v2,
+      destRoot,
+      destinationOrigin: 'project',
+      conflictPolicy: 'overwrite',
+    })).ok).toBe(true);
+
+    const installedRoot = join(destRoot, '.forgeax/extensions/upgradeable');
+    expect(JSON.parse(readFileSync(join(installedRoot, 'forgeax-extension.json'), 'utf8')).version).toBe('2.0.0');
+    expect(readFileSync(join(installedRoot, 'NEW'), 'utf8')).toBe('v2');
+    expect(readInstalled(destRoot).map(({ action, state }) => [action, state])).toEqual([
+      ['install', 'enabled'],
+      ['upgrade', 'enabled'],
+    ]);
+  });
+
+  it('disables, enables, and recoverably removes an installed extension', async () => {
+    const src = join(TMP, 'src', 'lifecycle');
+    const out = join(TMP, 'lifecycle.fxpack');
+    const destRoot = join(TMP, 'dest');
+    writeMinimalPlugin(src, '@me/lifecycle', '1.2.3');
+    await exportPack({
+      type: 'single',
+      plugins: [{ id: '@me/lifecycle', srcDir: src }],
+      outPath: out,
+      bundleMeta: { id: '@me/lifecycle', version: '1.2.3', title: { en: 'Lifecycle' } },
+    });
+    expect((await installPack({ zipPath: out, destRoot, destinationOrigin: 'project' })).ok).toBe(true);
+    process.env.FORGEAX_PROJECT_ROOT = destRoot;
+
+    expect(disableInstalledExtension({ id: '@me/lifecycle', destinationOrigin: 'project' })).toMatchObject({ ok: true, state: 'disabled' });
+    expect(existsSync(join(destRoot, '.forgeax/extensions/lifecycle'))).toBe(false);
+    expect(existsSync(join(destRoot, '.forgeax/extensions-disabled/lifecycle'))).toBe(true);
+
+    expect(enableInstalledExtension({ id: '@me/lifecycle', destinationOrigin: 'project' })).toMatchObject({ ok: true, state: 'enabled' });
+    expect(existsSync(join(destRoot, '.forgeax/extensions/lifecycle'))).toBe(true);
+
+    const removed = removeInstalledExtension({ id: '@me/lifecycle', destinationOrigin: 'project' });
+    expect(removed).toMatchObject({ ok: true, state: 'removed' });
+    expect(existsSync(join(destRoot, '.forgeax/extensions/lifecycle'))).toBe(false);
+    expect(existsSync((removed as { archivePath: string }).archivePath)).toBe(true);
+    expect(readInstalled(destRoot).map(({ action, state }) => [action, state])).toEqual([
+      ['install', 'enabled'],
+      ['disable', 'disabled'],
+      ['enable', 'enabled'],
+      ['remove', 'removed'],
+    ]);
+  });
+
   it('installPack returns bad_input when zip path missing', async () => {
     const r = await installPack({
       zipPath: join(TMP, 'does-not-exist.fxpack'),
@@ -380,9 +472,46 @@ describe('packs ledger', () => {
   });
 });
 
+describe('packs lifecycle API', () => {
+  it('derives the project root from the host and ignores client-supplied filesystem roots', async () => {
+    const src = join(TMP, 'src', 'api-lifecycle');
+    const out = join(TMP, 'api-lifecycle.fxpack');
+    const projectRoot = join(TMP, 'project');
+    const outside = join(TMP, 'outside');
+    writeMinimalPlugin(src, '@me/api-lifecycle');
+    await exportPack({
+      type: 'single',
+      plugins: [{ id: '@me/api-lifecycle', srcDir: src }],
+      outPath: out,
+      bundleMeta: { id: '@me/api-lifecycle', version: '0.1.0', title: { en: 'API lifecycle' } },
+    });
+    expect((await installPack({ zipPath: out, destRoot: projectRoot, destinationOrigin: 'project' })).ok).toBe(true);
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, 'KEEP'), 'untouched');
+    process.env.FORGEAX_PROJECT_ROOT = projectRoot;
+
+    const response = await createPacksRouter().request('/disable', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: '@me/api-lifecycle',
+        destinationOrigin: 'project',
+        destRoot: outside,
+        reload: false,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, state: 'disabled' });
+    expect(existsSync(join(projectRoot, '.forgeax/extensions-disabled/api-lifecycle'))).toBe(true);
+    expect(readFileSync(join(outside, 'KEEP'), 'utf8')).toBe('untouched');
+    expect(existsSync(join(outside, '.forgeax'))).toBe(false);
+  });
+});
+
 describe('packs bundle closure', () => {
   it('auto-includes a dependency plugin from the snapshot when bundling', async () => {
-    // Lay down two plugin dirs on disk: a "host" workbench that depends on
+    // Lay down two extension dirs on disk: a host tool that depends on
     // a "dep" tool. Seed the snapshot with the dep so the closure walker
     // can resolve it (`originPath` → `dirname` → srcDir).
     const hostDir = join(TMP, 'src', 'host');
@@ -394,11 +523,11 @@ describe('packs bundle closure', () => {
           schemaVersion: 1,
           id: '@me/host',
           version: '0.1.0',
-          kind: 'workbench',
+          kind: 'tool',
           displayName: { en: 'Host' },
           author: { name: 't' },
           dependencies: [{ id: '@me/dep' }],
-          provides: { workbench: { id: 'host:wb' } },
+          provides: { tools: [{ id: 'host.run' }] },
           entry: { backend: './h.ts' },
           compatibleWith: { 'forgeax-bus': '^1.0.0' },
         },
@@ -415,15 +544,12 @@ describe('packs bundle closure', () => {
     // Seed snapshot so closure walker can find the dep at originPath/...
     const seeded: ExtensionSnapshot = {
       ...emptySnapshot(),
-      manifests: [
-        {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          manifest: JSON.parse(readFileSync(join(depDir, 'forgeax-extension.json'), 'utf-8')) as any,
-          origin: 'project',
-          originPath: join(depDir, 'forgeax-extension.json'),
-          shadowedBy: [],
-        },
-      ],
+      manifests: [snapshotManifest(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        JSON.parse(readFileSync(join(depDir, 'forgeax-extension.json'), 'utf-8')) as any,
+        'project',
+        join(depDir, 'forgeax-extension.json'),
+      )],
     };
     _setSnapshotForTests(seeded);
 
@@ -450,11 +576,11 @@ describe('packs bundle closure', () => {
         schemaVersion: 1,
         id: '@me/host',
         version: '0.1.0',
-        kind: 'workbench',
+        kind: 'tool',
         displayName: { en: 'Host' },
         author: { name: 't' },
         dependencies: [{ id: '@me/missing' }],
-        provides: { workbench: { id: 'host:wb' } },
+        provides: { tools: [{ id: 'host.run' }] },
         entry: { backend: './h.ts' },
         compatibleWith: { 'forgeax-bus': '^1.0.0' },
       }),
@@ -483,11 +609,11 @@ describe('packs bundle closure', () => {
         schemaVersion: 1,
         id: '@me/host',
         version: '0.1.0',
-        kind: 'workbench',
+        kind: 'tool',
         displayName: { en: 'Host' },
         author: { name: 't' },
         dependencies: [{ id: '@me/missing', optional: true }],
-        provides: { workbench: { id: 'host:wb' } },
+        provides: { tools: [{ id: 'host.run' }] },
         entry: { backend: './h.ts' },
         compatibleWith: { 'forgeax-bus': '^1.0.0' },
       }),
@@ -845,13 +971,12 @@ describe('packs closure helper', () => {
 
     const seeded: ExtensionSnapshot = {
       ...emptySnapshot(),
-      manifests: ['@me/a', '@me/b', '@me/c'].map((id) => ({
+      manifests: ['@me/a', '@me/b', '@me/c'].map((id) => snapshotManifest(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        manifest: JSON.parse(readFileSync(join(dirs[id], 'forgeax-extension.json'), 'utf-8')) as any,
-        origin: 'project' as const,
-        originPath: join(dirs[id], 'forgeax-extension.json'),
-        shadowedBy: [],
-      })),
+        JSON.parse(readFileSync(join(dirs[id], 'forgeax-extension.json'), 'utf-8')) as any,
+        'project',
+        join(dirs[id], 'forgeax-extension.json'),
+      )),
     };
     _setSnapshotForTests(seeded);
 
@@ -880,11 +1005,11 @@ describe('packs closure helper', () => {
           schemaVersion: 1,
           id: '@me/sclosure-host',
           version: '0.1.0',
-          kind: 'workbench',
+          kind: 'tool',
           displayName: { en: 'Host' },
           author: { name: 't' },
           dependencies: [{ id: '@me/sclosure-dep' }],
-          provides: { workbench: { id: 'sclosure:wb' } },
+          provides: { tools: [{ id: 'sclosure.run' }] },
           entry: { backend: './h.ts' },
           compatibleWith: { 'forgeax-bus': '^1.0.0' },
         },
@@ -900,15 +1025,12 @@ describe('packs closure helper', () => {
 
     const seeded: ExtensionSnapshot = {
       ...emptySnapshot(),
-      manifests: [
-        {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          manifest: JSON.parse(readFileSync(join(depDir, 'forgeax-extension.json'), 'utf-8')) as any,
-          origin: 'project',
-          originPath: join(depDir, 'forgeax-extension.json'),
-          shadowedBy: [],
-        },
-      ],
+      manifests: [snapshotManifest(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        JSON.parse(readFileSync(join(depDir, 'forgeax-extension.json'), 'utf-8')) as any,
+        'project',
+        join(depDir, 'forgeax-extension.json'),
+      )],
     };
     _setSnapshotForTests(seeded);
 
@@ -942,11 +1064,11 @@ describe('packs closure helper', () => {
         schemaVersion: 1,
         id: '@me/sclosure2-host',
         version: '0.1.0',
-        kind: 'workbench',
+        kind: 'tool',
         displayName: { en: 'Host' },
         author: { name: 't' },
         dependencies: [{ id: '@me/whatever' }],
-        provides: { workbench: { id: 'sclosure2:wb' } },
+        provides: { tools: [{ id: 'sclosure2.run' }] },
         entry: { backend: './h.ts' },
         compatibleWith: { 'forgeax-bus': '^1.0.0' },
       }),

@@ -20,7 +20,6 @@ const SRC = join(fileURLToPath(new URL('..', import.meta.url)), 'src');
 // orchestration. Each is a path-default / business module awaiting its own move.
 const SOFT_ALLOWLIST = new Set([
   'api/lib/watcher.ts',                  // generic watcher's default watch path
-  'lib/wb-bgm/tool-specs.ts',            // bgm tool-spec strings (builtin bgm kit coupling — deferred)
   'kernel/mcp/forgeax-tools-server.mjs', // game host-tools MCP server (hostTools migration — deferred)
   'kernel/forgeax-builtin-tools.ts',     // game host-tools host-side impl (list_games …) — same hostTools migration, deferred
 ]);

@@ -2,7 +2,7 @@
  * host-tool-bridge —— 编排层(cli)提供给「原生 in-process 内核」的 host 工具执行桥。
  *
  * 它把内核发起的工具调用接到 cli 的宿主能力上(与 `POST /:sid/kernel-tool` 同一信任闸口
- * T-D,免 HTTP):定位活 agent → loadAgentRecord 权威 trustTier → checkKernelTool →
+ * T-D,免 HTTP):定位活 agent → Catalog 权威 trustTier → checkKernelTool →
  * (ask → 弹卡等用户)→ executeTool。
  *
  * 三档闸:allow 直跑;deny 抛;**ask 经 `requestToolApproval` 弹权限卡阻塞等用户**
@@ -12,8 +12,8 @@
  * DIP 边界:本桥**只依赖 cli 内部**(session / soul / trust-gate / tool-approval / tool-executor),
  * 不 import 任何具体内核包。产品壳(packages/server)在装配原生内核时复用本桥,从而 cli 不反向依赖内核实现。
  */
+import { executionToolScope } from '../agents/execution-tool-scope';
 import { getSessionManager } from '../core/session-manager';
-import { loadAgentRecord } from '../soul';
 import { checkKernelTool } from './trust-gate';
 import { requestToolApproval } from './tool-approval';
 import { executeTool } from '../kits/tool/tool-executor';
@@ -30,7 +30,24 @@ import { tt } from '../lib/turn-trace';
 import { appendToolAudit } from './tool-audit';
 import { shouldDelegateHostToolConfirmation } from './host-tool-confirmation';
 import { runSkillKernelTool } from '../skills/kernel-tool-bridge';
-import { createProjectMcpBridge, isProjectMcpToolName } from './project-mcp';
+import {
+  createProjectMcpBridge,
+  isProjectMcpToolName,
+  ProjectMcpToolNotFoundError,
+  type ProjectMcpBridge,
+} from './project-mcp';
+import { recordSessionHostToolWrites } from './host-tool-written-files';
+import { resolveTemplateTrust } from '../agents/agent-template-catalog';
+import { loadAgentRecord } from '../soul/soul-pack-loader';
+import { visibleTools } from '../runtime/visible-tools';
+import {
+  filterVisibleAgentManagementTools,
+  visibleAgentManagementToolsForAgent,
+  type AgentManagementToolName,
+} from '../kits/agent-management-visibility';
+import { isBuiltinToolEnabled } from './builtin-tool-policy';
+import { canonicalAgentManagementTool } from '../api/lib/host-tools-for-agent';
+import { withAgentHostToolDefinitions } from '../tools/agent-host-tool-surface';
 
 /** 与原生内核约定的 host 工具执行签名(结构化,不 import 内核包的类型)。
  *  `agentId` = 本轮真实发起工具的 agent(委派轮里即被委派方,如 mochi);缺省回落 defaultAgentPath。
@@ -50,11 +67,14 @@ export type HostExecuteToolFn = (
  *  始终走真实实现(其副作用即被断言的审计行)。 */
 export interface HostToolBridgeDeps {
   getSessionManager: typeof getSessionManager;
+  /** Legacy injectable loader retained for host-bridge audit fixtures. */
   loadAgentRecord: typeof loadAgentRecord;
   checkKernelTool: typeof checkKernelTool;
   shouldDelegateHostToolConfirmation: typeof shouldDelegateHostToolConfirmation;
   requestToolApproval: typeof requestToolApproval;
   executeTool: typeof executeTool;
+  /** Test seam; production uses the shared pooled project-MCP bridge. */
+  projectMcp: ProjectMcpBridge;
 }
 
 /** in-process host-tool 桥:与 `POST /:sid/kernel-tool` 同一信任闸口(T-D),免 HTTP。 */
@@ -69,7 +89,7 @@ export function makeInProcessExecuteTool(
     deps.shouldDelegateHostToolConfirmation ?? shouldDelegateHostToolConfirmation;
   const _requestToolApproval = deps.requestToolApproval ?? requestToolApproval;
   const _executeTool = deps.executeTool ?? executeTool;
-  const projectMcp = createProjectMcpBridge(defaultProjectRoot());
+  const projectMcp = deps.projectMcp ?? createProjectMcpBridge(defaultProjectRoot());
   return async (
     name: string,
     args: unknown,
@@ -78,12 +98,13 @@ export function makeInProcessExecuteTool(
     callId?: string,
     turnCallId?: string,
   ): Promise<unknown> => {
-    // 2026-08-06 外审根因:HostExecuteToolFn 的类型**早就声明**了 callId / turnCallId,
-    // 实现却只解构前四个 —— id 就在边界上被扔掉,于是工具审计账没有连接键,
-    // "哪次用户请求导致了哪次工具调用"只能靠时间戳猜。有值才带键(见 ToolAuditEntry)。
-    const trace = { ...(callId ? { callId } : {}), ...(turnCallId ? { turnCallId } : {}) };
+    const trace = {
+      ...(callId?.trim() ? { callId: callId.trim() } : {}),
+      ...(turnCallId?.trim() ? { turnCallId: turnCallId.trim() } : {}),
+    };
     if (!sid) throw new Error('forgeax-core kernel: missing hostSessionId for host-tool bridge');
     // Normalize catalog-derived ui_act_* and reject missing declarations before trust policy.
+    const requestedToolName = name;
     const preflight = preflightUiToolDispatch(name, args, sid);
     if (preflight.rejection) return preflight.rejection;
     name = preflight.name;
@@ -96,19 +117,45 @@ export function makeInProcessExecuteTool(
     // denyPermissionsForSession(sid,'forge') 误杀其 pending,用户回答 resolve 不回去 → 卡死。
     const agentPath = agentId?.trim() || defaultAgentPath;
     const session = _getSessionManager().peek(sid) ?? (await _getSessionManager().open(sid));
-    const agent = session.scheduler.getAgent(agentPath);
-    if (!agent) {
+    // 新 Session 以 tree 为 runtime 身份权威;旧的最小 host 协作方只有 scheduler。
+    // 无 tree 时只降级身份解析,后面的 trust gate 仍然照常执行,不能从兼容分支直达工具。
+    const hasRuntimeTree = typeof session.tree?.resolve === 'function';
+    const runtimeInstance = hasRuntimeTree ? session.tree.resolve(agentPath) : undefined;
+    if (runtimeInstance) {
+      await session.initializeAgentHost(agentPath);
+    }
+    const agent = hasRuntimeTree
+      ? session.getAgentHost(agentPath)
+      : typeof session.getAgentHost === 'function'
+        ? session.getAgentHost(agentPath)
+        : session.scheduler?.getAgent?.(agentPath);
+    if (!agent || (hasRuntimeTree && !runtimeInstance)) {
       // agent 不在线 —— trustTier 尚未求得,与 sessions.ts 一致记 'unknown' / allow=false。
       appendToolAudit({ ...trace, sid, agent: agentPath, tool: name, trustTier: 'unknown', allow: false, error: `agent '${agentPath}' not live in session`, durationMs: Date.now() - start, ts: start });
       throw new Error(`forgeax-core kernel: agent '${agentPath}' not live in session ${sid}`);
     }
 
-    // 信任闸:own=full;imported=deny 危险集。权威 trustTier 按加载路径求(fail-closed)。
+    // Live Runtime identity is templateRef-based. Catalog registration is the
+    // single trust authority; a missing entry fails closed to imported.
     let trustTier: 'own' | 'imported' = 'imported';
-    try {
-      trustTier = (await _loadAgentRecord(agentPath, { projectRoot: defaultProjectRoot() })).trustTier;
-    } catch {
-      /* fail-closed → imported */
+    if (runtimeInstance) {
+      trustTier = resolveTemplateTrust(
+        session.templateCatalog,
+        runtimeInstance.templateRef,
+      );
+    } else {
+      // Compatibility for minimal/fake sessions that predate RuntimeInstance.
+      // This is only an identity fallback; _checkKernelTool below remains mandatory.
+      try {
+        trustTier = (await _loadAgentRecord(agentPath, { projectRoot: defaultProjectRoot() })).trustTier;
+      } catch {
+        /* fail-closed → imported */
+      }
+    }
+    if (!isBuiltinToolEnabled(name)) {
+      const error = `builtin tool not enabled: ${name}`;
+      appendToolAudit({ ...trace, sid, agent: agentPath, tool: name, trustTier, allow: false, error, durationMs: Date.now() - start, ts: start });
+      throw new Error(error);
     }
     // R2-08:imported 写禁但「该 session 绑定的 game 目录内」豁免。永久绑定(PR2)下豁免基准
     // 是 session 自己绑的 game(config.defaultDir 由路径派生),非全局 active game——绑 A、
@@ -124,11 +171,32 @@ export function makeInProcessExecuteTool(
       throw new Error(decision.reason ?? `denied by trust tier: ${name}`);
     }
     // ask:弹权限卡阻塞等用户(命中本会话 remember 直放);拒绝/超时 → 抛(fail-closed)。
+    // The registry keeps hidden kit entries for hot reload. Re-project the
+    // canonical agent_manage visibility at this second execution boundary so
+    // a direct native host-tool call cannot bypass kits.disable.
+    const visibleAgentManagementTools = new Set(
+      visibleAgentManagementToolsForAgent(sid, agentPath),
+    );
+    const visible = filterVisibleAgentManagementTools(
+      visibleTools(
+        withAgentHostToolDefinitions(agent.agentContext.tools.list(), agent.agentContext),
+        agent.agentContext,
+      ),
+      visibleAgentManagementTools,
+    );
+    const toolScope = await executionToolScope(
+      runtimeInstance?.template, visible.map((tool) => tool.name), projectRoot, scopeGame,
+    );
+    if (!toolScope.allows(requestedToolName)) {
+      const error = `tool not granted to agent: ${requestedToolName}`;
+      appendToolAudit({ ...trace, sid, agent: agentPath, tool: requestedToolName, trustTier, allow: false, error, durationMs: Date.now() - start, ts: start });
+      throw new Error(error);
+    }
     const delegateConfirmation =
       decision.outcome === 'ask' &&
       !isForgeaxBuiltinTool(name) &&
       !getHostTool(name)?.run &&
-      _shouldDelegateHostToolConfirmation(name, agent.agentContext.tools.list());
+      _shouldDelegateHostToolConfirmation(name, visible);
     if (decision.outcome === 'ask' && !delegateConfirmation) {
       tt('htb.approval-wait', { name, agent: agentPath, sid, cap: decision.capability });
       const approved = await _requestToolApproval({
@@ -160,14 +228,33 @@ export function makeInProcessExecuteTool(
         projectRoot,
         agentId: agentPath,
         ...(scopeGame ? { game: scopeGame } : {}),
-        // 连接键往下传:产品壳的 host 工具(editor_ui_browse)据它把 ui-browse-metrics
-        // 连回主账本。不填的话上面那个字段就是个永不生效的声明 —— 那正是这轮在修的病。
-        ...(callId ? { callId: callId } : {}),
+        ...(callId?.trim() ? { callId: callId.trim() } : {}),
+        ...(turnCallId?.trim() ? { turnCallId: turnCallId.trim() } : {}),
         eventBus: session.eventBus,
         sid,
       };
+      let kitExecuted = false;
+      const runKit = () => {
+        kitExecuted = true;
+        return _executeTool(
+          name,
+          (args ?? {}) as Record<string, unknown>,
+          visible,
+          agent.agentContext,
+        );
+      };
+      const canonicalAgentTool = visibleAgentManagementTools.has(name as AgentManagementToolName)
+        ? canonicalAgentManagementTool(name as AgentManagementToolName)
+        : undefined;
       const out = isForgeaxBuiltinTool(name)
         ? await runForgeaxBuiltinTool(name, (args ?? {}) as Record<string, unknown>, builtinCtx)
+        : canonicalAgentTool
+          ? await executeTool(
+              name,
+              (args ?? {}) as Record<string, unknown>,
+              [canonicalAgentTool],
+              agent.agentContext,
+            )
         : seamTool?.run
           ? await seamTool.run((args ?? {}) as Record<string, unknown>, hostToolRunCtx(builtinCtx))
           : name.startsWith('skill_')
@@ -175,27 +262,16 @@ export function makeInProcessExecuteTool(
                 kind: 'ai',
                 sessionId: sid,
                 agentId: agentPath,
-            })
+              })
             : name.startsWith('mcp__')
               ? await (async () => {
                   const projectResult = await projectMcp.callIfKnown(name, args);
                   if (configuredProjectMcp && projectResult === undefined) {
-                    // A configured project-MCP namespace is an explicit
-                    // execution domain. Never let a stale schema or a
-                    // missing remote tool fall through to a same-named
-                    // ordinary ToolRegistry entry.
-                    throw new Error(`project_mcp_tool_not_found: ${name}`);
+                    throw new ProjectMcpToolNotFoundError(name);
                   }
-                  return projectResult === undefined
-                    ? await _executeTool(name, (args ?? {}) as Record<string, unknown>, agent.agentContext.tools.list(), agent.agentContext)
-                    : projectResult;
+                  return projectResult === undefined ? await runKit() : projectResult;
                 })()
-          : await _executeTool(
-              name,
-              (args ?? {}) as Record<string, unknown>,
-              agent.agentContext.tools.list(),
-              agent.agentContext,
-            );
+              : await runKit();
       // 工具返回 `{error}` 形状 = 失败(与 `:sid/kernel-tool` 同口径:Unknown tool / 校验失败 /
       //   工具内 throw 都落此形状)。翻成 throw → 下方 catch 记**唯一**一行 ok:false 审计 +
       //   rethrow → RPC reject → 内核标 isError(而非 ok:true 夹 error,§5 fail-fast)。
@@ -209,6 +285,14 @@ export function makeInProcessExecuteTool(
       tt('htb.exec-done', { name, agent: agentPath, ms: Date.now() - start });
       // 工具执行成功 —— allow=true / ok=true。
       appendToolAudit({ ...trace, sid, agent: agentPath, tool: name, trustTier, allow: true, ok: true, durationMs: Date.now() - start, ts: start });
+      if (kitExecuted) {
+        recordSessionHostToolWrites(session, {
+          result: out,
+          agentPath,
+          ...(callId?.trim() ? { toolCallId: callId.trim() } : {}),
+          ...(scopeGame ? { gameSlug: scopeGame } : {}),
+        });
+      }
       return out;
     } catch (e) {
       tt('htb.exec-error', { name, agent: agentPath, ms: Date.now() - start, err: (e as Error).message });

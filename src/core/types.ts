@@ -3,12 +3,12 @@
  *  Two halves:
  *    1. LLM-facing slice (ContentPart / ModelSpec / ModelsConfig / ToolDefinition).
  *       Pre-existing — used by the provider layer in src/llm/.
- *    2. Runtime-facing slice (Event / EventBusAPI / SchedulerAPI / AgentNode /
+ *    2. Runtime-facing slice (Event / EventBusAPI / AgentNode /
  *       AgentJson / SessionConfig / BlackboardAPI / TreeChange / ...).
  *       Added in C0 — public contracts for core/, session/, message/, hooks/.
  *
  *  This file holds only public interfaces. Implementations live in their
- *  respective modules (event-bus.ts / scheduler.ts / blackboard.ts / etc.). */
+ *  respective modules (event-bus.ts / runtime/ / blackboard.ts / etc.). */
 
 // ─── Content (9-variant) ───
 
@@ -94,6 +94,15 @@ export interface ModelsConfig {
 // 在 src/kits/，内容填充见 runtime-rewrite-gaps.md §B1）。
 
 export interface AgentJson {
+  /** Explicit ambient capability grants, independent of kit visibility and kernel toolPolicy. */
+  toolGrants?: import("../agents/tool-grants").AgentToolGrants;
+  /** Host-owned trust snapshot for a Session resident.
+   *
+   * Written when an external persona is materialized into `agents/` and read
+   * back by the resident Catalog adapter on Session bootstrap. Arbitrary
+   * filesystem/memory templates do not get to self-declare their Catalog
+   * trust through this field; their registration call remains authoritative. */
+  trustTier?: "own" | "imported";
   /** LLM 模型配置；缺则继承 SessionConfig.defaultModels。 */
   models?: ModelsConfig;
   /** EventBus 合并窗口（ms），同源同类型事件在窗口内合并。 */
@@ -124,16 +133,26 @@ export interface AgentJson {
    *  目录（如游戏 project 内）。缺省走 `<agent-root>/kits/`。 */
   kitRedirect?: string;
   /** Persona markdown 路径（绝对或相对 projectRoot）。Sub-agent 由
-   *  marketplace plugin / 旧 manifest 衍生时由 sessions API 自动写入。
-   *  builtin/kits/persona/slots/persona.ts 读取此字段把 persona 注入
-   *  ContextEngine 作为 STATIC_CORE 优先级的 stable SystemBlock。 */
+   *  marketplace plugin / 旧 manifest 衍生时由 sessions API 自动写入；
+   *  AgentTemplateLoader 将它解析进唯一 FrozenAgentTemplate。 */
   personaFile?: string;
   /** Long-term memory 目录（绝对或相对 projectRoot / marketplace 根）。
    *  Sub-agent 由 plugin / marketplace manifest 衍生时由 sessions API
-   *  自动写入。builtin/kits/persona/slots/memory.ts 读取此字段，把目录里
-   *  全部 .md 文件拼成 SystemBlock 注入 prompt。值为空 / 读不到 → slot
-   *  静默 skip，不影响 persona slot。 */
+   *  自动写入。AgentTemplateLoader 按 persona 语言选择目录里的 .md 资源并
+   *  解析进唯一 FrozenAgentTemplate。值为空 / 读不到时静默跳过。 */
   memoryDir?: string;
+  /** Resolved external/default skill sources owned by this resident template.
+   *
+   * Extension/marketplace materialization writes concrete source paths here so
+   * Session bootstrap can rebuild the same FrozenAgentTemplate without a
+   * turn-time lookup by agent id. Local skill-directory `SKILL.md` entries
+   * are discovered separately by the filesystem template loader. */
+  skillSources?: Array<{
+    id: string;
+    path: string;
+    description?: string;
+    executor?: "prompt" | "typescript" | "python";
+  }>;
 }
 
 // ─── Session config (session.json schema) ───
@@ -152,6 +171,8 @@ export interface SessionConfig {
   timezone?: string;
   /** Server-boot autoStart flag. Default true; explicit false to skip. */
   autoStart?: boolean;
+  /** Frozen Session-relative root for ephemeral and global runtime events. */
+  runtimeEventsRoot?: string;
 }
 
 // ─── Event system ───
@@ -176,6 +197,8 @@ export interface EventPayload {
 }
 
 export interface EventBase {
+  /** Stable across all per-instance projections of the same bus event. */
+  eventId?: string;
   source: string;
   type: string;
   payload: EventPayload;
@@ -205,6 +228,10 @@ export type Event = EventBase & (
 /** Self-routed event — `to` is auto-filled to the emitting agent's id. */
 export type SelfEvent = EventBase & { handoff?: EventHandoff };
 
+/** Legacy queue surface retained for the pre-runtime Scheduler compatibility
+ * path. RuntimeSupervisor owns new lifecycle routing; this interface remains
+ * so older consumers can drain an EventQueue without widening the runtime
+ * authority. */
 export interface EventQueueAPI {
   push(event: Event): void;
   drain(filter?: (event: Event) => boolean): Event[];
@@ -222,6 +249,15 @@ export interface EventBusAPI {
   observe(handler: (event: Event, emitterId?: string) => void): () => void;
   /** Observe only events from a specific agent (filtered by emitterId). */
   observeAgent(agentId: string, handler: (event: Event) => void): () => void;
+}
+
+/** Compatibility surface for the legacy BaseAgent/Scheduler callers. */
+export interface SchedulerAPI {
+  attachAgent(agentPath: string): Promise<void>;
+  startAgent(agentPath: string): Promise<void>;
+  routeMessage(agentPath: string, event: Event): void;
+  start(): void;
+  shutdown(): Promise<void>;
 }
 
 // ─── Agent tree ───
@@ -289,43 +325,44 @@ export interface BlackboardAPI {
   flush(): void;
 }
 
-// ─── Scheduler ───
-
-export interface SchedulerAPI {
-  /** Register an agent path. Idempotent. */
-  attachAgent(agentPath: string): Promise<void>;
-  /** Begin scheduling for a single agent (claims its lifecycle lock). */
-  startAgent(agentPath: string): Promise<void>;
-  /** Push an external message into an agent's inbox. */
-  routeMessage(agentPath: string, event: Event): void;
-  /** Begin processing for the whole session — observe bus + drive turn loops. */
-  start(): void;
-  /** Soft stop — drain in-flight turns, leave bus / tree / ledger intact. */
-  shutdown(): Promise<void>;
-}
-
 // ─── Tools (LLM-facing slice; full ToolDefinition lives elsewhere) ───
 
 export type ToolOutput = string | ContentPart[];
 
-/** AgentContext —— BaseAgent 暴露给 kit / tool / slot / plugin 的统一入口。
+/** AgentContext —— runtime host 暴露给 kit / tool / slot / plugin 的统一入口。
  *
- *  对齐 agenteam ref `core/base-agent.ts` L148-163：agentContext 是
+ *  agentContext 是
  *  **per-agent 共享对象**（同一 agent 内的所有 kit 看见同一个引用），构造
- *  时由 BaseAgent 注入 3 个 registry 实例 + 现有 EventBus/Blackboard/Tree。
+ *  RuntimeAgentHost 构造时注入 3 个 registry 实例 + EventBus/Blackboard/Tree。
  *
  *  循环依赖：core 反向引用 `kits/slot/types.ts` 的 `ContextSlot` 与
  *  `kits/types.ts` 的 `PluginSource` —— **type-only**，tsc 允许，runtime 不绑。 */
 export interface AgentContext {
   agentPath: string;
-  agentDir: string;
+  /** Legacy BaseAgent filesystem identity; runtime hosts use instanceId. */
+  readonly agentDir?: string;
+  /** Runtime identity is explicit; agentPath remains a presentation address. */
+  readonly sid: string;
+  readonly instanceId: string;
+  readonly runtimeEpochId: string;
+  /** Instance-owned writable state; author templates must never be mutated through it. */
+  readonly runtimeStateRoot: string;
+  /** Optional read-only resource source captured from a registered template. */
+  readonly templateRoot?: string;
+  /** Explicit Kit package sources captured in the frozen template snapshot. */
+  readonly kitSources: readonly import("../agents/template-types").KitSourceRef[];
+  readonly runtimeManaged?: boolean;
+  /** Narrow, instance-bound lifecycle authority exposed to Agent Tools. */
+  readonly runtime?: import("../runtime/runtime-context").RuntimeToolContext;
   signal: AbortSignal;
   eventBus: EventBusAPI;
   blackboard: BlackboardAPI;
   tree: AgentTreeAPI;
   hook: typeof import("../hooks/types").Hook;
   getAgentJson(): AgentJson;
-  /** Tool registry —— ConsciousAgent buildPrompt / executeTool 直接消费。 */
+  /** Apply loader defaults to the in-memory runtime snapshot without writing a template. */
+  applyAgentDefaults?(defaults: Record<string, unknown>): void;
+  /** Tool registry —— RuntimeAgentHost 的 prompt/tool 执行直接消费。 */
   tools: ToolRegistryAPI;
   /** Slot registry —— context-engine 拼 prompt 时遍历。 */
   slots: SlotRegistryAPI;
@@ -345,14 +382,14 @@ export interface AgentContext {
    *  后续 sandbox 启用后会与 defaultDir 指向的 game-project 容器联动，
    *  接口对调用方保持不变。 */
   terminal: import("../terminal/types").TerminalManagerAPI;
-  /** Per-agent ledger reader for context-window compaction. Set by ConsciousAgent. */
+  /** Per-instance ledger reader for context-window compaction. */
   ledger?: import("../context-window/context-window").LedgerReader;
-  /** Resolved models config getter for compaction. Set by ConsciousAgent. */
+  /** Resolved models config getter for compaction. */
   resolveModels?: () => ModelsConfig;
 }
 
-/** ToolRegistry 公开面 —— BaseAgent 给的是 ToolRegistry 类，kit / context-engine
- *  / ConsciousAgent 都按这个接口消费。dynamic 区由 register/release 维护。 */
+/** ToolRegistry 公开面 —— RuntimeAgentHost 给的是 ToolRegistry 类，kit /
+ *  context-engine 都按这个接口消费。dynamic 区由 register/release 维护。 */
 export interface ToolRegistryAPI {
   list(): ToolDefinition[];
   get(key: string): ToolDefinition | undefined;
@@ -388,6 +425,7 @@ export interface ToolDefinition {
     required?: string[];
     /** Preserve JSON Schema keywords used by provider-facing tool contracts. */
     [keyword: string]: unknown;
+    anyOf?: unknown[];
   };
   validateInput?: (
     args: Record<string, unknown>,

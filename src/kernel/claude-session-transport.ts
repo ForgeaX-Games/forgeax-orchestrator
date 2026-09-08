@@ -39,6 +39,10 @@ export function createDirectClaudeTransport(options: DirectOptions): ClaudeSessi
   child.stderr.setEncoding('utf8');
   child.stdout.on('data', (chunk: string) => { for (const cb of dataCbs) cb('stdout', chunk); });
   child.stderr.on('data', (chunk: string) => { for (const cb of dataCbs) cb('stderr', chunk); });
+  // `stdin.write(..., callback)` reports EPIPE to the callback and Node also
+  // emits an error event. The callback remains the write result; consume the
+  // duplicate event so the direct transport cannot crash its host process.
+  child.stdin.on('error', () => {});
   const settle = (code: number, signal?: string) => {
     if (settled) return;
     settled = true;

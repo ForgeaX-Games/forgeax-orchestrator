@@ -16,7 +16,9 @@ function parseRunBody(body: any): SkillRunRequest | null {
   if (!body || typeof body.skillId !== 'string') return null;
   const caller = body.caller;
   const callerKind = caller?.kind;
-  if (!callerKind || !['user', 'ai', 'cli', 'workbench'].includes(callerKind)) return null;
+  if (!callerKind || !['user', 'ai', 'cli', 'extension'].includes(callerKind)) return null;
+  if (callerKind === 'extension'
+    && (typeof caller.extensionId !== 'string' || typeof caller.instanceId !== 'string')) return null;
   return {
     skillId: body.skillId,
     extensionId: typeof body.extensionId === 'string' ? body.extensionId : undefined,
@@ -26,6 +28,8 @@ function parseRunBody(body: any): SkillRunRequest | null {
       sessionId: typeof caller.sessionId === 'string' ? caller.sessionId : undefined,
       threadId: typeof caller.threadId === 'string' ? caller.threadId : undefined,
       agentId: typeof caller.agentId === 'string' ? caller.agentId : undefined,
+      extensionId: typeof caller.extensionId === 'string' ? caller.extensionId : undefined,
+      instanceId: typeof caller.instanceId === 'string' ? caller.instanceId : undefined,
     },
   };
 }

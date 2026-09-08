@@ -21,7 +21,7 @@ export async function sanitizeMedia(messages: LLMMessage[]): Promise<LLMMessage[
     let changed = false;
     const content: ContentPart[] = [];
     for (const part of msg.content) {
-      const sanitized = sanitizePart(part);
+      const sanitized = sanitizeMediaPart(part);
       if (sanitized !== part) changed = true;
       content.push(sanitized);
     }
@@ -30,7 +30,12 @@ export async function sanitizeMedia(messages: LLMMessage[]): Promise<LLMMessage[
   return result;
 }
 
-function sanitizePart(part: ContentPart): ContentPart {
+/**
+ * Pure single-part media guard shared by history producers and the async
+ * message sanitizer. Keeping the magic-byte check here prevents a history
+ * projector from growing a second provider/media validation implementation.
+ */
+export function sanitizeMediaPart(part: ContentPart): ContentPart {
   if (!isInlineMediaContentPart(part)) return part;
 
   if (part.type === "image" && !looksLikeImage(part.data)) {

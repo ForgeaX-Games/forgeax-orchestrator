@@ -36,7 +36,9 @@ function objectOf(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-/** Keep the original flat one-question shape as a wire-compatible alias. */
+/** Keep the original flat one-question export for older host integrations.
+ * Validation deliberately does not call this compatibility helper: grouped
+ * rows must be checked before any projection can discard their shape. */
 export function normalizeAskUserArgs(args: Record<string, unknown>): Record<string, unknown> {
   if (typeof args.question === "string" && args.question.trim()) return args;
   if (!Array.isArray(args.questions) || args.questions.length !== 1) return args;
@@ -217,6 +219,29 @@ export default {
     if (Array.isArray(args.questions) && (args.questions.length < 1 || args.questions.length > 3)) {
       return "ask_user: 'questions' must contain 1–3 items.";
     }
+    const rawQuestions = Array.isArray(args.questions)
+      ? args.questions
+      : typeof args.question === "string" ? [args] : [];
+    if (rawQuestions.some((value) => !objectOf(value))) {
+      return "ask_user: every question must be an object.";
+    }
+    if (rawQuestions.some((value) => {
+      const row = objectOf(value)!;
+      return typeof row.question !== "string" || !row.question.trim();
+    })) {
+      return "ask_user: every 'question' must be a non-empty string.";
+    }
+    if (rawQuestions.some((value) => {
+      const options = objectOf(value)!.options;
+      if (!Array.isArray(options) || options.length < 1 || options.length > 5) return true;
+      return options.some((option) => {
+        if (typeof option === "string") return !option.trim();
+        const record = objectOf(option);
+        return !record || typeof record.label !== "string" || !record.label.trim();
+      });
+    })) {
+      return "ask_user: every question must provide 1–5 valid options.";
+    }
     const questions = normalizeAskUserQuestions(args);
     if (questions.length === 0) return "ask_user: at least one non-empty question is required.";
     if (questions.some((question) => !question.question.trim())) {
@@ -238,7 +263,12 @@ export default {
     const sid = ctx.tree.sid;
     const agentPath = ctx.agentPath;
 
-    const handle = registerAsk(sid, agentPath, ASK_TIMEOUT_MS);
+    const handle = registerAsk({
+      sid,
+      agentPath,
+      instanceId: ctx.instanceId,
+      runtimeEpochId: ctx.runtimeEpochId,
+    }, ASK_TIMEOUT_MS);
 
     // Abort (user interrupt) → resolve the pending ask with null so we don't
     // dangle. registerAsk's dispose() in finally also clears it.
@@ -257,7 +287,11 @@ export default {
       }
       // 不做选项白名单过滤 —— 除了给定选项,UI 还允许用户「其他…」自填自由文本,
       // 这类值不在 opts 里,必须如实带回(只去空白)。
-      const byId = new Map(answers.map((answer) => [answer.questionId, answer.values]));
+      const groupedAnswers: Array<{ questionId: string; values: string[] }> =
+        typeof answers[0] === "string"
+          ? [{ questionId: questions[0]?.id ?? "question-1", values: answers as string[] }]
+          : answers as Array<{ questionId: string; values: string[] }>;
+      const byId = new Map(groupedAnswers.map((answer) => [answer.questionId, answer.values]));
       const picked = questions.map((question) => ({
         questionId: question.id,
         values: (byId.get(question.id) ?? []).map((value) => value.trim()).filter(Boolean),

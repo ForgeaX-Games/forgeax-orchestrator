@@ -10,14 +10,18 @@
  * `/llmkey` endpoint and the `llmKeyConfigured` field are gone.
  */
 
+import { invalidateModelCatalogCache } from '../kernel/model-catalog';
+import { invalidateLiveCatalogCache } from '../lib/llm-gateway/live-catalog';
 import { Hono } from 'hono';
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { defaultProjectRoot } from '@forgeax/platform-io';
-import { friendlyPath } from '@forgeax/platform-io';
+import { defaultProjectRoot, friendlyPath, resolveStudioRuntimePorts } from '@forgeax/platform-io';
 import { getSessionManager } from '../core/session-manager';
-import { DEFAULT_UPLOAD_REPO } from '../upload/config';
+import { getUploadDefaults } from '../orchestration-seams';
+
+const DEFAULT_FEEDBACK_DATA_REPO = 'ForgeaX-Games/Forgeax-Data';
+const DEFAULT_FEEDBACK_ISSUES_REPO = 'ForgeaX-Games/forgeax-issues';
 
 const SAFE_ENV_KEYS = new Set([
   'ANTHROPIC_API_KEY',
@@ -31,7 +35,7 @@ const SAFE_ENV_KEYS = new Set([
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
   'GEMINI_API_KEY',
-  // wb-character & other multimodal plugins — image / video keys. See
+  // character & other multimodal plugins — image / video keys. See
   // src/lib/image-gateway/clients/dispatcher.ts for the
   // primary/fallback chain (seedream → gemini → azure-gpt-image).
   'ARK_IMAGE_KEY',
@@ -48,13 +52,18 @@ const SAFE_ENV_KEYS = new Set([
   'DEEPSEEK_API_KEY',
   'DEEPSEEK_BASE_URL',
   // Runtime-instance → GitHub upload (see src/upload). All three are drawer-editable.
-  // Decision 2026-07-09: FORGEAX_UPLOAD_REPO is user-configurable (default =
-  // DEFAULT_UPLOAD_REPO shared org repo) — users may upload to any repo their own
-  // token can write. Residual risk of a network-repointable destination is
+  // Decision 2026-07-09: FORGEAX_UPLOAD_REPO is user-configurable (default = the
+  // product-shell-injected shared org repo) — users may upload to any repo their
+  // own token can write. Residual risk of a network-repointable destination is
   // accepted pending the loopback hardening (server binds 127.0.0.1 in dev-local).
   'FORGEAX_UPLOAD_GITHUB_TOKEN',
   'FORGEAX_UPLOAD_REPO',
   'FORGEAX_UPLOAD_BRANCH',
+  // Product feedback delivery: redacted .forgeax diagnostics + GitHub Issue.
+  'FORGEAX_FEEDBACK_GITHUB_TOKEN',
+  'FORGEAX_FEEDBACK_DATA_REPO',
+  'FORGEAX_FEEDBACK_ISSUES_REPO',
+  'FORGEAX_FEEDBACK_TRIAGE_MODEL',
 ]);
 
 /**
@@ -157,6 +166,13 @@ export function createSettingsRouter(): Hono {
     if (existsSync(envPath)) {
       try { env = parseEnv(await readFile(envPath, 'utf-8')); } catch { /* */ }
     }
+    // Server boot keeps explicit process values and fills only missing keys
+    // from .env. Settings must show that same effective configuration, including
+    // process-only credentials and explicit empty overrides. Response masking
+    // and the fixed key allowlist below remain the network boundary.
+    for (const key of SAFE_ENV_KEYS) {
+      if (process.env[key] !== undefined) env[key] = process.env[key]!;
+    }
     return c.json({
       env: {
         ANTHROPIC_API_KEY: maskKey(env.ANTHROPIC_API_KEY),
@@ -176,17 +192,25 @@ export function createSettingsRouter(): Hono {
         DEEPSEEK_API_KEY: maskKey(env.DEEPSEEK_API_KEY),
         DEEPSEEK_BASE_URL: env.DEEPSEEK_BASE_URL ?? null,
         // Workspace upload — a masked token represents an env override; null
-        // means no override, so upload uses the compiled built-in fallback. Repo
-        // shows the effective destination (env override or shared default).
+        // means no override, so upload uses the product-shell-injected shared
+        // default. Repo shows the effective destination (env override or the
+        // injected shared repo; null on a standalone build with neither).
         FORGEAX_UPLOAD_GITHUB_TOKEN: maskKey(env.FORGEAX_UPLOAD_GITHUB_TOKEN),
-        FORGEAX_UPLOAD_REPO: env.FORGEAX_UPLOAD_REPO?.trim() || DEFAULT_UPLOAD_REPO,
+        FORGEAX_UPLOAD_REPO: env.FORGEAX_UPLOAD_REPO?.trim() || getUploadDefaults()?.repo || null,
         FORGEAX_UPLOAD_BRANCH: env.FORGEAX_UPLOAD_BRANCH ?? null,
+        // A masked value is an env override; null uses Server's compiled shared
+        // credential, matching the existing workspace-upload configuration.
+        FORGEAX_FEEDBACK_GITHUB_TOKEN: maskKey(env.FORGEAX_FEEDBACK_GITHUB_TOKEN),
+        FORGEAX_FEEDBACK_DATA_REPO: env.FORGEAX_FEEDBACK_DATA_REPO?.trim() || DEFAULT_FEEDBACK_DATA_REPO,
+        FORGEAX_FEEDBACK_ISSUES_REPO: env.FORGEAX_FEEDBACK_ISSUES_REPO?.trim() || DEFAULT_FEEDBACK_ISSUES_REPO,
+        FORGEAX_FEEDBACK_TRIAGE_MODEL: env.FORGEAX_FEEDBACK_TRIAGE_MODEL ?? null,
       },
       // UI displays these in the "关于" section — redact $HOME → ~ for
       // portability + privacy hygiene (was leaking operator home prefix).
       paths: {
         projectRoot: friendlyPath(projectRoot),
         envPath: friendlyPath(envPath),
+        studioPorts: resolveStudioRuntimePorts(projectRoot),
       },
     });
   });
@@ -208,15 +232,16 @@ export function createSettingsRouter(): Hono {
     for (const [k, v] of Object.entries(body)) {
       if (!SAFE_ENV_KEYS.has(k)) continue;
       if (typeof v !== 'string') continue;
+      const previous = process.env[k] ?? env[k] ?? '';
       if (v === '') {
         // Empty string = clear override (restore built-in defaults, e.g. upload token).
-        if (SIDECAR_CRED_KEYS.has(k) && (env[k] ?? '') !== '') credChanged = true;
+        if (SIDECAR_CRED_KEYS.has(k) && previous !== '') credChanged = true;
         delete env[k];
         delete process.env[k];
         touched++;
         continue;
       }
-      if (SIDECAR_CRED_KEYS.has(k) && (env[k] ?? '') !== v) credChanged = true;
+      if (SIDECAR_CRED_KEYS.has(k) && previous !== v) credChanged = true;
       env[k] = v;
       process.env[k] = v;   // live-apply so the running server picks it up without a restart (U3 first-run onboarding)
       touched++;
@@ -228,6 +253,8 @@ export function createSettingsRouter(): Hono {
       // 刚写入的新凭据 spawn。不重启则新 key/base-url 要等整进程重启才生效(本 bug 根因)。
       // best-effort:重启失败不该让"已保存"的写回退;失败只记 warning,用户仍可手动重启兜底。
       if (credChanged) {
+        invalidateModelCatalogCache();
+        invalidateLiveCatalogCache();
         try {
           const { restartSidecar } = await import('../kernel/sidecar-singleton');
           await restartSidecar();

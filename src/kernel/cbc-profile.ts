@@ -35,7 +35,10 @@ import {
   toCcPermissionMode,
   type CcPermissionMode,
 } from './cc-profile';
+import { buildKernelTask } from './kernel-context';
 import { DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
+import { resolveForgeaxToolsServerEntry } from './mcp/forgeax-tools-runtime';
+import { resolveBundledBunExecutable } from '../cli-providers/mcp/permission-server-entry';
 
 const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
 
@@ -77,6 +80,12 @@ export type CbcPermissionMode = CcPermissionMode;
 /** 中立 PermissionMode → cbc `--permission-mode`(枚举与 cc 一致,直接复用翻译)。 */
 export const toCbcPermissionMode = toCcPermissionMode;
 
+export const CBC_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = [
+  'gated', 'autoEdits', 'planning', 'unrestricted',
+];
+
+export const CBC_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
+
 /**
  * 模型 id 方言翻译:forgeax 用**连字符**版本号(`claude-opus-4-8`,可带 `[1m]`),
  * 而 cbc 只认**点号**版本号(`claude-opus-4.8` / 长上下文 `claude-opus-4.8-1m`)。
@@ -97,24 +106,6 @@ export function toCbcModel(m?: string): string | undefined {
   return oneM ? `${base}-1m` : base;
 }
 
-/** cbc 能兑现的档位:枚举与 cc 一致(同一 `--permission-mode` 分叉),故四档全支持。
- *
- *  ⚠️ 已知风险(不再偷偷抬档,改为如实告知):cbc 把原生 project MCP 调用当
- *  DeferExecuteTool,**低档 + 携带 project MCP 的轮次可能等一个 Studio 答不了的
- *  审批而挂住**。历史实现对这种轮次强制抬到 bypassPermissions 来规避,但那等于
- *  静默改掉用户显式选择(见 buildCbcArgs 内注释),故已移除。选低档的用户由 UI
- *  的 riskyGearHint 提示承担这个风险。 */
-export const CBC_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = [
-  'gated',
-  'autoEdits',
-  'planning',
-  'unrestricted',
-];
-
-/** cbc 默认档 —— 派生自全内核默认,不独立持值(headless 无 permission-prompt-tool,
- *  必须自足放行;host-tool 经 `--allowedTools` 显式放行)。 */
-export const CBC_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
-
 /** 是否已有该 thread 的 cbc on-disk session 文件(决定 resume vs 新建,重启安全)。
  *  cbc 编码:去掉前导 `/`、把 `/` 换 `-`、**保留点号**(与 cc 的 `[/.]→-` 不同)。 */
 export function cbcSessionExists(cwd: string, tid: string): boolean {
@@ -131,13 +122,13 @@ export function buildCbcSessionArgs(
   tid: string | undefined,
   projectRoot: string,
   startedThreadIds: ReadonlySet<string>,
-): { args: string[]; threadId?: string } {
+): { args: string[]; threadId?: string; fresh: boolean } {
   const t = tid?.trim();
-  if (!t || !/^[0-9a-f-]{36}$/i.test(t)) return { args: [] };
+  if (!t || !/^[0-9a-f-]{36}$/i.test(t)) return { args: [], fresh: true };
   if (startedThreadIds.has(t) || cbcSessionExists(projectRoot, t)) {
-    return { args: ['--resume', t], threadId: t };
+    return { args: ['--resume', t], threadId: t, fresh: false };
   }
-  return { args: ['--session-id', t], threadId: t };
+  return { args: ['--session-id', t], threadId: t, fresh: true };
 }
 
 /**
@@ -179,9 +170,11 @@ function buildCbcSystemPromptArgs(text: string, mode: 'append' | 'replace', key:
 /** 工具面策略 argv(中立 toolPolicy → cbc `--tools` / `--disallowedTools`,与 cc 一致)。 */
 function buildCbcToolPolicyArgs(policy: TurnRequest['toolPolicy']): string[] {
   const out: string[] = [];
-  const allow = policy?.allow?.filter((t): t is string => typeof t === 'string' && t.trim().length > 0);
+  const allow = policy?.allow?.filter((t) => typeof t === 'string' && t.trim());
   if (allow && allow.length) out.push('--tools', allow.join(','));
-  const deny = new Set(['TodoWrite', ...(policy?.deny ?? [])].filter((t): t is string => typeof t === 'string' && t.trim().length > 0));
+  const deny = new Set(['TodoWrite', ...(policy?.deny ?? [])].filter(
+    (t): t is string => typeof t === 'string' && t.trim().length > 0,
+  ));
   out.push('--disallowedTools', ...deny);
   return out;
 }
@@ -240,18 +233,13 @@ export function buildCbcMcpArgs(req: TurnRequest, permSid: string, projectRoot =
     FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
     FORGEAX_SID: req.hostSessionId?.trim() || permSid,
     FORGEAX_AGENT: req.session.agentId?.trim() || 'forge',
-    FORGEAX_FXT_EXPOSE: tools.map((tool) => tool.name).join(','),
-    // a peer agent CLI has no reliable per-tool hook/approval callback for native
-    // MCP. Keep project MCP on the host route for every trust tier so the
-    // canonical server trust gate remains in force and no second child is
-    // mounted beside the pooled bridge.
     FORGEAX_DISABLE_PROJECT_MCP: '1',
     // 让 fxt server 也从 tools/list 里剔除感知工具(双保险:模型既看不到也调不动)。
     FORGEAX_DISABLE_PERCEPTION: '1',
   };
 
   // host-tool 桥:非内置工具经 MCP→HTTP 回调宿主执行(内置工具在 mcp server 内本地处理)。
-  const BUILTIN_FXT = new Set(['echo', 'list_games', 'memory_search', 'remember', 'soul_create', 'npc_wire', 'query_world', 'capture_frame']);
+  const BUILTIN_FXT = new Set(['echo', 'list_games', 'memory_search', 'remember', 'npc_wire', 'query_world', 'capture_frame']);
   const bridged = tools.filter((t) => !BUILTIN_FXT.has(t.name));
   if (bridged.length > 0) {
     try {
@@ -263,19 +251,19 @@ export function buildCbcMcpArgs(req: TurnRequest, permSid: string, projectRoot =
     }
   }
 
-  const mcpServers: Record<string, unknown> = {
+  const mcpServers = {
     fxt: {
-      command: process.execPath,
-      args: [resolvePath(import.meta.dirname, 'mcp/forgeax-tools-server.mjs')],
+      command: resolveBundledBunExecutable(),
+      args: [resolveForgeaxToolsServerEntry()],
       env,
     },
   };
+
   try {
     const cfgPath = resolvePath(tmpdir(), `forgeax-cbc-mcp-${permSid || req.session.agentId || 'x'}.json`);
     writeFileSync(cfgPath, JSON.stringify({ mcpServers }));
     // 编排层显式放行声明的工具 → headless 不卡审批(= 权限归编排层)。感知工具已剔除。
-    const allowedTools = tools.map((tool) => `mcp__fxt__${tool.name}`);
-    return ['--mcp-config', cfgPath, '--allowedTools', ...allowedTools];
+    return ['--mcp-config', cfgPath, '--allowedTools', ...tools.map((t) => `mcp__fxt__${t.name}`)];
   } catch {
     return [];
   }
@@ -289,8 +277,8 @@ export function buildCbcArgs(
   req: TurnRequest,
   _projectRoot: string,
   sessionArgs: string[],
-  // fail-safe 缺省(同 cc):漏传时走 req.permissionMode,不静默跳最高放行档。
-  permissionMode: PermissionMode = req.permissionMode ?? CBC_DEFAULT_PERMISSION_MODE,
+  permissionMode: PermissionMode | CbcPermissionMode = req.permissionMode ?? CBC_DEFAULT_PERMISSION_MODE,
+  bootstrapContext = false,
 ): string[] {
   const sp = req.systemPrompt;
   const systemPrompt = sp.persona?.trim()
@@ -304,29 +292,18 @@ export function buildCbcArgs(
   const hermeticArgs = buildCbcHermeticArgs(req.trustTier);
   const budgetArgs = buildCbcBudgetArgs(req.budget);
   const fallbackArgs = buildCbcFallbackArgs(req.fallbackModels);
-  // 历史上这里对「携带 mcp__ 工具的轮次」强制抬到 bypassPermissions:a peer agent CLI 把原生
-  // project MCP 调用当 DeferExecuteTool,非交互流模式下低档会等一个 Studio 中途答不了的
-  // 审批而挂住。
-  //
-  // 现在默认档已是 `unrestricted`,那条抬档对默认路径是 no-op —— 它唯一还能生效的场合,
-  // 就是**用户显式选了更严的档**,于是等于静默改掉用户的选择(实测:选 gated 后真实 argv
-  // 仍是 bypassPermissions)。故移除:尊重显式档位,挂住风险由 UI 的 riskyGearHint 明示,
-  // 不在这里偷偷改档。
-  const effectivePermissionMode = toCcPermissionMode(permissionMode);
 
   const spKey = req.hostSessionId?.trim() || tid || req.session.agentId?.trim() || 'x';
   const systemPromptArgs = buildCbcSystemPromptArgs(systemPrompt, sp.mode ?? 'append', spKey);
 
-  const message = sp.dynamicSuffix?.trim()
-    ? `${req.input.text}\n\n${sp.dynamicSuffix.trim()}`
-    : req.input.text;
+  const message = buildKernelTask(req, bootstrapContext);
 
   return [
     '-p',
     '--output-format=stream-json',
     '--include-partial-messages',
     '--verbose',
-    '--permission-mode', effectivePermissionMode,
+    '--permission-mode', toCbcPermissionMode(permissionMode),
     ...hermeticArgs,
     ...mcpArgs,
     ...toolPolicyArgs,

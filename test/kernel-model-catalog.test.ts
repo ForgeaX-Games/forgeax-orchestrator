@@ -16,7 +16,7 @@ import { mkdtempSync, readFileSync, rmSync, existsSync, mkdirSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { registerKernel, unregisterKernel, type AgentKernel, type KernelCapabilities } from "@forgeax/agent-runtime";
-import { resolveKernelModelCatalog, _resetModelCatalogCache } from "../src/kernel/model-catalog";
+import { resolveKernelModelCatalog, invalidateModelCatalogCache } from "../src/kernel/model-catalog";
 
 const CAPS: KernelCapabilities = {
   streaming: false,
@@ -55,7 +55,7 @@ beforeEach(() => {
   keyRoot = mkdtempSync(resolve(tmpdir(), "forgeax-modelcat-"));
   prevTtl = process.env.FORGEAX_DRIVER_MODEL_CACHE_TTL_MS;
   process.env.FORGEAX_DRIVER_MODEL_CACHE_TTL_MS = "0"; // 缺省关缓存,缓存单测自己开
-  _resetModelCatalogCache();
+  invalidateModelCatalogCache();
 });
 
 afterEach(() => {
@@ -63,7 +63,7 @@ afterEach(() => {
   if (prevTtl === undefined) delete process.env.FORGEAX_DRIVER_MODEL_CACHE_TTL_MS;
   else process.env.FORGEAX_DRIVER_MODEL_CACHE_TTL_MS = prevTtl;
   rmSync(keyRoot, { recursive: true, force: true });
-  _resetModelCatalogCache();
+  invalidateModelCatalogCache();
 });
 
 describe("resolveKernelModelCatalog — fallback chain", () => {

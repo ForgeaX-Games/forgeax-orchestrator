@@ -2,7 +2,7 @@
  * Phase D1 — tool kind loader.
  *
  * Walks every merged manifest and extracts ManifestToolEntry records from
- * `provides.tools[]` (any of kind=workbench/agent/skill/tool can carry tools).
+ * normalized `contributes.tools[]` across every extension category.
  * Schema refs (args/returns) given as strings are resolved relative to the
  * manifest dir but **not** read from disk here — the loader only normalizes
  * the path so ToolRegistry.call() can read it lazily on first dispatch.
@@ -13,7 +13,7 @@
  *
  *     // entry.backend
  *     export default {
- *       'wb-character.generate': async (args, ctx) => { ... },
+ *       'character.generate': async (args, ctx) => { ... },
  *     }
  *
  * Tools whose plugin omits entry.backend get registered as **schema-only** —
@@ -22,7 +22,7 @@
  * lands.
  */
 import { dirname, isAbsolute, resolve } from 'node:path';
-import type { ManifestToolEntry, ExtensionManifest } from '@forgeax/types';
+import type { ManifestToolEntry } from '@forgeax/types';
 import type { MergedManifest } from '../merger';
 import type { ExtensionOrigin } from '../scanner';
 import type { KindLoadIssue } from './types';
@@ -36,6 +36,10 @@ export interface ToolEntry {
   /** Absolute path to returns JSONSchema file, or the inline object. */
   returnsSchema?: unknown;
   exposedToAI: boolean;
+  /** Plugin-owned: inject into the default conversation agent's host-tool allow. */
+  defaultAgentAllow?: boolean;
+  /** Keep this tool when the provider tool list is trimmed to 128. */
+  pinned?: boolean;
   /** 07 §9.5 — handler must wait for user ack before running for AI callers.
    *  Three-value enum aligned with ManifestToolEntrySchema.requireConfirm:
    *  'always' (every ai call), 'destructive' (irreversible side-effects),
@@ -71,14 +75,14 @@ function pickDescription(d: ManifestToolEntry['description']): string | undefine
 export function loadTools(
   merged: MergedManifest,
 ): { entries: ToolEntry[]; issues: KindLoadIssue[] } {
-  const m = merged.manifest as ExtensionManifest & { provides?: { tools?: ManifestToolEntry[] } };
-  const tools = m.provides?.tools;
+  const m = merged.manifest;
+  const tools = merged.normalizedManifest.contributes.tools;
   if (!tools || tools.length === 0) return { entries: [], issues: [] };
 
   const dir = dirname(merged.originPath);
   const backend = m.entry?.backend?.trim();
   const backendPath = backend ? (isAbsolute(backend) ? backend : resolve(dir, backend)) : null;
-  const requestedEnv = (m as ExtensionManifest & { requestedEnv?: string[] }).requestedEnv ?? [];
+  const requestedEnv = m.requestedEnv ?? [];
 
   const entries: ToolEntry[] = [];
   const issues: KindLoadIssue[] = [];
@@ -100,6 +104,8 @@ export function loadTools(
       argsSchema: normalizeSchemaRef(t.args, dir),
       returnsSchema: normalizeSchemaRef(t.returns, dir),
       exposedToAI: t.exposedToAI ?? false,
+      defaultAgentAllow: t.defaultAgentAllow,
+      pinned: t.pinned,
       requireConfirm: t.requireConfirm,
       confirmMessage: pickDescription(t.confirmMessage),
       description: pickDescription(t.description),

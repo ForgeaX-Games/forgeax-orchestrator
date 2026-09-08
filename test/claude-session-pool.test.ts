@@ -42,6 +42,7 @@ let nextFakePid = 50_000;
 function createFakeTransport(
   initialize: 'success' | 'error' | 'timeout' | 'exit',
   onClose: () => void,
+  options: { failUserWrite?: boolean } = {},
 ): ClaudeSessionTransport {
   const dataCbs = new Set<(stream: 'stdout' | 'stderr', chunk: string) => void>();
   const exitCbs = new Set<(info: { code: number; signal?: string; error?: Error }) => void>();
@@ -77,7 +78,10 @@ function createFakeTransport(
         });
         return;
       }
-      if (request.type === 'user') emit({ type: 'result', result: 'RECOVERED', stop_reason: 'end_turn' });
+      if (request.type === 'user') {
+        if (options.failUserWrite) throw new Error('fixture user write failed');
+        emit({ type: 'result', result: 'RECOVERED', stop_reason: 'end_turn' });
+      }
     },
     onData(cb) { dataCbs.add(cb); return () => dataCbs.delete(cb); },
     onExit(cb) { exitCbs.add(cb); return () => exitCbs.delete(cb); },
@@ -89,6 +93,41 @@ function createFakeTransport(
 }
 
 describe('Claude stream-json session pool', () => {
+  test('direct transport rejects Node stdin EPIPE without crashing its host', async () => {
+    const moduleUrl = new URL('../src/kernel/claude-session-transport.ts', import.meta.url).href;
+    const program = `
+      import { createDirectClaudeTransport } from ${JSON.stringify(moduleUrl)};
+      const transport = createDirectClaudeTransport({
+        cmd: 'bash', args: ['-c', 'exec 0<&-; echo READY; sleep 30'], cwd: process.cwd(),
+      });
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('fixture did not become ready')), 2000);
+        const off = transport.onData((stream, chunk) => {
+          if (stream !== 'stdout' || !chunk.includes('READY')) return;
+          clearTimeout(timer); off(); resolve();
+        });
+      });
+      try { await transport.write('must-fail\\n'); console.log('WRITE_OK'); }
+      catch { console.log('WRITE_REJECTED'); }
+      await transport.close();
+    `;
+    const node = Bun.spawn({
+      cmd: ['node', '--no-warnings', '--experimental-strip-types', '--input-type=module', '-e', program],
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(node.stdout).text(),
+      new Response(node.stderr).text(),
+      node.exited,
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('WRITE_REJECTED');
+    expect(stderr).not.toContain("Unhandled 'error' event");
+  }, 8000);
+
   test('keeps own dynamic context eligible and keeps imported turns cold', () => {
     expect(claudeSessionEligible({ trustTier: 'own' })).toBe(true);
     expect(claudeSessionEligible({ trustTier: 'own' })).toBe(true);
@@ -522,6 +561,91 @@ process.stdin.on('data', (chunk) => {
     } finally {
       if (previousTimeout === undefined) delete process.env.FORGEAX_CLAUDE_CONTROL_INITIALIZE_TIMEOUT_MS;
       else process.env.FORGEAX_CLAUDE_CONTROL_INITIALIZE_TIMEOUT_MS = previousTimeout;
+    }
+  });
+
+  test('evicts a persistent session when the user frame write fails', async () => {
+    const pool = new ClaudeSessionPool<Record<string, unknown>>();
+    let createCount = 0;
+    let closeCount = 0;
+    let abortAdds = 0;
+    let abortRemoves = 0;
+    const signal = {
+      aborted: false,
+      addEventListener(type: string) { if (type === 'abort') abortAdds += 1; },
+      removeEventListener(type: string) { if (type === 'abort') abortRemoves += 1; },
+    } as unknown as AbortSignal;
+    const make = () => pool.acquire('thread-write-error', 'same-capability-key', async () => {
+      createCount += 1;
+      return createFakeTransport('success', () => { closeCount += 1; }, { failUserWrite: createCount === 1 });
+    });
+    try {
+      const first = await make();
+      await expect(first.session.execute('first-write-fails', signal)).rejects.toThrow('fixture user write failed');
+      expect(closeCount).toBe(1);
+      expect(abortAdds).toBe(1);
+      expect(abortRemoves).toBe(1);
+
+      const recovered = await make();
+      expect(recovered.reused).toBe(false);
+      const turn = await recovered.session.execute('second-write-succeeds', new AbortController().signal);
+      expect((await collect(turn.lines)).some((line) => line.result === 'RECOVERED')).toBe(true);
+      expect((await turn.exit).code).toBe(0);
+      expect(createCount).toBe(2);
+    } finally {
+      await pool.closeAll();
+    }
+  });
+
+  test('a queued turn never writes to a transport after the active write fails', async () => {
+    const pool = new ClaudeSessionPool<Record<string, unknown>>();
+    let createCount = 0;
+    let closeCount = 0;
+    let userWrites = 0;
+    let rejectFirstWrite: ((error: Error) => void) | undefined;
+    const broken = createFakeTransport('success', () => { closeCount += 1; });
+    const healthy = createFakeTransport('success', () => { closeCount += 1; });
+    const brokenWrite = broken.write.bind(broken);
+    broken.write = (data) => {
+      const request = JSON.parse(data) as { type?: string };
+      if (request.type !== 'user') return brokenWrite(data);
+      userWrites += 1;
+      if (userWrites === 1) {
+        return new Promise<void>((_, reject) => { rejectFirstWrite = reject; });
+      }
+      return brokenWrite(data);
+    };
+    const make = () => pool.acquire('thread-write-race', 'same-capability-key', async () => {
+      createCount += 1;
+      return createCount === 1 ? broken : healthy;
+    });
+    try {
+      const acquired = await make();
+      const first = acquired.session.execute('FIRST', new AbortController().signal);
+      const writeDeadline = Date.now() + 1_000;
+      while (!rejectFirstWrite && Date.now() < writeDeadline) await Bun.sleep(1);
+      expect(rejectFirstWrite).toBeDefined();
+      const second = acquired.session.execute('SECOND', new AbortController().signal);
+      const firstOutcome = first.then(
+        () => ({ resolved: true as const }),
+        (error: Error) => ({ resolved: false as const, error }),
+      );
+      const secondOutcome = second.then(
+        () => ({ resolved: true as const }),
+        (error: Error) => ({ resolved: false as const, error }),
+      );
+      rejectFirstWrite!(new Error('fixture deferred write failed'));
+      const [firstResult, secondResult] = await Promise.all([firstOutcome, secondOutcome]);
+      expect(firstResult).toMatchObject({ resolved: false, error: { message: 'fixture deferred write failed' } });
+      expect(secondResult).toMatchObject({ resolved: false, error: { message: expect.stringMatching(/not alive/i) } });
+      expect(userWrites).toBe(1);
+      expect(closeCount).toBe(1);
+
+      const recovered = await make();
+      expect(recovered.reused).toBe(false);
+      expect(createCount).toBe(2);
+    } finally {
+      await pool.closeAll();
     }
   });
 

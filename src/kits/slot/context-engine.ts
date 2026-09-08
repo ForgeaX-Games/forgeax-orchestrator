@@ -1,13 +1,13 @@
 /** ContextEngine —— assemble system prompt blocks from `SlotRegistry`.
  *
- *  Lives between BaseAgent (owns the SlotRegistry instance) and
- *  ConsciousAgent's `assemblePrompt` callback. Returns `{ system,
+ *  Lives between RuntimeAgentHost (owns the SlotRegistry instance) and
+ *  prompt assembly. Returns `{ system,
  *  messages }`:
  *    - `system`   : SystemBlock[]  flat, sorted by (cacheHint section, priority asc)
  *    - `messages` : LLMMessage[]   passthrough of sessionHistory
  *
  *  Why a class（vs free function）：keeps the registry reference captured so
- *  callers don't reach into BaseAgent for slots. Matches ref shape; same
+ *  callers don't reach into RuntimeAgentHost for slots. Matches ref shape; same
  *  contract.
  *
  *  Ported from `agenteam-os-ref/src/capability/slot/context-engine.ts`. */

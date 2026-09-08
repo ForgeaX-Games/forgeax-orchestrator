@@ -6,3 +6,4 @@ dist/
 .env
 .env.local
 docs/agentic-design-patterns
+.codex/hooks.json

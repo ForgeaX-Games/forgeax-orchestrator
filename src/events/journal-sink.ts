@@ -38,7 +38,7 @@ const FILE_LIMIT_BYTES = 32 * 1024 * 1024;
  *  记了待办 —— 严重度判错了,它是密钥落盘。另有任意-topic 的 HTTP 入口,所以白名单
  *  必须是前缀精确匹配,新 topic 一律不落。 */
 function isJournalTopic(topic: string): boolean {
-  return topic.startsWith('ui.') || topic === 'workbench.active-game.changed';
+  return topic.startsWith('ui.') || topic === 'project.active.changed';
 }
 
 /** 键名像凭据就把值换掉。白名单之内也照脱 —— 纵深防御:哪天有人往 ui.* 事件里

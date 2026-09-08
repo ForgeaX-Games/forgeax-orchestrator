@@ -10,8 +10,7 @@
  *    SSE）；命令系统通过 `cli_providers_list` 等 temporary 命令读取本 registry 元数据
  *    （R3 后期补，本轮不在范围）。
  *  - lifecycle 标记：整个 /api/cli/ 分支带 `Deprecation: true` header；目标是
- *    forgeax-v1.0 sunset，届时被原生 ScriptAgent / commands `attach_script_agent`
- *    取代。 */
+ *    forgeax-v1.0 sunset，届时统一由 Kernel-backed RuntimeAgentHost 取代。 */
 
 import type { CliProvider, ProviderId } from "./types";
 

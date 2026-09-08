@@ -76,7 +76,7 @@ export default {
     const description = args.description ? String(args.description) : undefined;
     const result = await terminalManager.exec(command!, {
       cwd, initialCwd,
-      agentId: ctx.agentPath,
+      agentId: `${ctx.sid}:${ctx.instanceId}:${ctx.runtimeEpochId}`,
       timeout, description,
       signal: ctx.signal,
     });

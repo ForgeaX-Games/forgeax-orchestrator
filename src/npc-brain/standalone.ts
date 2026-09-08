@@ -1,5 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Hono } from 'hono';
 import { createNpcRouter } from '../api/npc';
 import { NpcBrainService, type NpcBrainConfig } from './service';
@@ -214,7 +215,23 @@ function cors(response: Response, origin: string | null): Response {
   return response;
 }
 
-if (import.meta.main) {
+/** `import.meta.main` is rewritten to a CommonJS main check by Bun's bundle
+ * step, which becomes true when this module is inlined into dist/index.js.
+ * Compare the actual entry path instead so importing the package root cannot
+ * accidentally launch the standalone service inside forgeax-server. */
+export function isStandaloneNpcBrainEntrypoint(
+  moduleUrl: string,
+  argvEntry: string | undefined,
+): boolean {
+  if (!argvEntry) return false;
+  try {
+    return resolve(fileURLToPath(moduleUrl)) === resolve(argvEntry);
+  } catch {
+    return false;
+  }
+}
+
+if (isStandaloneNpcBrainEntrypoint(import.meta.url, process.argv[1])) {
   try {
     const service = startStandaloneNpcBrain(resolveStandaloneNpcBrainConfig());
     process.stdout.write(`[forgeax-npc-brain] listening ${service.url}\n`);

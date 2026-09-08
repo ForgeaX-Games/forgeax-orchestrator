@@ -8,16 +8,17 @@
  *
  * See docs/v2-vision/architecture-evolution/03-AGENT-SKILL-PLUGIN-TRINITY.md §2.1.
  */
-import { normalizeManifest, type ExtensionManifest, type ExtensionManifestV2 } from '@forgeax/types';
-import type { ExtensionOrigin, ScannedManifest } from './scanner';
+import type { AnyExtensionManifest, ExtensionManifestV2 } from '@forgeax/types';
+import type { DevExtensionRuntime, ExtensionOrigin, ScannedManifest } from './scanner';
 
 export interface MergedManifest {
-  manifest: ExtensionManifest;
-  normalizedManifest?: ExtensionManifestV2;
+  manifest: AnyExtensionManifest;
+  normalizedManifest: ExtensionManifestV2;
   origin: ExtensionOrigin;
   originPath: string;
   /** Lower-precedence copies of the same id, ordered most→least specific. */
   shadowedBy: Array<{ origin: ExtensionOrigin; originPath: string }>;
+  runtime?: DevExtensionRuntime;
 }
 
 export interface MergeIssue {
@@ -32,9 +33,12 @@ export interface MergeResult {
   issues: MergeIssue[];
 }
 
-const ORIGIN_RANK: Record<ExtensionOrigin, number> = { builtin: 0, user: 1, project: 2 };
+// Higher rank wins on same-id dedupe. npm-declared embedded extensions are
+// product-pinned first-party (like builtin) but supersede a legacy builtin
+// vendored copy of the same id; user/project installs still override npm.
+const ORIGIN_RANK: Record<ExtensionOrigin, number> = { builtin: 0, npm: 1, user: 2, project: 3, dev: 4 };
 
-/** Apply project > user > builtin dedupe + topological sort.
+/** Apply project > user > npm > builtin dedupe + topological sort.
  *
  *  Topo failures (unknown dep, cycle) are reported in `issues` and the
  *  affected plugin is appended at the end in id-stable order so callers
@@ -53,10 +57,11 @@ export function mergeManifests(scanned: ScannedManifest[]): MergeResult {
     const [head, ...rest] = copies;
     winners.push({
       manifest: head.manifest,
-      normalizedManifest: head.normalizedManifest ?? normalizeManifest(head.manifest),
+      normalizedManifest: head.normalizedManifest,
       origin: head.origin,
       originPath: head.originPath,
       shadowedBy: rest.map((r) => ({ origin: r.origin, originPath: r.originPath })),
+      ...(head.runtime ? { runtime: head.runtime } : {}),
     });
   }
   // Stable order baseline before topo (id ascending) so equal-depth deps stay deterministic.

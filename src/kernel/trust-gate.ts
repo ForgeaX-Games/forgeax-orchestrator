@@ -21,8 +21,9 @@
  * R2-08 写/删作用域:目标路径能解析得出 ⇒ 目录内/外都弹卡确认(卡上显示解析后的目标路径,037-A);
  * 拿不到路径/projectRoot ⇒ fail-closed(deny,无法证明目标)。
  *
- * 权威 = agent 的 trustTier(由 R6 `loadAgentRecord` 按**加载路径**定,非 pack 自报);
- * endpoint 自行求 trustTier,**不信子进程上报**。fail-closed:未知/不确定 → 更严(deny/imported)。
+ * 权威 = live AgentInstance 的 TemplateCatalog registration trust；Session resident
+ * 在 materialize 时由宿主按来源推导并持久化，bootstrap 再恢复进 Catalog。endpoint
+ * **不信子进程上报**。fail-closed:未知/不确定 → 更严(deny/imported)。
  *
  * 向后兼容:`TrustDecision.allow` 保留(`true` 当且仅当 `outcome==='allow'`);旧调用方只看
  * `.allow` 时,`ask`/`deny` 都落到 `allow:false`(fail-closed),不会误放行。新调用方读

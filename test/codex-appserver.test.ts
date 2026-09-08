@@ -267,6 +267,7 @@ describe('codex-appserver mapNotification', () => {
       rawName: 'mcp__fxt__boom',
       ok: false,
       error: 'kaboom',
+      result: '',
     });
   });
 

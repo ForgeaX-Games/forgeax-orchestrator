@@ -92,6 +92,7 @@ export function materializeFileAttachments(
   const retained: Attachment[] = [];
   const lines: string[] = [];
   let saved = 0;
+  let needsToolGuidance = false;
 
   for (const att of attachments) {
     const kind = typeof att.kind === 'string' ? att.kind : 'file';
@@ -99,16 +100,31 @@ export function materializeFileAttachments(
     try {
       const stored = saveAttachment(att, uploadDir);
       const mediaType = typeof att.mediaType === 'string' && att.mediaType ? att.mediaType : 'unknown type';
-      lines.push(`[Attached ${kind}: ${stored.path} (${mediaType}, ${humanSize(stored.bytes)})]`);
       saved++;
       if (native.has(kind)) {
+        // Native kernels receive the durable path through the structured
+        // attachment contract and read it inside the host boundary. Keep the
+        // model-visible note path-free; the absolute path remains only in the
+        // host-owned attachment record used for rendering/resume.
+        lines.push(`[Attached ${kind}: ${name} (${mediaType}, ${humanSize(stored.bytes)})]`);
         retained.push({ kind, path: stored.path, ...(mediaType !== 'unknown type' ? { mediaType } : {}) });
+      } else if (native.size > 0 && kind === 'file') {
+        // A native kernel has no provider-neutral representation for a
+        // generic file. Keep the durable upload for the host/session layer,
+        // but never expose its absolute path or pretend it was sent inline.
+        // The explicit marker survives history and lets the provider wire
+        // validator distinguish safe degradation from a silent drop.
+        lines.push(`[Attached file: ${name} (${mediaType}, ${humanSize(stored.bytes)}); content unavailable for direct model input]`);
+      } else {
+        // Text-bridge/rented kernels still need a tool-readable path note.
+        lines.push(`[Attached ${kind}: ${stored.path} (${mediaType}, ${humanSize(stored.bytes)})]`);
+        needsToolGuidance = true;
       }
     } catch (err) {
       lines.push(`[Attached ${kind} "${name}" could not be saved: ${err instanceof Error ? err.message : String(err)}]`);
     }
   }
 
-  if (saved > 0) lines.push(GUIDANCE);
+  if (saved > 0 && needsToolGuidance) lines.push(GUIDANCE);
   return { attachments: retained.length ? retained : undefined, note: lines.join('\n') };
 }

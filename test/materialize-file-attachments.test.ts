@@ -27,7 +27,7 @@ describe('materializeFileAttachments', () => {
     expect(JSON.stringify(result)).not.toContain(data);
   });
 
-  test('core native image/document are path-only; generic file remains note-only', () => {
+  test('core native image/document are path-only; generic file degrades without a host path', () => {
     const data = Buffer.from('ABC').toString('base64');
     const result = materializeFileAttachments([
       { kind: 'image', name: 'shot.png', mediaType: 'image/png', data },
@@ -40,7 +40,13 @@ describe('materializeFileAttachments', () => {
       { kind: 'document', path: join(uploads(), 'brief.pdf'), mediaType: 'application/pdf' },
     ]);
     expect(JSON.stringify(result.attachments)).not.toContain('data');
-    expect(result.note).toContain(join(uploads(), 'data.zip'));
+    expect(result.note).toContain('[Attached image: shot.png');
+    expect(result.note).toContain('[Attached document: brief.pdf');
+    expect(result.note).not.toContain(join(uploads(), 'shot.png'));
+    expect(result.note).not.toContain(join(uploads(), 'brief.pdf'));
+    expect(result.note).not.toContain(join(uploads(), 'data.zip'));
+    expect(result.note).toContain('content unavailable for direct model input');
+    expect(result.attachments).not.toContainEqual(expect.objectContaining({ kind: 'file' }));
     expect(readFileSync(join(uploads(), 'shot.png'), 'utf8')).toBe('ABC');
   });
 

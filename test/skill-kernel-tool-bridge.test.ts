@@ -5,6 +5,7 @@ import { buildKindRegistry } from '../src/extensions/kinds';
 import { _resetSnapshotForTests, _setSnapshotForTests } from '../src/extensions/registry';
 import { runSkillKernelTool } from '../src/skills/kernel-tool-bridge';
 import type { MergedManifest } from '../src/extensions/merger';
+import { normalizeManifest } from '@forgeax/types';
 
 const ROOT = `/tmp/forgeax-skill-bridge-${process.pid}`;
 
@@ -35,6 +36,7 @@ describe('skill kernel tool bridge', () => {
     };
     const merged: MergedManifest = {
       manifest,
+      normalizedManifest: normalizeManifest(manifest),
       origin: 'user',
       originPath: join(extensionDir, 'forgeax-extension.json'),
       shadowedBy: [],

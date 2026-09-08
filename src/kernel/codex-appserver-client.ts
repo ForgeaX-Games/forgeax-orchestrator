@@ -16,6 +16,7 @@
 // ensureStarted() respawns. Unknown messages are tolerated (experimental proto).
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { prepareSpawnInvocation } from '../lib/node-spawn';
 
 export type JsonRpcId = number | string;
 
@@ -105,10 +106,15 @@ export class CodexAppServerClient {
   }
 
   private async _start(): Promise<void> {
-    const proc = spawn(this.opts.binary, [...(this.opts.globalArgs ?? []), 'app-server'], {
+    const invocation = prepareSpawnInvocation(
+      this.opts.binary,
+      [...(this.opts.globalArgs ?? []), 'app-server'],
+    );
+    const proc = spawn(invocation.command, invocation.args, {
       cwd: this.opts.cwd,
       env: { ...process.env, ...(this.opts.env ?? {}) },
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     });
     this.proc = proc;
     this.exitPromise = new Promise<void>((resolve) => { this.resolveExit = resolve; });
@@ -123,7 +129,7 @@ export class CodexAppServerClient {
       this.initialized = false;
       for (const [, pending] of this.pending) pending.reject(error);
       this.pending.clear();
-      try { this.opts.onExit?.(code, this.stderrTail.split('\n').filter(Boolean).slice(-3).join(' | ')); } catch { /* ignore */ }
+      try { this.opts.onExit?.(code, this.stderrSummary()); } catch { /* ignore */ }
       this.resolveExit?.();
       this.resolveExit = null;
     };
@@ -145,7 +151,10 @@ export class CodexAppServerClient {
       if (this.proc === proc) this.proc = null;
       settle(new Error(`codex app-server spawn failed: ${error.message}`), null);
     });
-    proc.on('exit', (code) => settle(new Error(`codex app-server exited (code=${code})`), code));
+    proc.on('exit', (code) => {
+      const tail = this.stderrSummary();
+      settle(new Error(`codex app-server exited (code=${code})${tail ? `: ${tail}` : ''}`), code);
+    });
 
     // Handshake. clientInfo shape verified: { name, title|null, version }.
     await this.request('initialize', {
@@ -153,6 +162,10 @@ export class CodexAppServerClient {
       capabilities: { experimentalApi: true },
     });
     this.initialized = true;
+  }
+
+  private stderrSummary(): string {
+    return this.stderrTail.split('\n').map((line) => line.trim()).filter(Boolean).slice(-3).join(' | ');
   }
 
   private _onStdout(chunk: string): void {

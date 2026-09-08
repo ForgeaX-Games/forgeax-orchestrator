@@ -11,5 +11,11 @@ export {
   writeMemoryEntry,
   classifyAndWrite,
 } from './layered-memory';
-export { loadAgentRecord, findSoulPack, trustForSource } from './soul-pack-loader';
+export {
+  loadAgentRecord,
+  loadNativeSoulOverlay,
+  layeredMemoryForAgent,
+  findSoulPack,
+  trustForSource,
+} from './soul-pack-loader';
 export { emitLifeEvent, onLifeEvent, recentLifeEvents } from './life-events';

@@ -75,30 +75,33 @@ export async function requestToolApproval(req: ApprovalRequest): Promise<boolean
   const reqId = randomUUID();
   pendingCtx.set(reqId, { sid: req.sid, agent: req.agent, capability: cap });
 
-  // 弹审批卡(与 `:sid/permission-request` 同款 per-session WS fan-out;UI 按 reqId 渲染模态)。
-  // 携带 capability + canRemember,让卡片可展示「记住本会话」选项。
-  req.eventBus.publish(
-    {
-      type: 'permission:request',
-      ts: Date.now(),
-      source: `agent:${req.agent}`,
-      payload: {
-        reqId,
-        toolName: req.toolName,
-        command: extractCommand(req.toolName, req.args, req.sid),
-        input: req.args ?? null,
-        agent: req.agent,
-        capability: cap,
-        reason: req.reason ?? null,
-        canRemember: true,
-      },
-    },
-    req.agent,
-  );
-
+  // Register the resolver before publishing. EventBus observers are allowed
+  // to resolve synchronously (including an abort/deny cleanup), so publishing
+  // first would lose that reply before the pending registry exists.
   const handle = registerPermission(reqId, APPROVAL_TIMEOUT_MS, { sid: req.sid, agent: req.agent });
+
   let allow = false;
   try {
+    // 弹审批卡(与 `:sid/permission-request` 同款 per-session WS fan-out;UI 按 reqId 渲染模态)。
+    // 携带 capability + canRemember,让卡片可展示「记住本会话」选项。
+    req.eventBus.publish(
+      {
+        type: 'permission:request',
+        ts: Date.now(),
+        source: `agent:${req.agent}`,
+        payload: {
+          reqId,
+          toolName: req.toolName,
+          command: extractCommand(req.toolName, req.args, req.sid),
+          input: req.args ?? null,
+          agent: req.agent,
+          capability: cap,
+          reason: req.reason ?? null,
+          canRemember: true,
+        },
+      },
+      req.agent,
+    );
     allow = await handle.promise;
   } finally {
     handle.dispose();

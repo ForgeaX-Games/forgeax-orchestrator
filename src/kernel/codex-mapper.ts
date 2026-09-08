@@ -27,7 +27,7 @@
  * thread.started 时记下(用于 `codex exec resume <thread_id>`)。
  */
 import type { KernelEvent } from '@forgeax/agent-runtime';
-import { canonicalToolFields } from './canonical-tool-name';
+import { canonicalToolArgs, canonicalToolFields } from './canonical-tool-name';
 
 // ─── codex JSONL raw 事件形状(只声明本映射用到的字段，其余 tolerant) ──
 
@@ -145,7 +145,7 @@ export function* mapCodexEvent(raw: CodexRawEvent, state: CodexMapperState): Gen
         state.toolCallsOpened.add(item.id);
         const rawName = toolName(item);
         state.toolNamesById.set(item.id, rawName);
-        yield { kind: 'tool.call', callId: item.id, ...canonicalToolFields(rawName), args: toolArgs(item) };
+        yield { kind: 'tool.call', callId: item.id, ...canonicalToolFields(rawName), args: canonicalToolArgs(rawName, toolArgs(item)) };
       }
       return;
     }
@@ -162,7 +162,7 @@ export function* mapCodexEvent(raw: CodexRawEvent, state: CodexMapperState): Gen
         return;
       }
       if (item.type === 'reasoning') {
-        if (item.text) yield { kind: 'thinking.delta', text: item.text };
+        if (item.text) yield { kind: 'thinking.delta', text: item.text, visibility: 'public_summary' };
         return;
       }
       if (isToolItem(item)) {
@@ -171,7 +171,7 @@ export function* mapCodexEvent(raw: CodexRawEvent, state: CodexMapperState): Gen
           state.toolCallsOpened.add(item.id);
           const rawName = toolName(item);
           state.toolNamesById.set(item.id, rawName);
-          yield { kind: 'tool.call', callId: item.id, ...canonicalToolFields(rawName), args: toolArgs(item) };
+          yield { kind: 'tool.call', callId: item.id, ...canonicalToolFields(rawName), args: canonicalToolArgs(rawName, toolArgs(item)) };
         }
         const ok = toolOk(item);
         const rawName = state.toolNamesById.get(item.id) ?? toolName(item);

@@ -1,10 +1,10 @@
-/** sandbox/fs-bridge —— ConsciousAgent / tool 层访问 game-project 容器内 fs 的统一出口。
+/** sandbox/fs-bridge —— RuntimeAgentHost / tool 层访问 game-project 容器内 fs 的统一出口。
  *
  *  本轮（C10）**只留 interface + 类型签名，不实现 body**。后续 sandbox 阶段（与
  *  game-project / docker exec 一起做）填充 docker-cli 路由 + bind-mount 快路径。
  *
  *  设计原则（plan §3.12）：
- *  - ConsciousAgent / tool 实现**不直接调** `node:fs` / `node:child_process` 触达
+ *  - RuntimeAgentHost / tool 实现**不直接调** `node:fs` / `node:child_process` 触达
  *    game-project，而是统一走 `FsBridge`。
  *  - sandbox 不挂在 Session 上 —— 由 SandboxManager 按 `SessionConfig.defaultDir`
  *    池化共享；first tool exec 时 lazy `SandboxManager.acquire(slug)`。
@@ -65,7 +65,7 @@ export interface GrepOptions {
 
 // ─── FsBridge 接口（plan §3.12）─────────────────────────────────────────────
 //
-// 给 ConsciousAgent / tool 实现使用。Session 层在 first tool exec 时调
+// 给 RuntimeAgentHost / tool 实现使用。Session 层在 first tool exec 时调
 // `SandboxManager.acquire(defaultDir)` 拿到一份 FsBridge 实现。
 
 /** Sandbox 文件系统桥接 —— 屏蔽 host fs / docker exec 路由细节。
@@ -110,8 +110,28 @@ export interface FsBridge {
  *  机 fs。等 sandbox 实现进来后，这个 const 会被 SandboxManager 在启动时替换成
  *  绑定到 sandboxRef 的真实 FsBridge.read 投影。 */
 export const sandboxFs = {
-  async readBinary(path: string): Promise<Buffer> {
-    return await readFile(path);
+  async readBinary(path: string, maxBytes?: number): Promise<Buffer> {
+    if (maxBytes === undefined) return await readFile(path);
+    const { open } = await import("node:fs/promises");
+    const handle = await open(path, "r");
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error("not a regular file");
+      if (info.size > maxBytes) throw new Error(`larger than ${maxBytes} bytes`);
+      const bytes = Buffer.alloc(Math.min(Number(info.size), maxBytes + 1));
+      let offset = 0;
+      while (offset < bytes.length) {
+        const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      if (offset > maxBytes) throw new Error(`larger than ${maxBytes} bytes`);
+      const after = await handle.stat();
+      if (after.size > maxBytes) throw new Error(`larger than ${maxBytes} bytes`);
+      return bytes.subarray(0, offset);
+    } finally {
+      await handle.close();
+    }
   },
 };
 

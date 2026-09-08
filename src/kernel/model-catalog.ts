@@ -174,15 +174,17 @@ export async function resolveKernelModelCatalog(
   catalogCache.set(key, { expiresAt: now + ttl, promise });
   try {
     const value = await promise;
-    catalogCache.set(key, { expiresAt: Date.now() + ttl, value });
+    if (catalogCache.get(key)?.promise === promise) {
+      catalogCache.set(key, { expiresAt: Date.now() + ttl, value });
+    }
     return { ...value, kernelDisplayName: kernel.displayName };
   } catch (err) {
-    catalogCache.delete(key);
+    if (catalogCache.get(key)?.promise === promise) catalogCache.delete(key);
     throw err;
   }
 }
 
-/** Test-only:清缓存。 */
-export function _resetModelCatalogCache(): void {
+/** Invalidate discovery after credentials change or an explicit refresh. */
+export function invalidateModelCatalogCache(): void {
   catalogCache.clear();
 }

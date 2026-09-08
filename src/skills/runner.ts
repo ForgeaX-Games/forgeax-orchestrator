@@ -39,7 +39,9 @@ export interface SkillRunRequest {
   extensionId?: string;
   input?: unknown;
   caller: {
-    kind: 'user' | 'ai' | 'cli' | 'workbench' | 'event';
+    kind: 'user' | 'ai' | 'cli' | 'extension' | 'event';
+    extensionId?: string;
+    instanceId?: string;
     sessionId?: string;
     threadId?: string;
     agentId?: string;

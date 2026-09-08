@@ -6,17 +6,17 @@ describe('bus plugin dev port overrides', () => {
     const items = applyExtensionDevPortOverridesForTest(
       [
         {
-          id: '@forgeax-extension/wb-scene-generator',
+          id: '@forgeax-extension/scene-generator',
           version: '0.1.0',
-          kind: 'workbench',
+          kind: 'extension',
           displayName: { zh: 'scene' },
           source: { origin: 'builtin', relativeManifestPath: 'wb-scene-generator/forgeax-extension.json' },
           entry: { standalone: { start: 'pnpm dev', port: 9555, readyProbe: '/', embeddedAlso: false } },
         },
         {
-          id: '@forgeax-extension/wb-3d-lowpoly',
+          id: '@forgeax-extension/3d-lowpoly',
           version: '0.1.0',
-          kind: 'workbench',
+          kind: 'extension',
           displayName: { zh: 'lowpoly' },
           source: { origin: 'builtin', relativeManifestPath: 'wb-3d-lowpoly/forgeax-extension.json' },
           entry: { standalone: { start: 'pnpm dev', port: 9565, readyProbe: '/', embeddedAlso: false } },
@@ -24,7 +24,7 @@ describe('bus plugin dev port overrides', () => {
       ],
       {
         plugins: {
-          '@forgeax-extension/wb-scene-generator': { frontendPort: 9755, backendPort: 9757 },
+          '@forgeax-extension/scene-generator': { frontendPort: 9755, backendPort: 9757 },
         },
       },
     );

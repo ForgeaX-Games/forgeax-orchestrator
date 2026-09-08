@@ -1,109 +1,212 @@
-/** ask-user-registry —— `ask_user` 工具的「阻塞 + HTTP 回执」往返中枢。
+/** Instance-aware ask_user pending registry.
  *
- *  `ask_user` 工具在 execute() 里 registerAsk()，拿到一个会阻塞的 Promise；
- *  前端选完后 `POST /api/sessions/:sid/ask-reply` 调 resolveAsk() 把它解开。
- *
- *  与 `src/tools/registry.ts::awaitConfirm` 同款模式：模块级 Map<token, resolve>，
- *  单进程（Bun）安全。token = `${sid}::${agentPath}` —— 工具默认串行
- *  (tool-batch-runner partition)，故同一 agent 同一时刻至多一个 ask 在 pending，
- *  键天然唯一，无需 tool_call id。 */
+ * UI replies should carry instanceId/runtimeEpochId. The agent address remains
+ * a compatibility projection only; a stale epoch reply may never resolve a
+ * newly-created resident instance after Session reload.
+ */
 
-import { tt } from '../lib/turn-trace';
+import { randomUUID } from "node:crypto";
+import { tt } from "../lib/turn-trace";
+
+export interface AskOwner {
+  readonly sid: string;
+  readonly agentPath: string;
+  readonly instanceId: string;
+  readonly runtimeEpochId: string;
+}
 
 export interface AskReplyItem {
-  questionId: string;
-  values: string[];
+  readonly questionId: string;
+  readonly values: string[];
 }
 
 export type AskReply = AskReplyItem[];
+export type AskResult = AskReply | string[];
 
-interface Pending {
-  resolve: (answers: AskReply | null) => void;
-  /** 仅在传了有限正超时时存在;缺省 = 无超时(像 the reference agent CLI 一样无限等用户回答)。 */
-  timer?: ReturnType<typeof setTimeout>;
+export interface AskReplyIdentity {
+  readonly requestId?: string;
+  readonly instanceId?: string;
+  readonly runtimeEpochId?: string;
 }
 
-const pending = new Map<string, Pending>();
+export type ExternalAskReplyResolver = (
+  sid: string,
+  agentPath: string,
+  values: AskReply | string[],
+  identity: AskReplyIdentity,
+) => boolean | Promise<boolean>;
 
-function keyOf(sid: string, agentPath: string): string {
-  return `${sid}::${agentPath}`;
+interface Pending extends AskOwner {
+  readonly requestId: string;
+  readonly resolve: (values: AskResult | null) => void;
+  readonly timer?: ReturnType<typeof setTimeout>;
+}
+
+// The packaged desktop server currently reaches the orchestrator through both
+// the package root (`dist/index.js`) and the curated kernel subpath. Depending
+// on the bundler, those entry points can materialize two module instances in
+// one process. A module-local Map then makes an ask registered by the host-tool
+// bridge invisible to the HTTP `/ask-reply` route. Keep the registry on the
+// process global symbol registry so source/dist entry aliases and hot reloads
+// share the same pending asks without weakening the per-instance identity
+// checks below.
+const PENDING_REGISTRY_KEY = Symbol.for('@forgeax/orchestrator/ask-user-registry/v1');
+const EXTERNAL_RESOLVER_KEY = Symbol.for('@forgeax/orchestrator/ask-user-resolver/v1');
+const processGlobals = globalThis as typeof globalThis & { [key: symbol]: unknown };
+const existingPending = processGlobals[PENDING_REGISTRY_KEY];
+const pending = existingPending instanceof Map
+  ? existingPending as Map<string, Pending>
+  : new Map<string, Pending>();
+processGlobals[PENDING_REGISTRY_KEY] = pending;
+
+/** Register the product-kernel resolver on globalThis so the package-root HTTP
+ * graph can reach a pending ask owned by a second bundled package entry. */
+export function setExternalAskReplyResolver(resolver: ExternalAskReplyResolver): void {
+  processGlobals[EXTERNAL_RESOLVER_KEY] = resolver;
+}
+
+export async function resolveAskReply(
+  sid: string,
+  agentPath: string,
+  values: AskReply | string[],
+  identity: AskReplyIdentity = {},
+): Promise<boolean> {
+  if (resolveAsk(sid, agentPath, values, identity)) return true;
+  const resolver = processGlobals[EXTERNAL_RESOLVER_KEY];
+  return typeof resolver === 'function'
+    ? Boolean(await (resolver as ExternalAskReplyResolver)(sid, agentPath, values, identity))
+    : false;
 }
 
 export interface AskHandle {
-  /** Resolves to every question's chosen values, or null when aborted. */
-  promise: Promise<AskReply | null>;
+  readonly requestId: string;
+  /** Resolves to the chosen label array, or null when aborted / timed out. */
+  readonly promise: Promise<AskResult | null>;
   /** Idempotent cleanup —— removes the pending entry + clears the timer. */
   dispose(): void;
 }
 
-/** Register a pending ask. The returned promise resolves when the UI replies
- *  via resolveAsk(). `timeoutMs <= 0`(或非有限)= **无超时**:像 the reference agent CLI 的
- *  AskUserQuestion 一样无限等用户回答(用户答 或 中断本轮 abort → dispose 才结束),
- *  绝不因"超时"替用户作答。Always call dispose() in a finally to drop the entry. */
-export function registerAsk(sid: string, agentPath: string, timeoutMs: number): AskHandle {
-  const key = keyOf(sid, agentPath);
-  // Drop any stale pending under the same key (e.g. a previous ask that the
-  // user never answered and which is being superseded).
-  const prev = pending.get(key);
-  if (prev) {
-    if (prev.timer) clearTimeout(prev.timer);
-    prev.resolve(null);
-    pending.delete(key);
+export function registerAsk(owner: AskOwner, timeoutMs: number): AskHandle;
+/** Legacy address-only overload. New runtime callers must provide instance
+ * identity so stale UI replies cannot resolve a reloaded resident ask. */
+export function registerAsk(sid: string, agentPath: string, timeoutMs: number): AskHandle;
+export function registerAsk(
+  ownerOrSid: AskOwner | string,
+  agentPathOrTimeout: string | number,
+  legacyTimeoutMs?: number,
+): AskHandle {
+  const owner: AskOwner = typeof ownerOrSid === "string"
+    ? {
+        sid: ownerOrSid,
+        agentPath: agentPathOrTimeout as string,
+        instanceId: `legacy:${ownerOrSid}:${agentPathOrTimeout}`,
+        runtimeEpochId: "legacy",
+      }
+    : ownerOrSid;
+  const timeoutMs = typeof agentPathOrTimeout === "number"
+    ? agentPathOrTimeout
+    : (legacyTimeoutMs ?? 0);
+  // Tool batches are serial for one live instance. Superseding is scoped to
+  // the exact epoch so an old turn cannot cancel a new resident epoch's ask.
+  for (const entry of pending.values()) {
+    if (
+      entry.sid === owner.sid &&
+      entry.instanceId === owner.instanceId &&
+      entry.runtimeEpochId === owner.runtimeEpochId
+    ) {
+      settle(entry, null);
+    }
   }
 
-  let settle!: (answers: AskReply | null) => void;
-  const promise = new Promise<AskReply | null>((res) => {
-    settle = res;
+  const requestId = randomUUID();
+  let resolvePromise!: (values: AskResult | null) => void;
+  const promise = new Promise<AskResult | null>((resolve) => {
+    resolvePromise = resolve;
   });
-
-  // 仅当传了有限正超时才挂定时器;否则无超时(无限等)。
   const timer =
     timeoutMs > 0 && Number.isFinite(timeoutMs)
       ? setTimeout(() => {
-          if (pending.get(key)?.resolve === settle) pending.delete(key);
-          settle(null);
+          const entry = pending.get(requestId);
+          if (entry) settle(entry, null);
         }, timeoutMs)
       : undefined;
-
-  pending.set(key, { resolve: settle, ...(timer ? { timer } : {}) });
-  tt('ask.register', { key, sid, agentPath, timeoutMs });
+  const entry: Pending = {
+    ...owner,
+    requestId,
+    resolve: resolvePromise,
+    ...(timer ? { timer } : {}),
+  };
+  pending.set(requestId, entry);
+  tt("ask.register", { ...owner, requestId, timeoutMs });
 
   return {
+    requestId,
     promise,
     dispose() {
-      const cur = pending.get(key);
-      if (cur && cur.resolve === settle) {
-        if (cur.timer) clearTimeout(cur.timer);
-        pending.delete(key);
-      }
-      // 必须 settle(null) 才能解开 `await handle.promise` —— 无超时后,abort/中断
-      // 走 dispose 这条路解除阻塞(已被 resolveAsk 答过则此处幂等 no-op)。
-      settle(null);
+      const current = pending.get(requestId);
+      if (current) settle(current, null);
     },
   };
 }
 
-/** Resolve a pending ask with the user's selection. Returns true when a
- *  matching pending entry was found and resolved, false otherwise (already
- *  answered / timed out / unknown key). */
-export function resolveAsk(sid: string, agentPath: string, answers: AskReply): boolean {
-  const exactKey = keyOf(sid, agentPath);
-  let key = exactKey;
-  let entry = pending.get(key);
-  // 回执 agent 对不上时的兜底:前端卡片可能回的是当前 tab 的 agent,而 ask 是
-  // 被委派子 agent(ctx.agentPath)注册的 → 精确键 miss。若该 sid 下**恰好只有一个**
-  // 待答 ask,就解它(同 sid 同一刻至多一个 ask 在 pending,见文件头不变量)。
-  if (!entry) {
-    const sidKeys = [...pending.keys()].filter((k) => k.startsWith(`${sid}::`));
-    if (sidKeys.length === 1) {
-      key = sidKeys[0]!;
-      entry = pending.get(key);
-    }
-  }
-  tt('ask.resolve', { exactKey, resolvedKey: key, sid, agentPath, found: !!entry, pendingKeys: [...pending.keys()].join('|') });
-  if (!entry) return false;
-  if (entry.timer) clearTimeout(entry.timer);
-  pending.delete(key);
-  entry.resolve(answers);
+export function resolveAsk(
+  sid: string,
+  agentPath: string,
+  values: AskReply | string[],
+  identity: AskReplyIdentity = {},
+): boolean {
+  const candidates = identity.requestId
+    ? [pending.get(identity.requestId)].filter(
+        (entry): entry is Pending => Boolean(entry),
+      )
+    : [...pending.values()].filter((entry) => {
+        if (entry.sid !== sid) return false;
+        if (identity.instanceId && entry.instanceId !== identity.instanceId) {
+          return false;
+        }
+        if (
+          identity.runtimeEpochId &&
+          entry.runtimeEpochId !== identity.runtimeEpochId
+        ) {
+          return false;
+        }
+        if (!identity.instanceId && entry.agentPath !== agentPath) return false;
+        return true;
+      });
+  const entry = candidates.length === 1
+    ? candidates[0]
+    : !identity.requestId && !identity.instanceId
+      ? onlyPendingForSession(sid)
+      : undefined;
+  const valid = Boolean(
+    entry &&
+      entry.sid === sid &&
+      (!identity.instanceId || entry.instanceId === identity.instanceId) &&
+      (
+        !identity.runtimeEpochId ||
+        entry.runtimeEpochId === identity.runtimeEpochId
+      ),
+  );
+  tt("ask.resolve", {
+    sid,
+    agentPath,
+    ...identity,
+    found: valid,
+    candidateCount: candidates.length,
+  });
+  if (!entry || !valid) return false;
+  settle(entry, values);
   return true;
+}
+
+function onlyPendingForSession(sid: string): Pending | undefined {
+  const matches = [...pending.values()].filter((entry) => entry.sid === sid);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function settle(entry: Pending, values: AskResult | null): void {
+  if (pending.get(entry.requestId) !== entry) return;
+  pending.delete(entry.requestId);
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.resolve(values);
 }

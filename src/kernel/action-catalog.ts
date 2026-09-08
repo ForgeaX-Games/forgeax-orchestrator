@@ -34,7 +34,15 @@ export interface ActionCatalogEntry {
   readonly capability: ActionCapability;
   readonly surface?: ActionSurface;
   readonly timeoutMs?: number;
+  /** 是否每轮作为独立 ToolSpec 常驻模型上下文。缺省/false 仍可经通用目录发现。
+   *  新增 true 只用于领域入口/发现能力,或已有可复核跨场景高频证据的能力;
+   *  PR 必须说明命中哪条及上下文成本。现有 14 项是存量兼容基线,不据此扩张。 */
   readonly firstClass?: boolean;
+  /** 状态性前置条件 —— 事实,不是行为指南。只写"世界需要什么样",禁写顺序规则。
+   *  反例(现有 description 里这类句式不许进本字段):
+   *  "Discover existing roles first via role.list" / "list existing slugs"。
+   *  缺省 = 无已知前置;空数组非法(缺席=无,不用空数组冒充)。 */
+  readonly preconditions?: readonly string[];
   /** 门位**事实**(不是行为指南):这个能力的人类入口在哪。
    *  - menuCommandId:菜单叶子用了别的 command id(同一能力两个名字)时的别名,
    *    如 game.switch 的菜单门走 game.pick。门对账凭它把两个 id 认成同一能力。
@@ -64,21 +72,6 @@ export interface ActionCatalogBuildOptions {
  */
 const ACTION_CATALOG_DECLARATIONS = [
   {
-    id: 'app.set_mode',
-    title: '切换主模式',
-    // 2026-08-06 撤 door(railMode):rail 面无发布者,声明即把 agent 指向死门。
-    description:
-      "Switch the app's main workspace: 'scene' (game editing) or 'ai' (AI · plugins & tools). Same as clicking the Scene / AI tabs.",
-    schema: {
-      type: 'object',
-      properties: { mode: { type: 'string', enum: ['scene', 'ai'] } },
-      required: ['mode'],
-    },
-    capability: 'write',
-    firstClass: true,
-    surface: 'ui',
-  },
-  {
     id: 'panel.toggle_sidebar',
     title: '折叠/展开侧栏',
     description: 'Toggle the left sidebar collapsed state.',
@@ -101,42 +94,30 @@ const ACTION_CATALOG_DECLARATIONS = [
     surface: 'ui',
   },
   {
-    id: 'workbench.open',
-    title: '打开 Workbench',
-    description: "Open the workbench surface, optionally at a specific tab (e.g. 'plugins').",
-    schema: { type: 'object', properties: { tab: { type: 'string' } } },
-    capability: 'write',
-    firstClass: true,
-    surface: 'ui',
-  },
-  {
-    id: 'workbench.list_plugins',
-    title: '列出工作台插件',
-    // 与 interface/src/lib/builtin-actions.ts 的同名声明逐字节一致 —— studio 层
-    // 漂移闸(scripts/check-action-catalog-drift.spec.ts)按 description 全等对账。
-    // 2026-08-07 pin-bump CI 实证:interface 侧补了 rail 可见性事实而这里没同步,
-    // 两账源当场漂移。改任何一侧必须同改另一侧。
-    description:
-      'List installed workbench plugins (id, name, description). Use this to tell the user what workbench tools exist and what each does, then guide them with workbench.open_plugin. Returns { count, plugins:[{id,name,description}] }. A plugin shows on the rail only when its manifest declares an activity AND the user has pinned it; the pin half is per-user localStorage, so this list cannot tell you what the rail currently shows. The workbench grid always lists every installed plugin, so do NOT claim a plugin is unreachable.',
+    id: 'extension.list',
+    title: '列出扩展页面',
+    description: 'List installed extensions that contribute pages. Returns { count, plugins:[{id,name,description}] }.',
     capability: 'read',
     firstClass: true,
     surface: 'ui',
   },
   {
-    id: 'workbench.open_plugin',
-    title: '打开工作台插件',
-    description:
-      "Open the workbench and expand a specific plugin by id — the concrete 'open this plugin' step. It switches to the workbench (AI) workspace, then expands that plugin's panel. Discover valid ids and what each does via workbench.list_plugins.",
+    id: 'extension.open',
+    title: '打开扩展页面',
+    description: 'Open the Page contributed by a specific extension id. Discover valid ids via extension.list.',
     schema: { type: 'object', properties: { extensionId: { type: 'string' } }, required: ['extensionId'] },
     capability: 'write',
     firstClass: true,
     surface: 'ui',
+    preconditions: [
+      'The target extension must contribute an available singleton page.',
+    ],
   },
   {
     id: 'role.create',
     title: '创建新角色',
     description:
-      'Mint a NEW teammate/agent role when no existing role in the roster fits. Args: id (single segment [a-zA-Z0-9_-]) + persona (markdown: who they are / what they are good at / when to delegate to them / what they produce) + optional displayName / role / avatar / color / scope("global"|"project") / tools(host-tool allow globs). The new role persists and joins the roster (delegate_to_subagent can then dispatch it). Duplicate ids are rejected, never overwritten. Discover existing roles first via role.list.',
+      'Mint a NEW teammate/agent role when no existing role in the roster fits. Args: id (single segment [a-zA-Z0-9_-]) + persona (markdown: who they are / what they are good at / when to delegate to them / what they produce) + optional displayName / role / avatar / color / scope("global"|"project") / tools(host-tool allow globs). The new role persists and joins the roster (delegate_to_subagent can then dispatch it). Duplicate ids are rejected, never overwritten.',
     schema: {
       type: 'object',
       properties: {
@@ -158,12 +139,14 @@ const ACTION_CATALOG_DECLARATIONS = [
     firstClass: true,
     surface: 'both',
     timeoutMs: 15_000,
+    preconditions: [
+      'The requested id must not already exist in the role roster.',
+    ],
   },
   {
     id: 'role.list',
     title: '列出角色',
-    description:
-      'List all currently dispatchable roles (plugin agents + built-ins). Use this to tell the user which roles exist / check for duplicates before role.create. Returns { count, roles:[{id,role,displayName,source}] }.',
+    description: 'List all currently dispatchable roles (plugin agents + built-ins). Returns { count, roles:[{id,role,displayName,source}] }.',
     capability: 'read',
     firstClass: true,
     surface: 'both',
@@ -171,13 +154,16 @@ const ACTION_CATALOG_DECLARATIONS = [
   {
     id: 'role.open',
     title: '打开角色页',
-    // 2026-08-06 撤 door(railTab):同 app.set_mode —— rail 面无发布者,声明即指死门。
     description:
-      'Open the roles/team surface. With no args it switches to the AI workspace (where the roster lives). With { id } it also binds that role to the current chat session so its persona detail is shown. Use this to show the user the team or a specific teammate.',
+      'Open the roles/team Page. With { id } it also binds that role to the current chat session so its persona detail is shown.',
     schema: { type: 'object', properties: { id: { type: 'string' } } },
     capability: 'read',
     firstClass: true,
     surface: 'ui',
+    preconditions: [
+      'When id is provided, it must identify a role in the current roster.',
+      'When id is provided, an active chat session must exist for the role binding.',
+    ],
   },
   {
     id: 'overlay.open',
@@ -190,6 +176,9 @@ const ACTION_CATALOG_DECLARATIONS = [
     },
     capability: 'write',
     surface: 'ui',
+    preconditions: [
+      'The requested id must identify an overlay currently registered by the product shell.',
+    ],
   },
   {
     id: 'overlay.close',
@@ -264,7 +253,7 @@ const ACTION_CATALOG_DECLARATIONS = [
   {
     id: 'session.rename',
     title: '重命名会话',
-    description: 'Rename a chat session tab.',
+    description: 'Persistent session rename is not available in this Studio version; this action rejects instead of changing only the temporary tab label.',
     schema: {
       type: 'object',
       properties: { sid: { type: 'string' }, displayName: { type: 'string' } },
@@ -297,12 +286,14 @@ const ACTION_CATALOG_DECLARATIONS = [
     firstClass: true,
     surface: 'both',
     timeoutMs: 20_000,
+    preconditions: [
+      'The requested slug must identify an existing game.',
+    ],
   },
   {
     id: 'game.create',
     title: '新建游戏',
-    description:
-      'Create a NEW game (project) from the template and give it its own dedicated chat session. Args: slug (required, 1-41 chars lowercase ASCII/digits/hyphens, must start with a letter/digit — e.g. "neon-runner") + optional name (display name) + optional brief (one line describing what game to make, recorded in FORGE.md for later). Fails with 409 if the slug already exists — use game.switch for existing games; list existing slugs to avoid collisions. NOTE: this does NOT switch the UI to the new game (switching mid-turn would break the active chat channel). Tell the user the game is ready and to open it from the top-bar game switcher; game.switch will land on its dedicated session.',
+    description: 'Create a new game (project) from the template and give it its own dedicated chat session. The action does not switch the UI to the new game.',
     schema: {
       type: 'object',
       properties: {
@@ -319,12 +310,15 @@ const ACTION_CATALOG_DECLARATIONS = [
     firstClass: true,
     surface: 'both',
     timeoutMs: 20_000,
+    preconditions: [
+      'The requested slug must not already identify an existing game.',
+    ],
   },
   {
     id: 'trajectory.read',
     title: '读取操作轨迹',
     description:
-      'Read the recent trajectory of UI operations performed on the page by BOTH the human and the AI, ordered oldest→newest. Every operation dispatched through the action registry is recorded (page mode switches, panel toggles, session/game/role/workbench ops, etc.). Use this to understand what the user just did before asking you something. Params: limit (default 50, max 200), source ("human"|"ai" to filter by who performed it). Returns { total, count, entries:[{seq,ts,id,title,source,capability,args}] } in the result.',
+      'Read the recent trajectory of UI operations performed on the page by BOTH the human and the AI, ordered oldest→newest. Every operation dispatched through the action registry is recorded (page mode switches, panel toggles, session/game/role/extension ops, etc.). Use this to understand what the user just did before asking you something. Params: limit (default 50, max 200), source ("human"|"ai" to filter by who performed it). Returns { total, count, entries:[{seq,ts,id,title,source,capability,args}] } in the result.',
     schema: {
       type: 'object',
       properties: {
@@ -482,6 +476,17 @@ function compileEntry(raw: unknown, declarationIndex: number): ActionCatalogEntr
     throw new Error(`ActionCatalog: action "${id}" has invalid firstClass flag`);
   }
 
+  let preconditions: readonly string[] | undefined;
+  if (raw.preconditions !== undefined) {
+    if (!Array.isArray(raw.preconditions) || raw.preconditions.length === 0) {
+      throw new Error(`ActionCatalog: action "${id}" preconditions must be a non-empty string array`);
+    }
+    if (raw.preconditions.some((value) => typeof value !== 'string' || !value.trim())) {
+      throw new Error(`ActionCatalog: action "${id}" preconditions must contain non-empty strings`);
+    }
+    preconditions = Object.freeze([...raw.preconditions]) as readonly string[];
+  }
+
   // door 门位事实:构建层必须原样放行 —— 2026-08-05 实测,这里的白名单静默丢掉了
   // door,门对账拿不到别名事实,咽喉改道整条失效(agent 又走回无头直调)。
   // 2026-08-06:railTab/railMode 随 rail 死门下线一并撤出合法键 —— 有人重新声明时
@@ -506,6 +511,7 @@ function compileEntry(raw: unknown, declarationIndex: number): ActionCatalogEntr
     ...(surface !== undefined ? { surface: surface as ActionSurface } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(firstClass !== undefined ? { firstClass } : {}),
+    ...(preconditions !== undefined ? { preconditions } : {}),
     ...(door !== undefined ? { door } : {}),
   });
 }

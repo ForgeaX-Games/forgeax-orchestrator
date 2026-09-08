@@ -1,5 +1,5 @@
 // litellm audio gateway — host-side wrapper around the proxy's OpenAI-shaped
-// text-to-speech endpoint (`/audio/speech`). Used by wb-reel (角色音色 / 旁白合成)
+// text-to-speech endpoint (`/audio/speech`). Used by reel (角色音色 / 旁白合成)
 // so the TTS key never reaches the browser bundle and stays server-managed.
 //
 // Verified contract (2026-06, LITELLM_PROXY_BASE_URL, model=`doubao-tts`):

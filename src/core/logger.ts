@@ -16,7 +16,7 @@
  *        delete / boot / cross-session 操作 / autoStart 失败等 SM plumbing），
  *        不接收任何 agent turn / 模型消息。
  *      - **session 级 debug.log + latest.log** 落该 session 下所有日志（agent turn /
- *        kits / scheduler plumbing / event-bus → log 桥）。
+ *        kits / runtime plumbing / event-bus → log 桥）。
  *      - 调用方视角透明：**仍然写 `console.log(...)`**，bridge 按 ALS `LogContext.sid`
  *        自动路由（命中 → 写对应 session logger；缺失 → 落 globalLogger 兜底）。
  *
@@ -33,7 +33,7 @@
  *  落点（实际写盘）：
  *  - `<userRoot>/debug.log`：SM.logger —— *仅 session 元事件*。
  *  - `<sid>/logs/debug.log` + `<sid>/logs/latest.log`：per-Session logger —— *该 sid
- *    范围内所有日志*（含 agent / kits / scheduler / event-bus 桥）。 */
+ *    范围内所有日志*（含 agent / kits / runtime / event-bus 桥）。 */
 
 import { createWriteStream, statSync, renameSync, existsSync, mkdirSync } from "node:fs";
 import type { WriteStream } from "node:fs";
@@ -74,7 +74,7 @@ export interface LogContext {
   /** 全写 = `agents/` 下的相对路径（root、iori、iori/agents/suzu），来源**唯一**。
    *  特殊值：`system`（boot / 跨 session 操作） / `gateway`（forwardToOriginalConsole）。 */
   agentId: string;
-  /** 该 agent 当前 turn（仅 ConsciousAgent.runMain 内有）。 */
+  /** 该 AgentInstance 当前 turn。 */
   turn?: number;
   /** 当前归属的 Session sid —— bridge 据此路由 console.* 到对应 session logger。
    *  缺失时 fallback 到 globalLogger（SM.logger）。Scheduler.runAgent + lifecycle
@@ -101,7 +101,7 @@ export function runWithSession<T>(sid: string, fn: () => T): T {
   return logContextStorage.run({ ...(prev ?? DEFAULT_LOG_CONTEXT), sid }, fn);
 }
 
-/** 进 agent scope 带 turn（ConsciousAgent.runMain 包整 turn）。继承上层 sid。 */
+/** 进 AgentInstance scope 带 turn。继承上层 sid。 */
 export function runWithAgentTurn<T>(agentId: string, turn: number, fn: () => T): T {
   const prev = logContextStorage.getStore();
   return logContextStorage.run({ ...(prev ?? DEFAULT_LOG_CONTEXT), agentId, turn }, fn);

@@ -7,7 +7,7 @@ export default function environmentSlot(ctx: AgentContext): ContextSlot {
   return {
     name: "environment",
     description:
-      "Resolved session paths, game info, installed workbench plugins, " +
+      "Resolved session paths, game info, installed extensions, " +
       "and available skills. Lets the LLM know where it is working without " +
       "needing to run shell commands.",
     priority: SlotPriority.STATIC_ENVIRONMENT,

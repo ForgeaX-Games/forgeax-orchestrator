@@ -98,6 +98,18 @@ function validateConfig(raw: unknown, brandId: string): BrandConfig {
       throw new Error(`[brand] manifest missing required object field: ${k}`);
     }
   }
+  const assistant = o.assistant as Record<string, unknown>;
+  const agent = assistant.agent as Record<string, unknown> | undefined;
+  const personaFiles = agent?.personaFiles as Record<string, unknown> | undefined;
+  if (!agent || typeof agent.id !== 'string' || !agent.id.trim()) {
+    throw new Error('[brand] assistant.agent.id must be a non-empty string');
+  }
+  if (!personaFiles || typeof personaFiles.zh !== 'string' || !personaFiles.zh.trim()) {
+    throw new Error('[brand] assistant.agent.personaFiles.zh must be a non-empty string');
+  }
+  if (agent.tools !== undefined && (!Array.isArray(agent.tools) || agent.tools.some((tool) => typeof tool !== 'string'))) {
+    throw new Error('[brand] assistant.agent.tools must be an array of strings');
+  }
   return raw as BrandConfig;
 }
 

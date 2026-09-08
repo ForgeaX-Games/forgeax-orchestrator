@@ -8,7 +8,7 @@
  *    lessons.md      ← legacy / language-neutral (still honoured)
  *
  *  Both the runtime prompt assemblers (persona `memory` slot + agent loader)
- *  and the wb-agent-persona viewer must pick exactly ONE file per base so a
+ *  and the agent-persona viewer must pick exactly ONE file per base so a
  *  bilingual agent never gets both languages injected into the same prompt.
  *  This module is the single source of truth for that grouping so the two
  *  runtime paths stay in lockstep.

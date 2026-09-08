@@ -6,8 +6,8 @@
  *  - `stream:*` 前缀是临时流式事件，**不**写 EventLedger（StreamLLM 是热路径，
  *    每 token 一次，落盘代价不可接受）。
  *
- *  ConsciousAgent 在 turn loop 关键点调 `boundEventBus.hook(Hook.TurnStart, ...)`
- *  —— `hook` 由 BaseAgent.boundEventBus 提供，自动带 `source: agent:<id>`；
+ *  RuntimeAgentHost 在 turn 关键点调 `boundEventBus.hook(Hook.TurnStart, ...)`
+ *  —— `hook` 由 instance-bound eventBus 提供，自动带 `source: agent:<id>`；
  *  raw EventBus 不实现该方法（参考 ref core/event-bus.ts）。
  *  Hook handler 收到事件后可以 `event.block(reason)` 短路后续 observer / 路由，
  *  这就是确认对话框 / 内容审查 / ToolCall guard kit 共用的机制。 */
@@ -47,25 +47,29 @@ export interface HookPayloadMap {
     model?: string;
     usage?: { inputTokens: number; outputTokens: number };
     providerSidecarData?: ProviderSidecarData;
+    providerId?: string;
+    kernelId?: string;
   };
   [Hook.TurnStart]: {
     turn: number;
     eventCount: number;
+    turnId?: string;
+    providerId?: string;
+    kernelId?: string;
   };
   [Hook.TurnEnd]: {
     turn: number;
     aborted: boolean;
     error?: string;
     turnId?: string;
-    durationMs?: number;
-    waitingForInput?: boolean;
-    artifactResolutionExpected?: true;
-    schemaVersion?: number;
+    providerId?: string;
+    kernelId?: string;
   };
   [Hook.ToolCall]: {
     name: string;
     args: Record<string, unknown>;
     toolCall: LLMToolCall;
+    providerId?: string;
   };
   [Hook.ToolResult]: {
     name: string;
@@ -80,10 +84,12 @@ export interface HookPayloadMap {
      *  prerequisite for host-owned context). Kernel-neutral: every kernel
      *  (claude-code / codex / forgeax-core) surfaces `tool.result.result`. */
     result?: unknown;
+    providerId?: string;
   };
   [Hook.StreamLLM]: {
     chunk: StreamEvent;
     turn: number;
+    providerId?: string;
   };
   [Hook.SystemPrompt]: {
     /** Changed or new blocks since last emission. First emission is a full snapshot. */

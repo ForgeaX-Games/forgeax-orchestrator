@@ -61,7 +61,11 @@ export function bindSystemEventLog(
     void block;
     void isBlocked;
     void blockReason;
-    appendFileSync(filePath, JSON.stringify(persisted) + "\n", "utf-8");
+    appendFileSync(filePath, JSON.stringify({
+      eventId: persisted.eventId,
+      ...persisted,
+      owner: { kind: "session" },
+    }) + "\n", "utf-8");
   });
 
   return () => {

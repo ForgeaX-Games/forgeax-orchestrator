@@ -40,7 +40,7 @@ const compact: CommandModule = {
     const instructions = args.join(" ").trim();
 
     // Get ledger + resolveModels from the running agent instance.
-    const agent = session.scheduler.getAgent(agentPath);
+    const agent = await session.initializeAgentHost(agentPath);
     if (!agent) throw new Error(`compact: agent '${agentPath}' not running`);
 
     const resolveModels = agent.agentContext.resolveModels;

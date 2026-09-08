@@ -5,38 +5,28 @@
 //   - staging root (WRITE) = mkdtemp under os.tmpdir()     (see git-uploader)
 // `pm.user()` (= ~/.forgeax) is NOT the source — that tree has no games.
 //
-// The effective GitHub credential is the FORGEAX_UPLOAD_GITHUB_TOKEN env
-// override when present, otherwise the compiled built-in fallback. An env
-// override is never written to upload.json / commits / logs, and read_file
-// denies credential files that may contain it. The fallback is shipped code.
+// The effective GitHub credential and destination are resolved with this
+// precedence: the FORGEAX_UPLOAD_* env override when present, otherwise the
+// product-shell-injected default (`getUploadDefaults()` — the shared repo and
+// shared write token are product policy/credential the shell owns, NOT baked
+// into this business-agnostic base). An env override is never written to
+// upload.json / commits / logs, and read_file denies credential files that may
+// contain it. When neither env nor an injected default supplies a credential,
+// upload is simply unconfigured on this build.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { defaultProjectRoot } from "@forgeax/platform-io";
+import { getUploadDefaults } from "../orchestration-seams";
 
-/** Default upload destination — the shared org repo every workspace lands in
- *  (one `<namespace>/` subdirectory each). Users may point FORGEAX_UPLOAD_REPO at
- *  any repo their own token can write (Settings → Upload edits it; the settings
- *  PUT live-applies, so no restart). Decision 2026-07-09: user-configurable repo
- *  replaces the earlier fixed-destination stance; the shared repo is just this
- *  default. */
-export const DEFAULT_UPLOAD_REPO = "ForgeaX-Games/Forgeax-Data";
-
+/** Generic default branch — not product identity, so it stays in the base. The
+ *  shared destination repo and write token are product policy/credential and are
+ *  injected by the product shell via `getUploadDefaults()` (see header). Users may
+ *  point FORGEAX_UPLOAD_REPO at any repo their own token can write (Settings →
+ *  Upload edits it; the settings PUT live-applies, so no restart). */
 export const DEFAULT_BRANCH = "main";
-
-/** Built-in shared token (write access to the shared repo only), so upload works
- *  out of the box; FORGEAX_UPLOAD_GITHUB_TOKEN overrides it. Stored in pieces —
- *  GitHub secret-scanning/push-protection auto-revokes verbatim `github_pat_`
- *  strings the moment they land in a public mirror.
- *  Scope check 2026-07-20: Contents write only on ForgeaX-Games/Forgeax-Data
- *  (personal-repo blob create → 403 Resource not accessible by PAT). */
-export const DEFAULT_UPLOAD_TOKEN = [
-  "github_pat_",
-  "11AD6JT7Q01J0AtpQyDmzz_",
-  "8nFt5DkPQIyww1qhquNbc3eLOXyMv7yuhugt3HN8uY1BQVJHRRPr2FqsLXS",
-].join("");
 
 export type UploadConfigErrorKind = "no-repo";
 
@@ -81,24 +71,25 @@ export function uploadLogFile(projectRoot: string = defaultProjectRoot()): strin
   return resolve(projectRoot, ".forgeax", "upload-log.jsonl");
 }
 
-/** Resolve + validate the destination repo (env override or shared default). */
+/** Resolve + validate the destination repo (env override → injected default). */
 function resolveRepo(env: NodeJS.ProcessEnv): string {
-  const repo = (env.FORGEAX_UPLOAD_REPO?.trim() || DEFAULT_UPLOAD_REPO).trim();
+  const repo = (env.FORGEAX_UPLOAD_REPO?.trim() || getUploadDefaults()?.repo || "").trim();
   if (!repo || !REPO_RE.test(repo)) {
     throw new UploadConfigError(
       "no-repo",
-      "upload destination not published yet — ask the maintainer for the shared repo, or set FORGEAX_UPLOAD_REPO=owner/repo in this machine's .env",
+      "upload destination not configured — the product shell injects the shared repo, or set FORGEAX_UPLOAD_REPO=owner/repo in this machine's .env",
     );
   }
   return repo;
 }
 
 function resolveBranch(env: NodeJS.ProcessEnv): string {
-  return env.FORGEAX_UPLOAD_BRANCH?.trim() || DEFAULT_BRANCH;
+  return env.FORGEAX_UPLOAD_BRANCH?.trim() || getUploadDefaults()?.branch?.trim() || DEFAULT_BRANCH;
 }
 
+/** env override → product-shell-injected shared token → "" (unconfigured). */
 function resolveToken(env: NodeJS.ProcessEnv): string {
-  return env.FORGEAX_UPLOAD_GITHUB_TOKEN?.trim() || DEFAULT_UPLOAD_TOKEN;
+  return env.FORGEAX_UPLOAD_GITHUB_TOKEN?.trim() || getUploadDefaults()?.token?.trim() || "";
 }
 
 // ── namespace ────────────────────────────────────────────────────────────────

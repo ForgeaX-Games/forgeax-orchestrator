@@ -3,13 +3,14 @@
  *  覆盖：
  *  - GET /api/cli/health 报告 mock provider ok
  *  - POST /api/cli/chat 走 SSE，按事件类型 emit，遇 done 自动收尾
+ *  - POST /api/cli/warm 只做 provider health probe，不创建聊天回合
  *  - 缺 message → 400
  *  - 缺 provider → 503
  *  - 所有响应带 Deprecation: true header */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
-import { createCliRouter } from "../src/api/cli/chat";
+import { createCliRouter, normalizeChatModelOverride, normalizeClientMessageId } from "../src/api/cli/chat";
 import { _resetRegistry, registerProvider } from "../src/cli-providers/registry";
 import type { CliProvider, ChatEvent } from "../src/cli-providers/types";
 import { initPathManager, resetPathManager, getPathManager } from "../src/fs/path-manager";
@@ -133,7 +134,53 @@ describe("/api/cli/health", () => {
   });
 });
 
+describe("/api/cli/warm", () => {
+  test("无 provider → 503", async () => {
+    const res = await app.fetch(new Request("http://localhost/api/cli/warm", {
+      method: "POST",
+      body: "{}",
+      headers: { "content-type": "application/json" },
+    }));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ ok: false });
+  });
+
+  test("probes the selected provider without starting a turn", async () => {
+    registerProvider(makeMockProvider({ id: "warm-provider" }), { default: true });
+    const res = await app.fetch(new Request("http://localhost/api/cli/warm", {
+      method: "POST",
+      body: JSON.stringify({ providerOverride: "warm-provider", sessionId: "must-not-start" }),
+      headers: { "content-type": "application/json" },
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, providerId: "warm-provider", detail: "mocked" });
+  });
+
+  test("unhealthy provider → 503", async () => {
+    registerProvider(makeMockProvider({ id: "broken-warm", ok: false }), { default: true });
+    const res = await app.fetch(new Request("http://localhost/api/cli/warm", {
+      method: "POST",
+      body: JSON.stringify({ providerOverride: "broken-warm" }),
+      headers: { "content-type": "application/json" },
+    }));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ ok: false, providerId: "broken-warm" });
+  });
+});
+
 describe("/api/cli/chat", () => {
+  test("normalizes the Composer-selected model override", () => {
+    expect(normalizeChatModelOverride("  gpt-5.6-luna  ")).toBe("gpt-5.6-luna");
+    expect(normalizeChatModelOverride("   ")).toBeUndefined();
+    expect(normalizeChatModelOverride(null)).toBeUndefined();
+  });
+
+  test("normalizes the UI client message id used for echo dedupe", () => {
+    expect(normalizeClientMessageId("  c-ui-message-1  ")).toBe("c-ui-message-1");
+    expect(normalizeClientMessageId("   ")).toBeUndefined();
+    expect(normalizeClientMessageId(null)).toBeUndefined();
+  });
+
   test("缺 message → 400", async () => {
     registerProvider(makeMockProvider(), { default: true });
     const res = await app.fetch(new Request("http://localhost/api/cli/chat", {
@@ -266,13 +313,13 @@ describe("/api/cli/chat", () => {
     }), { default: true });
 
     try {
-      const post = () => app.fetch(new Request("http://localhost/api/cli/chat", {
+      const post = (clientMsgId: string) => app.fetch(new Request("http://localhost/api/cli/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "edit it", sessionId: session.sid, agentId: "forge" }),
+        body: JSON.stringify({ message: "edit it", clientMsgId, sessionId: session.sid, agentId: "forge" }),
       }));
 
-      const first = await post();
+      const first = await post("c-cli-echo-one");
       expect(first.status).toBe(200);
       await readSSEEvents(first);
 
@@ -287,7 +334,7 @@ describe("/api/cli/chat", () => {
       expect("error" in rewind).toBe(false);
       expect(readFileSync(source, "utf-8")).toBe("base\n");
 
-      const second = await post();
+      const second = await post("c-cli-echo-two");
       expect(second.status).toBe(200);
       await readSSEEvents(second);
       expect(getCheckpointManager().pendingOf(session)).toBeNull();

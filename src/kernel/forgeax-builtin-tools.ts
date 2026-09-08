@@ -34,6 +34,9 @@ import {
   type HostToolRunCtx,
 } from '../orchestration-seams';
 import { catalogGet } from './action-catalog';
+import { findVisibleDoor } from './action-door';
+import { walkDoorInstead } from './door-reroute';
+import { getSurfaceSnapshot } from '../api/bus';
 import { getBuiltinHeadlessUiAction } from './ui-headless-actions';
 import { NPC_TOOL_CONTRACTS } from '@forgeax/types/npc-tools';
 
@@ -65,6 +68,25 @@ export interface UiActionNotFoundResult {
   status: 'rejected';
   code: 'not_found';
   reason: string;
+}
+
+/** Attach the catalog-to-visible-door reconciliation at the capability boundary. */
+export function annotateUiInvokeResult(
+  value: unknown,
+  actionId: string,
+  actionArgs: unknown,
+): unknown {
+  if (!actionId || value === null || typeof value !== 'object' || Array.isArray(value)) return value;
+  const menubar = getSurfaceSnapshot('host.menubar') as { menus?: unknown } | null;
+  const sidebar = getSurfaceSnapshot('host.sidebar') as {
+    entries?: Array<{ id?: unknown; label?: unknown }>;
+  } | null;
+  const door = findVisibleDoor({
+    menus: menubar?.menus ?? null,
+    rail: sidebar?.entries ?? null,
+    fact: catalogGet(actionId)?.door,
+  }, actionId, actionArgs);
+  return { ...(value as Record<string, unknown>), door };
 }
 
 function notFoundUiAction(actionId: string): UiActionNotFoundResult {
@@ -126,6 +148,10 @@ export interface BuiltinToolCtx {
   eventBus?: EventPublisher;
   /** 会话 id，用于 UI lease、runtime binding 与 catalog projection。 */
   sid?: string;
+  /** Correlation keys for host-side tool/audit joins. */
+  callId?: string;
+  turnCallId?: string;
+  toolExecutionId?: string;
 }
 
 const PERCEPTION_TIMEOUT_MS = 8_000;
@@ -136,6 +162,28 @@ const UI_SCREENSHOT_TIMEOUT_MS = 15_000;
 
 function memoryRef(ctx: BuiltinToolCtx): LayeredMemoryRef {
   return { root: soulMemoryRoot(ctx.projectRoot, ctx.agentId), ...(ctx.game ? { game: ctx.game } : {}) };
+}
+
+export function annotateUiSnapshotResult(out: unknown): unknown {
+  if (!out || typeof out !== 'object' || Array.isArray(out)) return out;
+  const actions = (out as { actions?: unknown }).actions;
+  if (!Array.isArray(actions)) return out;
+  try {
+    let changed = false;
+    const annotatedActions = actions.map((row) => {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return row;
+      const id = typeof (row as { id?: unknown }).id === 'string'
+        ? (row as { id: string }).id
+        : '';
+      const preconditions = id ? catalogGet(id)?.preconditions : undefined;
+      if (!preconditions?.length) return row;
+      changed = true;
+      return { ...(row as Record<string, unknown>), preconditions: [...preconditions] };
+    });
+    return changed ? { ...(out as Record<string, unknown>), actions: annotatedActions } : out;
+  } catch {
+    return out;
+  }
 }
 
 /** 将内置工具上下文适配为 seam 工具使用的 HostToolRunCtx。 */
@@ -149,6 +197,9 @@ export function hostToolRunCtx(ctx: BuiltinToolCtx): HostToolRunCtx {
   };
   return {
     ...deliveryContext,
+    ...(ctx.callId ? { callId: ctx.callId } : {}),
+    ...(ctx.turnCallId ? { turnCallId: ctx.turnCallId } : {}),
+    ...(ctx.toolExecutionId ? { toolExecutionId: ctx.toolExecutionId } : {}),
     perception: (kind, query) => perceptionQuery(ctx, kind, query),
     ...(delivery
       ? { delivery: { enrich: (claim) => delivery.enrich(claim, deliveryContext) } }
@@ -424,8 +475,10 @@ export async function runForgeaxBuiltinTool(
     case 'npc_wire':
       return npcWire(ctx, args);
     // UI 语义操作层：与 seam 感知工具同构，应答方是 interface 的 ActionRegistry。
-    case 'ui_snapshot':
-      return perceptionQuery(ctx, 'ui_snapshot', args ?? {});
+    case 'ui_snapshot': {
+      const out = await perceptionQuery(ctx, 'ui_snapshot', args ?? {});
+      return annotateUiSnapshotResult(out);
+    }
     case 'ui_screenshot': {
       // 成功截图转换为模型可见的 image ContentPart；失败结果按 JSON 原样透传。
       const out = await perceptionQuery(ctx, 'ui_screenshot', args ?? {}, UI_SCREENSHOT_TIMEOUT_MS);
@@ -446,6 +499,12 @@ export async function runForgeaxBuiltinTool(
       const actionId = typeof args?.actionId === 'string' ? args.actionId : '';
       const rejection = uiActionCatalogRejection(actionId);
       if (rejection) return rejection;
+      const actionArgs = (args?.args ?? {}) as Record<string, unknown>;
+      const walked = await walkDoorInstead(
+        { actionId, args: actionArgs },
+        { runCtx: hostToolRunCtx(ctx) },
+      );
+      if (walked) return walked.result;
       // catalog 已校验 action 存在；UI 侧按声明的 timeoutMs 执行。
       // A live lease + accepted manifest row is only an executor binding. With no binding,
       // cold-start dispatch must not wait for a UI timeout before trying the server surface.
@@ -453,7 +512,7 @@ export async function runForgeaxBuiltinTool(
         ? await perceptionQuery(
             ctx,
             'ui_invoke',
-            { actionId, args: args?.args ?? {} },
+            { actionId, args: actionArgs },
             uiInvokeTimeoutMs(ctx.sid, actionId, UI_INVOKE_TIMEOUT_MS),
           )
         : { unavailable: true, reason: `no live UI executor binding for action ${JSON.stringify(actionId)}` };
@@ -464,15 +523,20 @@ export async function runForgeaxBuiltinTool(
           const handler = getHostUiAction(actionId) ?? getBuiltinHeadlessUiAction(actionId);
           if (handler) {
             try {
-              const res = await handler.run((args?.args ?? {}) as Record<string, unknown>, hostToolRunCtx(ctx));
-              return res && typeof res === 'object' ? { ...res, executedVia: 'headless' } : res;
+              const res = await handler.run(actionArgs, hostToolRunCtx(ctx));
+              const headless = res && typeof res === 'object' ? { ...res, executedVia: 'headless' } : res;
+              return annotateUiInvokeResult(headless, actionId, actionArgs);
             } catch (e) {
-              return { status: 'rejected', reason: `headless handler threw: ${(e as Error).message}` };
+              return annotateUiInvokeResult(
+                { status: 'rejected', reason: `headless handler threw: ${(e as Error).message}` },
+                actionId,
+                actionArgs,
+              );
             }
           }
         }
       }
-      return out;
+      return annotateUiInvokeResult(out, actionId, actionArgs);
     }
     default:
       // 防御分支：调用方原则上已通过 isForgeaxBuiltinTool 校验。

@@ -8,25 +8,91 @@
  *    内存。要看具体内容用 `fetch_blob(sha256)` 单独捞。 */
 
 import type { StoredEvent } from "./types";
-import { walkAndReinflate, LedgerBlobMissingError } from "./event-blob";
+import type { Event } from "../core/types";
+import type {
+  InstanceEventBinding,
+  ResolvedEventStorePaths,
+} from "./types";
+import {
+  parseEvents,
+  LedgerBlobMissingError,
+} from "./event-codec";
+import { EventLedger } from "./event-ledger";
+import {
+  AsyncLedgerWriter,
+  type EventDurability,
+} from "../session/async-ledger-writer";
 
 export type { StoredEvent };
 
 export { LedgerBlobMissingError };
+export { parseEvents };
 
-export function parseEvents(raw: string, blobsDir?: string): StoredEvent[] {
-  const events: StoredEvent[] = [];
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try { events.push(JSON.parse(trimmed) as StoredEvent); } catch { /* skip malformed */ }
+/**
+ * Per-instance history facade. It owns durability/backpressure policy while
+ * EventLedger remains the synchronous shard/blob codec.
+ */
+export class EventStore {
+  readonly ledger: EventLedger;
+  private readonly writer: AsyncLedgerWriter;
+  private _historyDegraded = false;
+
+  constructor(
+    readonly binding: InstanceEventBinding,
+    readonly paths: ResolvedEventStorePaths,
+  ) {
+    this.ledger = new EventLedger(binding, paths);
+    this.writer = new AsyncLedgerWriter(binding.storeId);
   }
-  if (blobsDir) {
-    for (const ev of events) {
-      if (ev.payload && typeof ev.payload === "object") {
-        walkAndReinflate(ev.payload, blobsDir);
-      }
+
+  async append(
+    event: StoredEvent,
+    durability: EventDurability,
+  ): Promise<void> {
+    try {
+      await this.writer.enqueueTask(
+        async () => this.ledger.appendStored(event),
+        durability,
+      );
+    } catch (error) {
+      if (durability === "required") this._historyDegraded = true;
+      throw error;
     }
   }
-  return events;
+
+  async appendEvent(
+    event: Event,
+    emitterId: string | undefined,
+    durability: EventDurability,
+  ): Promise<void> {
+    try {
+      await this.writer.enqueueTask(
+        async () => { this.ledger.append(event, emitterId); },
+        durability,
+      );
+    } catch (error) {
+      if (durability === "required") this._historyDegraded = true;
+      throw error;
+    }
+  }
+
+  readAllEvents(): Promise<StoredEvent[]> {
+    return this.ledger.readAllEvents();
+  }
+
+  async flush(): Promise<void> {
+    await this.writer.flush();
+  }
+
+  dispose(): void {
+    this.writer.dispose();
+  }
+
+  get historyDegraded(): boolean {
+    return this._historyDegraded;
+  }
+
+  get droppedBestEffort(): number {
+    return this.writer.dropped;
+  }
 }

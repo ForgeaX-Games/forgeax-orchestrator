@@ -92,7 +92,7 @@ export async function forkExtension(input: ForkInput): Promise<ForkResult> {
     cpSync(srcDir, destDir, { recursive: true });
     // node_modules / build artefacts shouldn't ship; we keep cpSync simple here
     // and trust the fork to be a hand-authored plugin tree (not a built
-    // workbench dist). For built workbenches, ship a `.fxpack` instead.
+    // page dist). For built Pages, ship a `.fxpack` instead.
 
     const manifestPath = join(destDir, 'forgeax-extension.json');
     if (!existsSync(manifestPath)) {

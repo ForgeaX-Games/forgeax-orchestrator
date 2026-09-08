@@ -8,17 +8,19 @@
 //   - args 是 string[]，复杂结构走 JSON.stringify 模块自解析
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { initPathManager, resetPathManager } from "../src/fs/path-manager";
 import { initSessionManager, resetSessionManager, getSessionManager } from "../src/core/session-manager";
 import { getPathManager } from "../src/fs/path-manager";
 import { listAllCommands, callQuery, callExecute, _resetImportLedger } from "../src/commands/runner";
+import { STATIC_BUILTIN_COMMANDS } from "../src/commands/static-builtins";
 
 let userRoot: string;
 let commandsDir: string;
 let prevCmdDir: string | undefined;
+let prevStaticBuiltins: string | undefined;
 
 function writeMod(file: string, body: string): string {
   const path = resolve(commandsDir, file);
@@ -34,6 +36,8 @@ beforeEach(async () => {
   userRoot = mkdtempSync(resolve(tmpdir(), "forgeax-cmd-runner-"));
   commandsDir = mkdtempSync(resolve(tmpdir(), "forgeax-cmd-dir-"));
   prevCmdDir = process.env.FORGEAX_COMMANDS_DIR;
+  prevStaticBuiltins = process.env.FORGEAX_STATIC_BUILTIN_COMMANDS;
+  delete process.env.FORGEAX_STATIC_BUILTIN_COMMANDS;
   process.env.FORGEAX_COMMANDS_DIR = commandsDir;
   resetPathManager();
   await resetSessionManager();
@@ -45,6 +49,8 @@ beforeEach(async () => {
 afterEach(async () => {
   if (prevCmdDir === undefined) delete process.env.FORGEAX_COMMANDS_DIR;
   else process.env.FORGEAX_COMMANDS_DIR = prevCmdDir;
+  if (prevStaticBuiltins === undefined) delete process.env.FORGEAX_STATIC_BUILTIN_COMMANDS;
+  else process.env.FORGEAX_STATIC_BUILTIN_COMMANDS = prevStaticBuiltins;
   await resetSessionManager();
   resetPathManager();
   rmSync(userRoot, { recursive: true, force: true });
@@ -52,6 +58,17 @@ afterEach(async () => {
 });
 
 describe("listAllCommands", () => {
+  test("static desktop registry stays in sync and exposes list_models without command files", async () => {
+    const sourceFiles = readdirSync(resolve(import.meta.dir, "../builtin/commands"))
+      .filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts"))
+      .sort();
+    expect(STATIC_BUILTIN_COMMANDS.map(({ file }) => file).sort()).toEqual(sourceFiles);
+
+    process.env.FORGEAX_STATIC_BUILTIN_COMMANDS = "1";
+    const specs = await listAllCommands(ctx());
+    expect(specs.map((spec) => spec.name)).toContain("list_models");
+  });
+
   test("空目录 → []", async () => {
     const specs = await listAllCommands(ctx());
     expect(specs).toEqual([]);
@@ -75,6 +92,19 @@ describe("listAllCommands", () => {
     expect(specs.map((s) => s.name).sort()).toEqual(["alpha", "beta"]);
     expect(specs.find((s) => s.name === "alpha")?.hasQuery).toBe(true);
     expect(specs.find((s) => s.name === "beta")?.hasExecute).toBe(true);
+  });
+
+  test("packaged .mjs command modules are scanned", async () => {
+    writeMod("packaged.mjs", `
+      export default {
+        async list() {
+          return [{ name: "packaged", description: "p", hasQuery: true, hasExecute: false }];
+        },
+        async query() { return { packaged: true }; },
+      };
+    `);
+    expect((await listAllCommands(ctx())).map((spec) => spec.name)).toContain("packaged");
+    expect(await callQuery("packaged", [], ctx())).toEqual({ ok: true, data: { packaged: true } });
   });
 
   test("坏模块 → `_error:<file>` synthetic spec（不抛）", async () => {

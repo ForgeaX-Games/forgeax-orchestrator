@@ -2,9 +2,8 @@
  *
  *  问题背景:`core/logger.ts` 的 console bridge 按 ALS `LogContext.sid` 把
  *  `console.*` 路由进 `<sid>/logs/debug.log`。但建立这个 sid scope 的
- *  `runWithSession(...)` 此前**只**在老的 `core/scheduler.ts`(Scheduler→
- *  ConsciousAgent)路径里。默认主对话走内核路径(`kernelEnabled()` 默认开),
- *  `/api/cli/chat` 直接在 Hono handler 里 `kernel.runTurn(...)`,绕开 Scheduler,
+ *  `runWithSession(...)` 由 RuntimeAgentHost turn 路径建立。兼容的
+ *  `/api/cli/chat` 仍直接在 Hono handler 里 `kernel.runTurn(...)`,
  *  栈上没有 sid scope ⇒ turn-trace / handler 的 `console.*` 全落 user-root
  *  fallback(`debug.log`),进不了对应 session 的日志(turn-trace 改走通用
  *  console 通道、删独立 turn-trace.log 之后,这表现为"日志没被持久化")。

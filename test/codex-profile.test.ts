@@ -9,7 +9,9 @@ import { describe, test, expect } from 'bun:test';
 import type { TurnRequest, ComposedPrompt } from '@forgeax/agent-runtime/contract';
 import {
   buildCodexArgs,
+  resolveCodexModelEffort,
   buildCodexAppServerGlobalArgs,
+  buildCodexAppServerTurnInput,
   buildCodexInstructions,
   buildCodexSingleAgentArgs,
 } from '../src/kernel/codex-profile';
@@ -68,6 +70,26 @@ describe('codex-profile — buildCodexArgs 内嵌单 Agent 关闭参数', () => 
     expect(args).toContain('multi_agent_v2');
     expect(args).toContain('agents.enabled=false');
   });
+
+  test('image attachment ⇒ uses --image path and never inline data', () => {
+    const args = buildCodexArgs(req({
+      input: {
+        text: 'describe this',
+        attachments: [{ kind: 'image', path: '/tmp/uploads/large.png', data: 'not-on-wire' }],
+      },
+    }), undefined);
+    expect(args).toContain('--image');
+    expect(args).toContain('/tmp/uploads/large.png');
+    expect(args).not.toContain('not-on-wire');
+  });
+
+  test('resume image attachment ⇒ uses --image after the resume thread id', () => {
+    const args = buildCodexArgs(req({
+      input: { text: 'next', attachments: [{ kind: 'image', path: '/tmp/uploads/large.png' }] },
+    }), 'thread-123');
+    expect(args.indexOf('--image')).toBeGreaterThan(args.indexOf('thread-123'));
+    expect(args).toContain('/tmp/uploads/large.png');
+  });
 });
 
 describe('codex-profile — ForgeaX ask_user routing', () => {
@@ -90,5 +112,46 @@ describe('codex-profile — ForgeaX ask_user routing', () => {
     const instructions = buildCodexInstructions(req());
     expect(instructions).toBe('CHARTER');
     expect(instructions).not.toContain('host-provided `ask_user` tool');
+  });
+});
+
+describe('codex-profile — buildCodexAppServerTurnInput', () => {
+  test('large image uses localImage path and never enters text/base64', () => {
+    const input = buildCodexAppServerTurnInput(req({
+      input: {
+        text: 'describe this',
+        attachments: [{ kind: 'image', path: '/tmp/uploads/large.png', data: 'not-on-wire' }],
+      },
+    }));
+    expect(input).toEqual([
+      { type: 'text', text: 'describe this', text_elements: [] },
+      { type: 'localImage', path: '/tmp/uploads/large.png' },
+    ]);
+    expect(JSON.stringify(input)).not.toContain('not-on-wire');
+  });
+});
+
+
+describe('explicit product model effort', () => {
+  const model = { id: 'catalog-id', model: 'selected-model', defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'high' }] };
+  test('uses advertised medium for either exact catalog identifier', () => {
+    expect(resolveCodexModelEffort('catalog-id', [model])).toBe('medium');
+    expect(resolveCodexModelEffort('selected-model', [model])).toBe('medium');
+    expect(resolveCodexModelEffort(' selected-model ', [model])).toBe('medium');
+  });
+  test('respects non-reasoning capability and preserves no-selection config', () => {
+    expect(resolveCodexModelEffort('plain', [{ id: 'plain', defaultReasoningEffort: 'none', supportedReasoningEfforts: [{ reasoningEffort: 'none' }] }])).toBe('none');
+    expect(resolveCodexModelEffort(undefined, [])).toBeUndefined();
+  });
+  test('fails closed on unknown or incomplete selected metadata', () => {
+    expect(() => resolveCodexModelEffort('missing', [model])).toThrow('no advertised compatible');
+    expect(() => resolveCodexModelEffort('selected-model', [{ model: 'selected-model' }])).toThrow('no advertised compatible');
+  });
+  test('exec start and resume carry the resolved effort without editing config', () => {
+    for (const thread of [undefined, 'existing-thread']) {
+      const args = buildCodexArgs(req({ model: 'selected-model' }), thread, false, [], undefined, 'medium');
+      expect(args).toContain('model_reasoning_effort="medium"');
+    }
+    expect(buildCodexArgs(req(), undefined).join(' ')).not.toContain('model_reasoning_effort');
   });
 });

@@ -1,9 +1,9 @@
 /**
  * soul cache-warm 提取驱动 —— turnEnd 经内核 `forkExtract` 复用上一轮缓存前缀做后台记忆抽取。
  *
- * 关键:`composeTurnRequest` 内部经 materializeNativeHistory 构建 host-owned history,且 systemPrompt
- * /tools 与上一轮 runTurn **同一构建器** → 一次调用即给齐「与上一轮字节对齐」的 systemPrompt+tools
- * +history,喂给 `kernel.forkExtract`,整段前缀走 cache-read(对齐 cc runForkedAgent)。
+ * 关键:`composeTurnRequest` 使用与正常 Runtime turn 相同的上下文投影和 prompt/tool
+ * 构建器，一次调用给齐 systemPrompt + tools + history，交给 `kernel.forkExtract`；
+ * 对支持私有会话的 Kernel，稳定前缀仍可命中 cache-read（对齐 cc runForkedAgent）。
  *
  * 内核支持 forkExtract(forgeax-core)→ cache-warm;不支持(codex 等)/无会话/异常 → 返回 false,
  * 由调用方(runAutoExtract)回落冷链路(§9 graceful degradation)。fork 内模型经 `remember` 工具
@@ -11,10 +11,11 @@
  *
  * Boundary(HOST 层):相对 import + @forgeax/agent-runtime 契约。
  */
-import type { ForkExtractRequest, ForkExtractResult } from '@forgeax/agent-runtime';
+import type { AgentKernel, ForkExtractRequest, ForkExtractResult } from '@forgeax/agent-runtime';
 import { resolveKernel } from '../kernel/resolve-kernel';
-import { composeTurnRequest } from '../kernel/compose-turn-request';
-import { deriveThreadId } from '../lib/thread-id';
+import { composeTurnRequest, type ComposeInput } from '../kernel/compose-turn-request';
+import { kernelThreadId } from '../runtime/kernel-turn-runner';
+import { visibleAgentManagementToolsForAgent } from '../kits/agent-management-visibility';
 
 /** 追加给 fork 的唯一一条 user 指令(英文,分层 taxonomy 经 remember 工具)。 */
 export const SOUL_EXTRACT_INSTRUCTION = [
@@ -34,7 +35,37 @@ export interface SoulForkExtractInput {
   sid: string;
   /** 刚结束回合的 agent 路径(emitterId)。 */
   agentPath: string;
+  /**
+   * Runtime instance id used for the just-finished turn. Must match
+   * `runKernelTurn`'s threadId key (`uuidv5(sid::instanceId)`), otherwise
+   * forgeax-core `sessionKeyOf` (threadId-first) misses the live serve session
+   * and cache-warm always falls back to the cold path.
+   */
+  instanceId: string;
+  /** Kernel that actually executed the completed turn. */
+  kernelId?: string;
   signal?: AbortSignal;
+}
+
+/** Build the exact compose input used by the fork cache-warm path.
+ *
+ * Keeping this seam explicit makes it impossible for the fork to silently
+ * drop the canonical agent-management visibility while rebuilding the prefix.
+ * The optional visibility value is only a narrow test/integration seam;
+ * production callers derive it from `(sid, agentPath)` here. */
+export function buildSoulForkComposeInput(
+  input: SoulForkExtractInput,
+  kernel: AgentKernel,
+  visibleAgentManagementTools = visibleAgentManagementToolsForAgent(input.sid, input.agentPath),
+): ComposeInput {
+  return {
+    message: SOUL_EXTRACT_INSTRUCTION,
+    agentId: input.agentPath,
+    kernel,
+    threadId: kernelThreadId(input.sid, input.instanceId),
+    sessionId: input.sid,
+    visibleAgentManagementTools,
+  };
 }
 
 /**
@@ -44,25 +75,16 @@ export interface SoulForkExtractInput {
 export async function tryKernelForkExtract(input: SoulForkExtractInput): Promise<boolean> {
   let kernel;
   try {
-    kernel = resolveKernel(input.agentPath);
+    kernel = resolveKernel(input.agentPath, input.kernelId);
   } catch {
     return false; // 无可用内核 → 冷兜底
   }
   if (!kernel.capabilities?.forkExtract || typeof kernel.forkExtract !== 'function') return false;
 
   // 复用上一轮的 systemPrompt+tools+history(同一 composeTurnRequest 构建器 → 缓存对齐)。
-  // threadId 必须与正常轮次(kernel-turn.ts)同一派生公式 —— 否则内核侧缓存前缀 key 对不上,
-  // fork 这次调用就白丢一次本该有的 cache-warm(bug:此前直接传 raw sid,与正常轮次的
-  // deriveThreadId(sid, agentPath) 不一致)。
   let composed;
   try {
-    composed = await composeTurnRequest({
-      message: SOUL_EXTRACT_INSTRUCTION,
-      agentId: input.agentPath,
-      kernel,
-      threadId: deriveThreadId(input.sid, input.agentPath),
-      sessionId: input.sid,
-    });
+    composed = await composeTurnRequest(buildSoulForkComposeInput(input, kernel));
   } catch {
     return false;
   }

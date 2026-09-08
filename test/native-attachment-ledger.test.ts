@@ -47,15 +47,16 @@ describe('native EventBus attachment persistence', () => {
     const events = await session.getOrCreateLedger('forge').readAllEvents();
     expect(events.filter((e) => e.type === 'user_input')).toHaveLength(1);
     expect(JSON.stringify(events)).not.toContain('QUJD');
-    const stored = events[0]!;
+    const stored = events.find((event) => event.type === 'user_input')!;
     expect(stored.payload?.content).toBe('inspect this');
-    expect(stored.payload?.contextContent).toContain('/uploads/shot.png');
+    expect(stored.payload?.contextContent).toContain('shot.png');
+    expect(stored.payload?.contextContent).not.toContain('/uploads/shot.png');
     expect((stored.payload?.attachments as Array<Record<string, unknown>>)[0]).toEqual({
       kind: 'image', path: expect.stringContaining('/uploads/shot.png'), mediaType: 'image/png',
     });
 
     const modelMessage = eventToSessionMessage(stored as any);
-    expect(modelMessage?.content[0]).toEqual({ type: 'text', text: expect.stringContaining('/uploads/shot.png') });
+    expect(modelMessage?.content[0]).toEqual({ type: 'text', text: expect.not.stringContaining('/uploads/shot.png') });
     expect(modelMessage?.content.some((p: any) => p.type === 'image_file' && String(p.path).includes('/uploads/shot.png'))).toBe(true);
     const visible = adapt(stored, createAdapterState());
     expect(visible).toEqual([{ type: 'user_message', text: 'inspect this' }]);

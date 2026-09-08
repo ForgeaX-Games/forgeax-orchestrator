@@ -44,6 +44,24 @@ describe('native ask_user input compatibility', () => {
     })).toContain('1–3');
   });
 
+  it('rejects invalid rows before normalization instead of dropping them', async () => {
+    expect(await askUserTool.validateInput?.({
+      questions: [
+        { id: 'valid', question: 'Valid?', options: ['A'] },
+        { id: 'missing-question', options: ['B'] },
+      ],
+    })).toContain('non-empty');
+    expect(await askUserTool.validateInput?.({
+      questions: [{ question: 'Broken option?', options: [{ description: 'missing label' }] }],
+    })).toContain('valid options');
+    expect(await askUserTool.validateInput?.({
+      questions: [
+        { id: 'same', question: 'One?', options: ['A'] },
+        { id: 'same', question: 'Two?', options: ['B'] },
+      ],
+    })).toContain('unique');
+  });
+
   it('accepts one concrete option because the UI supplies Other', async () => {
     expect(await askUserTool.validateInput?.({
       questions: [{ question: 'Any custom notes?', options: [{ label: 'No extra notes' }] }],

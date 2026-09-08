@@ -3,9 +3,8 @@
 // 对齐 agenteam-os-ref `commands/skill-dispatch.ts` / `commands/compact.ts` 的
 // 设计模式：UI / CLI 通过 commands transport 暴露 execute 命令，命令体内 publish
 // 一个 `agent_command` event 到 session.eventBus —— Session 构造里的
-// `_bindAgentCommandRouting` observer 会接住事件并桥到 `scheduler.getAgent(to)
-// .queueCommand(toolName, args)`，让目标 ConsciousAgent 把这次调用合成 user-issued
-// tool_call event 注入下一 turn 的 LLM 历史。
+// `_bindAgentCommandRouting` observer 会接住事件并交给目标实例唯一的
+// RuntimeController，在下一 turn 执行该 tool。
 //
 // 跟 builtin/commands/character-forge.ts 那种"直调 handler"命令的本质区别：
 //   - 直调命令：业务逻辑就地跑完，事件 emit 给前端，**不进 LLM 历史**
@@ -27,11 +26,10 @@
 
 import type { CommandModule } from "../../src/commands/types";
 import type { Event } from "../../src/core/types";
-import type { ToolDefinition } from "../../src/core/types";
+import type { AgentContext } from "../../src/core/types";
+import { visibleTools } from "../../src/runtime/visible-tools";
 
-/** ConsciousAgent.queueCommand 接收 `Record<string, string>`，复杂值约定走
- *  `JSON.stringify`；本函数把 args 字段统一 string 化，但保留对象/数组形态时
- *  整段 stringify（agent 端 tool.execute 会 try-parse）。 */
+/** 命令 transport 只接收字符串参数；复杂值按约定 JSON.stringify。 */
 function stringifyArgs(raw: unknown): Record<string, string> {
   if (!raw || typeof raw !== "object") return {};
   const out: Record<string, string> = {};
@@ -74,13 +72,18 @@ const agentCommand: CommandModule = {
       if (!agentPath) throw new Error(`${name}: args[1] (agentPath) required`);
 
       const session = await ctx.sm.open(sid);
-      // BaseAgent.agentContext 是 public readonly field —— ScriptAgent / ConsciousAgent
-      // 都暴露同一份 toolRegistry，list() 已经把 visibility/condition wrap 进去。
-      const agent = session.scheduler.getAgent(agentPath);
+      // RuntimeTree registration is independent from compatibility-host
+      // construction. Tool discovery is the first capability access for an
+      // idle resident, so initialize that host explicitly.
+      await session.initializeAgentHost(agentPath);
+      // RuntimeAgentHost 暴露同一份 instance-scoped toolRegistry，list()
+      // 已经把 visibility/condition wrap 进去。
+      const agent = session.getAgentHost(agentPath);
       if (!agent) throw new Error(`${name}: agent not found: ${agentPath}`);
 
-      const tools = ((agent as { agentContext?: { tools?: { list?: () => ToolDefinition[] } } })
-        .agentContext?.tools?.list?.() ?? []) as ToolDefinition[];
+      const agentContext = (agent as { agentContext?: AgentContext }).agentContext;
+      if (!agentContext) throw new Error(`${name}: agent context unavailable: ${agentPath}`);
+      const tools = visibleTools(agentContext.tools.list(), agentContext);
 
       return {
         sid,
@@ -120,14 +123,15 @@ const agentCommand: CommandModule = {
       const reason = args[4] ? args[4].trim() : undefined;
 
       const session = await ctx.sm.open(sid);
-      // 不使用 event.to —— EventBus.emit 会用 to 走 route() 把事件 push 到 agent
-      // queue，跟 queueCommand 路径重复（agent 会同时把 agent_command 当成普通
-      // inbound message 跑一遍）。改用 payload.agentId 让 routing observer 单
-      // 路径转发，与 ref attachSchedulerListeners 行为对齐。
+      // 不使用 event.to —— publish 虽已不再 route 入队,但 _bindLedgerPersistence
+      // 仍会因 to 把裸 agent_command 写进 agent WAL。改用 payload.agentId 让
+      // routing observer 单路径转发(与旧 ConsciousAgent 契约一致)。
       const ev: Event = {
         source: "user",
         type: "agent_command",
         payload: { toolName, args: toolArgs, agentId: agentPath, reason },
+        to: agentPath,
+        handoff: "turn",
         ts: Date.now(),
       };
       session.eventBus.publish(ev, "user");

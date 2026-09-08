@@ -25,8 +25,20 @@ function auditRows(): Array<Record<string, unknown>> {
 }
 
 function bridge() {
+  const fakeAgent = { agentContext: { tools: { list: () => [] } } };
+  const fakeInstance = {
+    instanceId: 'res_audit_trace',
+    templateRef: 'tpl_audit_trace',
+    residentPath: 'forge',
+    parentInstanceId: null,
+    lifetime: 'resident',
+    template: { definition: { id: 'forge' } },
+  };
   const fakeSession = {
-    scheduler: { getAgent: () => ({ agentContext: { tools: { list: () => [] } } }) },
+    tree: { resolve: (agentPath: string) => agentPath === 'forge' ? fakeInstance : undefined },
+    templateCatalog: { get: (templateRef: string) => templateRef === fakeInstance.templateRef ? { trust: 'own' } : undefined },
+    initializeAgentHost: async (_agentPath: string) => fakeAgent,
+    getAgentHost: (agentPath: string) => agentPath === 'forge' ? fakeAgent : null,
     eventBus: { publish: () => {} },
     config: {},
   };

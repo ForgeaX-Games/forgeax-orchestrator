@@ -1,6 +1,7 @@
 // @desc Command module: inspect_tools — expose agent tool definitions to frontend
 
 import type { CommandModule } from "../../src/commands/types";
+import { visibleTools } from "../../src/runtime/visible-tools";
 
 const inspectTools: CommandModule = {
   async list() {
@@ -31,10 +32,10 @@ const inspectTools: CommandModule = {
     }
     if (!agentPath) throw new Error("inspect_tools: no agent available");
 
-    const agent = session.scheduler.getAgent(agentPath);
+    const agent = await session.initializeAgentHost(agentPath);
     if (!agent) throw new Error(`inspect_tools: agent '${agentPath}' not running`);
 
-    const tools = agent.agentContext.tools.list();
+    const tools = visibleTools(agent.agentContext.tools.list(), agent.agentContext);
 
     return {
       agentPath,

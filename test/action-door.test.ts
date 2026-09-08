@@ -18,18 +18,6 @@ const MENUS = {
 };
 
 describe('findVisibleDoor', () => {
-  it('工作区模式切换:rail 面无发布者 → 门位未知,不给死路径也不指控 headless', () => {
-    // 2026-08-06(B1):旧 railMode 分支**不查任何投影**就返回最高置信度 found +
-    // rail: 路径,而 host.sidebar 全树零发布者 —— open('rail:...') 必死,文案还让
-    // agent 请用户"打开页面"(页面明明开着)。下线后 app.set_mode 落到 shell-widget
-    // 未知档:界面上那两个页签仍然真实可见,但 AI 无法沿它可见执行 —— 如实说未知。
-    const toAi = findVisibleDoor({ menus: MENUS, rail: [] }, 'app.set_mode', { mode: 'ai' });
-    expect(toAi.certainty).toBe('unknown');
-    expect(toAi.path).toBeUndefined();
-    expect(toAi.hint).toContain('门位未知');
-    expect(toAi.hint).not.toContain("open('rail:");
-  });
-
   it('菜单投影缺席时不指控 headless —— 那是未知,不是否定', () => {
     // 页面没打开/进程刚重启还没重新注册时菜单树为空。空对账源会把每一个有菜单门
     // 的能力都说成"界面上没有入口、屏幕不会变化",等于向用户隐瞒真实的点击路径。
@@ -40,12 +28,11 @@ describe('findVisibleDoor', () => {
   });
 
   it('shell 级动作没在菜单树里,不等于没门', () => {
-    // app./panel./workbench. 的门在 rail 页签或侧栏控件上,本来就不在菜单树里。
+    // app./panel. 的门可位于 Page 内，本来就不在菜单树里。
     const door = findVisibleDoor({ menus: MENUS, rail: [] }, 'app.dock.reset');
     expect(door.visible).toBe(false);
     expect(door.certainty).toBe('unknown'); // 配不上 ≠ 无门 —— 不许指控 headless
     expect(door.hint).toContain('门位未知'); // 提示语为禁止而引用了那句话,故按未知措辞断言
-    expect(door.hint).toContain('rail');
   });
 
   it('有门:给出 editor_ui_browse 可直接消费的链,并劝走人路径', () => {
@@ -66,32 +53,6 @@ describe('findVisibleDoor', () => {
     expect(door.path).toBeUndefined();
     expect(door.hint).toContain('headless');
     expect(door.hint).toContain('屏幕上不会有任何变化');
-  });
-
-  it('rail 的门:workbench.open_plugin 反查到边栏页签,不再误标 headless', () => {
-    const door = findVisibleDoor(
-      { menus: MENUS, rail: [{ id: 'wb:observatory', label: 'Observatory · 轨迹观察台' }] },
-      'workbench.open_plugin',
-      { extensionId: '@forgeax-extension/wb-observatory' },
-    );
-    expect(door.visible).toBe(true);
-    expect(door.path).toBe('rail:wb:observatory');
-    expect(door.hint).toContain("open('rail:wb:observatory')");
-  });
-
-  it('rail 未收录的插件:说真话 —— 不在 rail,但工作台网格点得到', () => {
-    // 2026-08-04:agent 教用户"点更多插件→选轨迹观察台",搜索结果"没有匹配的插件"。
-    // 2026-08-05 修正:上一版据此断言"用户自己点不到" —— 只对了 rail 一个账源。
-    // 实测工作台网格(installed − hidden)列出全部插件且 tile 可点。
-    const door = findVisibleDoor(
-      { menus: MENUS, rail: [{ id: 'wb:anim', label: '动画设计' }] },
-      'workbench.open_plugin',
-      { extensionId: '@forgeax-extension/wb-observatory' },
-    );
-    expect(door.visible).toBe(true);
-    expect(door.hint).toContain('工作台网格');
-    expect(door.hint).not.toContain('点不到');
-    expect(door.walk).toBeUndefined(); // 网格路径无法自动行走,只交代,不改道
   });
 
   it('别名事实:game.switch 经 catalog door 解析到「打开最近」动态链,可自动行走', () => {

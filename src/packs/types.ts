@@ -193,3 +193,13 @@ export interface FxpackInstallInput {
 export type FxpackInstallResult =
   | { ok: true; installed: string[]; skipped: string[]; renamed: Record<string, string> }
   | { ok: false; code: 'install_error' | 'fs_error' | 'inspect_failed' | 'bad_input'; error: string; details?: unknown };
+
+export interface FxpackLifecycleInput {
+  id: string;
+  destinationOrigin: 'user' | 'project';
+}
+
+export type FxpackLifecycleResult =
+  | { ok: true; id: string; state: 'enabled' | 'disabled'; path: string }
+  | { ok: true; id: string; state: 'removed'; archivePath: string }
+  | { ok: false; code: 'bad_input' | 'not_found' | 'conflict' | 'lifecycle_error'; error: string };

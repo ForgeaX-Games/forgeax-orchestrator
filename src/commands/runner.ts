@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { getPathManager } from "../fs/path-manager";
 import { defaultProjectRoot } from "@forgeax/platform-io";
+import { STATIC_BUILTIN_COMMANDS } from "./static-builtins";
 import type {
   CallContext,
   CommandModule,
@@ -91,27 +92,20 @@ function errSpec(name: string, msg: string): CommandSpec {
 
 interface ScannedEntry { spec: CommandSpec; mod: CommandModule | null }
 
-/** Scan one layer; failures become synthetic `_error:*` specs (never throw).
- *  与 ref 一致：bad module → `_error:<file>` spec；同层同名冲突 → `_error:duplicate:*`。 */
-async function scanLayer(layer: Layer, ctx: ModuleContext): Promise<ScannedEntry[]> {
-  const dir = dirOf(layer);
-  if (!existsSync(dir)) return [];
-
+async function scanModules(
+  modules: readonly { file: string; mod: CommandModule | string }[],
+  ctx: ModuleContext,
+): Promise<ScannedEntry[]> {
   const out: ScannedEntry[] = [];
   const seen = new Map<string, string>(); // name → first owning file
-  let files: string[];
-  try {
-    files = readdirSync(dir).filter((f) => f.endsWith(".ts") && !f.endsWith(".d.ts") && !f.endsWith(".test.ts"));
-  } catch { return []; }
 
-  for (const file of files) {
-    const r = await importModule(join(dir, file));
-    if (typeof r === "string") {
-      out.push({ spec: errSpec(file, `${file}: ${r}`), mod: null });
+  for (const { file, mod } of modules) {
+    if (typeof mod === "string") {
+      out.push({ spec: errSpec(file, `${file}: ${mod}`), mod: null });
       continue;
     }
     try {
-      for (const s of await r.list(ctx)) {
+      for (const s of await mod.list(ctx)) {
         const prev = seen.get(s.name);
         if (prev !== undefined) {
           out.push({
@@ -121,13 +115,39 @@ async function scanLayer(layer: Layer, ctx: ModuleContext): Promise<ScannedEntry
           continue;
         }
         seen.set(s.name, file);
-        out.push({ spec: s, mod: r });
+        out.push({ spec: s, mod });
       }
     } catch (err) {
       out.push({ spec: errSpec(file, `${file} list() threw: ${(err as Error)?.message ?? String(err)}`), mod: null });
     }
   }
   return out;
+}
+
+/** Scan one layer; failures become synthetic `_error:*` specs (never throw).
+ *  与 ref 一致：bad module → `_error:<file>` spec；同层同名冲突 → `_error:duplicate:*`。 */
+async function scanLayer(layer: Layer, ctx: ModuleContext): Promise<ScannedEntry[]> {
+  if (layer === "builtin" && process.env.FORGEAX_STATIC_BUILTIN_COMMANDS === "1") {
+    return scanModules(STATIC_BUILTIN_COMMANDS, ctx);
+  }
+
+  const dir = dirOf(layer);
+  if (!existsSync(dir)) return [];
+
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter((f) =>
+      (f.endsWith(".ts") || f.endsWith(".mjs"))
+      && !f.endsWith(".d.ts")
+      && !f.endsWith(".test.ts"),
+    );
+  } catch { return []; }
+
+  const modules = await Promise.all(files.map(async (file) => ({
+    file,
+    mod: await importModule(join(dir, file)),
+  })));
+  return scanModules(modules, ctx);
 }
 
 /** List all commands. R3 阶段单层；与 ref 行为对齐：跨层同名后扫的覆盖前扫的（team wins）。 */

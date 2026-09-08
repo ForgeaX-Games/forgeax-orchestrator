@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexAppServerClient } from '../src/kernel/codex-appserver-client';
@@ -67,11 +67,11 @@ afterEach(() => {
   for (const dir of fixtureDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function initializeFailureFixture(): string {
+function initializeFailureFixture(): { binary: string; globalArgs: string[] } {
   const dir = mkdtempSync(join(tmpdir(), 'codex-appserver-init-fail-'));
   fixtureDirs.push(dir);
-  const script = join(dir, 'codex');
-  writeFileSync(script, `#!/usr/bin/env bun
+  const script = join(dir, 'codex.mjs');
+  writeFileSync(script, `
 process.on('SIGTERM', () => process.exit(0));
 for await (const line of console) {
   const req = JSON.parse(line);
@@ -80,14 +80,47 @@ for await (const line of console) {
   }
 }
 `);
-  chmodSync(script, 0o755);
-  return script;
+  return { binary: process.execPath, globalArgs: [script] };
+}
+
+function initializeCmdFixture(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'codex appserver cmd-'));
+  fixtureDirs.push(dir);
+  const script = join(dir, 'codex-appserver.mjs');
+  writeFileSync(script, `
+const expected = JSON.parse(process.env.EXPECTED_CODEX_ARGS ?? '[]');
+const actual = process.argv.slice(2);
+if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  console.error('argv mismatch: ' + JSON.stringify(actual));
+  process.exit(17);
+}
+for await (const line of console) {
+  const req = JSON.parse(line);
+  if (req.method === 'initialize') {
+    console.log(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }));
+    setTimeout(() => process.exit(0), 50);
+  }
+}
+`);
+  const launcher = join(dir, 'codex.CMD');
+  writeFileSync(launcher, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+  return launcher;
+}
+
+function immediateExitFixture(): { binary: string; globalArgs: string[] } {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-appserver-exit-'));
+  fixtureDirs.push(dir);
+  const script = join(dir, 'codex-exit.mjs');
+  writeFileSync(script, `console.error('invalid TOML override from launcher'); process.exit(1);\n`);
+  return { binary: process.execPath, globalArgs: [script] };
 }
 
 describe('CodexAppServerClient failed initialization lifecycle', () => {
   test('closes its spawned process after initialize rejection', async () => {
+    const fixture = initializeFailureFixture();
     const client = new CodexAppServerClient({
-      binary: initializeFailureFixture(),
+      binary: fixture.binary,
+      globalArgs: fixture.globalArgs,
       cwd: process.cwd(),
       onNotification: () => {},
       onServerRequest: () => ({}),
@@ -107,5 +140,43 @@ describe('CodexAppServerClient failed initialization lifecycle', () => {
     await expect(client.ensureStarted()).rejects.toThrow('spawn failed');
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(client.alive).toBe(false);
+  });
+
+  test('preserves the stderr tail when app-server exits during initialize', async () => {
+    const fixture = immediateExitFixture();
+    const client = new CodexAppServerClient({
+      binary: fixture.binary,
+      globalArgs: fixture.globalArgs,
+      cwd: process.cwd(),
+      onNotification: () => {},
+      onServerRequest: () => ({}),
+    });
+
+    await expect(client.ensureStarted()).rejects.toThrow(
+      'codex app-server exited (code=1): invalid TOML override from launcher',
+    );
+    expect(client.alive).toBe(false);
+  });
+});
+
+describe('CodexAppServerClient Windows launcher', () => {
+  test.skipIf(process.platform !== 'win32')('starts app-server through a .CMD launcher', async () => {
+    const globalArgs = [
+      '--disable',
+      'multi_agent',
+      '-c',
+      String.raw`mcp_servers.fxt.args=["C:\Program Files\ForgeaX\forgeax tools.mjs","A&B"]`,
+    ];
+    const client = new CodexAppServerClient({
+      binary: initializeCmdFixture(),
+      cwd: process.cwd(),
+      env: { EXPECTED_CODEX_ARGS: JSON.stringify([...globalArgs, 'app-server']) },
+      globalArgs,
+      onNotification: () => {},
+      onServerRequest: () => ({}),
+    });
+
+    await client.ensureStarted();
+    await client.close();
   });
 });

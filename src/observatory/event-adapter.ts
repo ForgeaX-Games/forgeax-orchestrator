@@ -244,29 +244,36 @@ export function adapt(stored: StoredEvent, state: AdapterState): AgentEventOut[]
     }];
   }
 
-  // ─── agent_added / agent_removed (depth>1) → sub_agent/started|done ────
-  if (t === 'agent_added') {
-    const path = (stored.payload?.path as string | undefined) ?? '';
-    if (!path.includes('/')) return [];
+  // ─── runtime:instance-added / -removed (has parentInstanceId) → sub_agent/started|done ────
+  // 深度判断不再靠 path 里有没有 '/'（ephemeral 的 address 是扁平 instanceId，没有
+  // '/'）；parentInstanceId 存在即为非根实例，与旧 depth>1 语义等价。
+  if (t === 'runtime:instance-added') {
+    if (!stored.payload?.parentInstanceId) return [];
+    const address = (stored.payload?.address as string | undefined)
+      ?? (stored.payload?.agentInstanceId as string | undefined)
+      ?? '';
+    const displayName = (stored.payload?.displayName as string | undefined) ?? address;
     return [{
       type: 'sub_agent',
       subtype: 'started',
-      agentId: path,
-      agentType: path.split('/').pop() ?? path,
-      task: (stored.payload?.task as string | undefined) ?? '',
-      persona: (stored.payload?.persona as string | undefined) ?? '',
-      identityBlock: (stored.payload?.identityBlock as string | undefined) ?? '',
+      agentId: address,
+      agentType: displayName,
+      task: '',
+      persona: '',
+      identityBlock: '',
     }];
   }
-  if (t === 'agent_removed') {
-    const path = (stored.payload?.path as string | undefined) ?? '';
-    if (!path.includes('/')) return [];
+  if (t === 'runtime:instance-removed') {
+    if (!stored.payload?.parentInstanceId) return [];
+    const address = (stored.payload?.address as string | undefined)
+      ?? (stored.payload?.agentInstanceId as string | undefined)
+      ?? '';
     return [{
       type: 'sub_agent',
       subtype: 'done',
-      agentId: path,
+      agentId: address,
       status: 'completed',
-      result: (stored.payload?.result as string | undefined) ?? '',
+      result: '',
     }];
   }
 

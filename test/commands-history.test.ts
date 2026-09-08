@@ -13,7 +13,7 @@
 //      验证跨 shard 时遇 boundary 即停（不再回读更老的 shard）。
 //
 // 注：ref 还有 `commands/compact.ts` 派发 agent_command；forgeax 这边
-// ConsciousAgent 还没接 compact tool，移植该命令也只是死代码，等真 compact
+// RuntimeAgentHost 还没接 compact tool，移植该命令也只是死代码，等真 compact
 // tool 实装后再补。
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -88,7 +88,7 @@ async function makeSidWithRootAgent(): Promise<{ sid: string; agentPath: string 
  *  跟 bus 解耦；测试构造直接走 ledger.append 更直白也更稳。
  *
  *  这是与 ref `commands/sessions.test` 同样的做法 —— ref 测试也是直接构造
- *  events.jsonl 文本，不模拟 scheduler / bus 那一长串。 */
+ *  events.jsonl 文本，不模拟 runtime / bus 那一长串。 */
 async function appendEvent(sid: string, agentPath: string, event: Event): Promise<void> {
   const session = await getSessionManager().open(sid);
   session.getOrCreateLedger(agentPath).append(event);
@@ -303,4 +303,3 @@ describe("commands/history — fetch_session_events / fetch_blob", () => {
     expect(r.json.result.error).not.toContain(userRoot);
   });
 });
-

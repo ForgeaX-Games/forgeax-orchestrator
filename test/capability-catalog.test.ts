@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { parseManifest } from '@forgeax/types';
+import { normalizeManifest, parseAnyManifest } from '@forgeax/types';
 import { buildCapabilitySnapshot, findCapabilities } from '../src/capabilities/catalog';
 import { buildKindRegistry } from '../src/extensions/kinds';
 import type { MergedManifest } from '../src/extensions/merger';
@@ -10,6 +10,7 @@ function merged(
 ): MergedManifest {
   return {
     manifest,
+    normalizedManifest: normalizeManifest(manifest),
     origin,
     originPath: `/tmp/${origin}/${manifest.id}/forgeax-extension.json`,
     shadowedBy: [],
@@ -19,15 +20,22 @@ function merged(
 describe('capability catalog', () => {
   it('derives shared metadata from one extension manifest', () => {
     const manifest = {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       id: '@example/shared',
       version: '1.2.3',
-      kind: 'workbench' as const,
       displayName: { zh: '共享能力' },
       hot: true,
       permissions: ['memory:read:iori'],
-      provides: {
-        workbench: { id: 'shared' },
+      contributes: {
+        panelTypes: [{ id: 'content', runtime: 'iframe' as const, entry: './index.html' }],
+        pages: [{
+          id: 'shared',
+          title: { zh: '共享能力' },
+          cardinality: 'singleton' as const,
+          layout: { version: 1 as const, root: { kind: 'tabs' as const, placements: ['content'], active: 'content' } },
+          layoutVersion: 1,
+          panels: [{ id: 'content', panelType: { extension: 'self', id: 'content' } }],
+        }],
         skills: [{ id: 'hello', entry: './SKILL.md', trigger: '/hello' }],
         commands: [{ id: 'hello-command', description: 'hello' }],
         mcp: [{ id: 'shared-mcp', requiresRestart: true }],
@@ -35,7 +43,7 @@ describe('capability catalog', () => {
       },
     };
     const manifests = [merged('user', manifest)];
-    expect(parseManifest(manifest).ok).toBe(true);
+    expect(parseAnyManifest(manifest).ok).toBe(true);
     const kinds = buildKindRegistry(manifests);
     const snapshot = buildCapabilitySnapshot({
       generation: 7,

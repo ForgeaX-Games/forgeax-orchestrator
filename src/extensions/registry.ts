@@ -20,6 +20,7 @@ import {
   type CapabilityRegistryInput,
 } from '../capabilities/catalog';
 import type { CapabilitySnapshot } from '@forgeax/types';
+import { loadDevExtensions } from './dev-registry';
 
 export interface ExtensionSnapshot {
   /** Surrogate timestamp; bumps on every successful replaceFromManifests. */
@@ -35,6 +36,22 @@ export interface ExtensionSnapshot {
 
 export interface ExtensionRegistryOpts {
   roots?: Partial<Record<ExtensionOrigin, string | null>>;
+  /** Resolved package directories for npm-declared embedded extensions. When
+   *  omitted, the module-level set configured via `configureNpmExtensionDirs`
+   *  is used, so every reload (boot, fork, POST /reload) keeps them. */
+  npmExtensionDirs?: readonly string[];
+  /** Override the explicit dev-registration authority. `null` disables it for
+   *  hermetic scans such as unit tests; production callers use the default. */
+  devRegistrationFile?: string | null;
+}
+
+/** Product-configured npm-declared embedded extension directories. Set once by
+ *  the product composition at boot (the composition root resolves the packages), then
+ *  applied on every `reloadExtensions` so npm extensions survive reloads that
+ *  don't pass explicit opts (fork, POST /reload). */
+let _npmExtensionDirs: readonly string[] = [];
+export function configureNpmExtensionDirs(dirs: readonly string[]): void {
+  _npmExtensionDirs = dirs;
 }
 
 const EMPTY: ExtensionSnapshot = {
@@ -42,7 +59,6 @@ const EMPTY: ExtensionSnapshot = {
   loadedAt: 0,
   manifests: [],
   kinds: {
-    workbench: [],
     agents: [],
     skills: [],
     cliProviders: [],
@@ -85,7 +101,14 @@ export function onExtensionsReloaded(fn: ExtensionsReloadedHook): void {
  *  not fatal — they're surfaced in `scanErrors` so the UI/CI can flag
  *  them while the rest of the snapshot still works. */
 export async function reloadExtensions(opts: ExtensionRegistryOpts = {}): Promise<ExtensionSnapshot> {
-  const scan = await scanAllExtensionOrigins(opts.roots);
+  const scan = await scanAllExtensionOrigins(opts.roots, opts.npmExtensionDirs ?? _npmExtensionDirs);
+  // Externally-owned dev adapters are optional: each invalid/stale record is
+  // isolated as a scan error and can never make Studio boot fail.
+  const dev = opts.devRegistrationFile === null
+    ? { found: [], errors: [] }
+    : loadDevExtensions(opts.devRegistrationFile);
+  scan.found.push(...dev.found);
+  scan.errors.push(...dev.errors);
   const merge = mergeManifests(scan.found);
   const kinds = buildKindRegistry(merge.manifests);
   const generation = _current.generation + 1;

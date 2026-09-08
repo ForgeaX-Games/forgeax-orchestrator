@@ -9,7 +9,7 @@
  *   GET  /api/extensions/manifests    → full snapshot incl. kinds + issues
  *   POST /api/extensions/reload       → re-scan disk, return fresh snapshot
  */
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { getExtensionSnapshot, reloadExtensions } from '../extensions/registry';
 import { forkExtension } from '../extensions/fork';
 import { readInstalled, readTrust, recordTrust, latestTrustFor } from '../packs/ledger';
@@ -24,6 +24,45 @@ import { listAllCommands } from '../commands/runner';
 import { commandCapabilities } from '../capabilities/adapters';
 import { commonCapabilityRoots } from '../capabilities/common-roots';
 import { listCommonMcpServers } from '../capabilities/mcp-catalog';
+import { registerDevExtension, unregisterDevExtension } from '../extensions/dev-registry';
+
+interface DevRegistrationApiDependencies {
+  register: (input: unknown) =>
+    | { ok: true; registration: { registrationId: string } }
+    | { ok: false; reason: string };
+  reload: () => Promise<{ generation: number }>;
+  snapshot: () => { generation: number };
+}
+
+export async function applyDevRegistration(
+  body: unknown,
+  expectedRegistrationId?: string,
+  reload = true,
+  dependencies: DevRegistrationApiDependencies = {
+    register: registerDevExtension,
+    reload: reloadExtensions,
+    snapshot: getExtensionSnapshot,
+  },
+): Promise<
+  | { status: 200; body: { ok: true; registrationId: string; generation: number } }
+  | { status: 400; body: { ok: false; error: string } }
+> {
+  if (
+    expectedRegistrationId
+    && (!body || typeof body !== 'object' || (body as { registrationId?: unknown }).registrationId !== expectedRegistrationId)
+  ) {
+    return { status: 400, body: { ok: false, error: 'registrationId does not match reload route' } };
+  }
+  const result = dependencies.register(body);
+  if (!result.ok) return { status: 400, body: { ok: false, error: result.reason } };
+  const generation = reload
+    ? (await dependencies.reload()).generation
+    : dependencies.snapshot().generation;
+  return {
+    status: 200,
+    body: { ok: true, registrationId: result.registration.registrationId, generation },
+  };
+}
 
 export function createExtensionsRouter(): Hono {
   const router = new Hono();
@@ -31,9 +70,39 @@ export function createExtensionsRouter(): Hono {
   /** Slim list for the shell strip (formerly GET /api/bus/plugins). */
   router.get('/list', async (c) => {
     const kind = c.req.query('kind');
-    const all = await loadExtensionList();
+    const snapshot = getExtensionSnapshot();
+    const all = loadExtensionList(snapshot.manifests, snapshot.generation);
     const items = kind ? all.filter((p) => p.kind === kind) : all;
-    return c.json({ kind: kind ?? null, count: items.length, items });
+    return c.json({
+      kind: kind ?? null,
+      count: items.length,
+      generation: snapshot.generation,
+      items,
+    });
+  });
+
+  const registerDev = async (
+    c: Context,
+    expectedRegistrationId?: string,
+    reload = true,
+  ) => {
+    const result = await applyDevRegistration(
+      await c.req.json().catch(() => null),
+      expectedRegistrationId,
+      reload,
+    );
+    return c.json(result.body, result.status);
+  };
+
+  router.post('/dev/register', (c) => registerDev(c));
+  router.post('/dev/:registrationId/reload', (c) => registerDev(c, c.req.param('registrationId')));
+  router.post('/dev/:registrationId/heartbeat', (c) =>
+    registerDev(c, c.req.param('registrationId'), false),
+  );
+  router.delete('/dev/:registrationId', async (c) => {
+    unregisterDevExtension(c.req.param('registrationId'));
+    const snapshot = await reloadExtensions();
+    return c.json({ ok: true, generation: snapshot.generation });
   });
 
   router.get('/manifests', (c) => {
@@ -203,7 +272,7 @@ export function createExtensionsRouter(): Hono {
     return c.json(result, result.code === 'bad_input' ? 400 : 409);
   });
 
-  /** Doc 09 §2.1 — wb-plugin-author backend. List / read / write files
+  /** Doc 09 §2.1 — plugin-author backend. List / read / write files
    *  inside an project plugin directory. Path-jail + extension whitelist + size
    *  cap live in plugins/files.ts. */
   router.get('/files', (c) => {
@@ -261,7 +330,7 @@ function serialize(snap: ReturnType<typeof getExtensionSnapshot>) {
     loadedAt: snap.loadedAt,
     counts: {
       manifests: snap.manifests.length,
-      workbench: snap.kinds.workbench.length,
+      pages: snap.manifests.reduce((count, item) => count + (item.normalizedManifest.contributes.pages?.length ?? 0), 0),
       agents: snap.kinds.agents.length,
       skills: snap.kinds.skills.length,
       cliProviders: snap.kinds.cliProviders.length,
@@ -271,7 +340,7 @@ function serialize(snap: ReturnType<typeof getExtensionSnapshot>) {
     manifests: snap.manifests.map((m) => ({
       id: m.manifest.id,
       version: m.manifest.version,
-      kind: m.manifest.kind,
+      categories: m.normalizedManifest.categories ?? [],
       origin: m.origin,
       originPath: m.originPath,
       shadowedBy: m.shadowedBy,
@@ -280,7 +349,6 @@ function serialize(snap: ReturnType<typeof getExtensionSnapshot>) {
       icon: m.manifest.icon,
       experimental: m.manifest.experimental,
     })),
-    workbench: snap.kinds.workbench,
     agents: snap.kinds.agents.map((a) => ({
       extensionId: a.extensionId,
       origin: a.origin,

@@ -90,12 +90,22 @@ afterEach(() => {
 });
 
 describe('architecture-evolution · trinity lifecycle', () => {
-  it('one scan picks up workbench + agent + skill + tool simultaneously', async () => {
-    writePlugin('user', 'wb-demo', {
-      id: '@x/wb-demo',
-      kind: 'workbench',
-      displayName: { zh: 'wb', en: 'wb' },
-      provides: { workbench: { id: 'wb-demo', position: 10, panelSize: 'md' } },
+  it('one scan picks up Page + agent + skill + tool simultaneously', async () => {
+    writePlugin('user', 'page-demo', {
+      schemaVersion: 2,
+      id: '@x/page-demo',
+      displayName: { zh: 'Page', en: 'Page' },
+      contributes: {
+        panelTypes: [{ id: 'content', runtime: 'iframe', entry: './index.html' }],
+        pages: [{
+          id: 'page-demo',
+          title: 'Page Demo',
+          cardinality: 'singleton',
+          layout: { version: 1, root: { kind: 'tabs', placements: ['content'], active: 'content' } },
+          layoutVersion: 1,
+          panels: [{ id: 'content', panelType: { extension: 'self', id: 'content' } }],
+        }],
+      },
     });
     writePlugin(
       'user',
@@ -145,7 +155,7 @@ describe('architecture-evolution · trinity lifecycle', () => {
     const snap = await reload();
     expect(snap.scanErrors).toEqual([]);
     expect(snap.mergeIssues).toEqual([]);
-    expect(snap.kinds.workbench.map((w) => w.workbenchId)).toContain('wb-demo');
+    expect(snap.manifests.flatMap((entry) => entry.normalizedManifest.contributes.pages ?? []).map((page) => page.id)).toContain('page-demo');
     expect(snap.kinds.agents.map((a) => a.definition.id)).toContain('demo.agent');
     expect(snap.kinds.skills.map((s) => s.definition.id)).toContain('demo.greet');
     expect(snap.kinds.tools.map((t) => t.toolId)).toContain('demo.echo');

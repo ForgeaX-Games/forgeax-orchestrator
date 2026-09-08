@@ -23,7 +23,7 @@ const TMP_ROOT = mkdtempSync(join(tmpdir(), 'cbc-e2e-root-'));
 for (const g of ['alpha', 'beta']) mkdirSync(join(TMP_ROOT, '.forgeax', 'games', g), { recursive: true });
 process.env.FORGEAX_PROJECT_ROOT = TMP_ROOT;
 
-const { runKernelTurn } = await import('../src/core/kernel-turn');
+const { runKernelTurn } = await import('../src/runtime/kernel-turn-runner');
 const { resolveKernel, listAvailableKernels } = await import('../src/kernel/resolve-kernel');
 const { Hook } = await import('../src/hooks/types');
 const { CbcKernel } = await import('../src/kernel/cbc-kernel');

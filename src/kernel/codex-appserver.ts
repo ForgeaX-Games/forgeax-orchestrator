@@ -16,7 +16,7 @@
  * KernelEvent(原产 ChatEvent)。
  */
 import type { KernelEvent } from '@forgeax/agent-runtime';
-import { canonicalToolFields } from './canonical-tool-name';
+import { canonicalToolArgs, canonicalToolFields } from './canonical-tool-name';
 
 /** app-server 起不来时抛出 → CodexKernel 回退到 exec 路径(在 yield 任何事件前抛)。 */
 export class AppServerUnavailable extends Error {}
@@ -160,7 +160,7 @@ export function mapCodexNotification(
         if (state.toolCallsOpened.has(it.id)) return;
         state.toolCallsOpened.add(it.id);
         state.toolNamesById.set(it.id, name);
-        queue.push({ kind: 'tool.call', callId: it.id, ...canonicalToolFields(name), args });
+        queue.push({ kind: 'tool.call', callId: it.id, ...canonicalToolFields(name), args: canonicalToolArgs(name, args) });
       };
       if (it.type === 'commandExecution') {
         openCall('Bash', { command: it.command, cwd: it.cwd });
@@ -188,7 +188,7 @@ export function mapCodexNotification(
             kind: 'tool.call',
             callId: it.id,
             ...canonicalToolFields(rawName),
-            args: it.arguments ?? {},
+            args: canonicalToolArgs(rawName, it.arguments ?? {}),
           });
         }
         const rawName = state.toolNamesById.get(it.id) ?? mcpToolName(it);
@@ -214,6 +214,7 @@ export function mapCodexNotification(
             ...(fields.rawName ? fields : {}),
             ok: false,
             error: msg,
+            result: resText,
           });
         }
         return;

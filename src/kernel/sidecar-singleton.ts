@@ -28,6 +28,15 @@ const AGENT_HOST_MAIN = resolveAgentHostMain();
 let cached: SidecarClient | null = null;
 let proc: ChildProcess | null = null;
 
+/** `ChildProcess.killed` only records whether `.kill()` was called; it stays
+ * false after a child exits by itself.  Use the exit fields when deciding
+ * whether a tracked agent-host can still satisfy the next request. */
+export function isTrackedSidecarAlive(
+  child: Pick<ChildProcess, 'exitCode' | 'signalCode'> | null,
+): boolean {
+  return child !== null && child.exitCode === null && child.signalCode === null;
+}
+
 async function tryConnect(): Promise<SidecarClient | null> {
   try {
     const c = await SidecarClient.connect(defaultSockPath(), 1000);
@@ -47,11 +56,15 @@ export async function ensureSidecar(): Promise<SidecarClient> {
   if (existing) { cached = existing; return cached; }
 
   // 2) 懒启 agent-host(共享 server 的 env,含 FORGEAX_AGENT_HOST_SOCK)。
-  if (!proc || proc.killed) {
+  if (!isTrackedSidecarAlive(proc)) {
     const launch = resolveRuntimeLaunch(AGENT_HOST_MAIN);
-    proc = spawn(launch.cmd, launch.args, {
+    const child = spawn(launch.cmd, launch.args, {
       env: process.env,
       stdio: ['ignore', 'ignore', 'inherit'],
+    });
+    proc = child;
+    child.once('exit', () => {
+      if (proc === child) proc = null;
     });
   }
 

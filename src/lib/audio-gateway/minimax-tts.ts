@@ -1,4 +1,4 @@
-// Direct MiniMax T2A (text-to-speech) — host-side primary path for wb-reel
+// Direct MiniMax T2A (text-to-speech) — host-side primary path for reel
 // 角色音色 / 旁白合成。
 //
 // 为什么用直连 MiniMax（2026-06）：

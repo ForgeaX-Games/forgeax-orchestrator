@@ -1,4 +1,4 @@
-/** /api/observatory — backing API for the wb-observatory workbench plugin.
+/** /api/observatory — backing API for the observatory page plugin.
  *
  *  Four endpoints, all read-only:
  *    GET /sessions                           — `[{sid, displayName, defaultDir}]`
@@ -22,6 +22,10 @@ import { adapt, createAdapterState, makeInitEvent } from '../observatory/event-a
 import { inspectAgentPrompt } from '../observatory/prompt-modules';
 import { replaySessionEvents } from '../observatory/ledger-replay';
 import { replaySessionTelemetry, tailSessionTelemetry } from '../observatory/telemetry-replay';
+import { visibleTools } from '../runtime/visible-tools';
+import { resolveAgentComposition } from '../agents/resolved-agent-composition';
+import { defaultProjectRoot } from '@forgeax/platform-io';
+import { composeHostSystemPrompt } from '../kernel/compose-turn-request';
 import type { TelemetryRecord } from '@forgeax/types';
 import type { Event } from '../core/types';
 
@@ -128,8 +132,8 @@ export function createObservatoryRouter() {
     catch { return c.json({ error: `session not found: ${sid}` }, 404); }
 
     // The observatory "agent" param is an agent-tree path like "iori" or
-    // "iori/suzu". Resolve the corresponding agent.json::id (the registry
-    // id, eg "forge", "iori") so composeSystemPrompt finds it.
+    // "iori/suzu". The live Runtime instance is authoritative for its frozen
+    // template; agent.json is only a compatibility fallback for old callers.
     // When the param is missing the panel asks for "the session's prompt"
     // — fall back to the root agent (depth 1).
     const node = agentParam
@@ -145,6 +149,8 @@ export function createObservatoryRouter() {
         if (typeof cfg.id === 'string' && cfg.id) agentId = cfg.id;
       } catch { /* fall through with display name */ }
     }
+    const runtimeInstance = session.tree.resolve(node.path);
+    if (runtimeInstance) agentId = runtimeInstance.template.definition.id;
 
     // Active-game scope = session.config.defaultDir (preferred — explicit
     // operator choice) → fall back to the workspace's most-recently-touched
@@ -155,15 +161,33 @@ export function createObservatoryRouter() {
       ? sessionSlug
       : getPathManager().resolveScope() ?? undefined;
 
-    // Native agents (running in-process via ConsciousAgent/scheduler) assemble
-    // their prompt via ContextEngine slots — they never see the FORGEAX_SYSTEM_PROMPT
-    // scaffold. Only claude-code CLI provider injects that scaffold via
-    // --append-system-prompt. Detect by checking if the scheduler owns this agent.
-    const runningAgent = session.scheduler.getAgent(node.path);
-    const isNativeAgent = !!runningAgent;
+    // Runtime agents assemble template content + Kit slots through the same
+    // ResolvedAgentComposition used by composeTurnRequest. The old standalone
+    // CLI inspector is the only fallback that may prepend its own scaffold.
+    // Host construction is lazy (first capability
+    // access), so initialize explicitly — getAgentHost alone would treat an
+    // idle resident as non-native and mix in the CLI scaffold.
+    const runningAgent = await session.initializeAgentHost(node.path);
+    const kitSystemBlocks = runningAgent
+      ? await runningAgent.assembleKitSystemBlocks()
+      : undefined;
+    const projectRoot = defaultProjectRoot();
+    const composition = runtimeInstance
+      ? await resolveAgentComposition({
+          agentId,
+          projectRoot,
+          ...(activeSlug ? { game: activeSlug } : {}),
+          template: runtimeInstance.template,
+          ...(kitSystemBlocks ? { kitSystemBlocks } : {}),
+        })
+      : undefined;
     const inspection = await inspectAgentPrompt(agentId, {
       activeSlug,
-      includeForgeaxScaffold: !isNativeAgent,
+      resolvedScaffold: composeHostSystemPrompt(projectRoot, activeSlug),
+      ...(composition ? { resolvedPersona: composition.persona } : {}),
+      ...(composition?.dynamicPrompt
+        ? { resolvedDynamicPrompt: composition.dynamicPrompt }
+        : {}),
     });
     if (!inspection) return c.json({ error: `agent id unresolved: ${agentId}` }, 404);
 
@@ -172,7 +196,10 @@ export function createObservatoryRouter() {
     // (Anthropic `tools` field) and contributes to context usage.
     let toolModules: typeof inspection.modules = [];
     if (runningAgent) {
-      const tools = runningAgent.agentContext.tools.list();
+      const tools = visibleTools(
+        runningAgent.agentContext.tools.list(),
+        runningAgent.agentContext,
+      );
       if (tools.length > 0) {
         const APPROX_CHARS_PER_TOKEN = 4;
         const toolsBody = tools.map(t => {

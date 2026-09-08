@@ -1,5 +1,5 @@
 // litellm video gateway — host-side wrapper around the proxy's OpenAI-shaped
-// async video API (`/v1/videos`). Used by wb-reel (互动影游) so the litellm key
+// async video API (`/v1/videos`). Used by reel (互动影游) so the litellm key
 // never reaches the browser bundle and concurrency stays server-managed.
 //
 // Verified contract (2026-06, LITELLM_PROXY_BASE_URL, model=`seedance`):

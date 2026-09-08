@@ -8,14 +8,14 @@
  * mirror the directional graph in 13-MIGRATION-ROADMAP package-layout:
  *
  *   server      <- types only (zod schema SSOT)
- *   interface   <- @forgeax/host-sdk + HTTP; never reaches into server/* sources
- *   marketplace <- @forgeax/host-sdk + @forgeax/types; never imports server or
+ *   interface   <- @forgeax/extension-platform/transport + HTTP; never reaches into server/* sources
+ *   marketplace <- @forgeax/extension-platform/transport + @forgeax/types; never imports server or
  *                  interface internals
- *   host-sdk    <- types only; the public seam between host and plugin
+ *   transport   <- Extension Platform; the public seam between runtime and Extension
  *
  * If a future change introduces a forbidden edge, this test fails with the
  * exact file + import string so the author can either widen the public API
- * (add an export to host-sdk / types) or rewrite the call.
+ * (add an Extension Platform export / types contract) or rewrite the call.
  */
 import { describe, it, expect } from 'bun:test';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
@@ -41,7 +41,7 @@ function forbidCliReachIn(spec: string): string | null {
   if (spec.includes('packages/interface')) return 'cli must not import interface';
   if (spec.includes('packages/cli') || spec === '@forgeax/cli' || spec.startsWith('@forgeax/cli/'))
     return 'cli must not import forgeax-core (kernel is injected via the @forgeax/agent-runtime registry)';
-  if (spec === '@forgeax/host-sdk' || spec.startsWith('@forgeax/host-sdk')) return 'cli must not depend on host-sdk (plugin-side seam)';
+  if (spec.startsWith('@forgeax/extension-platform/transport')) return 'cli must not depend on Extension transport (runtime-side seam)';
   return null;
 }
 
@@ -62,7 +62,7 @@ const RULES: Rule[] = [
     forbid: (spec) => {
       if (spec.includes('packages/interface')) return 'server must not import interface';
       if (spec.includes('packages/marketplace')) return 'server must not import marketplace plugin sources';
-      if (spec.startsWith('@forgeax/host-sdk')) return 'server must not depend on host-sdk (host-sdk is the plugin-side seam)';
+      if (spec.startsWith('@forgeax/extension-platform/transport')) return 'server must not depend on Extension transport (runtime-side seam)';
       return null;
     },
   },
@@ -81,16 +81,6 @@ const RULES: Rule[] = [
     forbid: (spec) => {
       if (spec.includes('packages/server')) return 'marketplace plugin must not import server internals';
       if (spec.includes('packages/interface')) return 'marketplace plugin must not import interface internals';
-      return null;
-    },
-  },
-  {
-    scope: 'host-sdk',
-    root: 'packages/host-sdk/src',
-    forbid: (spec) => {
-      if (spec.includes('packages/server')) return 'host-sdk must not import server';
-      if (spec.includes('packages/interface')) return 'host-sdk must not import interface';
-      if (spec.includes('packages/marketplace')) return 'host-sdk must not import marketplace';
       return null;
     },
   },

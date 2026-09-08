@@ -18,6 +18,7 @@ import { existsSync, statSync } from "node:fs";
 import { appendFile, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join, win32 } from "node:path";
 import { getPathManager } from "../fs/path-manager";
+import { terminalOwnerDirectory } from "./owner-directory";
 import type {
   TerminalManagerAPI,
   TerminalInstance,
@@ -166,13 +167,13 @@ export class TerminalManager implements TerminalManagerAPI {
   // ─── Path helpers ──────────────────────────────────────────────────────────
 
   /** Terminal log 目录：
-   *    有 agentId（agentPath）→ `<user>/terminals/<agentPath-with-slash-replaced>/`
+   *    有 agentId → `<user>/terminals/agent-<owner-sha256>/`
    *    无 agentId          → `<user>/terminals/`
    *  PathManager 当前无 `terminalsDir()`，先用 user.cacheDir() 下的 terminals/ 子目录。 */
   private logDirFor(agentId: string | undefined): string {
     const base = join(getPathManager().user().cacheDir(), "terminals");
     if (!agentId) return base;
-    return join(base, agentId.split("/").join("__"));
+    return join(base, terminalOwnerDirectory(agentId));
   }
 
   private stateDirFor(agentId: string | undefined): string {

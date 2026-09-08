@@ -4,11 +4,11 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { buildCbcArgs, buildCbcMcpArgs } from '../src/kernel/cbc-profile';
 
-const request = {
+const request: Record<string, unknown> = {
   tools: [{ name: 'npc_wire', description: 'wire', inputSchema: { type: 'object' } }],
   session: { agentId: 'forge' },
   hostSessionId: 'sid',
-} as never;
+};
 
 const turnRequest = {
   ...request,
@@ -19,7 +19,7 @@ const turnRequest = {
 
 describe('cbc builtin adoption surface', () => {
   test('keeps npc_wire local to the forgeax builtin MCP server', () => {
-    const args = buildCbcMcpArgs(request, 'sid');
+    const args = buildCbcMcpArgs(request as unknown as Parameters<typeof buildCbcMcpArgs>[0], 'sid');
     const configPath = args[args.indexOf('--mcp-config') + 1];
     expect(configPath).toBeTruthy();
     const config = JSON.parse(readFileSync(configPath!, 'utf8')) as { mcpServers?: { fxt?: { env?: Record<string, string> } } };

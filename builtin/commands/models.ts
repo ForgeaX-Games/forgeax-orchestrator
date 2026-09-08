@@ -17,22 +17,19 @@
 //
 // 设计要点：
 // - 永远以**数组形态**对外暴露（chain）；同时给一个 `selected = chain[0] ?? null`，
-//   让 UI 只想拿当前生效模型时不必判断 string / array / 缺省。
-// - get 直接读盘上 agent.json 的真实字段（不经 AGENT_DEFAULTS deep-merge），
-//   能区分「用户没配」与「显式 null」。
-// - set 把 model 写成 string[]（单模型也是 ["MODEL"]）；保留 models 里其它字段
-//   （temperature / maxRetries / routing 等）。
-// - 走 paths.session(sid).agent(agentPath).agentJson() 拿真实文件路径；isValidAgentPath
-//   防 ../ 越界 + tree 节点存在校验防对一个不存在的 agent 写盘。
-// - 已在跑的 agent 构造时吃了一份 agentJson 快照；set 末尾 controlAgent("restart")
-//   让 factory 重读盘。
+//   让 UI 只想拿下一回合模型时不必判断 string / array / 缺省。
+// - 运行时实例的 RuntimeConfigBinding 是 live truth；更新在 turn boundary 生效，
+//   不重建 AgentInstance，也不触发 agent.json watcher。
+// - resident 同步持久化其 author config，供下次 Session bootstrap 使用；
+//   ephemeral 只更新内存，不把 template source 当运行实体。
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { CommandModule } from "../../src/commands/types";
-import { isValidAgentName, isValidAgentPath } from "../../src/core/agent-scaffold";
-import { ensurePersonaScaffold } from "../../src/core/persona-scaffold";
 import { loadGatewayCatalog } from "../../src/lib/llm-gateway/gateway-catalog";
-import { resolveKernelModelCatalog } from "../../src/kernel/model-catalog";
+import { resolveKernelModelCatalog, invalidateModelCatalogCache } from "../../src/kernel/model-catalog";
+import { invalidateLiveCatalogCache } from "../../src/lib/llm-gateway/live-catalog";
+import { stableHash } from "../../src/runtime/freeze";
 
 interface ReadModelArgs {
   sid: string;
@@ -44,9 +41,6 @@ function parseAgentArgs(name: string, args: string[]): ReadModelArgs {
   const agentPath = (args[1] ?? "").trim();
   if (!sid) throw new Error(`${name}: args[0] (sid) required`);
   if (!agentPath) throw new Error(`${name}: args[1] (agentPath) required`);
-  if (!isValidAgentPath(agentPath)) {
-    throw new Error(`${name}: invalid agentPath '${agentPath}' (must match name(/agents/name)*)`);
-  }
   return { sid, agentPath };
 }
 
@@ -64,8 +58,8 @@ function readAgentJsonRaw(file: string, cmd: string): Record<string, unknown> {
   }
 }
 
-/** 把 agent.json::models.model 三种形态（string | string[] | null/缺省）
- *  归一成 fallback chain string[]，并算出当前生效模型（chain[0]）。 */
+/** 把 RuntimeConfig models.model 三种形态（string | string[] | null/缺省）
+ *  归一成 fallback chain string[]，并算出下一回合首选模型（chain[0]）。 */
 function normalizeModel(raw: unknown): { chain: string[]; selected: string | null } {
   if (typeof raw === "string") {
     const trimmed = raw.trim();
@@ -165,13 +159,13 @@ const models: CommandModule = {
       },
       {
         name: "get_agent_model",
-        description: "查 agent.json::models.model（args[0]=sid, args[1]=agentPath · 归一成 chain[] + selected = chain[0]）",
+        description: "查运行时 Agent 的下一回合模型配置（args[0]=sid, args[1]=agentPath 或 instanceId）",
         hasQuery: true,
         hasExecute: false,
       },
       {
         name: "set_agent_models",
-        description: "写 agent.json models.model 为模型链（args[0]=sid, args[1]=agentPath, args[2..]=model 名；单模型也写成 [\"MODEL\"]）",
+        description: "设置 Agent 下一回合模型链；resident 同步保存配置，ephemeral 仅更新内存",
         hasQuery: false,
         hasExecute: true,
       },
@@ -186,6 +180,10 @@ const models: CommandModule = {
 
   async query(name, args, ctx) {
     if (name === "list_models") {
+      if (args[1] === "--refresh") {
+        invalidateModelCatalogCache();
+        invalidateLiveCatalogCache();
+      }
       const providerId = (args[0] ?? "").trim();
       if (providerId) return await loadKernelCatalog(ctx, providerId);
 
@@ -201,30 +199,33 @@ const models: CommandModule = {
 
     const { sid, agentPath } = parseAgentArgs(name, args);
     const session = await ctx.sm.open(sid);
-    // Pre-scaffold tolerance: when the chat tab pins a marketplace persona
-    // (mochi / rin / …) before the session tree contains it, this query
-    // races the scaffold pipeline (POST /api/sessions/:sid/messages auto-
-    // scaffolds on first send). Returning a graceful empty state lets the
-    // composer keep rendering — the picker simply shows "no model selected
-    // yet" until the agent is real, instead of spamming a 500 every poll.
-    const agentJsonFile = ctx.paths.session(sid).agent(agentPath).agentJson();
-    if (!session.tree.get(agentPath) || !existsSync(agentJsonFile)) {
+    const instance = session.tree.resolve(agentPath);
+    if (!instance) {
+      // pending = 尚未物化进 RuntimeTree（extension persona 懒创建前）。
+      // 不要与「config staged / next-turn」共用此字段 —— Composer 用它跳过
+      // set_agent_models reconcile。
       return { sid, agentPath, selected: null, chain: [], raw: null, pending: true };
     }
 
-    const raw = readAgentJsonRaw(agentJsonFile, name);
-    const modelsField = raw.models && typeof raw.models === "object" && !Array.isArray(raw.models)
-      ? (raw.models as Record<string, unknown>)
-      : null;
-    const rawValue = modelsField ? modelsField.model ?? null : null;
+    const next = instance.runtimeConfig.next();
+    const current = instance.runtimeConfig.current();
+    const rawValue = next.value.models?.model ?? null;
     const { chain, selected } = normalizeModel(rawValue);
+    const staged = next.revision !== current.revision;
 
     return {
       sid,
-      agentPath,
-      selected,         // chain[0] ?? null —— UI 只想拿"当前用哪个"读这个
-      chain,            // 完整 fallback 链，永远 string[]（即使盘上是 string 也展开）
-      raw: rawValue,    // 原 agent.json 里的字段值（string / string[] / null），不会丢失"用户写了啥"
+      agentPath: session.tree.addressOf(instance),
+      instanceId: instance.instanceId,
+      lifetime: instance.lifetime,
+      selected,
+      chain,
+      raw: rawValue,
+      // Only "not yet in tree" — staging uses appliesAt / staged below.
+      pending: false,
+      staged,
+      appliesAt: staged ? "next-turn" : "current",
+      revision: next.revision,
     };
   },
 
@@ -257,45 +258,63 @@ const models: CommandModule = {
     }
 
     const session = await ctx.sm.open(sid);
-    if (!session.tree.get(agentPath)) {
-      // Symmetry with get_agent_model's pre-scaffold tolerance: the chat tab
-      // pins a marketplace/plugin persona (suzu / mochi / …) before the session
-      // tree contains it, so picking that agent's model must materialize it —
-      // the same lazy persona scaffold /messages runs on first send. Simple-name
-      // ids only; a nested path that's missing is a genuine "not found". This
-      // also covers the freshly-scaffolded / just-opened session case (FSWatcher
-      // lag) that the onboarding relax previously targeted: ensurePersonaScaffold
-      // is idempotent, so an already-materialized agent simply proceeds.
-      if (!isValidAgentName(agentPath)) {
-        throw new Error(`${name}: agent path not found in tree: ${agentPath}`);
+    let instance = session.tree.resolve(agentPath);
+    if (!instance) {
+      // Same lazy-materialization bridge as POST /messages / CLI chat: a
+      // simple persona name that isn't live yet can be scaffolded here so
+      // Composer can pin a model before the first chat turn.
+      if (agentPath.includes("/") || agentPath.includes("#")) {
+        throw new Error(`${name}: runtime agent not found: ${agentPath}`);
       }
-      const res = await ensurePersonaScaffold(session, agentPath);
-      if (!res.ok) throw new Error(`${name}: ${res.error}`);
+      try {
+        await session.ensureResidentAgent(agentPath);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`${name}: ${message}`);
+      }
+      instance = session.tree.resolve(agentPath);
+      if (!instance) {
+        throw new Error(`${name}: runtime agent not found: ${agentPath}`);
+      }
     }
 
-    const agentJsonFile = ctx.paths.session(sid).agent(agentPath).agentJson();
-    const raw = readAgentJsonRaw(agentJsonFile, name);
-
-    const prevModels =
-      raw.models && typeof raw.models === "object" && !Array.isArray(raw.models)
-        ? (raw.models as Record<string, unknown>)
-        : {};
-    raw.models = { ...prevModels, model: chain };
-
-    writeFileSync(agentJsonFile, JSON.stringify(raw, null, 2) + "\n", "utf-8");
-
-    let restarted = false;
-    if (session.scheduler.getAgent(agentPath)) {
-      await session.scheduler.controlAgent("restart", agentPath);
-      restarted = true;
+    let agentJsonFile: string | null = null;
+    if (instance.lifetime === "resident") {
+      const templateRoot = instance.template.resources.templateRoot;
+      if (!templateRoot) {
+        throw new Error(`${name}: resident template root missing: ${agentPath}`);
+      }
+      agentJsonFile = join(templateRoot, "agent.json");
+      const raw = readAgentJsonRaw(agentJsonFile, name);
+      const prevModels =
+        raw.models && typeof raw.models === "object" && !Array.isArray(raw.models)
+          ? (raw.models as Record<string, unknown>)
+          : {};
+      raw.models = { ...prevModels, model: chain };
+      writeFileSync(agentJsonFile, JSON.stringify(raw, null, 2) + "\n", "utf-8");
     }
+
+    const previous = instance.runtimeConfig.next().value;
+    const value = Object.freeze({
+      ...previous,
+      models: Object.freeze({
+        ...(previous.models ?? {}),
+        model: [...chain],
+      }),
+    });
+    const revision = `cfg_${stableHash(value)}`;
+    await session.stageRuntimeConfig(instance.instanceId, { revision, value });
 
     return {
       sid,
-      agentPath,
+      agentPath: session.tree.addressOf(instance),
+      instanceId: instance.instanceId,
+      lifetime: instance.lifetime,
       models: { model: chain },
       selected: chain[0],
-      restarted,
+      staged: true,
+      appliesAt: "next-turn",
+      revision,
       agentJsonFile,
     };
   },

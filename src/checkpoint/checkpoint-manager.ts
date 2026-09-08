@@ -15,13 +15,8 @@ import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { getPathManager } from "../fs/path-manager";
 import type { Session } from "../core/session";
 import type { Event } from "../core/types";
-import {
-  SnapshotStore,
-  type DiffStats,
-  type GarbageCollectResult,
-  type Manifest,
-  type RestoreResult,
-} from "./snapshot-store";
+import type { EventLedger } from "../ledger/event-ledger";
+import { SnapshotStore, type DiffStats, type Manifest } from "./snapshot-store";
 import { REWIND_BOUNDARY, REWIND_CANCEL } from "./rewind-mask";
 
 export type RewindMode = "both" | "conversation" | "code";
@@ -31,12 +26,6 @@ interface MessageRecord {
   msgId: string;
   ts: number;
   manifestId: string | null; // null = 该消息时刻无游戏目录 / 快照失败
-  providerId?: string;
-  checkpointMode?: "native" | "host-compatible";
-  /** New turn protocol marker. Legacy records intentionally omit it and are
-   * never eligible for artifact reconciliation. */
-  artifactResolutionExpected?: true;
-  schemaVersion?: 2;
 }
 
 interface RewindRecord {
@@ -77,45 +66,6 @@ export interface PendingRewind {
   overwrite: { safetyManifestId: string; files: string[] } | null;
 }
 
-export interface CheckpointDiagnostic {
-  kind: "invalid-index";
-  line: number;
-  detail: string;
-}
-
-export interface CheckpointListEntry {
-  msgId: string;
-  ts: number;
-  hasCode: boolean;
-  expired: boolean;
-  providerId?: string;
-  checkpointMode?: "native" | "host-compatible";
-}
-
-const DEFAULT_CHECKPOINT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-
-function checkpointMaxAgeMs(): number {
-  const configured = process.env.FORGEAX_CHECKPOINT_MAX_AGE_MS?.trim();
-  if (!configured) return DEFAULT_CHECKPOINT_MAX_AGE_MS;
-  const raw = Number(configured);
-  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_CHECKPOINT_MAX_AGE_MS;
-}
-
-function checkpointExpired(ts: number): boolean {
-  return Date.now() - ts > checkpointMaxAgeMs();
-}
-
-function restoreFailure(prefix: string, result: RestoreResult): { error: string; status: number } | null {
-  if (result.missingBlobs.length === 0 && result.corruptBlobs.length === 0) return null;
-  const missing = result.missingBlobs.map((x) => `${x.path} (${x.hash})`).join(", ");
-  const corrupt = result.corruptBlobs.map((x) => `${x.path} (${x.hash})`).join(", ");
-  const detail = [
-    missing ? `missing blob: ${missing}` : "",
-    corrupt ? `corrupt blob: ${corrupt}` : "",
-  ].filter(Boolean).join("; ");
-  return { error: `${prefix}: restore aborted; ${detail}`, status: 410 };
-}
-
 class SessionCheckpoints {
   readonly messages = new Map<string, MessageRecord>();
   readonly order: string[] = []; // msgId 时间序
@@ -133,7 +83,6 @@ class SessionCheckpoints {
     overwrite: { safetyManifestId: string; files: string[] } | null;
   } | null = null;
   loaded = false;
-  readonly diagnostics: CheckpointDiagnostic[] = [];
   lock: Promise<unknown> = Promise.resolve();
 
   constructor(
@@ -202,21 +151,12 @@ export class CheckpointManager {
     const rewinds = new Map<string, RewindRecord>();
     const status = new Map<string, StatusRecord["status"]>();
     const overwrites = new Map<string, OverwriteRecord | null>();
-    for (const [lineIndex, line] of raw.split("\n").entries()) {
+    for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       let rec: CheckpointJsonlRecord;
       try {
         rec = JSON.parse(line) as CheckpointJsonlRecord;
-      } catch (err) {
-        const detail = `invalid JSON ignored: ${(err as Error).message}`;
-        sc.diagnostics.push({ kind: "invalid-index", line: lineIndex + 1, detail });
-        process.stderr.write(`[checkpoint] ${sc.sid}/checkpoints.jsonl:${lineIndex + 1}: ${detail}\n`);
-        continue;
-      }
-      if (!rec || typeof rec !== "object" || typeof (rec as { kind?: unknown }).kind !== "string") {
-        const detail = "invalid checkpoint record ignored";
-        sc.diagnostics.push({ kind: "invalid-index", line: lineIndex + 1, detail });
-        process.stderr.write(`[checkpoint] ${sc.sid}/checkpoints.jsonl:${lineIndex + 1}: ${detail}\n`);
+      } catch {
         continue;
       }
       if (rec.kind === "message") {
@@ -272,11 +212,7 @@ export class CheckpointManager {
    *  代码回退能力);纯会话(无游戏目录)记录 manifestId=null,会话回退仍可用。
    *  async 快照后必须进 per-session 锁:否则 walk 可与同 session 的 rewind/restore
    *  交错,把半 restore 的盘面拍成 manifest。 */
-  snapshotForMessage(
-    session: Session,
-    msgId: string,
-    meta: { providerId?: string; checkpointMode?: "native" | "host-compatible" } = {},
-  ): Promise<void> {
+  snapshotForMessage(session: Session, msgId: string): Promise<void> {
     const sc = this.ensure(session);
     return this.withLock(sc, async () => {
       let manifestId: string | null = null;
@@ -290,16 +226,7 @@ export class CheckpointManager {
           return; // 连索引都不记 —— UI 不出回退入口
         }
       }
-      const rec: MessageRecord = {
-        kind: "message",
-        msgId,
-        ts: Date.now(),
-        manifestId,
-        ...(meta.providerId ? { providerId: meta.providerId } : {}),
-        ...(meta.checkpointMode ? { checkpointMode: meta.checkpointMode } : {}),
-        artifactResolutionExpected: true,
-        schemaVersion: 2,
-      };
+      const rec: MessageRecord = { kind: "message", msgId, ts: Date.now(), manifestId };
       try {
         this.record(sc, rec);
       } catch (err) {
@@ -313,18 +240,11 @@ export class CheckpointManager {
 
   // ─── queries ─────────────────────────────────────────────────────────────
 
-  list(session: Session): CheckpointListEntry[] {
+  list(session: Session): Array<{ msgId: string; ts: number; hasCode: boolean }> {
     const sc = this.ensure(session);
     return sc.order.map((msgId) => {
       const r = sc.messages.get(msgId)!;
-      return {
-        msgId,
-        ts: r.ts,
-        hasCode: r.manifestId !== null,
-        expired: checkpointExpired(r.ts),
-        ...(r.providerId ? { providerId: r.providerId } : {}),
-        ...(r.checkpointMode ? { checkpointMode: r.checkpointMode } : {}),
-      };
+      return { msgId, ts: r.ts, hasCode: r.manifestId !== null };
     });
   }
 
@@ -332,45 +252,17 @@ export class CheckpointManager {
     return this.ensure(session).pending;
   }
 
-  diagnosticsOf(session: Session): CheckpointDiagnostic[] {
-    return [...this.ensure(session).diagnostics];
-  }
-
-  private manifestFor(sc: SessionCheckpoints, manifestId: string):
-    | { manifest: Manifest }
-    | { error: string; status: number } {
-    if (!sc.store) return { error: "no code checkpoint store", status: 409 };
-    const loaded = sc.store.loadManifestChecked(manifestId);
-    if (loaded.manifest) return { manifest: loaded.manifest };
-    if (loaded.failure?.kind === "incompatible") return { error: loaded.failure.detail, status: 409 };
-    if (loaded.failure?.kind === "invalid") return { error: loaded.failure.detail, status: 422 };
-    return { error: loaded.failure?.detail ?? `manifest missing: ${manifestId}`, status: 410 };
-  }
-
-  private async validateManifest(
-    sc: SessionCheckpoints,
-    manifest: Manifest,
-    prefix: string,
-  ): Promise<{ error: string; status: number } | null> {
-    if (!sc.store) return { error: "no code checkpoint store", status: 409 };
-    const result = await sc.store.validateManifestBlobs(manifest);
-    return restoreFailure(prefix, { written: [], deleted: [], skippedDirty: [], ...result });
-  }
-
   /** 确认弹窗的 diff 预览。 */
   async preview(session: Session, msgId: string): Promise<DiffStats | { error: string; status: number }> {
     const sc = this.ensure(session);
     const rec = sc.messages.get(msgId);
     if (!rec) return { error: `unknown msgId: ${msgId}`, status: 404 };
-    if (checkpointExpired(rec.ts)) return { error: `checkpoint expired for ${msgId}`, status: 410 };
     if (!rec.manifestId || !sc.store || !sc.gameDir) {
       return { filesChanged: [], insertions: 0, deletions: 0, binaryOrLarge: 0, files: [] };
     }
-    const loaded = this.manifestFor(sc, rec.manifestId);
-    if ("error" in loaded) return loaded;
-    const invalidBlobs = await this.validateManifest(sc, loaded.manifest, `checkpoint ${msgId}`);
-    if (invalidBlobs) return invalidBlobs;
-    return sc.store.diffStats(sc.gameDir, loaded.manifest);
+    const manifest = sc.store.loadManifest(rec.manifestId);
+    if (!manifest) return { error: `manifest missing for ${msgId}`, status: 410 };
+    return sc.store.diffStats(sc.gameDir, manifest);
   }
 
   // ─── restore-class operations(全部走 per-session 锁)──────────────────
@@ -388,31 +280,19 @@ export class CheckpointManager {
     | { error: string; status: number }
   > {
     const sc = this.ensure(session);
-    return this.withLock(sc, async () => {
+    return this.withLock(sc, () => this.withRuntimeGate(session, "checkpoint rewind", async (extraLedgers) => {
       const rec = sc.messages.get(msgId);
       if (!rec) return { error: `unknown msgId: ${msgId}`, status: 404 };
-      if (checkpointExpired(rec.ts)) return { error: `checkpoint expired for ${msgId}`, status: 410 };
       if (mode !== "conversation" && !rec.manifestId) {
         return { error: `msgId ${msgId} has no code checkpoint`, status: 409 };
-      }
-
-      let target: Manifest | null = null;
-      if (mode !== "conversation" && rec.manifestId) {
-        const loaded = this.manifestFor(sc, rec.manifestId);
-        if ("error" in loaded) return loaded;
-        const invalidBlobs = await this.validateManifest(sc, loaded.manifest, `checkpoint ${msgId}`);
-        if (invalidBlobs) return invalidBlobs;
-        target = loaded.manifest;
       }
 
       // 是否"挂起态内再回退"。手改防护(keptDirty)只对这种场景生效。在 cancel
       // 旧 pending 前捕获。
       const wasPending = sc.pending != null;
 
-      // 1. 停掉进行中的 turn,确定性等它排空(而非猜时间的 sleep):await 到
-      // agent.settled resolve,保证半截 turn 的事件已经 flush 完才拍 boundary。
-      await session.scheduler.interruptAndDrain();
-
+      // 1. RuntimeSupervisor 已封住 spawn/input，取消并 drain ephemeral，
+      //    quiesce resident turn，随后 flush 全部 instance EventStore。
       // 1.5 挂起态再回退:单活跃 boundary 模型 —— 旧 boundary 作废(cancel),
       // 新 boundary 接管;恢复锚点继承第一次回退前的状态,Redo 永远回到「回退前最新」。
       let inheritedPre: string | null = null;
@@ -425,7 +305,7 @@ export class CheckpointManager {
             ts: Date.now(),
             source: "system",
             payload: { boundaryId: old.boundaryId },
-          });
+          }, extraLedgers);
         }
         this.record(sc, { kind: "rewind-status", boundaryId: old.boundaryId, status: "cancelled", ts: Date.now() });
         sc.pending = null;
@@ -447,25 +327,27 @@ export class CheckpointManager {
       let keptDirty: string[] = [];
       const boundaryId = randomUUID();
       if (mode !== "conversation" && sc.store && sc.gameDir && rec.manifestId) {
+        const target = sc.store.loadManifest(rec.manifestId);
         if (!target) return { error: `manifest missing for ${msgId}`, status: 410 };
         const dirty = wasPending ? await this.dirtySet(sc) : new Set<string>();
         const res = await sc.store.restore(sc.gameDir, target, { exclude: dirty });
-        const failed = restoreFailure(`checkpoint ${msgId}`, res);
-        if (failed) return failed;
         filesChanged = [...res.written, ...res.deleted];
         keptDirty = res.skippedDirty;
         sc.lastRestoreManifestId = rec.manifestId;
         sc.lastOp = { opId: boundaryId, keptDirty, restoreTargetManifestId: rec.manifestId, overwrite: null };
       }
 
-      // 4. 会话 boundary 落账(所有 agent —— 子 agent 联动)
+      // 4. 会话 boundary 落账(所有 agent —— 子 agent 联动，包括本次 gate 期间
+      //    刚被 cancel+GC 掉的 ephemeral:它们不再活在 session.tree 里，
+      //    appendToAllLedgers 单靠树遍历找不到它们，必须走 extraLedgers 补上，
+      //    否则这些 agent 的 WAL 里永远缺这条 boundary，回放时不会被正确掩码)。
       if (mode !== "code") {
         this.appendToAllLedgers(session, {
           type: REWIND_BOUNDARY,
           ts: Date.now(),
           source: "system",
           payload: { boundaryId, targetMsgId: msgId, targetTs: rec.ts, mode },
-        });
+        }, extraLedgers);
       }
 
       // 5. 索引 + 挂起态 + UI 通知
@@ -477,7 +359,7 @@ export class CheckpointManager {
       sc.pending = { boundaryId, targetMsgId: msgId, mode, preManifestId, keptDirty, overwrite: null };
       this.notify(session, "rewind:done", { boundaryId, msgId, mode, filesChanged, keptDirty });
       return { boundaryId, filesChanged, keptDirty, targetTs: rec.ts };
-    });
+    }));
   }
 
   /** 恢复(Redo checkpoint)。挂起态手改默认保留。 */
@@ -486,21 +368,17 @@ export class CheckpointManager {
     boundaryId: string,
   ): Promise<{ keptDirty: string[] } | { error: string; status: number }> {
     const sc = this.ensure(session);
-    return this.withLock(sc, async () => {
+    return this.withLock(sc, () => this.withRuntimeGate(session, "checkpoint cancel", async (extraLedgers) => {
       if (!sc.pending || sc.pending.boundaryId !== boundaryId) {
         return { error: `boundary ${boundaryId} is not pending (cancelled/finalized/unknown)`, status: 409 };
       }
       const pending = sc.pending;
       let keptDirty: string[] = [];
       if (pending.preManifestId && sc.store && sc.gameDir) {
-        const loaded = this.manifestFor(sc, pending.preManifestId);
-        if ("error" in loaded) return { error: `pre-rewind: ${loaded.error}`, status: loaded.status };
-        const invalidBlobs = await this.validateManifest(sc, loaded.manifest, "pre-rewind");
-        if (invalidBlobs) return invalidBlobs;
+        const pre = sc.store.loadManifest(pending.preManifestId);
+        if (!pre) return { error: `pre-rewind manifest missing`, status: 410 };
         const dirty = await this.dirtySet(sc);
-        const res = await sc.store.restore(sc.gameDir, loaded.manifest, { exclude: dirty });
-        const failed = restoreFailure("pre-rewind", res);
-        if (failed) return failed;
+        const res = await sc.store.restore(sc.gameDir, pre, { exclude: dirty });
         keptDirty = res.skippedDirty;
         sc.lastRestoreManifestId = pending.preManifestId;
         sc.lastOp = {
@@ -514,13 +392,13 @@ export class CheckpointManager {
           ts: Date.now(),
           source: "system",
           payload: { boundaryId },
-        });
+        }, extraLedgers);
       }
       this.record(sc, { kind: "rewind-status", boundaryId, status: "cancelled", ts: Date.now() });
       sc.pending = null;
       this.notify(session, "rewind:cancelled", { boundaryId, keptDirty });
       return { keptDirty };
-    });
+    }));
   }
 
   /** 「这些文件也回退」:显式覆盖上次 restore 保留的脏文件,覆盖前
@@ -531,7 +409,7 @@ export class CheckpointManager {
     boundaryId: string,
   ): Promise<{ files: string[] } | { error: string; status: number }> {
     const sc = this.ensure(session);
-    return this.withLock(sc, async () => {
+    return this.withLock(sc, () => this.withRuntimeGate(session, "checkpoint overwrite", async () => {
       const op = sc.lastOp;
       if (!op || op.opId !== boundaryId) {
         return { error: `boundary ${boundaryId} is not the latest restore op`, status: 409 };
@@ -541,10 +419,6 @@ export class CheckpointManager {
       }
       if (op.keptDirty.length === 0) return { files: [] };
       const files = new Set(op.keptDirty);
-      const targetLoaded = this.manifestFor(sc, op.restoreTargetManifestId);
-      if ("error" in targetLoaded) return { error: targetLoaded.error, status: targetLoaded.status };
-      const invalidTarget = await this.validateManifest(sc, targetLoaded.manifest, "restore target");
-      if (invalidTarget) return invalidTarget;
       // safety 快照(第 1 层):同步成功后才触盘,失败整体中止
       let safetyManifestId: string;
       try {
@@ -552,9 +426,9 @@ export class CheckpointManager {
       } catch (err) {
         return { error: `safety snapshot failed, aborted: ${(err as Error).message}`, status: 500 };
       }
-      const res = await sc.store.restore(sc.gameDir, targetLoaded.manifest, { only: files });
-      const failed = restoreFailure("restore target", res);
-      if (failed) return failed;
+      const target = sc.store.loadManifest(op.restoreTargetManifestId);
+      if (!target) return { error: "restore target manifest missing", status: 410 };
+      await sc.store.restore(sc.gameDir, target, { only: files });
       const fileList = [...files];
       this.record(sc, { kind: "overwrite", boundaryId, safetyManifestId, files: fileList, ts: Date.now() });
       op.overwrite = { safetyManifestId, files: fileList };
@@ -565,7 +439,7 @@ export class CheckpointManager {
       }
       this.notify(session, "rewind:overwrite", { boundaryId, files: fileList });
       return { files: fileList };
-    });
+    }));
   }
 
   /** 「撤销」:把被覆盖的脏文件从 safety 快照写回。 */
@@ -574,20 +448,16 @@ export class CheckpointManager {
     boundaryId: string,
   ): Promise<{ files: string[] } | { error: string; status: number }> {
     const sc = this.ensure(session);
-    return this.withLock(sc, async () => {
+    return this.withLock(sc, () => this.withRuntimeGate(session, "checkpoint undo overwrite", async () => {
       const op = sc.lastOp;
       if (!op || op.opId !== boundaryId || !op.overwrite) {
         return { error: `no overwrite to undo for ${boundaryId}`, status: 409 };
       }
       if (!sc.store || !sc.gameDir) return { error: "no code store", status: 409 };
-      const loaded = this.manifestFor(sc, op.overwrite.safetyManifestId);
-      if ("error" in loaded) return { error: `safety manifest: ${loaded.error}`, status: loaded.status };
-      const invalidSafety = await this.validateManifest(sc, loaded.manifest, "safety manifest");
-      if (invalidSafety) return invalidSafety;
+      const safety = sc.store.loadManifest(op.overwrite.safetyManifestId);
+      if (!safety) return { error: "safety manifest missing", status: 410 };
       const files = new Set(op.overwrite.files);
-      const res = await sc.store.restore(sc.gameDir, loaded.manifest, { only: files });
-      const failed = restoreFailure("safety manifest", res);
-      if (failed) return failed;
+      await sc.store.restore(sc.gameDir, safety, { only: files });
       this.record(sc, { kind: "overwrite-undo", boundaryId, ts: Date.now() });
       op.keptDirty = op.overwrite.files;
       op.overwrite = null;
@@ -597,7 +467,7 @@ export class CheckpointManager {
       }
       this.notify(session, "rewind:overwrite-undone", { boundaryId, files: [...files] });
       return { files: [...files] };
-    });
+    }));
   }
 
   /** 新 user_input 到达 → 定格。messages 路由在 emit 前调用。进 per-session 锁:
@@ -616,25 +486,25 @@ export class CheckpointManager {
     });
   }
 
-  /** Remove unreferenced manifests/blobs while retaining all active rewind data. */
-  collectGarbage(session: Session): Promise<GarbageCollectResult | { error: string; status: number }> {
-    const sc = this.ensure(session);
-    return this.withLock(sc, async () => {
-      if (!sc.store) return { error: "no code checkpoint store", status: 409 };
-      const reachable = new Set<string>();
-      for (const rec of sc.messages.values()) {
-        if (rec.manifestId) reachable.add(rec.manifestId);
-      }
-      if (sc.pending?.preManifestId) reachable.add(sc.pending.preManifestId);
-      if (sc.pending?.overwrite?.safetyManifestId) reachable.add(sc.pending.overwrite.safetyManifestId);
-      if (sc.lastRestoreManifestId) reachable.add(sc.lastRestoreManifestId);
-      if (sc.lastOp?.restoreTargetManifestId) reachable.add(sc.lastOp.restoreTargetManifestId);
-      if (sc.lastOp?.overwrite?.safetyManifestId) reachable.add(sc.lastOp.overwrite.safetyManifestId);
-      return sc.store.collectGarbage(reachable, { ownerSid: sc.sid });
-    });
-  }
-
   // ─── internals ───────────────────────────────────────────────────────────
+
+  /** `extraLedgers` 传给 `operation`:gate 期间被 cancel+GC 掉的 ephemeral 的
+   *  `EventLedger`——它们已经不在 `session.tree` 里，`appendToAllLedgers` 光靠
+   *  树遍历够不着,需要 `operation` 自己把它们一起传给 `appendToAllLedgers`
+   *  才能让 boundary/cancel 事件覆盖到这些"gate 期间刚消失"的 agent。 */
+  private async withRuntimeGate<T>(
+    session: Session,
+    reason: string,
+    operation: (extraLedgers: readonly EventLedger[]) => Promise<T>,
+  ): Promise<T> {
+    const { release, retiringEphemeralLedgers } =
+      await session.supervisor.prepareForSessionMutation(reason);
+    try {
+      return await operation(retiringEphemeralLedgers);
+    } finally {
+      release();
+    }
+  }
 
   /** 挂起态脏检测:diff(当前盘, 上次 restore 落点)→ changed + onlyOnDisk。
    *  无 restore 基准(从未 code 回退)→ 空集。 */
@@ -646,14 +516,31 @@ export class CheckpointManager {
     return new Set([...d.changed, ...d.onlyOnDisk]);
   }
 
-  /** boundary/cancel 直接 append 进每个 agent 的 WAL(确定性,不走 bus 路由)。 */
-  private appendToAllLedgers(session: Session, event: Event): void {
+  /** boundary/cancel 直接 append 进每个 agent 的 WAL(确定性,不走 bus 路由)。
+   *  `extraLedgers`(可选)——本次 gate 期间被 cancel+GC、已经不在
+   *  `session.tree` 里的 ephemeral 的 `EventLedger`,由 `withRuntimeGate` 从
+   *  `prepareForSessionMutation` 转发下来,一并补写,不让它们的历史漏掉这条
+   *  boundary/cancel 标记。 */
+  private appendToAllLedgers(
+    session: Session,
+    event: Event,
+    extraLedgers: readonly EventLedger[] = [],
+  ): void {
     for (const node of session.tree.list()) {
       try {
         session.getOrCreateLedger(node.path).append(event);
       } catch (err) {
         process.stderr.write(
           `[checkpoint] ledger append ${event.type} to ${node.path} failed: ${(err as Error).message}\n`,
+        );
+      }
+    }
+    for (const ledger of extraLedgers) {
+      try {
+        ledger.append(event);
+      } catch (err) {
+        process.stderr.write(
+          `[checkpoint] ledger append ${event.type} to retired ephemeral ${ledger.agentPath} failed: ${(err as Error).message}\n`,
         );
       }
     }

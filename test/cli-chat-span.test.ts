@@ -236,6 +236,15 @@ describe('MCP 结果信封只活在编排层内部', () => {
     // 账本 / 跨内核历史桥 / 事件格式化器也各有各的读法。信封若流出去,就得有四个地方
     // 分别认识它 —— 那正是本工作流犯过四次的"第二份事实源"。
     expect(unwrapMcpResultEnvelope({ text: 'panels: []', structuredContent: { forgeax: { toolExecutionId: 'fxt-9' } } })).toBe('panels: []');
+    expect(unwrapMcpResultEnvelope({
+      text: '{"schema":"forgeax-audio-project/2","revision":0}',
+      structuredContent: {
+        forgeax: {
+          toolExecutionId: 'fxt-10',
+          result: { schema: 'forgeax-audio-project/2', revision: 0 },
+        },
+      },
+    })).toBe('{"schema":"forgeax-audio-project/2","revision":0}');
   });
 
   it('第三方 structuredContent 一个字段都不许动', () => {

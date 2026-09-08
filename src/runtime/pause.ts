@@ -11,7 +11,7 @@
  *   3. The bus emits `runtime.paused` / `runtime.resumed` so connected UIs
  *      flip their TopBar indicator without polling.
  *
- * Scope rules: only `caller.kind === 'ai'` is paused. User/CLI/workbench
+ * Scope rules: only `caller.kind === 'ai'` is paused. User/CLI/page
  * actions remain live — the design intent is "freeze the agent, not the
  * user". Skills triggered from a paused AI turn inherit the block by
  * propagating the caller kind.

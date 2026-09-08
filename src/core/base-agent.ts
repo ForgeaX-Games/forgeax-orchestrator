@@ -40,6 +40,7 @@ import { createAgentFs } from "../fs/agent-fs";
 import { wrapAgentFsWithRecorder, type RecorderHooks } from "../fs/agent-fs-recorder";
 import { getPathManager } from "../fs/path-manager";
 import { getTerminalManager } from "../terminal/manager";
+import type { RuntimeToolContext } from "../runtime/runtime-context";
 
 export interface AgentInitConfig {
   /** Agent path within session, e.g. "root/iori"; 也是 EventBus / Blackboard 的命名空间 key。 */
@@ -62,6 +63,12 @@ export interface AgentInitConfig {
    *  Tests that build BaseAgent directly without a Session can omit this — the
    *  fs surface remains the bare `createAgentFs()` output, no recording. */
   fileRecorder?: RecorderHooks;
+  /** Compatibility Scheduler may expose the live RuntimeSupervisor authority
+   * to legacy kits; it never creates a second lifecycle owner. */
+  runtime?: RuntimeToolContext;
+  /** Instance-owned writable state. This belongs to AgentRuntimeContext, not
+   * the narrow RuntimeToolContext capability surface. */
+  runtimeStateRoot?: string;
 }
 
 export abstract class BaseAgent {
@@ -111,12 +118,25 @@ export abstract class BaseAgent {
 
     const me = this.agentPath;
     const bus = this.eventBus;
+    const identify = (event: Event): Event => ({
+      ...event,
+      payload: {
+        ...event.payload,
+        ...(config.runtime
+          ? {
+              agentInstanceId: config.runtime.instanceId,
+              runtimeEpochId: config.runtime.runtimeEpochId,
+              templateRef: config.runtime.templateRef,
+            }
+          : {}),
+      },
+    });
     this.boundEventBus = {
-      publish: (event: Event, emitterId?: string) => bus.publish(event, emitterId ?? me),
-      emit: (event: Event, emitterId?: string) => bus.emit(event, emitterId ?? me),
-      emitToSelf: (event: SelfEvent) => bus.emit({ ...event, to: me } as Event, me),
+      publish: (event: Event, emitterId?: string) => bus.publish(identify(event), emitterId ?? me),
+      emit: (event: Event, emitterId?: string) => bus.emit(identify(event), emitterId ?? me),
+      emitToSelf: (event: SelfEvent) => bus.emit(identify({ ...event, to: me } as Event), me),
       hook: (type, payload) => {
-        const event: Event = { source: `agent:${me}`, type, payload, ts: Date.now() };
+        const event = identify({ source: `agent:${me}`, type, payload, ts: Date.now() });
         bus.publish(event, me);
         return event;
       },
@@ -147,8 +167,14 @@ export abstract class BaseAgent {
       : baseAgentFs;
     this.agentContext = {
       agentPath: this.agentPath,
+      sid: config.runtime?.sid ?? "legacy",
+      instanceId: config.runtime?.instanceId ?? this.agentPath,
+      runtimeEpochId: config.runtime?.runtimeEpochId ?? "legacy",
+      runtimeStateRoot: config.runtimeStateRoot ?? this.agentDir,
+      kitSources: [],
       agentDir: this.agentDir,
       cwd: config.sessionCwd ?? config.agentDir,
+      ...(config.runtime ? { runtimeManaged: true, runtime: config.runtime } : {}),
       get signal() { return self.abortController.signal; },
       eventBus: this.boundEventBus,
       blackboard: this.blackboard,

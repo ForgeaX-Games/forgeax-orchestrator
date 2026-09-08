@@ -1,35 +1,25 @@
-/** Agent directory scaffolder —— 在 `<sid>/agents/<path>/` 下补全必要的 agent
- *  文件，使其成为 AgentTree 可识别的合法节点。
+/** Resident definition authoring helper.
  *
- *  入口（两条都走同一个 `ensureAgentScaffold`）：
- *  1. **API / 工具 path（create_agent）**：调 `ensureAgentScaffold(sid, path,
- *     { agentType: "conscious" | "script", overrides })`，显式指定类型。
- *  2. **裸 mkdir path**：用户/外部直接 `mkdir <sid>/agents/<path>/`，
- *     AgentTree 的 addDir watcher 见到合法 agent 路径 + 没 agent.json，
- *     回调到 `ensureAgentScaffold(sid, path, {})`，**默认 conscious**。
- *
- *  Scaffold 是 idempotent —— 已存在的文件不动；conscious 只写 `agent.json`，
- *  script 额外写 `src/index.ts`。forgeax 模型下 agent dir 自包含约定：
- *    必含 agent.json + （lazy）events/event-ledger.jsonl + events/blobs/
- *    可选 kits/ override + 子 agent 文件夹（套娃位于 `<self>/agents/<name>/`）
- *  其它（SOUL/PRINCIPLE/MEMORY/.env 等 ref 概念）**不属于 forgeax**。 */
+ * Writing a directory is configuration authoring only: it never mutates the
+ * live RuntimeTree by itself. Bootstrap scans these definitions in bulk;
+ * trusted runtime materialization must explicitly continue through
+ * TemplateCatalog + AgentRegistrar after this helper persists the definition.
+ * Custom code behavior remains an AgentKernel concern.
+ */
 
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { getPathManager } from "../fs/path-manager";
 import { deepMerge } from "../utils/deep-merge";
 import { AGENT_DEFAULTS } from "../defaults/agent-json";
-import { resolvePersonaForAgent } from "../agents/loader";
+import { resolveExternalAgentTemplate } from "../agents/loader";
 import type { AgentJson } from "./types";
 
 // ─── 类型 ────────────────────────────────────────────────────────────────────
 
-export type AgentType = "conscious" | "script";
-
 export interface AgentScaffoldOpts {
-  /** 缺省 "conscious"。 */
-  agentType?: AgentType;
+  /** Legacy caller hint; runtime templates derive lifecycle from registration. */
+  agentType?: "conscious" | "script";
   /** 写到 agent.json 的额外字段，deep-merge 进默认模板，已有文件不覆盖。 */
   overrides?: Partial<AgentJson>;
 }
@@ -60,47 +50,12 @@ export function isValidAgentPath(p: string): boolean {
   return true;
 }
 
-// ─── 默认 agent.json（script 模式）+ 默认 src/index.ts ───────────────────────
-
-/** ScriptAgent 的 agent.json 默认值 —— 在 AGENT_DEFAULTS 基础上把 kits
- *  全关掉（script 是代码驱动，默认不需要 LLM 工具堆），其它字段沿用。 */
-export function scriptAgentDefaults(): AgentJson {
-  return deepMerge(
-    AGENT_DEFAULTS as unknown as Record<string, unknown>,
-    {
-      kits: { user: "none", session: "none" },
-    },
-  ) as unknown as AgentJson;
-}
-
-/** ScriptAgent 的 `src/index.ts` 默认骨架 —— 与 ref 同步骤约定：
- *    导出 `start(ctx)` 与 `update(events, ctx)`，由 ScriptAgent.runMain 在
- *    每轮 queue.drain 后调用 update。 */
-export function defaultScriptTemplate(): string {
-  return `// @desc ScriptAgent entry —— event-driven automation
-import type { AgentContext, Event } from "@/core/types";
-
-/** Called once when the agent starts. */
-export async function start(ctx: AgentContext): Promise<void> {
-  console.log(\`[\${ctx.agentPath}] script-agent started\`);
-}
-
-/** Called each time new events arrive. */
-export async function update(events: Event[], ctx: AgentContext): Promise<void> {
-  for (const ev of events) {
-    console.log(\`[\${ctx.agentPath}] event: \${ev.type}\`);
-  }
-}
-`;
-}
-
 // ─── Scaffold 主入口 ─────────────────────────────────────────────────────────
 
 /** 在 `<sid>/agents/<path>/` 下补齐 agent 文件（idempotent）。
  *
  *  - 物理路径不存在 → 创建（递归）。
- *  - `agent.json` 不存在 → 写默认模板（conscious 或 script）+ overrides 合并。
- *  - script 模式下 `src/index.ts` 不存在 → 写默认骨架。
+ *  - `agent.json` 不存在 → 写默认模板 + overrides 合并。
  *  - 已存在的文件**不动**（包括 agent.json，所以反复调安全）。
  *
  *  ⚠️ 不要在这里建 events/ledger 或 blobs —— EventLedger.append() 第一次写盘
@@ -110,7 +65,7 @@ export async function ensureAgentScaffold(
   sid: string,
   agentPath: string,
   opts: AgentScaffoldOpts = {},
-): Promise<{ scaffolded: boolean; agentType: AgentType }> {
+): Promise<{ scaffolded: boolean }> {
   if (!isValidAgentPath(agentPath)) {
     throw new Error(
       `[agent-scaffold] invalid agent path '${agentPath}' (must match name(/agents/name)*)`,
@@ -118,14 +73,13 @@ export async function ensureAgentScaffold(
   }
 
   const layer = getPathManager().session(sid).agent(agentPath);
-  const agentType: AgentType = opts.agentType ?? "conscious";
   let scaffolded = false;
 
   await mkdir(layer.root(), { recursive: true });
 
   // 1) agent.json
   if (!existsSync(layer.agentJson())) {
-    const base = agentType === "script" ? scriptAgentDefaults() : (AGENT_DEFAULTS as unknown as AgentJson);
+    const base = AGENT_DEFAULTS as unknown as AgentJson;
     // 单一收口:host-tools allow 从 agent 的 manifest/persona 派生(SSOT),在这里
     // 注入——而不是让每个建 session 的调用方各自记得传。此前只有 sessions.ts
     // bootstrap / delegate 这几条路注入,别的路(reload 新建 session、裸 mkdir
@@ -136,10 +90,10 @@ export async function ensureAgentScaffold(
     let overrides = opts.overrides;
     const callerAllow = (overrides as { kits?: { config?: { ['host-tools']?: { allow?: unknown } } } } | undefined)
       ?.kits?.config?.['host-tools']?.allow;
-    if (agentType !== "script" && !callerAllow) {
+    if (!callerAllow) {
       const agentName = agentPath.split("/").pop() ?? agentPath;
       try {
-        const persona = await resolvePersonaForAgent(agentName);
+        const persona = await resolveExternalAgentTemplate(agentName);
         if (persona?.tools && persona.tools.length > 0) {
           overrides = deepMerge(
             { kits: { config: { "host-tools": { allow: persona.tools } } } },
@@ -160,16 +114,5 @@ export async function ensureAgentScaffold(
     scaffolded = true;
   }
 
-  // 2) ScriptAgent: 写 src/index.ts
-  if (agentType === "script") {
-    const srcDir = join(layer.root(), "src");
-    await mkdir(srcDir, { recursive: true });
-    const indexFile = join(srcDir, "index.ts");
-    if (!existsSync(indexFile)) {
-      await writeFile(indexFile, defaultScriptTemplate(), "utf-8");
-      scaffolded = true;
-    }
-  }
-
-  return { scaffolded, agentType };
+  return { scaffolded };
 }

@@ -1,6 +1,6 @@
 /** /api/sessions —— 最小入口：list / create / open / close / post-message / abort。
  *
- *  Plumbing 验证用：让外部 (curl / UI) 能创建 session、激活 scheduler、往 EventBus
+ *  Plumbing 验证用：让外部 (curl / UI) 能创建 session、启动 RuntimeTree、往 EventBus
  *  发事件、整 session 或 per-agent 取消。Observe 走 ws.ts 上的 ?sid= 订阅。
  *
  *  寻址（对齐 agenteam ref `ctl-command/gateway-ctl/agent.ts::cmdChat`）：caller
@@ -8,31 +8,26 @@
  *  `to` 就是普通 emit —— EventBus 仅向 observers 广播，不入任何 queue。这与 ref 的
  *  `instance.emit(event)` 行为一致。
  *
- *  abort 寻址（对齐 ref `core/scheduler.interruptAgents`）：POST `/:sid/abort` 不带
- *  `agent` query → 整 session 所有 agent.stop()；带 `?agent=<path>` → 只 stop 那一个。
- *  Session 不持 abortController，cancel 一律走 scheduler 派给 per-agent。 */
+ *  abort 寻址：POST `/:sid/abort` 不带 `agent` query → 中断整棵树当前 turn；
+ *  带 `?agent=<path>` → 只中断一个实例。AbortController 只归 RuntimeController。 */
 
+import { executionToolScope } from '../agents/execution-tool-scope';
 import { Hono } from 'hono';
 import { getSessionManager } from '../core/session-manager';
 import type { Session } from '../core/session';
 import type { Event } from '../core/types';
-import { isValidAgentName } from '../core/agent-scaffold';
-import { ensurePersonaScaffold } from '../core/persona-scaffold';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { getPathManager } from '../fs/path-manager';
-import { resolveAsk } from '../core/ask-user-registry';
+import {
+  resolveAskReply,
+  type AskReply,
+} from '../core/ask-user-registry';
 import { randomUUID } from 'node:crypto';
-import { findVisibleDoor } from '../kernel/action-door';
-import { catalogGet } from '../kernel/action-catalog';
-import { getSurfaceSnapshot, listSurfaces, shellLivePages, multiPageHint } from './bus';
+import { isValidSummonAgentId } from '../kernel/summon-agent';
 import { registerPermission, resolvePermission } from '../core/permission-registry';
 import { registerPerception, resolvePerception, pushPerceptionNote } from './lib/perception-registry';
 import { acquireUiLease, setUiManifest, uiInvokeTimeoutMs } from './lib/ui-manifest-registry';
-import {
-  createSessionWithBootstrap,
-  ensureSessionWithBootstrap,
-  type CreateSessionBody,
-} from './lib/session-create';
+import { createSessionWithBootstrap, ensureSessionWithBootstrap } from './lib/session-create';
 import { getHostTool } from '../orchestration-seams';
 import type { PerceptionKind } from '../kernel/forgeax-builtin-tools';
 import { executeTool } from '../kits/tool/tool-executor';
@@ -45,48 +40,58 @@ import {
 import { checkKernelTool } from '../kernel/trust-gate';
 import { requestToolApproval, applyRememberOnReply } from '../kernel/tool-approval';
 import { getCheckpointManager, type RewindMode } from '../checkpoint/checkpoint-manager';
-import { loadAgentRecord } from '../soul';
 import { appendToolAudit } from '../kernel/tool-audit';
 import { consultTurnGate } from '../kernel/cc-profile';
 import { evaluateSettingsRules, loadSettingsPermissionRules, ruleLabel } from './lib/permission-settings';
 import { shouldDelegateHostToolConfirmation } from '../kernel/host-tool-confirmation';
 import { resolveKernel } from '../kernel/resolve-kernel';
 import { orchestrationProfileOf } from '../kernel/kernel-profile';
-import { createProjectMcpBridge, isProjectMcpToolName } from '../kernel/project-mcp';
+import {
+  createProjectMcpBridge,
+  isProjectMcpToolName,
+  ProjectMcpToolNotFoundError,
+} from '../kernel/project-mcp';
+import { runSkillKernelTool } from '../skills/kernel-tool-bridge';
+import { recordSessionHostToolWrites } from '../kernel/host-tool-written-files';
+import { visibleTools } from '../runtime/visible-tools';
+import {
+  filterVisibleAgentManagementTools,
+  visibleAgentManagementToolsForAgent,
+  type AgentManagementToolName,
+} from '../kits/agent-management-visibility';
+import { canonicalAgentManagementTool } from './lib/host-tools-for-agent';
 import { prepareUserAttachmentPayload } from '../message/materialize-user-attachments';
 import { resolve as resolvePath, basename, join } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
 import { isPathInside } from '../kernel/materialize-file-attachments';
+import type { AgentTemplateDraft } from '../agents/template-types';
+import { ResidentDefinitionStore } from '../agents/resident-definition-store';
+import { AgentMaterializationError } from '../core/session';
+import { resolveTemplateTrust } from '../agents/agent-template-catalog';
+import { isBuiltinToolEnabled } from '../kernel/builtin-tool-policy';
+import { withAgentHostToolDefinitions } from '../tools/agent-host-tool-surface';
 
-function resolveAgentPath(session: Session, to: string): string {
+/** 寻址 + 懒创建兜底：session.tree 已有 → 直接用；带 `#` 的 fullId 要求已存在
+ *  （懒创建只对简单名字有意义——fullId 天然指一个已经活着的实例）；简单名字
+ *  且树里没有 → 尝试当作 marketplace/extension persona 现场 scaffold 成 resident
+ *  （`Session.ensureResidentAgent`，对齐已删除的 `ensurePersonaScaffold` 契约）。
+ *  嵌套 resident 路径（含 `/`）不进这条懒创建路，维持严格 404——只有"第一次跟
+ *  一个顶层 persona 说话"这一种场景需要现场造。 */
+async function resolveAgentPath(session: Session, to: string): Promise<string> {
   if (to.includes('#')) {
     const node = session.tree.getByFullId(to);
     if (!node) throw new Error(`agent fullId not found: ${to}`);
     return node.path;
   }
-  if (!session.tree.get(to)) {
+  if (session.tree.get(to)) return to;
+  if (to.includes('/')) {
     throw new Error(`agent path not found: ${to}`);
   }
-  return to;
-}
-
-function sessionCreateBody(raw: unknown): CreateSessionBody | null {
-  if (raw == null) return {};
-  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const body = raw as Record<string, unknown>;
-  if (body.scope !== undefined && (typeof body.scope !== 'string' || body.scope.length === 0)) {
-    return null;
-  }
-  return body as CreateSessionBody;
+  return session.ensureResidentAgent(to);
 }
 
 export function createSessionsRouter() {
   const r = new Hono();
-  // Host-routed project MCP calls share the orchestrator's pooled clients with
-  // compose-time discovery and the in-process core bridge. Native providers
-  // never reach this handle; it exists to give rented/host paths the same
-  // trust-gated execution semantics without spawning a second MCP child.
-  const projectMcp = createProjectMcpBridge(defaultProjectRoot());
 
   r.get('/', (c) => {
     const sm = getSessionManager();
@@ -105,8 +110,7 @@ export function createSessionsRouter() {
   });
 
   r.post('/', async (c) => {
-    const body = sessionCreateBody(await c.req.json().catch(() => ({})));
-    if (!body) return c.json({ error: 'scope must be a non-empty string when provided' }, 400);
+    const body = await c.req.json().catch(() => ({}));
     // 「建 session + bootstrap 入口 agent」的实现抽在 lib/session-create.ts(SSOT):
     // headless 的 `session.create` UI action(ui-headless-actions)与本路由共用同一份。
     const out = await createSessionWithBootstrap(body);
@@ -114,8 +118,7 @@ export function createSessionsRouter() {
   });
 
   r.post('/ensure', async (c) => {
-    const body = sessionCreateBody(await c.req.json().catch(() => ({})));
-    if (!body) return c.json({ error: 'scope must be a non-empty string when provided' }, 400);
+    const body = await c.req.json().catch(() => ({}));
     const out = await ensureSessionWithBootstrap(body);
     return c.json(out);
   });
@@ -123,14 +126,313 @@ export function createSessionsRouter() {
   r.post('/:sid/open', async (c) => {
     const sm = getSessionManager();
     const session = await sm.open(c.req.param('sid'));
-    session.scheduler.start();
     return c.json({ sid: session.sid });
+  });
+
+  r.post('/:sid/reload', async (c) => {
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      await session.reloadRuntime();
+      return c.json({
+        ok: true,
+        sid: session.sid,
+        agents: session.runtimeTree.list().map((instance) => ({
+          instanceId: instance.instanceId,
+          runtimeEpochId: instance.runtimeEpochId,
+          lifetime: instance.lifetime,
+          residentPath: instance.residentPath,
+          templateRef: instance.templateRef,
+          state: instance.state,
+        })),
+      });
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 409);
+    }
   });
 
   r.post('/:sid/close', async (c) => {
     const sm = getSessionManager();
     await sm.close(c.req.param('sid'));
     return c.json({ ok: true });
+  });
+
+  r.get('/:sid/runtime-agents', async (c) => {
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      const agents = session.runtimeTree.list().map((instance) => ({
+        instanceId: instance.instanceId,
+        runtimeEpochId: instance.runtimeEpochId,
+        parentInstanceId: instance.parentInstanceId,
+        lifetime: instance.lifetime,
+        residentPath: instance.residentPath,
+        templateRef: instance.templateRef,
+        displayName:
+          instance.template.definition.displayName ??
+          instance.template.definition.id,
+        state: instance.state,
+        createdAt: instance.createdAt,
+        eventStore: instance.events.locator,
+      }));
+      return c.json({ sid: session.sid, agents });
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 404);
+    }
+  });
+
+  r.get('/:sid/runtime-tree', async (c) => {
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      return c.json({
+        sid: session.sid,
+        agents: session.runtimeTree.list().map((instance) => ({
+          instanceId: instance.instanceId,
+          runtimeEpochId: instance.runtimeEpochId,
+          parentInstanceId: instance.parentInstanceId,
+          lifetime: instance.lifetime,
+          residentPath: instance.residentPath,
+          templateRef: instance.templateRef,
+          displayName:
+            instance.template.definition.displayName ??
+            instance.template.definition.id,
+          state: instance.state,
+          createdAt: instance.createdAt,
+          definitionRevision: instance.template.definitionRevision,
+          runtimeConfigRevision: instance.runtimeConfig.next().revision,
+          executionRevision: instance.execution.next().revision,
+        })),
+      });
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 404);
+    }
+  });
+
+  r.get('/:sid/resident-definitions', async (c) => {
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      const store = ResidentDefinitionStore.scan(
+        session.sid,
+        session.paths.agentsDir(),
+      );
+      return c.json({
+        sid: session.sid,
+        definitions: store.list().map((definition) => ({
+          logicalPath: definition.logicalPath,
+          parentLogicalPath: definition.parentLogicalPath,
+          instanceId: definition.identity.instanceId,
+        })),
+      });
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 404);
+    }
+  });
+
+  r.get('/:sid/instances/:instanceId', async (c) => {
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      const instance = session.runtimeTree.get(c.req.param('instanceId'));
+      if (!instance) return c.json({ error: 'runtime instance not found' }, 404);
+      return c.json({
+        sid: session.sid,
+        instance: {
+          instanceId: instance.instanceId,
+          runtimeEpochId: instance.runtimeEpochId,
+          parentInstanceId: instance.parentInstanceId,
+          children: session.runtimeTree
+            .childrenOf(instance.instanceId)
+            .map((child) => child.instanceId),
+          lifetime: instance.lifetime,
+          residentPath: instance.residentPath,
+          templateRef: instance.templateRef,
+          state: instance.state,
+          definitionRevision: instance.template.definitionRevision,
+          runtimeConfigRevision: instance.runtimeConfig.next().revision,
+          executionRevision: instance.execution.next().revision,
+          eventStore: instance.events.locator,
+        },
+      });
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 404);
+    }
+  });
+
+  r.get('/:sid/agent-templates', async (c) => {
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      return c.json({
+        sid: session.sid,
+        templates: session.templateCatalog.list().map((entry) => ({
+          templateRef: entry.templateRef,
+          entryId: entry.entryId,
+          medium: entry.locator.medium,
+          scope: entry.scope,
+          registrationLifetime: entry.registrationLifetime,
+          trust: entry.trust,
+          provenance: entry.provenance,
+          revisionPolicy: entry.revisionPolicy,
+        })),
+      });
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 404);
+    }
+  });
+
+  r.post('/:sid/agent-templates', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    if (typeof body.entryId !== 'string') {
+      return c.json({ error: 'entryId is required' }, 400);
+    }
+    if (body.medium === 'memory' && !body.template) {
+      return c.json({ error: 'memory registration requires template' }, 400);
+    }
+    if (body.medium !== 'memory' && typeof body.root !== 'string') {
+      return c.json({ error: 'filesystem registration requires root' }, 400);
+    }
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      const templateRef = body.medium === 'memory'
+        ? session.registerMemoryTemplate({
+            sourceId:
+              typeof body.sourceId === 'string'
+                ? body.sourceId
+                : `memory:${randomUUID()}`,
+            entryId: body.entryId,
+            template: body.template as AgentTemplateDraft,
+          })
+        : session.registerFileSystemTemplate({
+            root: body.root as string,
+            entryId: body.entryId,
+            ...(typeof body.sourceId === 'string'
+              ? { sourceId: body.sourceId }
+              : {}),
+          });
+      const snapshot = await session.templateCatalog.resolve(templateRef);
+      return c.json({
+        ok: true,
+        templateRef,
+        definitionRevision: snapshot.definitionRevision,
+        executionRevision: snapshot.execution.revision,
+      });
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 400);
+    }
+  });
+
+  r.post('/:sid/ephemeral-agents', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    if (typeof body.templateRef !== 'string') {
+      return c.json({ error: 'templateRef is required' }, 400);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'input')) {
+      return c.json({
+        error:
+          'ephemeral creation does not accept input; create first, then POST /messages to the returned instanceId',
+      }, 400);
+    }
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      let parentInstanceId: string | null = null;
+      if (typeof body.parentInstanceId === 'string') {
+        const parent = session.tree.resolve(body.parentInstanceId);
+        if (!parent) {
+          return c.json({
+            error: `parent runtime agent not found: ${body.parentInstanceId}`,
+          }, 404);
+        }
+        parentInstanceId = parent.instanceId;
+      }
+      const handle = await session.spawnEphemeral({
+        parentInstanceId,
+        templateRef: body.templateRef,
+        ...(body.runtimeConfigPatch && typeof body.runtimeConfigPatch === 'object'
+          ? { runtimeConfigPatch: body.runtimeConfigPatch as Record<string, unknown> }
+          : {}),
+      });
+      return c.json({ ok: true, instanceId: handle.instanceId }, 202);
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 400);
+    }
+  });
+
+  r.post('/:sid/ephemeral-agents/:instanceId/cancel', async (c) => {
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      const instanceId = c.req.param('instanceId');
+      const instance = session.runtimeTree.get(instanceId);
+      if (!instance || instance.lifetime !== 'ephemeral') {
+        return c.json({ error: `ephemeral agent not found: ${instanceId}` }, 404);
+      }
+      await session.supervisor.cancel(instanceId, 'cancelled by API');
+      return c.json({ ok: true, instanceId });
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 400);
+    }
+  });
+
+  r.post('/:sid/instances/:instanceId/cancel', async (c) => {
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      const instanceId = c.req.param('instanceId');
+      const instance = session.runtimeTree.get(instanceId);
+      if (!instance) return c.json({ error: 'runtime instance not found' }, 404);
+      if (instance.lifetime === 'resident') {
+        session.interruptRuntime(instanceId, 'resident turn cancelled by API');
+      } else {
+        await session.supervisor.cancel(instanceId, 'cancelled by API');
+      }
+      return c.json({ ok: true, instanceId, lifetime: instance.lifetime });
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 400);
+    }
+  });
+
+  r.delete('/:sid/resident-agents', async (c) => {
+    const logicalPath = c.req.query('path');
+    if (!logicalPath) return c.json({ error: 'path query is required' }, 400);
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      const result = await session.deleteResident(logicalPath);
+      return c.json(result, result.ok ? 200 : 500);
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 404);
+    }
+  });
+
+  r.delete('/:sid/residents/:instanceId', async (c) => {
+    try {
+      const session = await getSessionManager().open(c.req.param('sid'));
+      const instance = session.runtimeTree.get(c.req.param('instanceId'));
+      if (!instance || instance.lifetime !== 'resident' || !instance.residentPath) {
+        return c.json({ error: 'resident runtime instance not found' }, 404);
+      }
+      const result = await session.deleteResident(instance.residentPath);
+      return c.json(result, result.ok ? 200 : 500);
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+      }, 409);
+    }
   });
 
   // DELETE /:sid —— 关掉 + rm -rf session 目录（含 ledger / blobs / scaffold 全清）。
@@ -198,21 +500,48 @@ export function createSessionsRouter() {
     const agent = c.req.query('agent') || undefined;
     const session = sm.peek(sid);
     if (!session) return c.json({ error: `session not open: ${sid}` }, 404);
-    if (agent && !session.tree.get(agent)) {
-      return c.json({ error: `agent path not found: ${agent}` }, 404);
+    if (agent && !session.tree.resolve(agent)) {
+      return c.json({ error: `runtime agent not found: ${agent}` }, 404);
     }
-    session.scheduler.interruptAgents(agent);
+    session.interruptRuntime(agent, "aborted by API");
     return c.json({ ok: true, sid, agent: agent ?? null });
   });
 
   r.post('/:sid/messages', async (c) => {
-    const sm = getSessionManager();
     const sid = c.req.param('sid');
     const body = await c.req.json().catch(() => ({}));
     const content = body.content;
+    const requestedKernelId = (() => {
+      const nested =
+        body.payload && typeof body.payload === 'object'
+          ? body.payload as Record<string, unknown>
+          : {};
+      const raw =
+        typeof body.kernelId === 'string'
+          ? body.kernelId.trim()
+          : typeof body.providerOverride === 'string'
+            ? body.providerOverride.trim()
+            : typeof nested.kernelId === 'string'
+              ? nested.kernelId.trim()
+              : typeof nested.providerOverride === 'string'
+                ? nested.providerOverride.trim()
+            : '';
+      if (!raw) return undefined;
+      return raw === 'forgeax' ? 'forgeax-core' : raw;
+    })();
     const rawPayloadEarly = body.payload && typeof body.payload === 'object'
       ? body.payload as Record<string, unknown>
       : {};
+    // `summonAgentId` is a three-state wire field: absence is legacy-compatible,
+    // null means the user explicitly cleared the chip, and only a safe single
+    // agent-id segment may be carried onward to the durable event/WAL.
+    if (
+      Object.prototype.hasOwnProperty.call(rawPayloadEarly, 'summonAgentId')
+      && rawPayloadEarly.summonAgentId !== null
+      && !isValidSummonAgentId(rawPayloadEarly.summonAgentId)
+    ) {
+      return c.json({ error: 'payload.summonAgentId must be null or match /^[A-Za-z0-9_-]+$/' }, 400);
+    }
     const hasAttachments = Array.isArray(rawPayloadEarly.attachments)
       && (rawPayloadEarly.attachments as unknown[]).length > 0;
     // Allow empty content when the user only pasted attachments — UI projects a
@@ -220,6 +549,7 @@ export function createSessionsRouter() {
     if (typeof content !== 'string' || (!content && !hasAttachments)) {
       return c.json({ error: 'content (string) required' }, 400);
     }
+    const sm = getSessionManager();
     const resolvedContent = content || '(see attached file)';
     // 写时迁移(plan B PR2-compat):这是 UI 的主发消息端点。若 sid 还是 pre-PR2 老 session
     // (home/扁平),先把整份目录迁进当前项目 games/<bound-slug>/sessions/<sid>/,确保老历史 +
@@ -227,59 +557,29 @@ export function createSessionsRouter() {
     // close 再 move,open 随后从新位置 hydrate)。
     await sm.prepareForWrite(sid);
     const session = await sm.open(sid);
-    session.scheduler.start();
 
     let target: string | undefined;
     if (typeof body.to === 'string' && body.to) {
-      // Auto-scaffold persona sub-agent: when `to` is a single segment that
-      // the tree doesn't yet have, treat it as a marketplace persona id and
-      // try to scaffold `<sid>/agents/<id>/` with `personaFile` pre-filled.
-      // Falls through to plain resolveAgentPath for nested paths or fullIds.
       const candidate = body.to as string;
-      const isSimpleName =
-        !candidate.includes('/') && !candidate.includes('#') && isValidAgentName(candidate);
-      if (isSimpleName && !session.tree.get(candidate)) {
-        // Lazy persona scaffold (shared with delegate_to_subagent + set_agent_models).
-        const res = await ensurePersonaScaffold(session, candidate);
-        if (!res.ok) {
-          if (res.code === 'scaffold_failed') {
-            process.stderr.write(
-              `[sessions] persona auto-scaffold for '${candidate}' failed: ${res.error}\n`,
-            );
-            return c.json({
-              error: `auto-scaffold 失败: ${res.error}`,
-              code: 'scaffold_failed',
-              candidate,
-            }, 500);
-          }
-          // persona_not_found — surface an explicit 404 instead of silently
-          // falling through to resolveAgentPath (which, for a simple name that
-          // matches no node, leaves target undefined → event routed to root:
-          // the "点击 mochi 头像但 forge 接管对话" #91 confusion).
-          return c.json({ error: res.error, code: 'persona_not_found', candidate }, 404);
-        }
-      }
       try {
-        target = resolveAgentPath(session, candidate);
+        target = await resolveAgentPath(session, candidate);
       } catch (err: any) {
-        return c.json({ error: err?.message ?? String(err) }, 404);
+        // Persona simply doesn't exist → 404 (caller's fault, pick a known id).
+        // Found it but scaffolding/registering it failed → 500/409, not 404 —
+        // a materialization failure looks nothing like "unknown agent" to the
+        // Studio UI and would otherwise be silently mis-reported as one.
+        const status = err instanceof AgentMaterializationError ? err.status : 404;
+        return c.json({ error: err?.message ?? String(err) }, status);
       }
     }
 
-    // Ensure the consuming agent is actually attached + scheduled BEFORE we
-    // emit. `scheduler.start()` above is a no-op once `started` is true, and a
-    // *restored* session's root agent may never have been attached: its dir
-    // already existed on disk, so no tree "added" change fired to trigger
-    // attachAndStart, and if the tree wasn't fully listed when start() first
-    // ran the agent was skipped. The event would then route into a queue that
-    // nobody consumes → the turn hangs forever at "正在思考". attachAgent /
-    // startAgent are idempotent (attach early-returns when already present,
-    // start re-runs harmlessly), so this is safe for already-running agents.
+    // Materialize the instance-bound Kit/AgentContext host before the first
+    // message. RuntimeTree identity already exists; this only initializes
+    // capabilities and does not create a second lifecycle.
     const ensurePath = target ?? session.tree.list().find((n) => n.depth === 1)?.path;
     if (ensurePath) {
       try {
-        await session.scheduler.attachAgent(ensurePath);
-        await session.scheduler.startAgent(ensurePath);
+        await session.initializeAgentHost(ensurePath);
       } catch (err: any) {
         process.stderr.write(
           `[sessions] ensure attach+start '${ensurePath}' for ${session.sid} failed: ${err?.message ?? err}\n`,
@@ -305,7 +605,14 @@ export function createSessionsRouter() {
     // 仅 user_input:① 有挂起的软回退 → 先定格(此后 cancel 失效,UI 移除置灰段);
     // ② emit 前打消息锚点快照(失败不阻塞聊天)。msgId 是回退体系的稳定外键。
     const isUserInput = (body.type ?? 'user_input') === 'user_input';
-    const msgId: string | undefined = isUserInput ? randomUUID() : undefined;
+    const requestedMsgId =
+      typeof rawPayloadEarly.clientMsgId === 'string' &&
+      rawPayloadEarly.clientMsgId.trim()
+        ? rawPayloadEarly.clientMsgId.trim()
+        : undefined;
+    const msgId: string | undefined = isUserInput
+      ? requestedMsgId ?? randomUUID()
+      : undefined;
     if (isUserInput && msgId) {
       const cpm = getCheckpointManager();
       try { await cpm.finalizePending(session); } catch (err: any) {
@@ -318,15 +625,23 @@ export function createSessionsRouter() {
 
     // Authoritative pre-ledger attachment ingress. Materialize before EventBus so
     // neither the queue nor WAL ever sees inline base64. Keep `content` as the UI
-    // projection and carry model-only durable context separately; ConsciousAgent
-    // publishes exactly one inbound_message from that context.
-    const rawPayload = body.payload && typeof body.payload === 'object'
-      ? body.payload as Record<string, unknown>
-      : {};
+    // projection and carry model-only durable context separately; Kernel turn
+    // assembly publishes exactly one inbound_message from that context.
+    const rawPayload: Record<string, unknown> = {
+      ...(body.payload && typeof body.payload === 'object'
+        ? body.payload as Record<string, unknown>
+        : {}),
+      ...(requestedKernelId ? { kernelId: requestedKernelId } : {}),
+    };
     let safePayload: Record<string, unknown> = { ...rawPayload, content: resolvedContent };
     if (isUserInput) {
       try {
-        const kernel = resolveKernel(target);
+        const targetInstance = session.tree.resolve(target);
+        const kernel = resolveKernel(
+          target,
+          requestedKernelId ??
+            targetInstance?.template.definition.kernelId,
+        );
         safePayload = prepareUserAttachmentPayload({
           content: resolvedContent,
           payload: rawPayload,
@@ -353,7 +668,20 @@ export function createSessionsRouter() {
       handoff: body.handoff ?? 'turn',
       ts: Date.now(),
     };
-    session.eventBus.emit(event);
+    // RuntimeController owns the queue. Publish once for UI/history, then pass
+    // the same immutable input to the selected instance. `agent_command` has
+    // its own Session observer because command transport also publishes it;
+    // do not enqueue it a second time here.
+    session.eventBus.publish(event);
+    if (event.type !== 'agent_command') {
+      void session.enqueueAgent(target, event).catch((error) => {
+        session.logger.error(
+          target!,
+          undefined,
+          `runtime turn failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    }
     return c.json({ ok: true, to: target, msgId });
   });
 
@@ -407,24 +735,7 @@ export function createSessionsRouter() {
       return c.json({ error: 'session not found' }, 404);
     }
     const cpm = getCheckpointManager();
-    return c.json({
-      checkpoints: cpm.list(session),
-      pending: cpm.pendingOf(session),
-      diagnostics: cpm.diagnosticsOf(session),
-    });
-  });
-
-  r.post('/:sid/checkpoints/gc', async (c) => {
-    const sm = getSessionManager();
-    let session: Session;
-    try {
-      session = await sm.open(c.req.param('sid'));
-    } catch {
-      return c.json({ error: 'session not found' }, 404);
-    }
-    const result = await getCheckpointManager().collectGarbage(session);
-    if ('error' in result) return c.json({ error: result.error }, result.status as 409);
-    return c.json(result);
+    return c.json({ checkpoints: cpm.list(session), pending: cpm.pendingOf(session) });
   });
 
   r.post('/:sid/rewind/preview', async (c) => {
@@ -479,28 +790,45 @@ export function createSessionsRouter() {
   });
 
   // POST /:sid/ask-reply —— 解开 `ask_user` 工具阻塞的 Promise。前端在用户选完
-  // 选项后统一提交所有问题。键 = sid::agent(agent 默认串行,同一 agent 同刻至多一个 ask
+  // 选项后调用。键 = sid::agent(agent 默认串行,同一 agent 同刻至多一个 ask
   // pending,见 core/ask-user-registry.ts)。未命中(已超时/已答/键不对)返回
   // ok:false,前端忽略即可——不报错、不污染聊天历史、不触发新 turn。
   r.post('/:sid/ask-reply', async (c) => {
     const sid = c.req.param('sid');
     const body = await c.req.json().catch(() => ({}));
     const agent = typeof body.agent === 'string' && body.agent ? body.agent : null;
-    const answers = Array.isArray(body.answers)
-      ? body.answers.flatMap((answer: unknown) => {
-          if (!answer || typeof answer !== 'object') return [];
-          const row = answer as Record<string, unknown>;
-          if (typeof row.questionId !== 'string' || !row.questionId.trim() || !Array.isArray(row.values)) return [];
-          const values = row.values.filter((value): value is string => typeof value === 'string');
-          return [{ questionId: row.questionId.trim(), values }];
+    const values = Array.isArray(body.values)
+      ? body.values.filter((v: unknown): v is string => typeof v === 'string')
+      : null;
+    const answers: AskReply | null = Array.isArray(body.answers) &&
+        body.answers.every((answer: unknown) => {
+          if (!answer || typeof answer !== 'object') return false;
+          const candidate = answer as { questionId?: unknown; values?: unknown };
+          return typeof candidate.questionId === 'string' &&
+            candidate.questionId.length > 0 &&
+            Array.isArray(candidate.values) &&
+            candidate.values.every((value: unknown) => typeof value === 'string');
         })
-      : Array.isArray(body.values)
-        ? [{ questionId: 'question-1', values: body.values.filter((value: unknown): value is string => typeof value === 'string') }]
-        : null;
-    if (!agent || !answers || answers.length === 0) {
-      return c.json({ error: 'agent (string) and answers ({ questionId, values[] }[]) required' }, 400);
+      ? body.answers
+      : null;
+    const reply = answers ?? values;
+    if (!agent || !reply) {
+      return c.json({
+        error: 'agent (string) and answers ({ questionId, values[] }[]) or values (string[]) required',
+      }, 400);
     }
-    const ok = resolveAsk(sid, agent, answers);
+    const identity = {
+      ...(typeof body.requestId === 'string'
+        ? { requestId: body.requestId }
+        : {}),
+      ...(typeof body.agentInstanceId === 'string'
+        ? { instanceId: body.agentInstanceId }
+        : {}),
+      ...(typeof body.runtimeEpochId === 'string'
+        ? { runtimeEpochId: body.runtimeEpochId }
+        : {}),
+    };
+    const ok = await resolveAskReply(sid, agent, reply, identity);
     return c.json({ ok, ...(ok ? {} : { reason: 'no-pending' }) });
   });
 
@@ -517,18 +845,13 @@ export function createSessionsRouter() {
   // /permission-request reads + clears them after the await and returns them so
   // the MCP can inject updatedInput.answers back into the CLI.
   const permissionAnswers = new Map<string, Record<string, string>>();
-  // UI-only structured copy of the same answer. `answers` remains the CLI
-  // protocol (one string per question); this map preserves multi-select
-  // boundaries for the collapsed summary and WAL replay.
-  const permissionAnswerValues = new Map<string, Record<string, string[]>>();
+  // One router-owned handle backed by the shared project-MCP pool. The bridge
+  // itself is cheap; the stdio children remain pooled across turns.
+  const projectMcp = createProjectMcpBridge(defaultProjectRoot());
   // POST /:sid/kernel-tool —— host-tool 桥(T-A)。内核 CC 经 fxt MCP server 把对
   // host-tool 的调用 HTTP 回调到这里:定位活 agent → 信任闸 → host 侧执行 → 回结果。
-  // 信任闸(T-D)在此**唯一闸口**:trustTier 权威 = R6 loadAgentRecord 按加载路径定,
-  // 不信子进程上报。fail-closed:任何缺失/异常都按 deny / error 返回(不静默放行)。
-  // 多页帮手已单源化到 api/bus(shellLivePages / multiPageHint)。
-  // 统一协议改道(walkDoorInstead)已于 2026-08-06 移至 kernel/door-reroute.ts ——
-  // 收口装在能力实现层(runForgeaxBuiltinTool 的 ui_invoke 分支),本路由与原生
-  // 内核的 host-tool-bridge 两张嘴共用一份,不再只盖 HTTP 这一口(B3)。
+  // 信任闸(T-D)在此**唯一闸口**:trustTier 权威 = live instance 对应的 Catalog
+  // registration,不信子进程上报。缺失 registration fail-closed 为 imported。
   r.post('/:sid/kernel-tool', async (c) => {
     const sid = c.req.param('sid');
     const start = Date.now();
@@ -536,51 +859,43 @@ export function createSessionsRouter() {
     const agentPath = typeof body.agentPath === 'string' && body.agentPath ? body.agentPath : 'forge';
     let toolName = typeof body.toolName === 'string' ? body.toolName : '';
     let args = body.args && typeof body.args === 'object' ? (body.args as Record<string, unknown>) : {};
-    // 连接键(2026-08-06 外审):租用内核走的就是这条 HTTP 口。非字符串/空串一律当缺失,
-    // 有值才带键 —— 消费方据"有没有这个键"判断能不能 join,写空串会让它连到错的地方。
     const auditCallId = typeof body.callId === 'string' && body.callId.trim() ? body.callId.trim() : undefined;
     const auditTurnCallId = typeof body.turnCallId === 'string' && body.turnCallId.trim() ? body.turnCallId.trim() : undefined;
-    // MCP shim 自铸的**这一次宿主执行**的 id。租用内核走的就是这条口,而内核铸的 callId
-    // 结构上过不了 MCP(tools/call 只有 name+arguments)—— 所以这条路上通常只有它。
-    // 两个键语义不同,谁都不许顶替谁:callId = 模型发起的那次调用;toolExecutionId = 落到
-    // 宿主的那一次执行。同一轮里连跑两个一模一样的 act,靠的就是后者才分得开。
     const auditToolExecutionId = typeof body.toolExecutionId === 'string' && body.toolExecutionId.trim() ? body.toolExecutionId.trim() : undefined;
-    const trace = { ...(auditCallId ? { callId: auditCallId } : {}), ...(auditTurnCallId ? { turnCallId: auditTurnCallId } : {}), ...(auditToolExecutionId ? { toolExecutionId: auditToolExecutionId } : {}) };
+    const trace = {
+      ...(auditCallId ? { callId: auditCallId } : {}),
+      ...(auditTurnCallId ? { turnCallId: auditTurnCallId } : {}),
+      ...(auditToolExecutionId ? { toolExecutionId: auditToolExecutionId } : {}),
+    };
     if (!toolName) return c.json({ ok: false, error: 'toolName required' }, 400);
     // Normalize catalog-derived ui_act_* and reject missing declarations before trust policy.
+    const requestedToolName = toolName;
     const preflight = preflightUiToolDispatch(toolName, args, sid);
     if (preflight.rejection) return c.json({ ok: true, result: preflight.rejection });
     toolName = preflight.name;
     args = preflight.args as Record<string, unknown>;
 
     const session = getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
-    // /api/cli/chat can rent the kernel without a browser WS having opened the
-    // session first. Ensure the target exists at the authoritative tool
-    // boundary before applying trust policy; otherwise the first native
-    // callback can be rejected merely because the restored session has not
-    // attached its root agent yet.
-    let agent = session.scheduler.getAgent(agentPath);
-    if (!agent && session.tree.get(agentPath)) {
-      try {
-        await session.scheduler.attachAgent(agentPath);
-        await session.scheduler.startAgent(agentPath);
-        agent = session.scheduler.getAgent(agentPath);
-      } catch (err: any) {
-        appendToolAudit({ sid, agent: agentPath, tool: toolName, trustTier: 'unknown', allow: false, error: `agent '${agentPath}' attach failed: ${err?.message ?? err}`, durationMs: Date.now() - start, ts: start });
-      }
+    const runtimeInstance = session.tree.resolve(agentPath);
+    if (runtimeInstance) {
+      await session.initializeAgentHost(agentPath);
     }
-    if (!agent) {
+    const agent = session.getAgentHost(agentPath);
+    if (!agent || !runtimeInstance) {
       // agent 不在线 —— 审计记录 allow=false
       appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier: 'unknown', allow: false, error: `agent '${agentPath}' not live in session`, durationMs: Date.now() - start, ts: start });
       return c.json({ ok: false, error: `agent '${agentPath}' not live in session` });
     }
 
-    // 信任闸:own=full;imported=deny 危险集。权威 trustTier 按加载路径求。
-    let trustTier: 'own' | 'imported' = 'imported';
-    try {
-      trustTier = (await loadAgentRecord(agentPath, { projectRoot: defaultProjectRoot() })).trustTier;
-    } catch {
-      /* fail-closed → imported */
+    // 信任闸:own=full;imported=deny 危险集。Catalog 缺项按 imported 处理。
+    const trustTier = resolveTemplateTrust(
+      session.templateCatalog,
+      runtimeInstance.templateRef,
+    );
+    if (!isBuiltinToolEnabled(toolName)) {
+      const error = `builtin tool not enabled: ${toolName}`;
+      appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: false, error, durationMs: Date.now() - start, ts: start });
+      return c.json({ ok: false, error });
     }
     // R2-08:imported 写禁但「该 session 绑定的 game 目录内」豁免。永久绑定(PR2)下豁免基准
     // 必须是 session 自己绑的 game(config.defaultDir 由路径派生),**不是**全局 active game——
@@ -602,11 +917,33 @@ export function createSessionsRouter() {
       return c.json({ ok: false, error: decision.reason ?? 'denied by trust tier' });
     }
     // ask:弹权限卡阻塞等用户(命中本会话 remember 直放);拒绝/超时 → 审计 + 拒。
+    // Kit registries deliberately retain hidden entries for hot reload. The
+    // kernel-tool endpoint is another execution authority, so it must apply
+    // the same canonical agent_manage projection as composition before a
+    // stale in-memory registry can resolve a disabled tool.
+    const visibleAgentManagementTools = new Set(
+      visibleAgentManagementToolsForAgent(sid, agentPath),
+    );
+    const visible = filterVisibleAgentManagementTools(
+      visibleTools(
+        withAgentHostToolDefinitions(agent.agentContext.tools.list(), agent.agentContext),
+        agent.agentContext,
+      ),
+      visibleAgentManagementTools,
+    );
+    const toolScope = await executionToolScope(
+      runtimeInstance.template, visible.map((tool) => tool.name), projectRoot, scopeGame,
+    );
+    if (!toolScope.allows(requestedToolName)) {
+      const error = `tool not granted to agent: ${requestedToolName}`;
+      appendToolAudit({ ...trace, sid, agent: agentPath, tool: requestedToolName, trustTier, allow: false, error, durationMs: Date.now() - start, ts: start });
+      return c.json({ ok: false, error });
+    }
     const delegateConfirmation =
       decision.outcome === 'ask' &&
       !isForgeaxBuiltinTool(toolName) &&
       !getHostTool(toolName)?.run &&
-      shouldDelegateHostToolConfirmation(toolName, agent.agentContext.tools.list());
+      shouldDelegateHostToolConfirmation(toolName, visible);
     if (decision.outcome === 'ask' && !delegateConfirmation) {
       const approved = await requestToolApproval({
         eventBus: session.eventBus,
@@ -632,39 +969,51 @@ export function createSessionsRouter() {
       //   信任闸(ui_invoke 可触达 delete 级 action,必须过闸)。seam 工具无 .mjs 本地
       //   实现 → 经 BRIDGED specs 桥到本路由执行。
       const seamTool = getHostTool(toolName);
+      const configuredProjectMcp = isProjectMcpToolName(toolName, projectRoot);
       const builtinCtx = {
         projectRoot,
         agentId: agentPath,
         ...(scopeGame ? { game: scopeGame } : {}),
-        // 连接键往下传:产品壳的 host 工具(editor_ui_browse)据它把 ui-browse-metrics
-        // 连回主账本。不填的话上面那个字段就是个永不生效的声明 —— 那正是这轮在修的病。
         ...(auditCallId ? { callId: auditCallId } : {}),
-        // 租用内核路径上,产品壳 host 工具(editor_ui_browse)的旁账只有这个键可连。
+        ...(auditTurnCallId ? { turnCallId: auditTurnCallId } : {}),
         ...(auditToolExecutionId ? { toolExecutionId: auditToolExecutionId } : {}),
         eventBus: session.eventBus,
         sid,
       };
-      const isConfiguredProjectMcp = isProjectMcpToolName(toolName, projectRoot);
-      let out: unknown;
-      if (isConfiguredProjectMcp) {
-        const projectResult = await projectMcp.callIfKnown(toolName, args);
-        // A canonical project-MCP namespace must never fall through to the
-        // ordinary ToolRegistry when the remote tool disappeared. Failing
-        // closed here prevents a stale schema from dispatching a same-named
-        // plugin/skill implementation by accident.
-        if (projectResult === undefined) {
-          const error = `project MCP tool not found: ${toolName}`;
-          appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: false, error, durationMs: Date.now() - start, ts: start });
-          return c.json({ ok: false, code: 'project_mcp_tool_not_found', error });
-        }
-        out = projectResult;
-      } else if (isForgeaxBuiltinTool(toolName)) {
-        out = await runForgeaxBuiltinTool(toolName, args, builtinCtx);
-      } else if (seamTool?.run) {
-        out = await seamTool.run(args, hostToolRunCtx(builtinCtx));
-      } else {
-        out = await executeTool(toolName, args, agent.agentContext.tools.list(), agent.agentContext);
-      }
+      let kitExecuted = false;
+      const runKit = () => {
+        kitExecuted = true;
+        return executeTool(toolName, args, visible, agent.agentContext);
+      };
+      const canonicalAgentTool = visibleAgentManagementTools.has(toolName as AgentManagementToolName)
+        ? canonicalAgentManagementTool(toolName as AgentManagementToolName)
+        : undefined;
+      const out = configuredProjectMcp
+        ? await (async () => {
+            const projectResult = await projectMcp.callIfKnown(toolName, args);
+            if (projectResult === undefined) {
+              throw new ProjectMcpToolNotFoundError(toolName);
+            }
+            return projectResult;
+          })()
+        : isForgeaxBuiltinTool(toolName)
+        ? await runForgeaxBuiltinTool(toolName, args, builtinCtx)
+        : canonicalAgentTool
+          ? await executeTool(toolName, args, [canonicalAgentTool], agent.agentContext)
+        : seamTool?.run
+          ? await seamTool.run(args, hostToolRunCtx(builtinCtx))
+          : toolName.startsWith('skill_')
+            ? await runSkillKernelTool(toolName, args, {
+                kind: 'ai',
+                sessionId: sid,
+                agentId: agentPath,
+              })
+            : toolName.startsWith('mcp__')
+              ? await (async () => {
+                  const projectResult = await projectMcp.callIfKnown(toolName, args);
+                  return projectResult === undefined ? await runKit() : projectResult;
+                })()
+              : await runKit();
       if (out && typeof out === 'object' && !Array.isArray(out) && 'error' in out) {
         const rawErr = (out as { error: unknown }).error;
         const errMsg = typeof rawErr === 'string' ? rawErr
@@ -676,12 +1025,21 @@ export function createSessionsRouter() {
       }
       // 工具执行成功
       appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: true, durationMs: Date.now() - start, ts: start });
+      if (kitExecuted) {
+        recordSessionHostToolWrites(session, {
+          result: out,
+          agentPath,
+          ...(auditCallId ? { toolCallId: auditCallId } : {}),
+          ...(scopeGame ? { gameSlug: scopeGame } : {}),
+        });
+      }
       return c.json({ ok: true, result: out });
     } catch (err: any) {
       const errMsg = err?.message ?? String(err);
       // 工具执行抛出异常
       appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: false, error: errMsg, durationMs: Date.now() - start, ts: start });
-      return c.json({ ok: false, error: errMsg });
+      const code = typeof err?.code === 'string' && err.code.trim() ? err.code : undefined;
+      return c.json({ ok: false, error: errMsg, ...(code ? { code } : {}) });
     }
   });
 
@@ -743,36 +1101,28 @@ export function createSessionsRouter() {
   ): Promise<{ allow: boolean; answers?: Record<string, string> }> {
     const { sid, agent, toolName, command, input } = req;
     const reqId = randomUUID();
+    // Register before publishing. EventBus observers are synchronous and may
+    // resolve or abort the request in the same tick as the card is published.
+    // Registering after publish loses that decision and leaves the HTTP call
+    // waiting until timeout.
+    const handle = registerPermission(reqId, PERMISSION_TIMEOUT_MS, { sid, agent });
+    let allow = false;
     // Pop the approval card in the Studio UI. Reuses the per-session WS fan-out
     // (same channel as file-activity:*); the client's permission-stream handler
     // renders a modal keyed by reqId.
-    session.eventBus.publish(
-      {
-        type: 'permission:request',
-        ts: Date.now(),
-        source: `agent:${agent}`,
-        payload: { reqId, toolName, command, input: input ?? null, agent },
-      },
-      agent,
-    );
-
-    // Own the request by (sid, agent) so a turn abort/end can release it.
-    // sid here == FORGEAX_SID the MCP server posted to == threadId; agent ==
-    // FORGEAX_AGENT. cli/chat.ts's turn-end hook recomputes the identical pair.
-    // AskUserQuestion is not a security approval. It is a blocking user-input
-    // request and therefore has no deadline; ordinary command/file approvals
-    // remain fail-closed on the ten-minute permission timeout.
-    const timeoutMs = toolName === 'AskUserQuestion' ? 0 : PERMISSION_TIMEOUT_MS;
-    const handle = registerPermission(reqId, timeoutMs, { sid, agent });
-    let allow = false;
-    let settledAnswers: Record<string, string> | undefined;
-    let settledAnswerValues: Record<string, string[]> | undefined;
     try {
+      session.eventBus.publish(
+        {
+          type: 'permission:request',
+          ts: Date.now(),
+          source: `agent:${agent}`,
+          payload: { reqId, toolName, command, input: input ?? null, agent },
+        },
+        agent,
+      );
       allow = await handle.promise;
     } finally {
       handle.dispose();
-      settledAnswers = permissionAnswers.get(reqId);
-      settledAnswerValues = permissionAnswerValues.get(reqId);
       // Tell the UI to dismiss the card regardless of how it settled (reply /
       // timeout / abort) so a stale prompt never lingers.
       session.eventBus.publish(
@@ -780,14 +1130,7 @@ export function createSessionsRouter() {
           type: 'permission:resolved',
           ts: Date.now(),
           source: `agent:${agent}`,
-          payload: {
-            reqId,
-            allow,
-            toolName,
-            input: input ?? null,
-            ...(settledAnswers ? { answers: settledAnswers } : {}),
-            ...(settledAnswerValues ? { answerValues: settledAnswerValues } : {}),
-          },
+          payload: { reqId, allow },
         },
         agent,
       );
@@ -796,7 +1139,6 @@ export function createSessionsRouter() {
     // inject updatedInput.answers (without these, CC gets "did not answer").
     const answers = permissionAnswers.get(reqId);
     permissionAnswers.delete(reqId);
-    permissionAnswerValues.delete(reqId);
     return { allow, ...(answers ? { answers } : {}) };
   }
 
@@ -835,18 +1177,35 @@ export function createSessionsRouter() {
       session = undefined;
     }
     let activeGame: string | undefined;
-    try { activeGame = session?.config?.defaultDir ?? getPathManager().resolveScope(); } catch { /* fail-closed in the trust gate */ }
+    try {
+      activeGame = session?.config?.defaultDir ?? getPathManager().resolveScope();
+    } catch {
+      // Missing scope is handled fail-closed by checkKernelTool for scoped tools.
+    }
+
     let decision: ReturnType<typeof checkKernelTool>;
     if (isProjectMcpToolName(toolName, projectRoot)) {
-      // Native project MCP tools do not pass through /kernel-tool. Apply the
-      // same trust-tier policy here so own credential/delete operations still
-      // ask and settings/tier denies remain effective.
+      // Native project MCP tools do not pass through /kernel-tool. Use the
+      // live session template catalog as the trust authority so settings-none
+      // cannot turn credential/delete calls into a passthrough.
       let trustTier: 'own' | 'imported' = 'imported';
-      try {
-        trustTier = (await loadAgentRecord(agent, { projectRoot })).trustTier;
-      } catch {
-        /* fail-closed: unknown agent stays imported */
+      const runtimeInstance = session?.tree.resolve(agent);
+      if (runtimeInstance && session) {
+        trustTier = resolveTemplateTrust(session.templateCatalog, runtimeInstance.templateRef);
       }
+      const host = runtimeInstance && session ? await session.initializeAgentHost(agent) : undefined;
+      const nativeVisible = host ? visibleTools(
+        withAgentHostToolDefinitions(host.agentContext.tools.list(), host.agentContext), host.agentContext,
+      ) : [];
+      const nativeScope = await executionToolScope(
+        runtimeInstance?.template, nativeVisible.map((tool) => tool.name), projectRoot, activeGame,
+      );
+      if (!nativeScope.allows(toolName)) {
+        const reason = `tool not granted to agent: ${toolName}`;
+        appendToolAudit({ sid, agent, tool: toolName, trustTier, allow: false, error: reason, durationMs: Date.now() - start, ts: start });
+        return c.json({ decision: 'deny', reason });
+      }
+
       decision = checkKernelTool(trustTier, toolName, {
         args: input,
         projectRoot,
@@ -859,13 +1218,16 @@ export function createSessionsRouter() {
       // contract; their provider owns the native permission posture.
       const verdict = evaluateSettingsRules(rules, toolName, input);
       if (!verdict) return c.json({ decision: 'none' });
+
+      const label = ruleLabel(verdict.rule);
       if (verdict.behavior === 'deny' || verdict.behavior === 'allow') {
         const allow = verdict.behavior === 'allow';
-        appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow, ...(allow ? {} : { error: `denied by rule ${ruleLabel(verdict.rule)}` }), durationMs: Date.now() - start, ts: start });
-        return c.json({ decision: verdict.behavior, reason: `${verdict.behavior} by rule ${ruleLabel(verdict.rule)}` });
+        appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow, ...(allow ? {} : { error: `denied by rule ${label}` }), durationMs: Date.now() - start, ts: start });
+        return c.json({ decision: verdict.behavior, reason: `${verdict.behavior} by rule ${label}` });
       }
-      decision = { allow: false, outcome: 'ask', reason: `confirm (rule ${ruleLabel(verdict.rule)}): ${toolName}` };
+      decision = { allow: false, outcome: 'ask', reason: `confirm (rule ${label}): ${toolName}` };
     }
+
     if (decision.outcome === 'deny') {
       appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow: false, error: decision.reason ?? 'denied by trust tier', durationMs: Date.now() - start, ts: start });
       return c.json({ decision: 'deny', reason: decision.reason ?? 'denied by trust tier' });
@@ -875,7 +1237,7 @@ export function createSessionsRouter() {
       return c.json({ decision: 'allow', ...(decision.reason ? { reason: decision.reason } : {}) });
     }
 
-    // ask:弹卡阻塞交人(与 permission-request 同一张卡/同一 WS 通道)。session 不在
+    // ask:弹卡阻塞交人(与 permission-request 共用同一张卡/同一 WS 通道)。session 不在
     // (headless / 会话已收 / session-manager 未起)→ 无处弹卡,fail-closed deny(用户
     // 显式要求 ask 的操作,不能因没人可问而静默放行)。
     if (!session) {
@@ -905,15 +1267,6 @@ export function createSessionsRouter() {
         if (typeof v === 'string') a[k] = v;
       }
       if (Object.keys(a).length > 0) permissionAnswers.set(reqId, a);
-    }
-    if (allow && body.answerValues && typeof body.answerValues === 'object') {
-      const values: Record<string, string[]> = {};
-      for (const [key, raw] of Object.entries(body.answerValues as Record<string, unknown>)) {
-        if (!Array.isArray(raw)) continue;
-        const normalized = raw.filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
-        if (normalized.length > 0) values[key] = normalized;
-      }
-      if (Object.keys(values).length > 0) permissionAnswerValues.set(reqId, values);
     }
     // 「记住本会话」:allow && remember → 记住该 agent 的该 capability,本会话内同类免卡。
     // 必须在 resolvePermission 之前(此时 pendingCtx 仍在)。
@@ -965,10 +1318,6 @@ export function createSessionsRouter() {
     } finally {
       handle.dispose();
     }
-    // door 注解不在这里挂:ui_invoke 的真实链路是 MCP shim → /:sid/kernel-tool →
-    // runForgeaxBuiltinTool(进程内 perceptionQuery),从不经过本 HTTP 路由 ——
-    // 2026-08-05 终审发现挂在这里的注解对 agent 是死代码。现在注解长在能力实现层
-    // (forgeax-builtin-tools 的 ui_invoke 分支,annotateUiInvokeResult),两个执行口都盖。
     return c.json({ ok: true, reqId, snapshot });
   });
 

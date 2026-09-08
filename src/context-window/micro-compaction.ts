@@ -105,7 +105,7 @@ export function microCompact(messages: LLMMessage[], config: MicroCompactConfig 
 // ── Idle anchor helpers (LAST_USER_INPUT_AT in blackboard) ──────────────────
 
 /** Scan event batch for `user_input` events，把最大 ts 写到 blackboard。
- *  ConsciousAgent 在 process() 起始调用一次。 */
+ *  RuntimeAgentHost 在 turn 起始调用一次。 */
 export function trackUserInput(
   events: ReadonlyArray<{ type: string; ts: number }>,
   blackboard: { set(agentId: string, key: string, value: unknown, opts: { persist: boolean }): void },

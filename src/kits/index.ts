@@ -12,11 +12,11 @@
  *    tool-loader.ts      — KitToolLoader (skeleton)
  *    slot-loader.ts      — KitSlotLoader (skeleton)
  *    plugin-loader.ts    — KitPluginLoader (skeleton)
- *    reload-coordinator.ts — AgentKitReloadCoordinator (skeleton)
+ *    reload-coordinator.ts — AgentKitReloadCoordinator
  *
- *  All loader / registry classes pass tsc but most `_loadInternal` /
- *  `flushReloads` bodies are TODO stubs; see docs/features/runtime-rewrite-gaps.md
- *  §B1 for the porting checklist.
+ *  `flushReloads` is the unified turn-end polling backstop for missed
+ *  fs.watch events; it produces AgentExecution revisions, never Agent
+ *  lifecycle mutations.
  */
 
 export type {

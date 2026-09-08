@@ -39,12 +39,49 @@ export interface RunCaptureResult {
   timedOut?: boolean;
 }
 
+export interface SpawnInvocation {
+  command: string;
+  args: string[];
+  windowsVerbatimArguments?: boolean;
+}
+
+const CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
+
+function escapeCmdCommand(value: string): string {
+  return value.replace(CMD_META_CHARS, '^$1');
+}
+
+function escapeCmdArgument(value: string): string {
+  // A .cmd/.bat launcher parses the command once and then expands `%*` into a
+  // second command. Escape both passes so TOML quotes, spaces, and shell meta
+  // characters arrive at the real CLI as one unchanged argv item.
+  let escaped = value.replace(/(?=(\\+?)?)\1"/g, '$1$1\\"');
+  escaped = escaped.replace(/(?=(\\+?)?)\1$/, '$1$1');
+  escaped = `"${escaped}"`;
+  escaped = escaped.replace(CMD_META_CHARS, '^$1');
+  return escaped.replace(CMD_META_CHARS, '^$1');
+}
+
 /**
- * Windows 上 .cmd/.bat launcher 无法被 CreateProcess 直接 exec,node:child_process
- * 需 shell:true 经 cmd.exe 路由;POSIX 一律 false(直 exec)。
+ * Resolve a Windows batch launcher without `shell:true + args`. Node/Bun join
+ * that combination with spaces and do not escape individual arguments, which
+ * corrupts Codex's TOML `-c` overrides and permits shell metacharacter injection.
+ * Drive cmd.exe explicitly with an already escaped command line instead.
  */
-function needsShell(cmd: string): boolean {
-  return IS_WINDOWS && /\.(cmd|bat)$/i.test(cmd);
+export function prepareSpawnInvocation(
+  cmd: string,
+  args: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+): SpawnInvocation {
+  if (platform !== 'win32' || !/\.(cmd|bat)$/i.test(cmd)) {
+    return { command: cmd, args: [...args] };
+  }
+  const shellCommand = [escapeCmdCommand(cmd), ...args.map(escapeCmdArgument)].join(' ');
+  return {
+    command: process.env.ComSpec || process.env.COMSPEC || 'cmd.exe',
+    args: ['/d', '/s', '/c', `"${shellCommand}"`],
+    windowsVerbatimArguments: true,
+  };
 }
 
 /**
@@ -55,11 +92,12 @@ export function runCapture(cmd: string, args: string[], opts: RunCaptureOpts = {
   return new Promise((resolveP) => {
     let child;
     try {
-      child = spawn(cmd, args, {
+      const invocation = prepareSpawnInvocation(cmd, args);
+      child = spawn(invocation.command, invocation.args, {
         cwd: opts.cwd,
         env: opts.env,
         stdio: ['ignore', 'pipe', opts.captureStderr ? 'pipe' : 'ignore'],
-        shell: needsShell(cmd),
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
         detached: !IS_WINDOWS,
         windowsHide: true,
       });
@@ -174,15 +212,17 @@ export function isBunRuntime(): boolean {
 
 /**
  * 解析"用什么命令拉起一个脚本入口"。
- *  - Bun:`<process.execPath> <entry>`(Bun 下 execPath 即 bun 绝对路径;原生跑 .ts,
- *    用绝对路径规避 Windows 裸名 spawn ENOENT);
+ *  - Bun:`<FORGEAX_BUN_EXECUTABLE|process.execPath> <entry>`。普通 Bun 进程下
+ *    execPath 就是 bun；但 Bun compile 产物里的 execPath 是宿主业务二进制本身，
+ *    桌面发行包必须用装配层显式传入的 Bun 去启动 agent-host 等脚本入口；
  *  - Node + .ts/.tsx:`<node> --import <loader> <entry>`(默认 tsx;
  *    FORGEAX_NODE_TS_LOADER 可指定容器内其它 ESM loader,如 @swc-node/register/esm-register);
  *  - Node + .js/.mjs:`<node> <entry>`。
  */
 export function resolveRuntimeLaunch(entry: string, extraArgs: string[] = []): { cmd: string; args: string[] } {
   if (isBunRuntime()) {
-    return { cmd: process.execPath || 'bun', args: [entry, ...extraArgs] };
+    const bundledBun = process.env.FORGEAX_BUN_EXECUTABLE?.trim();
+    return { cmd: bundledBun || process.execPath || 'bun', args: [entry, ...extraArgs] };
   }
   if (entry.endsWith('.ts') || entry.endsWith('.tsx')) {
     const loader = process.env.FORGEAX_NODE_TS_LOADER || 'tsx';

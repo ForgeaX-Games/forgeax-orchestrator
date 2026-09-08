@@ -73,6 +73,7 @@ export interface RoundDeliverySession {
       isCreate?: boolean;
       toolCallId?: string;
       turnId?: string;
+      phase?: "intent" | "applied";
     }>;
   };
 }
@@ -334,7 +335,7 @@ export class RoundDeliveryEnricher implements DeliveryEnricher, ArtifactResolver
     } catch {
       return unavailable("Turn activity is unavailable");
     }
-    const activity = readFileActivity(session, context, record.ts, context.settledAt);
+    const activity = await readFileActivity(session, context, record.ts, context.settledAt);
     const externalActivity = externalArtifactFilesFromActivity(activity, game.gameDir, context.projectRoot);
     const touched = touchedPathsFromEvents(events, game.gameDir, context.projectRoot);
     for (const path of controlledManifestPathsFromEvents(events, game.gameDir, context.projectRoot)) touched.add(path);
@@ -351,6 +352,7 @@ export class RoundDeliveryEnricher implements DeliveryEnricher, ArtifactResolver
             externalActivity.files,
             externalActivity.conflicts,
             semanticFromEvents(events),
+            artifactAgents(context, activity),
           ),
         });
       }
@@ -384,6 +386,7 @@ export class RoundDeliveryEnricher implements DeliveryEnricher, ArtifactResolver
           externalActivity.files,
           externalActivity.conflicts,
           semanticFromEvents(events),
+          artifactAgents(context, activity),
         ),
       });
     }
@@ -412,7 +415,7 @@ export class RoundDeliveryEnricher implements DeliveryEnricher, ArtifactResolver
       status: context.aborted || context.error || unattributedCount > 0 || reliableConflicts.length > 0 ? "partial" : "complete",
       ...(reliableConflicts.length > 0 ? { unavailableReason: "Changed files were modified concurrently", reliableCandidatePaths: reliableConflicts.sort() } : {}),
       ...(unattributedCount > 0 ? { unattributedCount } : {}),
-      agents: meta.agents.length ? meta.agents : [context.agentId],
+      agents: artifactAgents(context, activity, meta.agents),
       durationMs: Math.max(0, context.settledAt - context.startedAt),
       ...(semantic ? { semantic } : {}),
     };
@@ -488,7 +491,7 @@ export class RoundDeliveryEnricher implements DeliveryEnricher, ArtifactResolver
 
 export function createRoundDeliveryEnricher(
   deps: RoundDeliveryDeps = {},
-): DeliveryEnricher {
+): DeliveryEnricher & ArtifactResolver {
   return new RoundDeliveryEnricher(deps);
 }
 
@@ -660,6 +663,7 @@ function artifactSummaryFromFiles(
   files: ArtifactSummary["files"],
   conflicts: string[],
   semantic: ArtifactSemantic | undefined,
+  agents: string[],
 ): ArtifactSummary {
   return {
     id: artifactId,
@@ -672,27 +676,76 @@ function artifactSummaryFromFiles(
       unavailableReason: "Changed files were modified concurrently",
       reliableCandidatePaths: [...conflicts].sort(),
     } : {}),
-    agents: [context.agentId],
+    agents,
     durationMs: Math.max(0, context.settledAt - context.startedAt),
     ...(semantic ? { semantic } : {}),
   };
 }
 
-function readFileActivity(
+function artifactAgents(
+  context: ArtifactTurnContext,
+  activity: FileActivityView[],
+  extra: readonly string[] = [],
+): string[] {
+  return [...new Set([context.agentId, ...extra, ...activity.map((record) => record.agentPath)])].sort();
+}
+
+async function readFileActivity(
   session: RoundDeliverySession,
   context: ArtifactTurnContext,
   startTs: number,
   endTs: number,
-): FileActivityView[] {
+): Promise<FileActivityView[]> {
   if (!session.fileActivity) return [];
   try {
-    return session.fileActivity.query({ agent: context.agentId, sinceTs: startTs, limit: 1000 })
-      .filter((record) => record.ts <= endTs)
-      .filter((record) => !record.turnId || record.turnId === context.turnId)
-      .sort((a, b) => a.ts - b.ts);
+    const teammates = await delegatedTeammatesSince(session, context.agentId, startTs, endTs);
+    const inWindow = (record: FileActivityView): boolean => record.ts <= endTs && record.phase !== "intent";
+    const own = session.fileActivity.query({ agent: context.agentId, sinceTs: startTs, limit: 1000 })
+      .filter(inWindow)
+      .filter((record) => !record.turnId || record.turnId === context.turnId);
+    const delegated: FileActivityView[] = [];
+    for (const teammate of teammates) {
+      delegated.push(
+        ...session.fileActivity.query({ agent: teammate, sinceTs: startTs, limit: 1000 }).filter(inWindow),
+      );
+    }
+    return [...own, ...delegated].sort((a, b) => a.ts - b.ts);
   } catch {
     return [];
   }
+}
+
+/** Parent WAL only, whole checkpoint window, no parent turnId filter.
+ *  A callback settle can be a later parent turn than the dispatch. */
+async function delegatedTeammatesSince(
+  session: RoundDeliverySession,
+  parentAgentId: string,
+  startTs: number,
+  endTs: number,
+): Promise<string[]> {
+  let ledger = session.ledgers.get(parentAgentId);
+  try {
+    ledger ??= session.getOrCreateLedger(parentAgentId);
+    const named = new Set<string>();
+    for (const event of await ledger.readAllEvents()) {
+      if (event.ts < startTs || event.ts > endTs) continue;
+      const teammate = delegatedTeammateFromEvent(event);
+      if (teammate && teammate !== parentAgentId) named.add(teammate);
+    }
+    return [...named];
+  } catch {
+    return [];
+  }
+}
+
+function delegatedTeammateFromEvent(event: StoredEvent): string | undefined {
+  if (event.type !== "hook:toolCall") return undefined;
+  const payload = event.payload ?? {};
+  const nested = asRecord(payload.toolCall);
+  const rawName = stringValue(payload.name) ?? stringValue(nested?.name);
+  if (!rawName || canonicalToolName(rawName) !== "delegate_to_subagent") return undefined;
+  const args = payload.args ?? payload.arguments ?? nested?.arguments;
+  return stringValue(asRecord(args)?.agent);
 }
 
 function touchedPathsFromActivity(

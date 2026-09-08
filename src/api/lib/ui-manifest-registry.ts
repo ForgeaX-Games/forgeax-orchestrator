@@ -196,6 +196,13 @@ function firstClassToolName(actionId: string): string {
   return FIRST_CLASS_PREFIX + actionId.toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
 }
 
+function modelDescription(entry: ActionCatalogEntry): string {
+  const preconditions = entry.preconditions?.length
+    ? `Preconditions (state facts, not operation order):\n${entry.preconditions.map((fact) => `- ${fact}`).join('\n')}`
+    : '';
+  return [entry.description ?? '', preconditions].filter(Boolean).join('\n\n');
+}
+
 export function isFirstClassUiToolName(toolName: string): boolean {
   return toolName.startsWith(FIRST_CLASS_PREFIX);
 }
@@ -224,7 +231,7 @@ export function firstClassUiToolSpecs(
     out.push({
       name: firstClassToolName(entry.id),
       description:
-        `[UI action] ${entry.title}. ${entry.description ?? ''} ` +
+        `[UI action] ${entry.title}. ${modelDescription(entry)} ` +
         `Executes on the connected UI surface; result semantics match ui_invoke ` +
         `({ status: completed|accepted|rejected, reason?, stateDigest? } — on 'accepted' do NOT wait or retry, ` +
         `confirm later via ui_snapshot).`,

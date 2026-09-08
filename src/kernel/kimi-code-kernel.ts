@@ -6,11 +6,10 @@ import type {
   KernelModelCatalog,
   PermissionCall,
   PermissionDecision,
-  PermissionMode,
   TurnHandle,
   TurnRequest,
 } from '@forgeax/agent-runtime';
-import { clampMode, DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
+import type { PermissionMode } from '@forgeax/agent-runtime';
 import type { McpServer } from '@agentclientprotocol/sdk';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { existsSync } from 'node:fs';
@@ -38,6 +37,8 @@ import {
   readProjectMcpServers,
   type ProjectMcpNativeLease,
 } from './project-mcp';
+import { buildKernelTask } from './kernel-context';
+import { clampMode, DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
 
 export const KIMI_CODE_DRIVER_LABEL = 'kimi-code · subscription runtime · no local cost';
 export const KIMI_CODE_FALLBACK_MODELS = [
@@ -46,6 +47,21 @@ export const KIMI_CODE_FALLBACK_MODELS = [
   'kimi-for-coding',
   'kimi-for-coding-highspeed',
 ];
+
+export const KIMI_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = ['gated', 'unrestricted'];
+export const KIMI_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
+export type KimiPermissionPlan = 'deny-by-rule' | 'deny-no-prompt' | 'ask' | 'allow';
+export function planKimiPermission(
+  ruleBehavior: 'allow' | 'deny' | 'ask' | undefined,
+  mode: PermissionMode,
+  hasPrompt: boolean,
+): KimiPermissionPlan {
+  if (ruleBehavior === 'deny') return 'deny-by-rule';
+  if (ruleBehavior === 'allow') return 'allow';
+  if (ruleBehavior === 'ask') return hasPrompt ? 'ask' : 'deny-no-prompt';
+  if (mode === 'unrestricted') return 'allow';
+  return hasPrompt ? 'ask' : 'deny-no-prompt';
+}
 
 interface KimiCodeKernelOptions {
   createClient?: (options: ConstructorParameters<typeof KimiAcpClient>[0]) => KimiAcpClient;
@@ -58,8 +74,7 @@ function* failure(message: string): Generator<KernelEvent> {
 }
 
 function promptText(req: TurnRequest, firstTurn: boolean): string {
-  const suffix = req.systemPrompt.dynamicSuffix?.trim();
-  const task = suffix ? `${req.input.text}\n\n${suffix}` : req.input.text;
+  const task = buildKernelTask(req, firstTurn);
   if (!firstTurn) return task;
   const persona = req.systemPrompt.persona?.trim();
   const instructions = persona
@@ -88,46 +103,11 @@ function toProjectMcpServers(projectRoot: string, requestedTools: readonly strin
   return readProjectMcpServers(projectRoot)
     .filter(({ name }) => requestedServers.has(name.replace(/[^a-zA-Z0-9_-]/g, '_')))
     .map(({ name, config }) => ({
-    name,
-    command: config.command,
-    args: config.args,
-    env: Object.entries(config.env ?? {}).map(([envName, value]) => ({ name: envName, value })),
+      name,
+      command: config.command,
+      args: config.args,
+      env: Object.entries(config.env ?? {}).map(([envName, value]) => ({ name: envName, value })),
     }));
-}
-
-/**
- * kimi 能兑现的档位:只有 `gated` / `unrestricted` 两档。
- *
- * 它走 ACP,**没有 spawn 期的放行 flag**,权限面就是 runTurn 里的 per-call `onPermission`
- * 回调。所以:
- *  - `unrestricted` = 无规则命中即放行(不弹审批);
- *  - `gated`        = 无规则命中就交 host 闸(有 prompt 则问);
- *  - `autoEdits` / `planning` **不声明** —— 前者要能区分「编辑类工具」、后者要能强制只读,
- *    kimi 侧都没有可靠的工具分类可依,硬映射等于猜。不猜。
- */
-export const KIMI_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = ['gated', 'unrestricted'];
-
-/** kimi 默认档 —— 派生自全内核默认,不独立持值。 */
-export const KIMI_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
-
-/** kimi per-call 闸的决策(纯函数,便于单测 —— 它是本内核唯一的权限落点)。
- *
- *  求值顺序刻意与 cc 一致:**规则先行且对档位免疫**。deny 规则、内容级 ask 永远压过
- *  「全权限」档,否则「默认全权限」就等于把闸拆了。只有无规则命中时,档位才说话。 */
-export type KimiPermissionPlan = 'deny-by-rule' | 'deny-no-prompt' | 'ask' | 'allow';
-export function planKimiPermission(
-  ruleBehavior: 'allow' | 'deny' | 'ask' | undefined,
-  mode: PermissionMode,
-  hasPrompt: boolean,
-): KimiPermissionPlan {
-  if (ruleBehavior === 'deny') return 'deny-by-rule';
-  if (ruleBehavior === 'allow') return 'allow';
-  if (ruleBehavior === 'ask') return hasPrompt ? 'ask' : 'deny-no-prompt';
-  // 无规则命中 → 档位说话:unrestricted = 基线放行(不弹审批);gated = 交 host 闸。
-  if (mode === 'unrestricted') return 'allow';
-  // gated 且没有审批通道 → **fail-closed**。用户显式要求逐项把闸,这时静默放行
-  // 就等于把 gated 悄悄变成 unrestricted;与上面规则级 ask 的处理保持同一姿态。
-  return hasPrompt ? 'ask' : 'deny-no-prompt';
 }
 
 export class KimiCodeKernel implements AgentKernel {
@@ -163,10 +143,6 @@ export class KimiCodeKernel implements AgentKernel {
       const nativeInstall = join(homedir(), '.kimi-code', 'bin', process.platform === 'win32' ? 'kimi.exe' : 'kimi');
       return existsSync(nativeInstall) ? nativeInstall : resolved;
     })());
-  }
-
-  hasNativeHistoryResume(threadId: string): boolean {
-    return this.threadToSession.has(threadId);
   }
 
   private createClient(options: ConstructorParameters<typeof KimiAcpClient>[0]): KimiAcpClient {
@@ -220,9 +196,6 @@ export class KimiCodeKernel implements AgentKernel {
     let wake: (() => void) | null = null;
     let ended = false;
     let assistantOutputSeen = false;
-    // Kimi's native ACP permission callback does not observe calls made by the
-    // per-turn fxt MCP server. Resolve the supported posture before mounting
-    // that server and carry it through its environment as a fail-closed gate.
     const requestedMode = req.permissionMode ?? KIMI_DEFAULT_PERMISSION_MODE;
     const { mode: permissionMode, downgraded } = clampMode(
       requestedMode,
@@ -231,7 +204,7 @@ export class KimiCodeKernel implements AgentKernel {
     );
     if (downgraded) {
       process.stderr.write(
-        `[kimi-code] permissionMode="${requestedMode}" 在 kimi 无落点(无 spawn 期放行档、无只读强制),已按 "${permissionMode}" 运行。\n`,
+        `[kimi-code] permissionMode="${requestedMode}" unsupported; using "${permissionMode}".\n`,
       );
     }
     const push = (event: KernelEvent) => {
@@ -264,9 +237,6 @@ export class KimiCodeKernel implements AgentKernel {
 
     const permissionRules = loadSettingsPermissionRules(projectRoot);
     const onPermission = async (call: PermissionCall): Promise<PermissionDecision> => {
-      // Native project MCP calls do not pass through /kernel-tool. Apply the
-      // same trust-tier gate here so own credential/delete tools still ask and
-      // settings/tier denies remain effective without disabling native MCP.
       const nativeProjectTool = req.trustTier !== 'imported'
         && isProjectMcpToolName(call.name, projectRoot);
       if (nativeProjectTool) {
@@ -276,7 +246,9 @@ export class KimiCodeKernel implements AgentKernel {
           ...(req.hostSessionId ? { sid: req.hostSessionId } : {}),
           rules: permissionRules,
         });
-        if (decision.outcome === 'deny') return { behavior: 'deny', message: decision.reason ?? 'denied by trust tier' };
+        if (decision.outcome === 'deny') {
+          return { behavior: 'deny', message: decision.reason ?? 'denied by trust tier' };
+        }
         if (decision.outcome === 'ask') {
           return req.requestPermission
             ? req.requestPermission(call)
@@ -292,7 +264,10 @@ export class KimiCodeKernel implements AgentKernel {
       const verdict = evaluateSettingsRules(permissionRules, call.name, call.args);
       const plan = planKimiPermission(verdict?.behavior, permissionMode, !!req.requestPermission);
       if (plan === 'deny-by-rule') {
-        return { behavior: 'deny', message: `denied by rule ${ruleLabel(verdict!.rule)}` };
+        return {
+          behavior: 'deny',
+          message: `denied by rule ${verdict?.rule ? ruleLabel(verdict.rule) : 'settings rule'}`,
+        };
       }
       if (plan === 'deny-no-prompt') {
         return { behavior: 'deny', message: 'permission requires confirmation, but no prompt is available' };
@@ -333,10 +308,9 @@ export class KimiCodeKernel implements AgentKernel {
       if (req.trustTier !== 'imported' && readProjectMcpServers(projectRoot).length > 0) {
         nativeLease = await acquireProjectMcpNativeLease(projectRoot);
       }
-      // Keep fxt for the host bridge and mount project-local stdio servers as
-      // native ACP MCP servers as well. Kimi's ACP implementation does not
-      // reliably surface tools proxied behind another MCP server in its tool
-      // catalog, so the project server must be visible at the ACP boundary.
+      // Keep fxt for the host bridge and mount only the requested project-local
+      // MCP servers natively.  The runtime materializer removes the same
+      // project tools from fxt, leaving one execution owner for each tool.
       const mcpServers = [
         ...(runtime ? [toMcpServer(runtime)] : []),
         ...(req.trustTier === 'imported'
@@ -344,30 +318,30 @@ export class KimiCodeKernel implements AgentKernel {
           : toProjectMcpServers(projectRoot, (req.tools ?? []).map(({ name }) => name))),
       ];
       let setup;
+      let startedFresh = false;
       try {
-        setup = previousSessionId
-          ? await client.resumeSession(previousSessionId, mcpServers)
-          : await client.newSession(mcpServers);
-      } catch (error) {
-        if (previousSessionId && threadId) this.threadToSession.delete(threadId);
-        if (previousSessionId && !signal.aborted) {
-          yield* failure(`kimi native session resume failed; retry to synchronize a fresh history snapshot: ${(error as Error).message}`);
-          return;
+        if (previousSessionId) {
+          setup = await client.resumeSession(previousSessionId, mcpServers);
+        } else {
+          startedFresh = true;
+          setup = await client.newSession(mcpServers);
         }
-        throw error;
+      } catch (error) {
+        if (previousSessionId && !signal.aborted && !/auth|login/i.test((error as Error).message)) {
+          startedFresh = true;
+          setup = await client.newSession(mcpServers);
+        } else {
+          throw error;
+        }
       }
       if (threadId) this.threadToSession.set(threadId, setup.sessionId);
       if (req.model?.trim()) await client.setModel(req.model.trim());
 
-      const responsePromise = client.prompt(promptText(req, previousSessionId === undefined));
+      const responsePromise = client.prompt(promptText(req, startedFresh));
       responsePromise.then(
         (response) => {
           const mapped = mapKimiAcpPromptResponse(response);
           if (!assistantOutputSeen && response.stopReason === 'end_turn') {
-            // A configured Kimi ACP session should emit at least one assistant
-            // or tool event. The installed CLI currently exits cleanly with an
-            // empty response when its provider catalog is empty; surfacing that
-            // as success makes the Studio look like it received a blank answer.
             for (const event of mapped) {
               if (event.kind === 'turn.usage') push(event);
             }
@@ -447,56 +421,18 @@ export class KimiCodeKernel implements AgentKernel {
 
   async probe(): Promise<KernelHealth> {
     const binary = await this.binary();
-    // Kimi's `--version` enters its interactive bootstrap on the installed
-    // 0.31 CLI; `-h` is the supported bounded command for readiness.
-    const { stdout, stderr, code, timedOut } = await runCapture(binary, ['-h'], {
-      timeoutMs: 10000,
-      captureStderr: true,
-    });
-    const detail = (stdout || stderr).trim().split('\n')[0] ?? '';
-    if (code !== 0) return {
-      ok: false,
-      kernelId: this.id,
-      detail: code == null
-        ? timedOut
-          ? 'kimi probe timed out after 10000ms'
-          : 'kimi binary not on PATH (install: https://www.kimi.com/code/docs/kimi-code-cli/guides/getting-started.html)'
-        : `kimi -h exit ${code}${detail ? `: ${detail}` : ''}`,
-    };
-
-    // `kimi -h` only proves that the CLI is installed. An unconfigured
-    // installation can still start ACP and return an empty successful turn;
-    // require a non-empty provider/model catalog for an honest health result.
-    const catalog = await runCapture(binary, ['provider', 'list', '--json'], {
+    const { stdout, stderr, code } = await runCapture(binary, ['--version'], {
       timeoutMs: 5000,
       captureStderr: true,
     });
-    if (catalog.code !== 0) {
-      const catalogDetail = (catalog.stderr || catalog.stdout).trim().split('\n')[0] ?? '';
-      return {
-        ok: false,
-        kernelId: this.id,
-        detail: `kimi provider catalog unavailable${catalogDetail ? `: ${catalogDetail}` : ''}`,
-      };
-    }
-    try {
-      const raw = JSON.parse(catalog.stdout) as { providers?: unknown; models?: unknown };
-      const providers = raw.providers && typeof raw.providers === 'object' && !Array.isArray(raw.providers)
-        ? Object.keys(raw.providers)
-        : [];
-      const models = raw.models && typeof raw.models === 'object' && !Array.isArray(raw.models)
-        ? Object.keys(raw.models)
-        : [];
-      if (providers.length === 0 && models.length === 0) {
-        return {
-          ok: false,
-          kernelId: this.id,
-          detail: 'kimi provider catalog is empty; configure a provider or run `kimi login`',
-        };
-      }
-    } catch {
-      return { ok: false, kernelId: this.id, detail: 'kimi provider list --json returned invalid JSON' };
-    }
-    return { ok: true, kernelId: this.id, detail: detail || 'kimi ready' };
+    const detail = (stdout || stderr).trim().split('\n')[0] ?? '';
+    if (code === 0) return { ok: true, kernelId: this.id, detail: detail || 'kimi ready' };
+    return {
+      ok: false,
+      kernelId: this.id,
+      detail: code == null
+        ? 'kimi binary not on PATH (install: https://www.kimi.com/code/docs/kimi-code-cli/guides/getting-started.html)'
+        : `kimi --version exit ${code}${detail ? `: ${detail}` : ''}`,
+    };
   }
 }

@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { canonicalToolFields, canonicalToolName } from '../src/kernel/canonical-tool-name';
+import { canonicalToolArgs, canonicalToolFields, canonicalToolName } from '../src/kernel/canonical-tool-name';
 
 describe('canonicalToolName', () => {
   test.each([
     ['TodoWrite', 'todo_write'],
+    ['update_plan', 'todo_write'],
     ['AskUserQuestion', 'ask_user'],
     ['Read', 'read_file'],
     ['Write', 'write_file'],
@@ -41,5 +42,22 @@ describe('canonicalToolName', () => {
   test('retains the raw alias only when normalization changes it', () => {
     expect(canonicalToolFields('TodoWrite')).toEqual({ name: 'todo_write', rawName: 'TodoWrite' });
     expect(canonicalToolFields('todo_write')).toEqual({ name: 'todo_write' });
+  });
+
+  test('normalizes Codex update_plan arguments to todos', () => {
+    expect(canonicalToolArgs('update_plan', {
+      plan: [{ step: 'Inspect', status: 'completed' }, { step: 'Implement', status: 'in_progress' }],
+    })).toEqual({ todos: [
+      { id: 'step-1', content: 'Inspect', status: 'completed' },
+      { id: 'step-2', content: 'Implement', status: 'in_progress' },
+    ] });
+  });
+
+  test('normalizes the namespaced Codex MCP update_plan alias too', () => {
+    expect(canonicalToolArgs('mcp__fxt__update_plan', {
+      plan: [{ step: 'Inspect' }],
+    })).toEqual({ todos: [
+      { id: 'step-1', content: 'Inspect', status: 'pending' },
+    ] });
   });
 });

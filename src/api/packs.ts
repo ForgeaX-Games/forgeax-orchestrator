@@ -17,9 +17,17 @@
  * can write to a tmp path before calling /inspect.
  */
 import { Hono } from 'hono';
+import { homedir } from 'node:os';
 import { resolve } from 'node:path';
+import { defaultProjectRoot } from '@forgeax/platform-io';
 import { exportPack } from '../packs/exporter';
-import { inspectPack, installPack } from '../packs/importer';
+import {
+  disableInstalledExtension,
+  enableInstalledExtension,
+  inspectPack,
+  installPack,
+  removeInstalledExtension,
+} from '../packs/importer';
 import { readInstalled, readTrust } from '../packs/ledger';
 import { getExtensionSnapshot, reloadExtensions } from '../extensions/registry';
 
@@ -44,11 +52,20 @@ interface InspectBody {
 
 interface InstallBody {
   path: string;
-  destRoot: string;
   destinationOrigin: 'user' | 'project';
   conflictPolicy?: 'skip' | 'overwrite' | 'rename';
   reload?: boolean;
   userAcknowledgedUnsigned?: boolean;
+}
+
+interface LifecycleBody {
+  id: string;
+  destinationOrigin: 'user' | 'project';
+  reload?: boolean;
+}
+
+function installDestinationRoot(origin: 'user' | 'project'): string {
+  return origin === 'user' ? homedir() : defaultProjectRoot();
 }
 
 export function createPacksRouter(): Hono {
@@ -103,15 +120,15 @@ export function createPacksRouter(): Hono {
 
   r.post('/install', async (c) => {
     const body = (await c.req.json().catch(() => null)) as InstallBody | null;
-    if (!body?.path || !body.destRoot || !body.destinationOrigin) {
+    if (!body?.path || !body.destinationOrigin) {
       return c.json(
-        { ok: false, error: 'expected { path, destRoot, destinationOrigin, conflictPolicy?, reload? }', code: 'bad_request' },
+        { ok: false, error: 'expected { path, destinationOrigin, conflictPolicy?, reload? }', code: 'bad_request' },
         400,
       );
     }
     const result = await installPack({
       zipPath: body.path,
-      destRoot: body.destRoot,
+      destRoot: installDestinationRoot(body.destinationOrigin),
       destinationOrigin: body.destinationOrigin,
       conflictPolicy: body.conflictPolicy,
       userAcknowledgedUnsigned: body.userAcknowledgedUnsigned,
@@ -121,6 +138,22 @@ export function createPacksRouter(): Hono {
     }
     return c.json(result, result.ok ? 200 : 400);
   });
+
+  for (const [route, mutate] of [
+    ['/disable', disableInstalledExtension],
+    ['/enable', enableInstalledExtension],
+    ['/remove', removeInstalledExtension],
+  ] as const) {
+    r.post(route, async (c) => {
+      const body = (await c.req.json().catch(() => null)) as LifecycleBody | null;
+      if (!body?.id || !body.destinationOrigin) {
+        return c.json({ ok: false, code: 'bad_request', error: 'expected { id, destinationOrigin, reload? }' }, 400);
+      }
+      const result = mutate({ id: body.id, destinationOrigin: body.destinationOrigin });
+      if (result.ok && body.reload !== false) await reloadExtensions();
+      return c.json(result, result.ok ? 200 : result.code === 'not_found' ? 404 : result.code === 'conflict' ? 409 : 400);
+    });
+  }
 
   /** 10 §plugins-trust.yaml + installed.yaml — read-only listings for the
    *  pack-management UI. The same data is also surfaced under

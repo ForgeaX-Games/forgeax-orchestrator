@@ -43,7 +43,7 @@ export function loadCliProvider(
   merged: MergedManifest,
 ): { entry: CliProviderEntry | null; issues: KindLoadIssue[] } {
   const m = merged.manifest;
-  if (m.kind !== 'cli-provider') return { entry: null, issues: [] };
+  if (m.schemaVersion !== 1 || m.kind !== 'cli-provider') return { entry: null, issues: [] };
 
   const cp = m.provides.cliProvider;
   const issues: KindLoadIssue[] = [];

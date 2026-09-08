@@ -1,4 +1,4 @@
-// Direct Doubao (Volcengine openspeech) TTS — host-side fallback for wb-reel
+// Direct Doubao (Volcengine openspeech) TTS — host-side fallback for reel
 // 角色音色 / 旁白合成.
 //
 // 为什么需要这条直连路径（2026-06）：
@@ -7,7 +7,7 @@
 //   （DOUBAO_TTS_KEY / DOUBAO_TTS_APP_ID / DOUBAO_TTS_CLUSTER），key 留在
 //   server 端同样不进前端 bundle。reel-tts 优先用这条直连，litellm 仅兜底。
 //
-// 协议（与 wb-reel 前端 createTtsClient 同形）：
+// 协议（与 reel 前端 createTtsClient 同形）：
 //   POST {base}/api/v1/tts
 //   headers: Authorization: "Bearer; <token>"   (分号是上游字面量约定，非笔误)
 //   body: { app:{appid, token, cluster}, user:{uid},

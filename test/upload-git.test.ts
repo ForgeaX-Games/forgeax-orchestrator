@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ARCHIVE_FILENAME, MANIFEST_FILENAME, buildUploadArchive, type UploadArchive } from "../src/upload/archive";
-import { pushSubset, snapshotDirName, type PushSubsetParams } from "../src/upload/git-uploader";
+import { pushFilesToPath, pushSubset, snapshotDirName, type PushSubsetParams } from "../src/upload/git-uploader";
 import type { UploadFile } from "../src/upload/manifest";
 
 let bare: string;
@@ -163,6 +163,38 @@ describe("pushSubset", () => {
     const config = readFileSync(join(wt, ".git/config"), "utf8");
     expect(config).not.toContain("http.extraHeader");
     expect(config).not.toContain("AUTHORIZATION");
+    rmSync(wt, { recursive: true, force: true });
+  });
+});
+
+describe("pushFilesToPath", () => {
+  test("commits an explicit file set into one feedback directory", async () => {
+    const archivePath = join(src, "archive.tar.gz");
+    const screenshotPath = join(src, "screenshot.png");
+    writeFileSync(archivePath, "archive");
+    writeFileSync(screenshotPath, "image");
+    const params = {
+      remoteUrl: bare,
+      branch: TEST_BRANCH,
+      destinationPath: "feedback/FB-260818-1/r1",
+      files: [
+        { sourcePath: archivePath, name: "workspace.tar.gz" },
+        { sourcePath: screenshotPath, name: "screenshot-1.png" },
+      ],
+      commitMessage: "feedback: FB-260818-1 occurrence 1",
+      sleep: async () => {},
+    };
+
+    const first = await pushFilesToPath(params);
+    expect(first.filesChanged).toBe(2);
+    expect(first.path).toBe("feedback/FB-260818-1/r1");
+    const second = await pushFilesToPath(params);
+    expect(second.skipped).toBe(true);
+    expect(second.commit).toBe(first.commit);
+
+    const wt = checkout();
+    expect(readFileSync(join(wt, first.path, "workspace.tar.gz"), "utf8")).toBe("archive");
+    expect(readFileSync(join(wt, first.path, "screenshot-1.png"), "utf8")).toBe("image");
     rmSync(wt, { recursive: true, force: true });
   });
 });

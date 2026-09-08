@@ -389,13 +389,12 @@ export interface AgentFsAPI {
  *    2. Relative input → resolve against blackboard.CURRENT_DIR
  *    2.5. CURRENT_DIR also absent → sessionCwd (absolute game root resolved
  *         from session.config.defaultDir slug, bug-20260522) → use directly
- *    3. All absent → agentJson.defaultDir (absolute or relative to agentDir)
- *    4. All absent → agentDir itself */
+ *    3. All absent → runtimeStateRoot */
 export function createAgentFs(
   pathManager: PathManagerAPI,
   blackboard: BlackboardAPI,
   agentPath: string,
-  agentDir: string,
+  runtimeStateRoot: string,
   defaultDirFallback?: () => string | undefined,
 ): AgentFsAPI {
   const fs = getHostFs();
@@ -409,8 +408,8 @@ export function createAgentFs(
     if (cwd) return cwd;
     /** bug-20260522: sessionCwd inserted at head of fallback chain. */
     const fb = defaultDirFallback?.();
-    if (fb) return isAbsolute(fb) ? fb : resolvePath(agentDir, fb);
-    return agentDir;
+    if (fb) return isAbsolute(fb) ? fb : resolvePath(runtimeStateRoot, fb);
+    return runtimeStateRoot;
   };
 
   const res = (p: string): string => {

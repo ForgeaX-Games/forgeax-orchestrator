@@ -24,6 +24,19 @@ function writeEvents(sid: string, agentPath: string, lines: any[]) {
   );
 }
 
+function writeEphemeralEvents(sid: string, instanceId: string, lines: any[]) {
+  const dir = join(SESSIONS, sid, 'runtime-events', 'ephemeral', instanceId);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, 'events-1.jsonl'),
+    lines.map((line) => JSON.stringify(line)).join('\n') + '\n',
+  );
+  writeFileSync(
+    join(SESSIONS, sid, 'session.json'),
+    JSON.stringify({ runtimeEventsRoot: 'runtime-events' }),
+  );
+}
+
 const T0 = Date.UTC(2026, 4, 22, 10, 0, 0); // 2026-05-22 10:00 UTC
 const T1 = Date.UTC(2026, 4, 23, 10, 0, 0); // 2026-05-23 10:00 UTC
 
@@ -135,5 +148,53 @@ describe('aggregateUsage', async () => {
     );
     const r = await aggregateUsage(opts(SESSIONS));
     expect(r.byModel).toEqual([{ model: 'unknown', calls: 1, inputTokens: 7, outputTokens: 3 }]);
+  });
+
+  it('counts ephemeral stores and prefers canonical turn.usage over its assistant projection', async () => {
+    writeEphemeralEvents('s1', 'eph_one', [
+      {
+        eventId: 'assistant-event',
+        type: 'hook:assistantMessage',
+        ts: T0,
+        payload: {
+          model: 'gpt-runtime',
+          usageId: 'usage-1',
+          usage: { inputTokens: 40, outputTokens: 8 },
+        },
+      },
+      {
+        eventId: 'usage-event',
+        type: 'turn.usage',
+        ts: T0,
+        payload: {
+          model: 'gpt-runtime',
+          usageId: 'usage-1',
+          inputTokens: 40,
+          outputTokens: 8,
+        },
+      },
+    ]);
+    const globalDir = join(SESSIONS, 's1', 'runtime-events');
+    writeFileSync(
+      join(globalDir, 'global-events.jsonl'),
+      JSON.stringify({
+        type: 'turn.usage',
+        ts: T0,
+        payload: { inputTokens: 999, outputTokens: 999 },
+      }) + '\n',
+    );
+
+    const report = await aggregateUsage(opts(SESSIONS));
+    expect(report.totals).toEqual({
+      calls: 1,
+      inputTokens: 40,
+      outputTokens: 8,
+    });
+    expect(report.byModel).toEqual([{
+      model: 'gpt-runtime',
+      calls: 1,
+      inputTokens: 40,
+      outputTokens: 8,
+    }]);
   });
 });

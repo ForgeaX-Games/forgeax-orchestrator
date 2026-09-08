@@ -1,6 +1,7 @@
 {
+  "packageManager": "bun@1.4.0",
   "name": "@forgeax/orchestrator",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "ForgeaX reusable orchestration layer: R2 compose/resolve/toWire/checkTool, session/scheduler/tree, soul (digital life), kits, llm, kernel adaptors, ledger, HTTP api routers, ws, builtin kits/personas.",
@@ -17,7 +18,31 @@
     },
     "./npc-brain/standalone": {
       "types": "./src/npc-brain/standalone.ts",
-      "import": "./src/npc-brain/standalone.ts"
+      "import": "./dist/npc-brain/standalone.js"
+    },
+    "./seams": {
+      "types": "./src/orchestration-seams.ts",
+      "import": "./dist/orchestration-seams.js"
+    },
+    "./extensions": {
+      "types": "./src/extensions/index.ts",
+      "import": "./dist/extensions/index.js"
+    },
+    "./session-fs": {
+      "types": "./src/fs/index.ts",
+      "import": "./dist/fs/index.js"
+    },
+    "./gateways": {
+      "types": "./src/lib/gateways/index.ts",
+      "import": "./dist/lib/gateways/index.js"
+    },
+    "./npc-brain/model-config": {
+      "types": "./src/npc-brain/model-config.ts",
+      "import": "./dist/npc-brain/model-config.js"
+    },
+    "./kernel": {
+      "types": "./src/kernel/index.ts",
+      "import": "./dist/kernel/index.js"
     }
   },
   "files": [
@@ -40,7 +65,12 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.23.0",
-    "@forgeax/workbench-host": "0.2.6",
+    "@forgeax/agent-host": "workspace:*",
+    "@forgeax/agent-runtime": "^0.1.2",
+    "@forgeax/platform-io": "workspace:*",
+    "@forgeax/toolkit": "0.1.2",
+    "@forgeax/types": "^0.1.2",
+    "@forgeax/extension-host": "0.3.0",
     "@google/genai": "^1.0.0",
     "chokidar": "^4.0.0",
     "hono": "^4.6.0",

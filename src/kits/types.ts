@@ -17,7 +17,7 @@
  *    - LLM-facing   → bare `name` when unambiguous across the registry,
  *                     otherwise qualified (`/` is rejected by Anthropic /
  *                     OpenAI tool-name validators, so on bare-collision
- *                     ConsciousAgent drops the group). */
+ *                     RuntimeAgentHost drops the group). */
 
 import type { AgentContext } from "../core/types";
 import type { ContextSlot } from "./slot/types";
@@ -34,6 +34,8 @@ export interface KitSource {
   id: KitLayerId;
   /** Absolute path to the `kits/` root of this layer. */
   dir: string;
+  /** When set, `dir` is this package root rather than a parent `kits/` root. */
+  packageName?: string;
 }
 
 export interface KitDescriptor {
@@ -47,7 +49,17 @@ export interface KitDescriptor {
   path: string;
   /** Source layer this descriptor was scanned from. */
   layer: KitLayerId;
+  /** Absolute package root; avoids re-resolving ambiguous custom sources. */
+  packageRoot: string;
 }
+
+/** The subset of `KitDescriptor` that visibility (`kits.enable/disable` token
+ *  matching) actually reads. A caller that knows an item's kit identity but not
+ *  its on-disk `path`/`kind` — e.g. the kernel turn composer, which advertises
+ *  kit tools it never imports through the loader — can ask
+ *  `BaseKitLoader.isVisibleByConfig` with this instead of fabricating a
+ *  descriptor. `KitDescriptor` is structurally assignable to it. */
+export type KitIdentity = Pick<KitDescriptor, "name" | "pkg" | "layer">;
 
 // ─── Kit visibility config (lives on AgentJson.kits) ────────────────────────
 

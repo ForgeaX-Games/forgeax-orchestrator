@@ -1,3 +1,4 @@
+import { makeInProcessExecuteTool } from '../src/kernel/host-tool-bridge';
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,6 +17,7 @@ import { mergeManifests } from '../src/extensions/merger';
 import { _resetSnapshotForTests, _setSnapshotForTests } from '../src/extensions/registry';
 import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { callTool, _resetConfirmsForTests, _resetToolHandlerCacheForTests } from '../src/tools/registry';
+import { initOrchestrationSeams, resetOrchestrationSeams } from '../src/orchestration-seams';
 
 let root: string;
 let extensionRoot: string;
@@ -98,11 +100,14 @@ async function loadTools(): Promise<void> {
   });
 }
 
-async function postTool(toolName: string): Promise<any> {
+async function postTool(
+  toolName: string,
+  identity: { toolExecutionId?: string; callId?: string; turnCallId?: string } = {},
+): Promise<any> {
   const response = await app.request(`/api/sessions/${sid}/kernel-tool`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ agentPath: 'market-agent', toolName, args: {} }),
+    body: JSON.stringify({ agentPath: 'market-agent', toolName, args: {}, ...identity }),
   });
   return response.json();
 }
@@ -136,8 +141,33 @@ beforeEach(async () => {
     bridgedTool('demo_get-token', 'demo:get-token'),
     bridgedTool('remember', 'remember'),
   ];
-  const fakeAgent = { agentContext: { tools: { list: () => tools } } };
-  (session.scheduler as unknown as { getAgent: () => unknown }).getAgent = () => fakeAgent;
+  const fakeAgent = {
+    agentContext: {
+      signal: new AbortController().signal,
+      tools: { list: () => tools },
+    },
+  };
+  // Model the current runtime contract: authorization starts from a live
+  // instance's templateRef, then resolves trust through the Catalog.
+  const fakeInstance = {
+    instanceId: 'res_market_agent',
+    templateRef: 'tpl_market_agent',
+    residentPath: 'market-agent',
+    parentInstanceId: null,
+    lifetime: 'resident',
+    template: { definition: { id: 'market-agent' }, configuration: { toolGrants: { projectMcp: ['mcp__project__read'] } } },
+  };
+  (session.tree as unknown as { resolve: () => unknown }).resolve = () =>
+    fakeInstance;
+  (
+    session.templateCatalog as unknown as {
+      get: () => { trust: 'imported' };
+    }
+  ).get = () => ({ trust: 'imported' });
+  (
+    session as unknown as { initializeAgentHost: () => Promise<unknown> }
+  ).initializeAgentHost = async () => fakeAgent;
+  (session as unknown as { getAgentHost: () => unknown }).getAgentHost = () => fakeAgent;
 
   app = new Hono().route('/api/sessions', createSessionsRouter());
   outerCards = 0;
@@ -163,6 +193,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  resetOrchestrationSeams();
   denyPermissionsForSession(sid);
   _resetConfirmsForTests();
   _resetEventBusForTests();
@@ -224,6 +255,7 @@ describe('POST /:sid/kernel-tool Host confirmation delegation', () => {
   });
 
   test('内置工具同名时保留外层确认，不会假设 ToolRegistry 会执行', async () => {
+    initOrchestrationSeams({ enabledBuiltinTools: ['remember'] });
     const json = await postTool('remember');
 
     expect(json.ok).toBe(false);
@@ -258,6 +290,20 @@ process.stdin.on('data', (chunk) => {
       mcpServers: { project: { command: process.execPath, args: [script], env: { FX_MCP_MODE: mode } } },
     }), 'utf8');
     resetProjectMcpPoolForTests();
+    const invokeHook = async (name: string) => {
+      const response = await app.request(`/api/sessions/${sid}/hook-gate`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ agent: 'market-agent', kernel: 'claude-code', toolName: name, input: {} }),
+      });
+      return response.json() as Promise<any>;
+    };
+    const bridge = makeInProcessExecuteTool('market-agent');
+    const denied = await postTool('mcp__project__read_other');
+    expect(denied).toMatchObject({ ok: false, error: 'tool not granted to agent: mcp__project__read_other' });
+    await expect(bridge('mcp__project__read_other', {}, sid, 'market-agent')).rejects.toThrow('not granted');
+    expect((await invokeHook('mcp__project__read_other')).decision).toBe('deny');
+    expect((await invokeHook('mcp__project__read')).decision).toBe('allow');
+    expect(await bridge('mcp__project__read', {}, sid, 'market-agent')).toContain('project-ok');
     const json = await postTool('mcp__project__read');
     expect(json.ok).toBe(true);
     expect(json.result).toBe('project-ok');
@@ -267,10 +313,24 @@ process.stdin.on('data', (chunk) => {
     writeFileSync(join(root, '.forgeax', 'mcp.json'), JSON.stringify({
       mcpServers: { project: { command: process.execPath, args: [script], env: { FX_MCP_MODE: mode }, version: 2 } },
     }), 'utf8');
-    const stale = await postTool('mcp__project__read');
+    const stale = await postTool('mcp__project__read', {
+      toolExecutionId: 'fxt-stale-1',
+      callId: 'call-stale-1',
+      turnCallId: 'turn-stale-1',
+    });
     expect(stale.ok).toBe(false);
     expect(stale.code).toBe('project_mcp_tool_not_found');
     expect(String(stale.error)).toContain('project MCP tool not found');
+    const audit = readFileSync(join(root, 'sessions', sid, 'kernel-tool-audit.jsonl'), 'utf8')
+      .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(audit.at(-1)).toMatchObject({
+      tool: 'mcp__project__read',
+      allow: true,
+      ok: false,
+      toolExecutionId: 'fxt-stale-1',
+      callId: 'call-stale-1',
+      turnCallId: 'turn-stale-1',
+    });
     resetProjectMcpPoolForTests();
   });
 });

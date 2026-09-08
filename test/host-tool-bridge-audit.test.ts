@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { initPathManager, resetPathManager } from '../src/fs/path-manager';
 import { makeInProcessExecuteTool, type HostToolBridgeDeps } from '../src/kernel/host-tool-bridge';
+import { initOrchestrationSeams, resetOrchestrationSeams } from '../src/orchestration-seams';
 
 // ── 可调的协作方行为(每个用例 beforeEach 重置后按需改写) ──────────────────
 let trustTier: 'own' | 'imported';
@@ -26,17 +27,23 @@ let delegateHostConfirmation: boolean;
 let approvalCalls: number;
 let execCalls: number;
 
-const fakeAgent = { agentContext: { tools: { list: () => [] } } };
+const fakeAgent = { agentContext: { tools: { list: () => ['read_file', 'run_cmd', 'aiasset_import-to-engine'].map((name) => ({ name })) } } };
 const fakeSession = {
   eventBus: { publish: () => {} },
-  scheduler: { getAgent: () => (agentLive ? fakeAgent : null) },
+  tree: {
+    resolve: () => agentLive ? { templateRef: 'tpl_fake' } : undefined,
+  },
+  templateCatalog: {
+    get: () => ({ trust: trustTier }),
+  },
+  initializeAgentHost: async () => fakeAgent,
+  getAgentHost: () => (agentLive ? fakeAgent : null),
 };
 
 /** 用桩协作方装配桥(deps 注入口 —— 生产路径默认走真实实现)。 */
 function makeBridge() {
   const deps: Partial<HostToolBridgeDeps> = {
     getSessionManager: (() => ({ peek: () => fakeSession, open: async () => fakeSession })) as unknown as HostToolBridgeDeps['getSessionManager'],
-    loadAgentRecord: (async () => ({ trustTier })) as unknown as HostToolBridgeDeps['loadAgentRecord'],
     checkKernelTool: (() => decision) as unknown as HostToolBridgeDeps['checkKernelTool'],
     shouldDelegateHostToolConfirmation: (() => delegateHostConfirmation) as unknown as HostToolBridgeDeps['shouldDelegateHostToolConfirmation'],
     requestToolApproval: (async () => {
@@ -75,11 +82,19 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetOrchestrationSeams();
   resetPathManager();
   try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
 describe('host-tool-bridge appendToolAudit', () => {
+  test('ungranted ambient skill is rejected before approval or execution and audited once', async () => {
+    decision = { allow: false, outcome: 'ask' };
+    await expect(makeBridge()('skill_unrelated_audio', {}, SID, 'forge')).rejects.toThrow('not granted');
+    expect(approvalCalls).toBe(0);
+    expect(execCalls).toBe(0);
+    expect(readAudit()).toMatchObject([{ allow: false, tool: 'skill_unrelated_audio' }]);
+  });
   test('allow + 执行成功 → 恰一行 {allow:true, ok:true}', async () => {
     const bridge = makeBridge();
     const out = await bridge('read_file', { path: 'x' }, SID, 'forge');
@@ -91,6 +106,23 @@ describe('host-tool-bridge appendToolAudit', () => {
     expect(rows[0].error).toBeUndefined();
     expect(typeof rows[0].durationMs).toBe('number');
     expect(typeof rows[0].ts).toBe('number');
+  });
+
+  test('builtin opt-in closed at native execution boundary', async () => {
+    const bridge = makeBridge();
+    await expect(bridge('list_subagents', {}, SID, 'forge')).rejects.toThrow(/builtin tool not enabled/i);
+
+    expect(execCalls).toBe(0);
+    expect(readAudit()).toContainEqual(expect.objectContaining({
+      tool: 'list_subagents',
+      trustTier: 'own',
+      allow: false,
+      error: 'builtin tool not enabled: list_subagents',
+    }));
+
+    initOrchestrationSeams({ enabledBuiltinTools: ['list_subagents'] });
+    await bridge('list_subagents', {}, SID, 'forge');
+    expect(execCalls).toBe(1);
   });
 
   test('deny → 抛 + 恰一行 {allow:false, error:reason}', async () => {

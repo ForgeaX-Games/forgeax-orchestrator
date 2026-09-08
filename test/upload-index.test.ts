@@ -8,6 +8,12 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { planUpload, uploadWorkspace, tailUploadLog } from "../src/upload";
+import { initOrchestrationSeams, resetOrchestrationSeams } from "../src/orchestration-seams";
+
+// The shared repo + write token are injected by the product shell (createForgeaxApp).
+// Mirror that here so the built-in-default fallback paths behave as in production.
+const FAKE_SHARED_TOKEN = "fake-shared-token-xyz";
+const FAKE_SHARED_REPO = "FakeOrg/Fake-Data";
 
 let projectRoot: string;
 let bare: string;
@@ -32,10 +38,12 @@ beforeEach(() => {
   bare = makeBare();
   fg("games/g/src/main.ts", "export const x = 1\n");
   fg("active-game.json", '{"slug":"g"}\n');
+  initOrchestrationSeams({ uploadDefaults: { repo: FAKE_SHARED_REPO, token: FAKE_SHARED_TOKEN, branch: "main" } });
 });
 afterEach(() => {
   rmSync(projectRoot, { recursive: true, force: true });
   rmSync(bare, { recursive: true, force: true });
+  resetOrchestrationSeams();
 });
 
 const env = (over: Record<string, string> = {}) =>
@@ -52,7 +60,7 @@ describe("planUpload (dry-run)", () => {
     expect(p.summary).toContain("/upload confirm");
   });
 
-  test("empty token env → built-in token keeps upload configured", () => {
+  test("empty token env → injected shared token keeps upload configured", () => {
     const p = planUpload({ projectRoot, env: env({ FORGEAX_UPLOAD_GITHUB_TOKEN: "" }) });
     if (!p.ok) throw new Error("unexpected");
     expect(p.tokenConfigured).toBe(true);
@@ -72,7 +80,7 @@ describe("planUpload (dry-run)", () => {
     expect(bad.ok).toBe(false);
     if (!bad.ok) expect(bad.kind).toBe("no-repo");
     const viaDefault = planUpload({ projectRoot, env: env({ FORGEAX_UPLOAD_REPO: "" }) });
-    expect(viaDefault.ok).toBe(true); // DEFAULT_UPLOAD_REPO applies
+    expect(viaDefault.ok).toBe(true); // injected shared default repo applies
   });
 });
 

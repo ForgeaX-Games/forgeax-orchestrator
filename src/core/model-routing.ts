@@ -8,7 +8,7 @@
  *  - order(config) 输出加工后的候选顺序，给 provider registry 拿去顺序尝试；
  *  - configKey 带 agentId + models + routing，配置变化 hint 自动重置。
  *
- *  纯内存，per-agent 实例化（ConsciousAgent 持有），进程重启丢弃 hint。 */
+ *  纯内存，per-instance 实例化（RuntimeAgentHost 持有），进程重启丢弃 hint。 */
 
 import type { ModelsConfig } from "../core/types";
 

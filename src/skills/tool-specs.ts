@@ -10,8 +10,14 @@ function textOf(value: string | { zh?: string; en?: string; ja?: string }): stri
 }
 
 /** Neutral ToolSpecs for extension skills that the host bridge can execute. */
-export function skillToolSpecs(): ToolSpec[] {
-  return getExtensionSnapshot().kinds.skills.map((skill) => ({
+export function skillToolSpecs(excludeSkillIds?: ReadonlySet<string>): ToolSpec[] {
+  // Prompt skills are materialized into the agent's system prompt by the
+  // template composer. A resident agent's prompt skills are therefore
+  // excluded by id at the composition seam; unrelated global prompt skills
+  // remain available to legacy callers that have no resident template.
+  return getExtensionSnapshot().kinds.skills
+    .filter((skill) => !excludeSkillIds?.has(skill.definition.id))
+    .map((skill) => ({
     name: safeSkillToolId(skill.definition.id),
     description: textOf(skill.definition.description) || `Invoke skill ${skill.definition.id}.`,
     inputSchema: {
@@ -21,5 +27,5 @@ export function skillToolSpecs(): ToolSpec[] {
         extensionId: { type: 'string' },
       },
     },
-  }));
+    }));
 }

@@ -56,4 +56,36 @@ describe('SidecarClient ↔ agent-host', () => {
     expect(exits.find((e) => e.sessionId === 'sc1')?.reason).toBe('cancelled');
     c.close();
   }, 20000);
+
+  test('write feeds stdin of a supervised persistent session', async () => {
+    const c = await startHostAndConnect();
+    const chunks: string[] = [];
+    c.onData(({ sessionId, stream, chunk }) => {
+      if (sessionId === 'sc-write' && stream === 'stdout') chunks.push(chunk);
+    });
+
+    await c.startSession({
+      sessionId: 'sc-write',
+      agentId: 'a',
+      trustTier: 'own',
+      kernel: {
+        kind: 'claude-code',
+        credential: 'user-managed',
+        cmd: process.execPath,
+        args: [
+          '-e',
+          "process.stdin.setEncoding('utf8'); process.stdin.on('data', (chunk) => process.stdout.write(String(chunk).toUpperCase()));",
+        ],
+      },
+    });
+
+    await c.write('sc-write', 'ready\n');
+    for (let i = 0; i < 40 && !chunks.join('').includes('READY'); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(chunks.join('')).toContain('READY');
+
+    await c.shutdownSession('sc-write');
+    c.close();
+  }, 20000);
 });

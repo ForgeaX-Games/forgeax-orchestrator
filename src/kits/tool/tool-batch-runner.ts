@@ -58,8 +58,8 @@ export async function runToolBatch(params: RunToolBatchParams): Promise<ToolBatc
   const { toolCalls, tools, toolCtx, materializePending, materializeResult } = params;
   if (toolCalls.length === 0) return [];
 
-  // boundEventBus.hook is BaseAgent-provided; raw EventBusAPI doesn't carry
-  // `hook`. Cast at the boundary —— BaseAgent guarantees this shape inside
+  // boundEventBus.hook is RuntimeAgentHost-provided; raw EventBusAPI doesn't carry
+  // `hook`. Cast at the boundary —— RuntimeAgentHost guarantees this shape inside
   // agentContext.eventBus.
   const hookBus = toolCtx.eventBus as unknown as {
     hook<T extends string>(

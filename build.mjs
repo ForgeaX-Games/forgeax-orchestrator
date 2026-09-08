@@ -17,34 +17,47 @@ import { rmSync, mkdirSync, copyFileSync, writeFileSync } from 'node:fs';
 import { Glob } from 'bun';
 import { dirname, join } from 'node:path';
 import { buildPlatformOptions } from './build-platform.mjs';
+import { shouldExternalizeBuildSpecifier } from './build-externals.mjs';
 
 rmSync('./dist', { recursive: true, force: true });
 
-/** Externalize every bare specifier except `@forgeax/*` (bundled from source). */
+/**
+ * Externalize third-party bare specifiers plus mutable ForgeaX singletons.
+ * Most workspace packages remain bundled from source, but agent-runtime owns
+ * the process-wide kernel registry and must be shared with the product shell.
+ */
 const externalizeNonForgeax = {
   name: 'externalize-non-forgeax',
   setup(b) {
     b.onResolve({ filter: /.*/ }, (a) => {
       const p = a.path;
-      if (p.startsWith('.') || p.startsWith('/')) return; // relative → bundle
-      if (p.startsWith('@/')) return; // internal tsconfig alias (@/* → src/*) → bundle
-      if (p.startsWith('@forgeax/')) return; // workspace pkg / internal alias (@forgeax/bus) → bundle
-      return { path: p, external: true }; // third-party + node: → external
+      if (!shouldExternalizeBuildSpecifier(p)) return;
+      return { path: p, external: true };
     });
   },
 };
 
 const res = await build({
   entrypoints: [
-    './src/kernel/forgeax-core-kernel.ts',
     './src/index.ts',
+    './src/kernel/index.ts',
+    './src/kernel/forgeax-core-kernel.ts',
+    './src/orchestration-seams.ts',
+    './src/extensions/index.ts',
+    './src/fs/index.ts',
+    './src/lib/gateways/index.ts',
+    './src/npc-brain/model-config.ts',
     './src/npc-brain/standalone.ts',
   ],
   outdir: './dist',
   root: './src',
   target: 'node',
   format: 'esm',
-  splitting: false,
+  // Every public runtime entry must share one graph. In particular, the root
+  // app installs mutable seams/registries that ./kernel and ./extensions read.
+  // Building those subpaths separately from source creates duplicate module
+  // instances inside a compiled consumer and silently drops advertised tools.
+  splitting: true,
   ...buildPlatformOptions(process.platform),
   plugins: [externalizeNonForgeax],
 });

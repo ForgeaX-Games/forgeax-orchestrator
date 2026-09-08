@@ -10,12 +10,13 @@
 // 自己只负责 Bun.serve + 静态 SPA + engine/interface 进程 spawn + vite 代理。
 
 import { Hono } from 'hono';
+import { join } from 'node:path';
 import type { AgentKernel } from '@forgeax/agent-runtime';
-import { createHonoWorkbenchRouter } from '@forgeax/workbench-host/http/hono';
+import { createHonoExtensionRouter } from '@forgeax/extension-host/http/hono';
 import {
-  configureWorkbenchAgentTools,
-  type WorkbenchAgentHost,
-} from './workbench/agent-tools';
+  configureExtensionAgentTools,
+  type ExtensionAgentHost,
+} from './extension-host/agent-tools';
 
 import { createFilesRouter } from '@forgeax/platform-io';
 import { createFsBrowserRouter } from '@forgeax/platform-io';
@@ -65,6 +66,7 @@ import {
   type AssetPathPolicy,
   type DeliveryEnricher,
   type ArtifactResolver,
+  type UploadDefaults,
 } from './orchestration-seams';
 import { ensureUserDirDefaults } from './defaults/scaffold';
 import { initSessionManager } from './core/session-manager';
@@ -76,9 +78,15 @@ import {
 import { listBuiltinHeadlessUiActionIds } from './kernel/ui-headless-actions';
 import './llm/register-all';
 
+// Part of the public seam contract (like ProductContext): the product shell
+// annotates the upload defaults it injects.
+export type { UploadDefaults } from './orchestration-seams';
+
 /** Product-specific context injected by the shell into the orchestration layer. */
 export interface ProductContext {
-  /** Where read-only resources live (builtin assets, interface dist, marketplace). */
+  /** Where orchestrator read-only resources live. Its `builtin/` child contains
+   *  runtime-discovered kits and commands. Omitted in source checkouts, where
+   *  PathManager derives the package-local builtin directory. */
   resourceRoot?: string;
   /** Private runtime instance root (.forgeax/). User projects are games. */
   instanceRoot: string;
@@ -141,8 +149,13 @@ export interface ProductContext {
    *  the shell opens roots explicitly. Conditionally required + fail-fast when
    *  asset routers are injected (§3.4). */
   assetPathPolicy?: AssetPathPolicy;
+  /** Upload destination defaults — the shared repo + shared write token are
+   *  product policy/credential, owned by the shell and injected here (the token
+   *  used to be a compiled constant in the base's upload/config.ts). Omitted ⇒
+   *  upload is unconfigured unless the operator sets `FORGEAX_UPLOAD_*`. */
+  uploadDefaults?: UploadDefaults;
   /** Optional game-host version-prepare hook (product shell injects platform-specific
-   *  behavior, e.g. wb-game-video syncing its component set into the game dir before
+   *  behavior, e.g. video-game syncing its component set into the game dir before
    *  a version is committed). game-host stays generic; app only passes it through. */
   gameHostBeforeVersion?: (args: { slug: string; gameDir: string; project: unknown }) => void | Promise<void>;
   gameHostSeedProvider?: (args: { slug: string }) => Promise<{
@@ -150,8 +163,8 @@ export interface ProductContext {
     blueprint: unknown;
     assetsManifest: unknown;
   }>;
-  /** One product-owned Workbench Host; orchestrator only mounts its shared HTTP projection. */
-  workbenchHost?: Parameters<typeof createHonoWorkbenchRouter>[0] & WorkbenchAgentHost;
+  /** One product-owned Extension Host; orchestrator only mounts its shared HTTP projection. */
+  extensionHost?: Parameters<typeof createHonoExtensionRouter>[0] & ExtensionAgentHost;
   /**
    * Host-owned provenance for Model Lab requests. The shell derives this from
    * trusted routing context so game code cannot opt itself into `studio-ui` by
@@ -171,13 +184,13 @@ export interface ForgeaxApp {
   npcRuntime: import('./npc-brain/runtime').NpcRuntime;
 }
 
-export function mountWorkbenchHost(
+export function mountExtensionHost(
   app: Hono,
-  host: Parameters<typeof createHonoWorkbenchRouter>[0],
+  host: Parameters<typeof createHonoExtensionRouter>[0],
 ): void {
   app.route(
-    '/__workbench__/v1',
-    createHonoWorkbenchRouter(host, { prefix: '/__workbench__/v1' }),
+    '/__extension__/v1',
+    createHonoExtensionRouter(host, { prefix: '/__extension__/v1' }),
   );
 }
 
@@ -211,6 +224,7 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
 
   const pm = initPathManager({
     projectRoot: instanceRoot,
+    builtinRoot: ctx.resourceRoot ? join(ctx.resourceRoot, 'builtin') : undefined,
     stateRoot: ctx.stateRootFactory?.(instanceRoot),
     layout: ctx.sessionLayoutFactory?.(instanceRoot),
   });
@@ -228,14 +242,14 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
     hostUiActions: ctx.hostUiActions,
     assetPathPolicy: ctx.assetPathPolicy,
     enabledBuiltinTools: ctx.enabledBuiltinTools,
+    uploadDefaults: ctx.uploadDefaults,
   });
-  if (ctx.workbenchHost) {
-    await configureWorkbenchAgentTools(ctx.workbenchHost);
+  if (ctx.extensionHost) {
+    await configureExtensionAgentTools(ctx.extensionHost);
   }
   await ensureUserDirDefaults(pm);
   const sm = initSessionManager(pm);
-  const restored = await sm.bootAutoStart();
-  for (const s of restored) s.scheduler.start();
+  await sm.bootAutoStart();
 
   // 组合根接线:把 skill 事件触发的 rewire 接到 plugins reload 后置钩子。
   // (registry 不直接 import event-bridge —— 断开 plugins→event-bridge→runner→plugins 环)
@@ -244,7 +258,7 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   await bootCliProviders();
 
   const app = new Hono();
-  if (ctx.workbenchHost) mountWorkbenchHost(app, ctx.workbenchHost);
+  if (ctx.extensionHost) mountExtensionHost(app, ctx.extensionHost);
   const npcRuntime = new NpcRuntime({ projectRoot: instanceRoot });
 
   // 给每个 /api/* 请求建立 ALS session 作用域(从 query/path/JSON body 解析 sid),

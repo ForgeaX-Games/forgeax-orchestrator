@@ -1,6 +1,6 @@
 /** summary-compaction —— 容量触发 / 边界滚动的全量压缩。
  *
- *  与 agenteam ref 718 行 1:1（plan §3.8）；只把 `ConsciousAgent.resolveModelsConfig`
+ *  与 agenteam ref 718 行 1:1（plan §3.8）；只把 Runtime host 的模型解析
  *  解耦成 caller 注入的 `resolveModels: () => ModelsConfig`，避免 context-window
  *  反向依赖 conscious-agent。SessionManager 对应替换成 LedgerReader（buildPrompt
  *  / getWindowEventsRaw 只用到这个最小接口）。

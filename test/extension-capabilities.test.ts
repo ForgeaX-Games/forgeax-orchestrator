@@ -6,9 +6,9 @@ import {
 
 const context: ExtensionCapabilityInvocationContext = {
   caller: { kind: 'ai' },
-  toolId: 'wb_game_video_generate_video',
+  toolId: 'video_game_generate_video',
   env: {},
-  cwd: '/extensions/wb-game-video',
+  cwd: '/extensions/video-game',
   projectRoot: '/project',
   game: 'game-1',
 };

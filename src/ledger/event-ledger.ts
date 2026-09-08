@@ -1,8 +1,8 @@
 /** EventLedger —— per-agent append-only WAL，5MB shard 自动滚。
  *
  *  与 agenteam ref 280 行的差异（plan §3.4）：
- *  - **构造参数**：`(sid, agentPath, paths)` 而非 `agentId`；ledger / blobs 路径走
- *    `paths.session(sid).agent(agentPath).{root, eventLedgerBlobs}`。
+ *  - **构造参数**：直接消费 `InstanceEventBinding + ResolvedEventStorePaths`；
+ *    resident/ephemeral 使用同一 shard/blob/recovery 实现。
  *    shard 文件名沿用 `events-<N>.jsonl`（5MB 拆分用，不是切 ledger）。
  *  - **砍 currentSessionId 指针 + newSession / switchSession**：forgeax 一棵 agent 一份
  *    ledger，没切换语义；要换历史另起 sid。
@@ -12,16 +12,24 @@
  *  线程模型：单进程内部使用，append 同步写盘；rotate 内部 _rotating flag 防重入。
  *  Caller（Session.ledgers map 持有者）需在 dispose 时停止使用，本类不主动 close。 */
 
-import { mkdirSync, statSync, appendFileSync, readdirSync, existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, statSync, appendFileSync, readdirSync, existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Event } from "../core/types";
-import type { PathManagerAPI } from "../fs/types";
-import { parseEvents } from "./event-store";
+import { parseEvents } from "./event-codec";
 import { walkAndExternalize } from "./event-blob";
-import type { StoredEvent } from "./types";
-import { randomUUID } from "node:crypto";
+import type {
+  InstanceEventBinding,
+  ResolvedEventStorePaths,
+  StoredEvent,
+} from "./types";
 
+const MAX_SHARD_BYTES = 5 * 1024 * 1024;
+const SIZE_CHECK_INTERVAL = 20;
+const SHARD_RE = /^events-(\d+)\.jsonl$/;
+
+/** Stable position used by the history coordinator. */
 export interface LedgerCursor {
   shard: number;
   line: number;
@@ -34,37 +42,30 @@ export interface LedgerHistoryMeta {
   origin?: { kernelId: string; laneId: string; epoch: number };
 }
 
-const MAX_SHARD_BYTES = 5 * 1024 * 1024;
-const SIZE_CHECK_INTERVAL = 20;
-const SHARD_RE = /^events-(\d+)\.jsonl$/;
-
 export class EventLedger {
   private readonly eventsDir: string;
   private readonly blobsDir: string;
   private _currentShard = 1;
   private _appendCount = 0;
+  private _currentLine = 0;
   private _rotating = false;
   // True once we've confirmed eventsDir exists. _initShardIndex() already
   // mkdirs at construction, but a paranoid append() previously re-created
   // it on every event — that's a stat-class syscall on every WS event.
   // Keep the safety net but skip it after the first successful append.
   private _dirEnsured = false;
-  private _currentLine = 0;
-  /** 本 (sid, agentPath) 已记录的 user_input 条数 —— 轮次序数的来源。
-   *  转录是**同步**的(transcribeKernelTurn),而 readAllEvents() 是 async,
-   *  所以计数必须在这里同步维护;`_initShardIndex` 本来就同步读当前分片全文,
-   *  顺手把它数出来,计数即可跨进程重启存活(不重启也不会从 1 重来)。 */
-  private _userInputCount = 0;
 
   constructor(
-    public readonly sid: string,
-    public readonly agentPath: string,
-    paths: PathManagerAPI,
+    public readonly binding: InstanceEventBinding,
+    resolvedPaths: ResolvedEventStorePaths,
   ) {
-    const layer = paths.session(sid).agent(agentPath);
-    this.eventsDir = layer.eventsDir();
-    this.blobsDir = layer.eventLedgerBlobs();
+    this.eventsDir = resolvedPaths.eventsDir;
+    this.blobsDir = resolvedPaths.blobsDir;
     this._initShardIndex();
+  }
+
+  get agentPath(): string {
+    return this.binding.ownerInstanceId;
   }
 
   // ─── Shard info ─────────────────────────────────────────────────────────
@@ -105,8 +106,9 @@ export class EventLedger {
    *  emitterId 由 EventBus 在 emit 时捕获，原样落盘。
    *  payload 在外置前 deep-clone，确保 in-memory observer 看到的对象不被改写。 */
   append(event: Event, emitterId?: string, history?: LedgerHistoryMeta): LedgerCursor {
-    const eventId = history?.eventId ?? randomUUID();
+    const eventId = history?.eventId ?? event.eventId ?? randomUUID();
     const stored: StoredEvent = {
+      eventId,
       type: event.type,
       ts: event.ts,
       source: event.source,
@@ -114,16 +116,33 @@ export class EventLedger {
       emitterId,
       priority: event.priority,
       handoff: event.handoff,
+      owner: {
+        kind: "agent",
+        instanceId: this.binding.ownerInstanceId,
+        runtimeEpochId: this.binding.runtimeEpochId,
+      },
+      agentInstanceId: this.binding.ownerInstanceId,
+      runtimeEpochId: this.binding.runtimeEpochId,
+      ...(history
+        ? {
+            history: {
+              ...(history.eventId ? { eventId: history.eventId } : {}),
+              ...(history.turnId ? { turnId: history.turnId } : {}),
+              ...(history.origin ? { origin: history.origin } : {}),
+            },
+          }
+        : {}),
       ...(typeof event.seq === "number" ? { seq: event.seq, sgen: event.sgen } : {}),
       payload: event.payload && typeof event.payload === "object"
         ? structuredClone(event.payload as Record<string, unknown>)
         : event.payload,
-      history: {
-        eventId,
-        ...(history?.turnId ? { turnId: history.turnId } : {}),
-        ...(history?.origin ? { origin: history.origin } : {}),
-      },
     };
+    this.appendStored(stored);
+    return { shard: this._currentShard, line: ++this._currentLine, eventId };
+  }
+
+  appendStored(event: StoredEvent): void {
+    const stored = structuredClone(event);
     if (stored.payload && typeof stored.payload === "object") {
       walkAndExternalize(stored.payload, this.blobsDir);
     }
@@ -132,40 +151,12 @@ export class EventLedger {
       this._dirEnsured = true;
     }
     appendFileSync(this._currentShardPath(), JSON.stringify(stored) + "\n", "utf-8");
-    if (event.type === "user_input") this._userInputCount += 1;
-    const cursor = { shard: this._currentShard, line: ++this._currentLine, eventId };
 
     this._appendCount++;
     if (this._appendCount >= SIZE_CHECK_INTERVAL) {
       this._appendCount = 0;
       this._maybeRotate();
     }
-    return cursor;
-  }
-
-  /** 下一轮的序数(= 已记录 user_input 数 + 1)。同步、O(1)。 */
-  nextTurnOrdinal(): number {
-    return this._userInputCount + 1;
-  }
-
-  async readAllWithCursors(): Promise<Array<{ event: StoredEvent; cursor: LedgerCursor }>> {
-    const out: Array<{ event: StoredEvent; cursor: LedgerCursor }> = [];
-    for (const path of this._listShardPaths()) {
-      const shardMatch = /events-(\d+)\.jsonl$/.exec(path);
-      const shard = shardMatch ? Number(shardMatch[1]) : 1;
-      let raw: string;
-      try { raw = await readFile(path, "utf-8"); } catch { continue; }
-      const lines = raw.split("\n").filter(Boolean);
-      const parsed = parseEvents(raw, this.blobsDir);
-      for (let i = 0; i < parsed.length; i++) {
-        const event = parsed[i];
-        const legacyId = `legacy:${shard}:${i + 1}`;
-        const eventId = event.history?.eventId ?? legacyId;
-        out.push({ event, cursor: { shard, line: i + 1, eventId } });
-      }
-      void lines;
-    }
-    return out;
   }
 
   async readAllEvents(): Promise<StoredEvent[]> {
@@ -183,6 +174,32 @@ export class EventLedger {
       all.push(...parseEvents(raw, this.blobsDir));
     }
     return all;
+  }
+
+  async readAllWithCursors(): Promise<Array<{ event: StoredEvent; cursor: LedgerCursor }>> {
+    const out: Array<{ event: StoredEvent; cursor: LedgerCursor }> = [];
+    for (const path of this._listShardPaths()) {
+      const match = /events-(\d+)\.jsonl$/.exec(path);
+      const shard = match ? Number(match[1]) : 1;
+      let raw: string;
+      try {
+        raw = await readFile(path, "utf-8");
+      } catch {
+        continue;
+      }
+      const parsed = parseEvents(raw, this.blobsDir);
+      for (let index = 0; index < parsed.length; index++) {
+        const event = parsed[index];
+        const eventRecord = event as Record<string, unknown>;
+        const eventId = typeof eventRecord.eventId === "string"
+          ? eventRecord.eventId
+          : typeof (eventRecord.history as { eventId?: unknown } | undefined)?.eventId === "string"
+            ? (eventRecord.history as { eventId: string }).eventId
+            : `legacy:${shard}:${index + 1}`;
+        out.push({ event, cursor: { shard, line: index + 1, eventId } });
+      }
+    }
+    return out;
   }
 
   /** 倒序读 shard，直到 isEnough(accumulated) 为 true 或全部读完；用于 summary 边界反扫。 */
@@ -219,28 +236,6 @@ export class EventLedger {
       }
     } catch { /* empty dir */ }
     this._currentShard = max > 0 ? max : 1;
-    try {
-      const raw = readFileSync(this._currentShardPath(), "utf-8");
-      this._currentLine = raw.split("\n").filter(Boolean).length;
-    } catch { this._currentLine = 0; }
-    // 轮序基线:**逐行解析 + 跨全部分片**,两条都是被实测逼出来的。
-    //  ① 子串判据会误加:工具返回体里嵌套 {type:'user_input'} 对象时(agent 回读
-    //     自己的轨迹账本就会产生这种返回,而那正是本项目的目标场景),序列化后
-    //     `"type":"user_input"` 未被转义,`includes` 命中 —— 实测轮序从 [1,2] 变成
-    //     [1,3]。必须比较解析后的 event.type。
-    //  ② 只数当前分片会在 5MB 轮转后把轮序重置回 1,产生重复轮号,离线按轮切分
-    //     直接错乱。构造时读全部分片一次(每个 ledger 实例只发生一次)换取全局单调。
-    this._userInputCount = 0;
-    for (const path of this._listShardPaths()) {
-      let raw: string;
-      try { raw = readFileSync(path, "utf-8"); } catch { continue; }
-      for (const line of raw.split("\n")) {
-        if (!line) continue;
-        try {
-          if ((JSON.parse(line) as { type?: unknown }).type === "user_input") this._userInputCount += 1;
-        } catch { /* 半行/损坏行不计数,宁可少算也不误加 */ }
-      }
-    }
   }
 
   private _maybeRotate(): void {

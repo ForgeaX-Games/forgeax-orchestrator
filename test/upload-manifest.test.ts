@@ -9,6 +9,7 @@ import {
   isBackupDir,
   isExcluded,
   isIncludedRoot,
+  redactSecretsInText,
   scanContentForSecrets,
   scanFilesForSecrets,
   sensitiveEnvLiterals,
@@ -20,6 +21,19 @@ describe("isExcluded predicate", () => {
     expect(isExcluded("games/moo/sessions/abc/events.json")).toBe(false);
     expect(isExcluded("sessions")).toBe(false);
     expect(isExcluded("workbench/layout.json")).toBe(false);
+  });
+  test("feedback drops project content; upload keeps it (PRD §5 不含项目内容)", () => {
+    for (const rel of ["games/untitled-1/src/main.ts", "games/g/.git/config", "ide-source-workspace/packages/x/dist/a.js"]) {
+      expect(isExcluded(rel, { excludeProjectContent: true })).toBe(true);
+      expect(isExcluded(rel, {})).toBe(false);
+    }
+    // The diagnostics PRD §5 asks for must survive the project-content filter.
+    for (const rel of ["logs/console.jsonl", "runtime/stack.log", "state/debug.log", "prefs/ui.json", "ui-events.jsonl", "workbench/a.json", "active-game.json"]) {
+      expect(isExcluded(rel, { includeDiagnosticLogs: true, excludeProjectContent: true })).toBe(false);
+    }
+    // Top-level identities only: a nested directory that happens to be named
+    // `games` is not project content.
+    expect(isExcluded("workbench/games/state.json", { excludeProjectContent: true })).toBe(false);
   });
   test("keeps real game source", () => {
     expect(isExcluded("games/moo/src/main.ts")).toBe(false);
@@ -134,6 +148,43 @@ describe("secret scan (fail-closed)", () => {
   test("detects non-classic GitHub token prefixes (gho_/ghs_)", () => {
     expect(scanContentForSecrets("a", "gho_" + "b".repeat(36), []).length).toBeGreaterThan(0);
     expect(scanContentForSecrets("a", "ghs_" + "c".repeat(36), []).length).toBeGreaterThan(0);
+  });
+  test("redaction is idempotent: its own sentinel is not a secret", () => {
+    // The redact→scan pipeline is fail-closed, so redaction must converge.
+    // [REDACTED] is 10 chars and neither boolean nor numeric, so it used to
+    // satisfy the sensitive-assignment heuristic and a successfully redacted
+    // file still failed the gate it had just been cleaned for.
+    // An env indirection is not a literal secret, so nothing is rewritten.
+    expect(redactSecretsInText("token: process.env.WS_TOKEN", []).value)
+      .toBe("token: process.env.WS_TOKEN");
+    // A real credential is, and that is what must converge.
+    const once = redactSecretsInText(`token: ghp_${"a".repeat(36)}`, []);
+    expect(once.value).toContain("[REDACTED]");
+    expect(scanContentForSecrets("install-server-ws.mjs", once.value, [])).toEqual([]);
+    // Re-running redaction changes nothing.
+    expect(redactSecretsInText(once.value, []).value).toBe(once.value);
+    // Minified bundles glue the sentinel to whatever follows, so the value
+    // capture (which stops only at whitespace, `,`, `;` and `&`) hands the
+    // scanner things like `[REDACTED]+t`. Every trailing character must pass.
+    const keys = ["authorization", "token", "cookie", "credentials", "api_key", "secret"];
+    const trailing = Array.from({ length: 94 }, (_, i) => String.fromCharCode(33 + i)).concat("", " ");
+    for (const key of keys) {
+      for (const separator of ["=", ":"]) {
+        for (const suffix of trailing) {
+          const line = `${key}${separator}[REDACTED]${suffix}x`;
+          expect(scanContentForSecrets("bundle.js", line, [])).toEqual([]);
+        }
+      }
+    }
+    // A credential hidden behind the sentinel is still caught by the
+    // value-shape patterns, so the prefix test does not open a bypass.
+    expect(
+      scanContentForSecrets("a.js", "token=[REDACTED]ghp_" + "d".repeat(36), []).length,
+    ).toBeGreaterThan(0);
+    // A real secret assigned to such a key is still caught.
+    expect(
+      scanContentForSecrets("a.mjs", "token: ghp_" + "a".repeat(36), []).length,
+    ).toBeGreaterThan(0);
   });
   test("detects literal env-secret values", () => {
     const hits = scanContentForSecrets("g/src.ts", "const T = 'super-secret-token-value'", ["super-secret-token-value"]);

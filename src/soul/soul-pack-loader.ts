@@ -32,9 +32,9 @@ import type { AgentRecord, LayeredMemoryRef, SkillRefLite, SoulSource, TrustTier
 
 const OWN_BUILTIN_IDS = new Set(['', 'default', 'root', 'forge']);
 
-/** 真正「无人格」的通用编排者 —— 这些 id 跳过 persona 装配(它们没有 marketplace 人格)。
- *  注意 `forge` **不在**此集:forge 是有人格的主控编排者(persona 在 marketplace manifest,
- *  经 composeSystemPrompt('forge') 兜底解析),但它仍属 OWN_BUILTIN_IDS → trustTier='own'。
+/** 真正「无人格」的通用编排者 —— 这些 id 跳过 persona 装配。
+ *  注意 `forge` **不在**此集:forge 是有人格的主控编排者(persona 在 Brand pack,
+ *  经 composeSystemPrompt('forge') 解析),但它仍属 OWN_BUILTIN_IDS → trustTier='own'。
  *  重构曾把 persona 装配错挂在 OWN_BUILTIN_IDS 上 → 连 forge 的人格一起跳过(主控 Forge
  *  人设整段丢失);拆成两套集合后,forge 恢复人格、信任档不变。 */
 const NO_PERSONA_IDS = new Set(['', 'default', 'root']);
@@ -52,28 +52,66 @@ export function trustForSource(source: SoulSource): TrustTier {
 
 /** 把一个 agentId「重生」成可跑 AgentRecord。 */
 export async function loadAgentRecord(agentId: string, opts: LoadOpts = {}): Promise<AgentRecord> {
+  const native = await loadNativeSoulOverlay(agentId, opts);
+  if (native) return native;
+
+  const memory = layeredMemoryForAgent(agentId, opts);
+  const record = await synthFromLegacy(agentId, memory);
+
+  emitLoadedRecord(record, opts.game);
+  return record;
+}
+
+/** Runtime-template path: resolve only a real native soul-pack.
+ *
+ * A miss deliberately returns null. It must never synthesize extension or
+ * marketplace content because those resources already belong to the resolved
+ * AgentTemplate and would otherwise be injected twice. */
+export async function loadNativeSoulOverlay(
+  agentId: string,
+  opts: LoadOpts = {},
+): Promise<AgentRecord | null> {
   const projectRoot = opts.projectRoot ?? defaultProjectRoot();
-  const memory: LayeredMemoryRef = {
+  const found = findSoulPack(agentId, projectRoot);
+  if (!found) return null;
+  const record = parseSoulPack(
+    agentId,
+    found.dir,
+    found.source,
+    layeredMemoryForAgent(agentId, opts),
+  );
+  emitLoadedRecord(record, opts.game);
+  return record;
+}
+
+/** Stable writable layered-memory binding shared by template and legacy paths. */
+export function layeredMemoryForAgent(
+  agentId: string,
+  opts: LoadOpts = {},
+): LayeredMemoryRef {
+  const projectRoot = opts.projectRoot ?? defaultProjectRoot();
+  return {
     root: soulMemoryRoot(projectRoot, agentId),
     ...(opts.game ? { game: opts.game } : {}),
   };
+}
 
-  const found = findSoulPack(agentId, projectRoot);
-  const record = found
-    ? parseSoulPack(agentId, found.dir, found.source, memory)
-    : await synthFromLegacy(agentId, memory);
-
+function emitLoadedRecord(record: AgentRecord, game?: string): void {
   emitLifeEvent({
     kind: 'soul.loaded',
-    agentId,
+    agentId: record.agentId,
     source: record.source,
     trustTier: record.trustTier,
     at: Date.now(),
   });
-  if (opts.game) {
-    emitLifeEvent({ kind: 'rebirth.projected', agentId, into: opts.game, at: Date.now() });
+  if (game) {
+    emitLifeEvent({
+      kind: 'rebirth.projected',
+      agentId: record.agentId,
+      into: game,
+      at: Date.now(),
+    });
   }
-  return record;
 }
 
 // ─── 原生 soul-pack ─────────────────────────────────────────────────────
@@ -83,11 +121,10 @@ interface FoundPack {
   source: SoulSource;
 }
 
-/** 三来源发现(顺序:user-imported → marketplace → builtin);返回首个命中 + 其来源档。 */
+/** 两来源发现(顺序:user-imported → builtin);返回首个命中 + 其来源档。 */
 export function findSoulPack(agentId: string, projectRoot: string): FoundPack | null {
   const candidates: Array<{ dir: string; source: SoulSource }> = [
     { dir: resolve(projectRoot, '.forgeax/souls-imported', agentId), source: 'user-imported' },
-    ...marketplaceRoots(projectRoot).map((mp) => ({ dir: join(mp, 'souls', agentId), source: 'marketplace' as const })),
     { dir: resolve(assetRoot(), 'souls', agentId), source: 'builtin' as const },
     { dir: resolve(projectRoot, '.forgeax/souls-builtin', agentId), source: 'builtin' as const },
   ];
@@ -341,12 +378,4 @@ function safeRead(abs: string, warnings: string[]): string {
     warnings.push(`unreadable ${abs}: ${(e as Error).message}`);
     return '';
   }
-}
-
-function marketplaceRoots(projectRoot: string): string[] {
-  return [
-    resolve(assetRoot(), 'marketplace'),
-    resolve(projectRoot, 'packages/marketplace'),
-    resolve(projectRoot, 'marketplace'),
-  ].filter((p) => existsSync(p));
 }

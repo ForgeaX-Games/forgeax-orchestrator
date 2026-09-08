@@ -1,30 +1,21 @@
-/** Session —— per-sid 容器：bus / queue / blackboard / tree / ledgers / scheduler 全在内。
+/** Session —— per-sid 容器：bus / blackboard / RuntimeTree / EventStores / Supervisor。
  *
  *  与 agenteam ref 的差异（plan §2.0 / §2.1 / §3.1.1）：
- *  - forgeax 的 sid 对应**一整棵 agent tree**（root + 所有 sub-agent）。一棵树一份
- *    ledger map（per-agent），一份 blackboard、一份 EventBus、一份 Scheduler。
- *  - **Session 不包 start/stop**：调度由 caller 直接 `session.scheduler.start() /
- *    .shutdown()`。`Session.dispose()` 只做容器层资源释放。
- *  - **abort 路径 = Scheduler，不放 Session**：cancel 由 caller 走
- *    `session.scheduler.interruptAgents(agentPath?)` 派给 per-agent `BaseAgent.stop()`
- *    （= `abortController.abort()`），与 agenteam ref `core/scheduler.interruptAgents`
- *    一致。Session 自身不持 AbortController。
+ *  - forgeax 的 sid 对应一棵统一 RuntimeTree；resident/ephemeral 都在其中。
+ *  - Session 不持第二套 start/stop 状态；RuntimeSupervisor 是唯一生命周期入口。
+ *  - abort 解析为 instanceId 后交给 RuntimeController；Session 不持 AbortController。
  *  - **不维护 client attach 计数**：哪个 ws 连着哪个 sid 由外层（WsHub / 单独 status
  *    API）查；Session 不背任何 ref-count，订阅直接 `session.eventBus.observe(handler)`。
  *  - **sandbox 不挂 Session**：由 SandboxManager 按 `defaultDir` 池化共享，first
  *    tool exec 时 lazy acquire，与 Session 解耦。
- *  - **agentFactory** 是 caller（SessionManager）注入的 callback：Scheduler 通过它
- *    为每个 agentPath 构造 ConsciousAgent 实例（包含 ledger / sessionDefaultModels
- *    注入），Session 自己只负责管 ledger map + 资源回收。
+ *  - KernelTurnExecutor 按需构造无生命周期的 RuntimeAgentHost。
  *
  *  字段（plan §2.1）：
- *  - sid / paths / config / blackboard / eventBus / scheduler / tree / ledgers → dispose */
+ *  - sid / paths / config / blackboard / eventBus / tree / stores → dispose */
 
 import { Blackboard } from "./blackboard";
 import { EventBus } from "./event-bus";
 import { LiveTurnTracker } from "./live-turn-tracker";
-import { AgentTree } from "./agent-tree";
-import { Scheduler, type AgentFactory } from "./scheduler";
 import { EventLedger } from "../ledger/event-ledger";
 import { FileActivityLedger } from "../ledger/file-activity-ledger";
 import type { FileLockMap } from "../fs/agent-fs-recorder";
@@ -32,19 +23,56 @@ import { bindSystemEventLog } from "../ledger/system-event-log";
 import { Logger } from "./logger";
 import type { Event, SessionConfig, ModelsConfig } from "./types";
 import type { PathManagerAPI, SessionLayerAPI } from "../fs/types";
-import { createOrGetFSWatcher } from "../fs/watcher";
-import { getPathManager } from "../fs/path-manager";
-import { AgentKitReloadCoordinator } from "../kits/reload-coordinator";
 import { clearRememberedForSession } from "../kernel/tool-approval";
+import { requestToolApproval } from "../kernel/tool-approval";
+import { checkKernelTool } from "../kernel/trust-gate";
+import { loadSettingsPermissionRules } from "../api/lib/permission-settings";
+import { resolveTemplateTrust } from "../agents/agent-template-catalog";
 import { clearUiStateForSession } from "../api/lib/ui-manifest-registry";
 import { runAutoExtract } from "../soul/auto-extract";
 import { tryKernelForkExtract } from "../soul/fork-extract";
 import { resolveKernel } from "../kernel/resolve-kernel";
 import { canonicalToolName } from "../kernel/canonical-tool-name";
+import { isAbsolute, relative, sep } from "node:path";
+import { AgentTemplateCatalog } from "../agents/agent-template-catalog";
+import { ResidentDefinitionStore } from "../agents/resident-definition-store";
+import {
+  registerResidentDefinition,
+  registerResidentDefinitions,
+} from "../agents/resident-template-adapter";
+import { resolveExternalAgentTemplate } from "../agents/loader";
+import { ensureAgentScaffold, isValidAgentName } from "./agent-scaffold";
+import { SessionEventPaths } from "../ledger/session-event-paths";
+import { MemoryTemplateRegistry } from "../runtime/agent-template-locator";
+import { AgentRegistrar } from "../runtime/agent-registrar";
+import { EphemeralAgentSpawner } from "../runtime/ephemeral-agent-spawner";
+import { KernelTurnExecutor } from "../runtime/kernel-turn-executor";
+import { RuntimeAgentTreeAdapter } from "../runtime/runtime-agent-tree-adapter";
+import { RuntimeSupervisor } from "../runtime/runtime-supervisor";
+import { RuntimeTree } from "../runtime/runtime-tree";
+import type { AgentHandle } from "../runtime/agent-handle";
+import type { SpawnEphemeralRequest } from "../runtime/ephemeral-agent-spawner";
+import { existsSync, mkdirSync, realpathSync, rmSync, readFileSync } from "node:fs";
+import { AgentKitReloadCoordinator } from "../kits/reload-coordinator";
+import { createOrGetFSWatcher } from "../fs/watcher";
+import { FileSystemTemplateSource } from "../agents/filesystem-template-source";
+import { MemoryTemplateSource } from "../agents/memory-template-source";
+import type {
+  AgentTemplateDraft,
+  TemplateRef,
+} from "../agents/template-types";
+import { recoverAbandonedEphemeralHistories } from "../ledger/ephemeral-history-recovery";
+import type { RuntimeAgentHost } from "../runtime/runtime-agent-host";
+import type { RuntimeConfigSnapshot } from "../runtime/runtime-config";
+import type { RuntimeToolContext } from "../runtime/runtime-context";
+import { defaultProjectRoot } from "@forgeax/platform-io";
+import { Scheduler } from "./scheduler";
+import { ConsciousAgent } from "./conscious-agent";
+import { AGENT_DEFAULTS } from "../defaults/agent-json";
 import type { ArtifactResolver, ArtifactTurnContext } from "../orchestration-seams";
 import type { ArtifactResolvedPayload, ArtifactSummary } from "@forgeax/types/artifact-summary";
+import { getArtifactResolver } from "../orchestration-seams";
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
 
 /** One pending delegate_to_subagent awaiting the sub-agent's turn-end.
  *  Keyed by sub-agent's `agentPath` (e.g. "suzu"). */
@@ -55,23 +83,83 @@ export interface DelegationInfo {
   brief: string;
   /** ms — used to GC stale entries if turn-end never fires. */
   ts: number;
+  /** Stable identity of the delegated delivery, not merely the target address. */
+  delegationId?: string;
+  /** Runtime identity captured before delivery. */
+  targetInstanceId?: string;
+  targetRuntimeEpochId?: string;
+  /** Source event and expected host turn identity. */
+  sourceEventId?: string;
+  turnId?: string;
+}
+
+/** Thrown by `Session.ensureResidentAgent` so HTTP callers can map
+ *  persona-not-found → 404, duplicate registration → 409, I/O/catalog
+ *  failures → 500 without string-matching error messages. */
+export class AgentMaterializationError extends Error {
+  constructor(
+    message: string,
+    readonly status: 404 | 409 | 500,
+  ) {
+    super(message);
+    this.name = "AgentMaterializationError";
+  }
 }
 
 export interface SessionInitConfig {
   sid: string;
   paths: PathManagerAPI;
   config: SessionConfig;
-  /** Caller 提供的 agent factory —— Scheduler attach 一个新 agentPath 时调它构造
-   *  BaseAgent 实例（注入 ledger / kit / models）。SessionManager 在构造 Session
-   *  时把它包出来，避免 Session 反向依赖 ConsciousAgent。 */
-  agentFactory: AgentFactory;
-  /** Optional: agent 被 `controlAgent("remove", path)` 摘掉后的清理钩子
-   *  （wipe blackboard 命名空间 / dispose ledger）。SessionManager 默认
-   *  包出 `(agentPath) => session.freeAgentState(agentPath)`。 */
-  onAgentFreed?: (agentPath: string) => void | Promise<void>;
-  /** Host-owned final-settle artifact derivation. Optional for standalone
-   * orchestrator consumers; the product shell injects it at app boot. */
   artifactResolver?: ArtifactResolver;
+}
+
+function stableArtifactId(sid: string, turnId: string, checkpointMsgId?: string): string {
+  return createHash("sha256")
+    .update(`${sid}\0${turnId}\0${checkpointMsgId ?? ""}`)
+    .digest("hex");
+}
+
+function askResultHasAnswer(value: unknown): boolean {
+  let source = value;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof source === "string") {
+      const raw = source.trim().replace(/^\[ask_user\]\s*/i, "");
+      try { source = JSON.parse(raw) as unknown; continue; } catch {
+        return /「[^」]+」/.test(raw);
+      }
+    }
+    if (!source || typeof source !== "object" || Array.isArray(source)) return false;
+    const envelope = source as {
+      ok?: unknown;
+      questions?: unknown;
+      text?: unknown;
+      structuredContent?: unknown;
+    };
+    if (envelope.ok === true && Array.isArray(envelope.questions)) break;
+    if (envelope.structuredContent !== null && envelope.structuredContent !== undefined) {
+      source = envelope.structuredContent;
+      continue;
+    }
+    if (typeof envelope.text === "string") {
+      source = envelope.text;
+      continue;
+    }
+    return false;
+  }
+  if (!source || typeof source !== "object" || Array.isArray(source)) return false;
+  const record = source as { ok?: unknown; questions?: unknown };
+  if (record.ok !== true || !Array.isArray(record.questions)) return false;
+  return record.questions.some((question) => {
+    if (!question || typeof question !== "object" || Array.isArray(question)) return false;
+    const values = (question as { values?: unknown }).values;
+    return Array.isArray(values)
+      && values.some((item) => typeof item === "string" && item.trim().length > 0);
+  });
+}
+
+function askToolResultResolved(payload: Record<string, unknown>): boolean {
+  if (typeof payload.error === "string" && payload.error) return false;
+  return askResultHasAnswer(payload.result ?? payload.resultData);
 }
 
 /** Pull plain text out of a `hook:assistantMessage` payload. The assistant
@@ -94,49 +182,6 @@ function extractAssistantText(payload: unknown): string {
   return "";
 }
 
-function stableArtifactId(sid: string, turnId: string, checkpointMsgId?: string): string {
-  return createHash("sha256")
-    .update(`${sid}\0${turnId}\0${checkpointMsgId ?? ""}`)
-    .digest("hex");
-}
-
-function askResultHasAnswer(value: unknown): boolean {
-  let source = value;
-  for (let depth = 0; depth < 4; depth += 1) {
-    if (typeof source === "string") {
-      const raw = source.trim().replace(/^\[ask_user\]\s*/i, "");
-      try { source = JSON.parse(raw) as unknown; continue; } catch {
-        return /「[^」]+」/.test(raw);
-      }
-    }
-    if (!source || typeof source !== "object" || Array.isArray(source)) return false;
-    const envelope = source as { ok?: unknown; questions?: unknown; text?: unknown; structuredContent?: unknown };
-    if (envelope.ok === true && Array.isArray(envelope.questions)) break;
-    if (envelope.structuredContent !== null && envelope.structuredContent !== undefined) {
-      source = envelope.structuredContent;
-      continue;
-    }
-    if (typeof envelope.text === "string") {
-      source = envelope.text;
-      continue;
-    }
-    return false;
-  }
-  if (!source || typeof source !== "object" || Array.isArray(source)) return false;
-  const record = source as { ok?: unknown; questions?: unknown };
-  if (record.ok !== true || !Array.isArray(record.questions)) return false;
-  return record.questions.some((question) => {
-    if (!question || typeof question !== "object" || Array.isArray(question)) return false;
-    const values = (question as { values?: unknown }).values;
-    return Array.isArray(values) && values.some((item) => typeof item === "string" && item.trim().length > 0);
-  });
-}
-
-function askToolResultResolved(payload: Record<string, unknown>): boolean {
-  if (typeof payload.error === "string" && payload.error) return false;
-  return askResultHasAnswer(payload.result ?? payload.resultData);
-}
-
 export class Session {
   readonly sid: string;
   readonly paths: SessionLayerAPI;
@@ -146,19 +191,28 @@ export class Session {
   readonly eventBus: EventBus;
   /** 在途 turn 累积 —— WsHub 给新连接发 turn-snapshot 用(多 tab 同步 §4.3)。 */
   readonly liveTurns: LiveTurnTracker;
-  readonly tree: AgentTree;
+  readonly runtimeTree: RuntimeTree;
+  readonly tree: RuntimeAgentTreeAdapter;
+  readonly templateCatalog: AgentTemplateCatalog;
+  readonly memoryTemplates: MemoryTemplateRegistry;
+  readonly eventPaths: SessionEventPaths;
+  readonly registrar: AgentRegistrar;
+  readonly supervisor: RuntimeSupervisor;
+  /** Legacy lifecycle projection retained for older kit/scaffold consumers;
+   * new runtime work must use supervisor/tree instance APIs. */
   readonly scheduler: Scheduler;
-
-  /** Kit hot-reload dispatcher（B1.11）：
-   *  - fs.watch builtin/user/session 3 共享层 + per-agent 那一层 kits/
-   *  - per-tool-batch poll baseline（ConsciousAgent.refreshTools 默认绑到这里）
-   *  - ScriptAgent src/index.ts 改动 → 走 `scheduler.controlAgent("restart", path)`
-   *
-   *  bun / node fs.watch 在 Linux 上 inotify 路径基本一致，但 bun 对
-   *  `O_TRUNC + write + close` 的 add 事件偶尔会漏；这正是 ref 设计 polling
-   *  fallback 的原因 —— ConsciousAgent 每个 tool batch 之后调一次 flushReloads
-   *  作为可靠路径，fs.watch 只是事件驱动的加速。 */
   readonly kitReloadCoordinator: AgentKitReloadCoordinator;
+
+  /** Compatibility projection for artifact delivery consumers. */
+  artifactProjectRoot(): string {
+    try {
+      const root = this.init.paths.sessionWorkDir(this.sid);
+      if (root && isAbsolute(root)) return root;
+    } catch {
+      // Generic/legacy sessions have no bound project root.
+    }
+    return defaultProjectRoot();
+  }
 
   /** Per-Session logger —— 落到 `<sid>/logs/debug.log` 全量 + `<sid>/logs/latest.log`
    *  INFO+。覆盖：Session plumbing 错误 / EventBus → log 桥 / agent plumbing
@@ -166,12 +220,11 @@ export class Session {
    *  是运维 / 观测真相。 */
   readonly logger: Logger;
 
-  /** Per-agent ledgers —— scheduler 通过 agentFactory 构造 ConsciousAgent 时
-   *  从这里取出 ledger 喂给 ContextWindow。 */
+  /** Address-indexed compatibility ledgers；实例 EventStore 才是持久化 owner。 */
   readonly ledgers = new Map<string, EventLedger>();
 
   /** Per-session **file-activity** ledger —— SSOT for "who touched what".
-   *  Wired into BaseAgent ctor: every wrapped `ctx.fs` mutation appends one
+   *  Wired into RuntimeAgentHost: every wrapped `ctx.fs` mutation appends one
    *  record here (via `wrapAgentFsWithRecorder`). UI / LLM slot / REST all
    *  derive from this one ledger; no agent owns/persists its own file list.
    *  See [[file-activity-tracking]] design notes in the recorder module. */
@@ -200,8 +253,9 @@ export class Session {
    *  back across chat tabs — the root of the "做一点就停/反复说继续" loop. */
   private readonly latestAssistantText = new Map<string, string>();
 
-  /** New turn protocol state. A turn is not considered settled until its
-   * `hook:turnEnd` is observed and any ask_user wait has completed. */
+  /** Host-owned final-settle artifact derivation.  RuntimeTree owns the live
+   * instance lifecycle, while these maps retain only the per-address turn
+   * boundary needed to derive one artifact after the turn is settled. */
   private readonly artifactResolver?: ArtifactResolver;
   private readonly artifactTurns = new Map<string, {
     turnId: string;
@@ -211,23 +265,20 @@ export class Session {
     waitingForInput?: boolean;
   }>();
   private readonly pendingAskCalls = new Set<string>();
-  /** CLI AskUserQuestion calls are answered through the permission side
-   * channel. Their tool result is often a human-readable sentence rather than
-   * the native structured `{ ok, questions }` payload, so keep provenance
-   * beside the pending call instead of guessing from result prose. */
   private readonly permissionAskCalls = new Set<string>();
-  /** Add the active turn id to tool events that predate the payload turnId
-   * field. EventLedger persists it as history metadata for precise attribution. */
   private readonly activeTurnIds = new Map<string, string>();
   private readonly artifactResolutionInFlight = new Map<string, Promise<void>>();
 
   private disposed = false;
+  private readonly residentTemplateRefs = new Set<TemplateRef>();
+  /** Per-agent single-flight for lazy persona materialization. */
+  private readonly residentMaterializations = new Map<string, Promise<string>>();
 
   constructor(private readonly init: SessionInitConfig) {
     this.sid = init.sid;
     this.paths = init.paths.session(init.sid);
     this.config = init.config;
-    this.artifactResolver = init.artifactResolver;
+    this.artifactResolver = init.artifactResolver ?? getArtifactResolver();
 
     this.blackboard = new Blackboard(this.paths.root() + "/blackboard.json");
     this.blackboard.loadFromDisk();
@@ -241,101 +292,178 @@ export class Session {
 
     this.eventBus = new EventBus();
     this.liveTurns = new LiveTurnTracker(this.eventBus);
-    this.tree = new AgentTree(init.sid, init.paths);
-    this.tree.init();
-
-    // 注意构造顺序：scheduler hooks 通过 `this.kitReloadCoordinator` 间接访问，
-    // 闭包延迟解引用 —— 把 coordinator 放在 scheduler **之后**构造也行，因为
-    // scheduler.attachAgent 是 async，第一次 attach 时 coordinator 已就位。
+    this.runtimeTree = new RuntimeTree(this.sid);
+    this.tree = new RuntimeAgentTreeAdapter(this.sid, this.runtimeTree);
+    this.kitReloadCoordinator = new AgentKitReloadCoordinator(
+      this.sid,
+      createOrGetFSWatcher(),
+      init.paths,
+      async (instance, revision, kinds) => {
+        const store = this.supervisor.getEventStore(instance.instanceId);
+        if (!store) return;
+        await store.append(
+          this.registrar.eventFactory.agent(
+            instance,
+            "agent.execution_revision_staged",
+            { revision, kinds: [...kinds] },
+          ),
+          "required",
+        );
+        await store.flush();
+        this.eventBus.publish(
+          {
+            source: "runtime",
+            type: "runtime:template-revision",
+            payload: {
+              sid: this.sid,
+              agentInstanceId: instance.instanceId,
+              runtimeEpochId: instance.runtimeEpochId,
+              templateRef: instance.templateRef,
+              revision,
+              kinds: [...kinds],
+            },
+            ts: Date.now(),
+          },
+          this.tree.addressOf(instance),
+        );
+      },
+    );
+    this.templateCatalog = new AgentTemplateCatalog();
+    this.memoryTemplates = new MemoryTemplateRegistry();
+    this.eventPaths = new SessionEventPaths(
+      this.paths.root(),
+      this.config.runtimeEventsRoot ?? "runtime-events",
+    );
+    let sessionCwd: string | undefined;
+    try {
+      const resolved = init.paths.sessionWorkDir(this.sid);
+      if (resolved && existsSync(resolved)) sessionCwd = resolved;
+    } catch {
+      // Invalid/missing binding falls back to the instance template root.
+    }
+    this.registrar = new AgentRegistrar(
+      this.sid,
+      this.templateCatalog,
+      this.memoryTemplates,
+      this.runtimeTree,
+      this.eventPaths,
+      (instance, eventStore) => new KernelTurnExecutor(
+        instance,
+        eventStore,
+        {
+          eventBus: this.eventBus,
+          blackboard: this.blackboard,
+          tree: this.tree,
+          ...(sessionCwd ? { sessionCwd } : {}),
+          sessionDefaultModels: this.config.defaultModels,
+          fileRecorder: {
+            ledger: this.fileActivity,
+            locks: this.fileLocks,
+            emit: (record, kind) => {
+              this.eventBus.publish(
+                {
+                  source: `agent:${record.agentPath}`,
+                  type: `file-activity:${kind}` as const,
+                  payload: record as unknown as Record<string, unknown>,
+                  ts: record.ts,
+                },
+                record.agentPath,
+              );
+            },
+          },
+          onAgentReady: (agent) =>
+            this.kitReloadCoordinator.registerAgent(instance, agent),
+          onAgentDisposed: () =>
+            this.kitReloadCoordinator.unregisterAgent(instance.instanceId),
+          authorizeTool: (toolName, args) =>
+            this.authorizeRuntimeTool(instance, toolName, args),
+          flushExecutionReloads: () =>
+            this.kitReloadCoordinator.flushReloads().then(() => undefined),
+          runtimeToolContext: this.runtimeToolContextFor(instance),
+        },
+      ),
+    );
+    const spawner = new EphemeralAgentSpawner(
+      this.templateCatalog,
+      this.memoryTemplates,
+      this.registrar,
+      sessionCwd ?? this.paths.root(),
+    );
+    this.supervisor = new RuntimeSupervisor({
+      sid: this.sid,
+      workspaceRoot: sessionCwd ?? this.paths.root(),
+      tree: this.runtimeTree,
+      registrar: this.registrar,
+      spawner,
+      memoryTemplates: this.memoryTemplates,
+      removeRuntimeState: (instanceId) =>
+        this.eventPaths.removeRuntimeState(instanceId),
+    });
     this.scheduler = new Scheduler({
       sid: this.sid,
       eventBus: this.eventBus,
       tree: this.tree,
-      agentFactory: init.agentFactory,
-      logger: this.logger,
-      onAgentFreed: init.onAgentFreed ?? ((agentPath) => this.freeAgentState(agentPath)),
-      onAgentAttached: (agent) => this.kitReloadCoordinator?.registerAgent(agent),
-      onAgentDetached: (agentPath) => {
-        this.kitReloadCoordinator?.unregisterAgent(agentPath);
-        // A detached agent may never emit a tool result. Drop its Ask wait
-        // keys and any in-memory artifact turn that cannot receive a final
-        // lifecycle event; otherwise a later agent with the same path can be
-        // held in waiting_for_input forever.
+      agentFactory: async (agentPath) => {
+        const layer = this.paths.agent(agentPath);
+        const runtimeInstance = this.tree.resolve(agentPath);
+        let agentJson = AGENT_DEFAULTS;
+        try {
+          agentJson = {
+            ...AGENT_DEFAULTS,
+            ...(JSON.parse(readFileSync(layer.agentJson(), "utf8")) as Record<string, unknown>),
+          } as typeof AGENT_DEFAULTS;
+        } catch {
+          // Legacy callers are allowed to attach a scaffold with no valid JSON.
+        }
+        return new ConsciousAgent({
+          agentPath,
+          agentDir: layer.root(),
+          agentJson,
+          eventBus: this.eventBus,
+          blackboard: this.blackboard,
+          tree: this.tree,
+          sid: this.sid,
+          ledger: this.getOrCreateLedger(agentPath),
+          sessionDefaultModels: this.config.defaultModels,
+          ...(runtimeInstance
+            ? {
+                runtime: this.runtimeToolContextFor(runtimeInstance),
+                runtimeStateRoot: runtimeInstance.runtime.runtimeStateRoot,
+              }
+            : {}),
+        });
+      },
+      onAgentDetached: async (agentPath) => {
+        this.finishDelegationsForTarget(agentPath);
         for (const key of this.pendingAskCalls) {
           if (key.startsWith(`${agentPath}:`)) this.pendingAskCalls.delete(key);
         }
         for (const key of this.permissionAskCalls) {
           if (key.startsWith(`${agentPath}:`)) this.permissionAskCalls.delete(key);
         }
-        if (!this.liveTurns.has(agentPath)) {
+        if (!this.liveTurns.snapshots().some((turn) => turn.emitterId === agentPath)) {
           this.artifactTurns.delete(agentPath);
           this.activeTurnIds.delete(agentPath);
         }
-        // Target of a pending delegation is going away (shutdown/restart/remove/
-        // crash) — `hook:turnEnd` will never fire for it, so without this the
-        // `delegations` entry leaks forever and permanently blocks future
-        // delegations to this path via `delegationGuard`'s target-busy check.
-        this._resolveDelegation(agentPath, { aborted: true });
-        // Same "hook:turnEnd will never fire" gap also strands the TARGET's own
-        // UI: the front-end's cancel button / "thinking" indicator only clear on
-        // `hook:turnEnd` (session-stream.ts's `setStreaming(sid, emitter, false)`),
-        // so a sub-agent that's forcibly terminated mid-turn stays visually
-        // "running" forever even though its delegator was already notified.
-        // Synthesize the same shape `ledger-recovery.ts` uses for unsealed turns
-        // (`aborted: true, synthesized: true`) and `publish` (not `emit`) it so
-        // `_bindLedgerPersistence` seals the ledger and the WS hub relays it to
-        // every tab watching this agentPath — no queue routing needed, this is a
-        // status broadcast, not a message. Gated on `liveTurns.has()` so we never
-        // double-fire if the real turnEnd already made it out.
-        if (this.liveTurns.has(agentPath)) {
+        if (this.liveTurns.snapshots().some((turn) => turn.emitterId === agentPath)) {
           this.eventBus.publish(
             {
               source: `agent:${agentPath}`,
               type: "hook:turnEnd",
-              payload: {
-                aborted: true,
-                error: "agent detached before its turn ended",
-                synthesized: true,
-              },
+              payload: { aborted: true, synthesized: true },
               ts: Date.now(),
             },
             agentPath,
           );
         }
       },
+      onAgentFreed: (agentPath) => this.freeAgentState(agentPath),
     });
-
-    this.kitReloadCoordinator = new AgentKitReloadCoordinator(
-      this.sid,
-      createOrGetFSWatcher(),
-      init.paths,
-      () => this.tree.list().map((n) => n.path),
-      async (agentPath) => {
-        // scheduler.controlAgent("restart") 拿 lifecycleLock，确保和正在 run
-        // 的 turn 串行。返回值字符串无所谓——只要它真跑完算 handled，让
-        // coordinator 推进 src baseline。busy 时 lifecycleLock 会让它排队等
-        // 而不是立刻返回 false，所以这里返回 true 即可。
-        try {
-          await this.scheduler.controlAgent("restart", agentPath);
-          return true;
-        } catch (err: any) {
-          this.logger.error(agentPath, undefined, `scriptSrcChanged restart failed: ${err?.message ?? err}`);
-          return false;
-        }
-      },
-    );
-    // **不**主动 startWatching —— coordinator 自己在第一次 registerAgent
-    // 时 lazy-boot 共享层 fs.watch（参考 ref：scheduler.start() 才起）。
-    // 这样纯 container session（不 attachAgent 的 bus/scaffold/LRU 用例）
-    // 不占任何 inotify slot，避免 bun 上 slot 累积引起的 fs 事件派发劣化。
-
     // 三条独立 observer：
     //   1) per-agent ledger persistence（对齐 ref `_bindEventBus`）—— 把跟某 agent
     //      关联的事件落到该 agent 的 events.jsonl。
-    //   2) `agent_command` routing（对齐 ref `attachSchedulerListeners`）—— UI / CLI
-    //      / 其他 agent 在总线上发 `{type:"agent_command", to:agentPath, payload:
-    //      {toolName, args}}` 时，桥到目标 ConsciousAgent.queueCommand，让对方在
-    //      下一 turn 把它合成 user-issued tool_call 进 LLM 历史。
+    //   2) `agent_command` routing —— UI / CLI 发到明确 RuntimeTree 节点，
+    //      observer 只负责转交给该实例唯一的 RuntimeController。
     //   3) per-session "headless" event log（对齐 ref `system-event-log`）——
     //      没 owner、没 to 的事件（agent_added/removed、default_dir_changed、
     //      partial_boundary、compact_boundary 等）落到 `<sid>/global-events.jsonl`。
@@ -344,41 +472,455 @@ export class Session {
       this._bindLedgerPersistence(),
       this._bindArtifactResolution(),
       this._bindAgentCommandRouting(),
+      this._bindRuntimeTreeEvents(),
       this._bindDelegationCallback(),
       this._bindAutoExtract(),
-      bindSystemEventLog(this.paths.globalEventsLog(), this.eventBus),
+      bindSystemEventLog(this.eventPaths.globalFile(), this.eventBus),
       () => this.liveTurns.dispose(),
     ];
-    // Reopen/restart recovery is best-effort and never blocks Session
-    // construction. The same resolver + append-before-broadcast path is used
-    // for repaired terminal events, so a crash between turn-end and artifact
-    // WAL append cannot permanently lose the card.
     queueMicrotask(() => { void this._reconcileArtifactTurns(); });
   }
 
-  /** Explicit settle hook for kernel paths that transcribe their WAL directly
-   * instead of publishing the lifecycle events through this EventBus (the CLI
-   * kernel path is one such caller). */
   async resolveArtifactTurn(context: ArtifactTurnContext): Promise<void> {
     await this._resolveArtifact(context);
   }
 
-  /** Project root used for attribution of relative tool paths. In Studio the
-   * session is nested under the bound game, so the session state directory is
-   * deliberately not used as the execution root. */
-  artifactProjectRoot(): string {
-    try {
-      if (this.config.defaultDir) {
-        // Tool hooks may report project-root-relative paths such as
-        // `.forgeax/games/<slug>/src/file.ts`, while SnapshotStore diffs are
-        // game-relative.  The project root is the directory containing the
-        // `.forgeax/games` tree, not the bound game directory itself.
-        return resolve(getPathManager().user().gamesDir(), "..", "..");
-      }
-    } catch {
-      /* Fall back to the generic session root for standalone consumers. */
+  /** One-shot resident bootstrap. Files prove identity; RuntimeTree proves life. */
+  async initializeRuntime(): Promise<void> {
+    mkdirSync(this.paths.agentsDir(), { recursive: true });
+    await recoverAbandonedEphemeralHistories(this.sid, this.paths.root());
+    await this._bootstrapResidentDefinitions();
+    // RuntimeTree and the address-indexed ledgers are populated by the
+    // bootstrap above.  Reconcile here as well as on construction so a
+    // reopen cannot miss terminal events that were already on disk before the
+    // asynchronous Session construction completed.
+    await this._reconcileArtifactTurns();
+  }
+
+  async reloadRuntime(): Promise<void> {
+    await this.supervisor.resetResidentsForReload();
+    for (const templateRef of this.residentTemplateRefs) {
+      this.templateCatalog.unregister(templateRef);
     }
-    return this.paths.root();
+    this.residentTemplateRefs.clear();
+    this.ledgers.clear();
+    await this._bootstrapResidentDefinitions();
+  }
+
+  private async _bootstrapResidentDefinitions(): Promise<void> {
+    const definitions = ResidentDefinitionStore.scan(
+      this.sid,
+      this.paths.agentsDir(),
+    );
+    const prepared = await registerResidentDefinitions(
+      this.templateCatalog,
+      definitions,
+    );
+    for (const resident of prepared) {
+      this.residentTemplateRefs.add(resident.templateRef);
+    }
+    const residents = await this.supervisor.bootstrapResidents(prepared);
+    this.eventBus.publish({
+      source: "runtime",
+      type: "runtime:tree-reloaded",
+      payload: {
+        sid: this.sid,
+        residentCount: residents.length,
+        instanceIds: residents.map((instance) => instance.instanceId),
+      },
+      ts: Date.now(),
+    });
+  }
+
+  spawnEphemeral(request: SpawnEphemeralRequest): Promise<AgentHandle> {
+    return this.supervisor.spawnEphemeral(request);
+  }
+
+  /** Build the one instance-bound lifecycle authority shared by RuntimeAgentHost
+   * and the legacy Scheduler compatibility projection. The latter may expose a
+   * BaseAgent context to older kits, but it must still delegate creation and
+   * delivery through RuntimeSupervisor rather than owning a second topology. */
+  private runtimeToolContextFor(
+    instance: import("../runtime/types").AgentInstance,
+  ): RuntimeToolContext {
+    return {
+      sid: instance.sid,
+      instanceId: instance.instanceId,
+      runtimeEpochId: instance.runtimeEpochId,
+      templateRef: instance.templateRef,
+      workspaceRoot: instance.runtime.workspaceRoot,
+      createChild: async (templateRef) => {
+        const handle = await this.spawnEphemeral({
+          parentInstanceId: instance.instanceId,
+          templateRef,
+        });
+        return { instanceId: handle.instanceId };
+      },
+      sendToAgent: async (agentAddress, input) => {
+        const target = this.tree.resolve(agentAddress);
+        if (!target) {
+          throw new Error(`runtime agent not found: ${agentAddress}`);
+        }
+        const targetAddress = this.tree.addressOf(target);
+        const event = isRuntimeEvent(input)
+          ? { ...input, to: targetAddress }
+          : {
+              source: `agent:${this.tree.addressOf(instance)}`,
+              type: "user_input",
+              payload: {
+                content:
+                  typeof input === "string"
+                    ? input
+                    : JSON.stringify(input ?? ""),
+              },
+              to: targetAddress,
+              handoff: "turn" as const,
+              ts: Date.now(),
+            };
+        // acceptTurn is the synchronous delivery receipt. Completion remains
+        // host-owned so a tool does not wait for the target's full turn.
+        const completion = this.supervisor.acceptTurn(target.instanceId, event);
+        this.eventBus.publish(event, this.tree.addressOf(instance));
+        void completion.catch((error) => {
+          this.logger.error(
+            targetAddress,
+            undefined,
+            `runtime target turn failed after accepted delivery: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+      },
+      listChildren: () =>
+        this.runtimeTree.childrenOf(instance.instanceId).map((child) => ({
+          instanceId: child.instanceId,
+          templateRef: child.templateRef,
+          lifetime: child.lifetime,
+          state: child.state,
+        })),
+      listTemplates: () =>
+        this.templateCatalog.list().map((entry) => ({
+          templateRef: entry.templateRef,
+          entryId: entry.entryId,
+        })),
+      ensureResident: (agentId, options) => this.ensureResidentAgent(agentId, options),
+    };
+  }
+
+  /** Authorize a command injected by the control plane before RuntimeAgentHost
+   * emits a tool-call or invokes any ToolDefinition. The live instance's
+   * catalog registration is the trust authority; visibility is checked by the
+   * host against the same per-instance ToolRegistry immediately before this
+   * callback. */
+  private async authorizeRuntimeTool(
+    instance: import("../runtime/types").AgentInstance,
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<void> {
+    const trustTier = resolveTemplateTrust(
+      this.templateCatalog,
+      instance.templateRef,
+    );
+    const projectRoot = defaultProjectRoot();
+    const decision = checkKernelTool(trustTier, toolName, {
+      args,
+      projectRoot,
+      activeGame: this.config.defaultDir,
+      sid: this.sid,
+      rules: loadSettingsPermissionRules(projectRoot),
+    });
+    if (decision.outcome === "deny") {
+      throw new Error(decision.reason ?? `agent command denied: ${toolName}`);
+    }
+    if (decision.outcome === "ask") {
+      const approved = await requestToolApproval({
+        eventBus: this.eventBus,
+        sid: this.sid,
+        agent: this.tree.addressOf(instance),
+        toolName,
+        ...(decision.capability ? { capability: decision.capability } : {}),
+        args,
+        ...(decision.reason ? { reason: decision.reason } : {}),
+      });
+      if (!approved) {
+        throw new Error(`denied by user: ${toolName}`);
+      }
+    }
+  }
+
+  /** Lazily materialize a top-level marketplace/extension persona as a
+   *  resident Agent the first time it's addressed (`to: '<id>'` on
+   *  `POST /messages`) and it isn't in the tree yet — restores the pre-runtime
+   *  `ensurePersonaScaffold` UX (Studio's persona avatars are populated from
+   *  `/api/agents`, decoupled from this session's live tree, so a
+   *  never-messaged persona has no `agents/<id>/` directory yet). Idempotent:
+   *  an id already in the tree returns its address untouched. Simple-name ids
+   *  only; nested resident paths / fullIds are the caller's job to gate out
+   *  (mirrors the old scaffold's contract). */
+  async ensureResidentAgent(
+    agentId: string,
+    options: import("../runtime/runtime-context").EnsureResidentOptions = {},
+  ): Promise<string> {
+    const existing = this.tree.get(agentId);
+    if (existing) return existing.path;
+    if (!isValidAgentName(agentId)) {
+      throw new AgentMaterializationError(`agent path not found: ${agentId}`, 404);
+    }
+    const inflight = this.residentMaterializations.get(agentId);
+    if (inflight) return inflight;
+    const promise = this._materializeResidentAgent(agentId, options).finally(() => {
+      this.residentMaterializations.delete(agentId);
+    });
+    this.residentMaterializations.set(agentId, promise);
+    return promise;
+  }
+
+  private async _materializeResidentAgent(
+    agentId: string,
+    options: import("../runtime/runtime-context").EnsureResidentOptions,
+  ): Promise<string> {
+    // Re-check once inside the single-flight slot: a sibling call that started
+    // just before this one may have already landed the instance in the tree.
+    const landed = this.tree.get(agentId);
+    if (landed) return landed.path;
+
+    const persona = await resolveExternalAgentTemplate(agentId);
+    if (!persona) {
+      throw new AgentMaterializationError(
+        `persona '${agentId}' 未找到 —— 不在 marketplace 或 plugin 列表里。` +
+          `请确认 plugin 已安装、id 拼写正确，或换一个已知 agent。`,
+        404,
+      );
+    }
+
+    try {
+      await ensureAgentScaffold(this.sid, agentId, {
+        overrides: {
+          trustTier: persona.trustTier,
+          personaFile: persona.personaPath,
+          ...(options.model
+            ? { models: { model: Array.isArray(options.model) ? [...options.model] : [options.model] } }
+            : {}),
+          ...(persona.memoryDir ? { memoryDir: persona.memoryDir } : {}),
+          skillSources: persona.skillSources,
+          ...(persona.tools && persona.tools.length > 0
+            ? { kits: { config: { "host-tools": { allow: persona.tools } } } }
+            : {}),
+        },
+      });
+    } catch (error) {
+      throw new AgentMaterializationError(
+        `failed to scaffold resident '${agentId}': ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        500,
+      );
+    }
+
+    const definitions = ResidentDefinitionStore.scan(this.sid, this.paths.agentsDir());
+    const definition = definitions.get(agentId);
+    if (!definition) {
+      throw new AgentMaterializationError(
+        `resident scaffold for '${agentId}' did not materialize on disk`,
+        500,
+      );
+    }
+
+    try {
+      const prepared = await registerResidentDefinition(this.templateCatalog, this.sid, definition);
+      this.residentTemplateRefs.add(prepared.templateRef);
+      const instance = await this.supervisor.registerResident(prepared, null);
+      const address = this.tree.addressOf(instance);
+      const store = this.supervisor.getEventStore(instance.instanceId);
+      if (store) this.ledgers.set(address, store.ledger);
+      return address;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new AgentMaterializationError(
+        `failed to register resident '${agentId}': ${message}`,
+        /duplicate/i.test(message) ? 409 : 500,
+      );
+    }
+  }
+
+  registerFileSystemTemplate(options: {
+    readonly root: string;
+    readonly entryId: string;
+    readonly sourceId?: string;
+  }): TemplateRef {
+    const source = new FileSystemTemplateSource({
+      sourceId: options.sourceId ?? `registered-path:${realpathSync(options.root)}`,
+      root: options.root,
+    });
+    return this.templateCatalog.register({
+      entryId: options.entryId,
+      source,
+      scope: { kind: "session", sid: this.sid },
+      registrationLifetime: "session",
+      trust: "own",
+      provenance: { adapter: "runtime-control-plane" },
+      revisionPolicy: { kind: "explicit" },
+    });
+  }
+
+  registerMemoryTemplate(options: {
+    readonly sourceId: string;
+    readonly entryId: string;
+    readonly template: AgentTemplateDraft;
+  }): TemplateRef {
+    const source = new MemoryTemplateSource({
+      sourceId: options.sourceId,
+      templates: { [options.entryId]: options.template },
+    });
+    return this.templateCatalog.register({
+      entryId: options.entryId,
+      source,
+      scope: { kind: "session", sid: this.sid },
+      registrationLifetime: "session",
+      trust: "own",
+      provenance: { adapter: "runtime-control-plane" },
+      revisionPolicy: { kind: "explicit" },
+    });
+  }
+
+  async deleteResident(logicalPath: string): Promise<
+    | {
+        readonly ok: true;
+        readonly memoryRemoved: true;
+        readonly removedInstanceIds: readonly string[];
+      }
+    | {
+        readonly ok: false;
+        readonly phase: "filesystem";
+        readonly memoryRemoved: true;
+        readonly residualPath: string;
+        readonly error: string;
+      }
+  > {
+    const instance = this.runtimeTree.findResident(logicalPath);
+    if (!instance) throw new Error(`resident agent not found: ${logicalPath}`);
+    const configRoot = instance.template.resources.templateRoot;
+    if (!configRoot) {
+      throw new Error(`resident template root missing: ${logicalPath}`);
+    }
+    const agentsRoot = realpathSync(this.paths.agentsDir());
+    const residentRoot = realpathSync(configRoot);
+    const containment = relative(agentsRoot, residentRoot);
+    if (
+      !containment ||
+      containment === ".." ||
+      containment.startsWith(`..${sep}`) ||
+      isAbsolute(containment)
+    ) {
+      throw new Error(`resident config root is outside Session agents/: ${residentRoot}`);
+    }
+
+    const removed = await this.supervisor.removeResidentSubtree(instance.instanceId);
+    for (const item of removed) {
+      const address = this.tree.addressOf(item);
+      this.blackboard.removeAll(address);
+      this.ledgers.delete(address);
+      this.templateCatalog.unregister(item.templateRef);
+      this.residentTemplateRefs.delete(item.templateRef);
+    }
+    try {
+      rmSync(residentRoot, { recursive: true });
+      return {
+        ok: true,
+        memoryRemoved: true,
+        removedInstanceIds: Object.freeze(
+          removed.map((item) => item.instanceId),
+        ),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        phase: "filesystem",
+        memoryRemoved: true,
+        residualPath: residentRoot,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  enqueueAgent(agentPath: string, input: unknown): Promise<import("../runtime/agent-runtime-controller").AgentTurnResult> {
+    const instance = this.tree.resolve(agentPath);
+    if (!instance) return Promise.reject(new Error(`runtime agent not found: ${agentPath}`));
+    return this.supervisor.enqueue(instance.instanceId, input);
+  }
+
+  /** Lazily materialize the Kit/AgentContext host; this creates no lifecycle. */
+  async initializeAgentHost(
+    agentAddress: string,
+  ): Promise<RuntimeAgentHost> {
+    const instance = this.tree.resolve(agentAddress);
+    if (!instance) {
+      throw new Error(`runtime agent not found: ${agentAddress}`);
+    }
+    const executor = this.supervisor
+      .getController(instance.instanceId)
+      ?.turnExecutor;
+    if (!(executor instanceof KernelTurnExecutor)) {
+      throw new Error(`runtime Agent has no KernelTurnExecutor: ${agentAddress}`);
+    }
+    return executor.initialize();
+  }
+
+  getAgentHost(agentAddress: string): RuntimeAgentHost | null {
+    const instance = this.tree.resolve(agentAddress);
+    if (!instance) return null;
+    const executor = this.supervisor
+      .getController(instance.instanceId)
+      ?.turnExecutor;
+    return executor instanceof KernelTurnExecutor
+      ? executor.compatibilityAgent
+      : null;
+  }
+
+  interruptRuntime(agentAddress?: string, reason = "turn interrupted"): void {
+    if (agentAddress) {
+      const instance = this.tree.resolve(agentAddress);
+      if (instance) this.supervisor.interruptTurn(instance.instanceId, reason);
+      return;
+    }
+    for (const instance of this.runtimeTree.list()) {
+      this.supervisor.interruptTurn(instance.instanceId, reason);
+    }
+  }
+
+  async stageRuntimeConfig(
+    instanceId: string,
+    snapshot: RuntimeConfigSnapshot,
+  ): Promise<void> {
+    const instance = this.runtimeTree.get(instanceId);
+    if (!instance) throw new Error(`runtime agent not found: ${instanceId}`);
+    const store = this.supervisor.getEventStore(instanceId);
+    if (!store) throw new Error(`runtime EventStore not found: ${instanceId}`);
+    await store.append(
+      this.registrar.eventFactory.agent(
+        instance,
+        "agent.runtime_config_staged",
+        { revision: snapshot.revision },
+      ),
+      "required",
+    );
+    await store.flush();
+    instance.runtimeConfig.stage(snapshot);
+    this.eventBus.publish(
+      {
+        source: "runtime",
+        type: "runtime:config-revision",
+        payload: {
+          sid: this.sid,
+          agentInstanceId: instance.instanceId,
+          runtimeEpochId: instance.runtimeEpochId,
+          templateRef: instance.templateRef,
+          revision: snapshot.revision,
+        },
+        ts: Date.now(),
+      },
+      this.tree.addressOf(instance),
+    );
   }
 
   // ─── turn-end → 自动沉淀(USER.md + 分层记忆)──────────────────────────────
@@ -389,19 +931,31 @@ export class Session {
   private _bindAutoExtract(): () => void {
     return this.eventBus.observe((event, emitterId) => {
       if (event.type !== "hook:turnEnd" || !emitterId) return;
-      const payload = (event.payload ?? {}) as { aborted?: boolean };
+      const payload = (event.payload ?? {}) as {
+        aborted?: boolean;
+        providerId?: string;
+      };
       if (payload.aborted) return;
-      if (!this.tree.get(emitterId)) return; // 仅树内 agent
-      // stable-identity gate(对齐 cc 主-agent-only):只**顶层 persona**(有稳定 soul 身份)长记忆;
-      //   临时 subagent(路径含 `/agents/`)跳过 → 不产孤儿 soul(抽了也读不回,白烧 token)。
-      if (emitterId.includes("/agents/")) return;
-      const agent = this.scheduler.getAgent(emitterId) as unknown as {
+      // stable-identity gate(对齐 cc 主-agent-only):只**顶层 resident persona**
+      // 长记忆。旧门闩查 emitterId 是否含 `/agents/`——那是旧 AgentTree 的物理相对
+      // 路径(`iori/agents/suzu`);RuntimeTree 改成逻辑路径(`iori/suzu`)后该字符串
+      // 永远匹配不到。改查 lifetime + parentInstanceId。
+      const instance = this.tree.resolve(emitterId);
+      if (!instance) return;
+      if (instance.lifetime === "ephemeral") return;
+      if (instance.parentInstanceId !== null) return;
+      const agent = this.getAgentHost(emitterId) as unknown as {
         agentContext?: { resolveModels?: () => ModelsConfig };
       } | null;
       const resolveModels = agent?.agentContext?.resolveModels;
-      if (typeof resolveModels !== "function") return; // ScriptAgent / 无模型 → 跳过
+      if (typeof resolveModels !== "function") return; // 无模型能力 → 跳过
       let kernelId: string | undefined;
-      try { kernelId = resolveKernel(emitterId).id; } catch { /* 无内核 → 按默认 gate */ }
+      try {
+        kernelId = resolveKernel(
+          emitterId,
+          payload.providerId ?? instance.template.definition.kernelId,
+        ).id;
+      } catch { /* 无内核 → 按默认 gate */ }
       void runAutoExtract(
         {
           sid: this.sid,
@@ -411,7 +965,15 @@ export class Session {
           ...(kernelId ? { kernelId } : {}),
         },
         // cache-warm 优先:内核支持 forkExtract → 复用上一轮缓存前缀抽取;否则冷兜底。
-        { tryFork: () => tryKernelForkExtract({ sid: this.sid, agentPath: emitterId }) },
+        {
+          tryFork: () =>
+            tryKernelForkExtract({
+              sid: this.sid,
+              agentPath: emitterId,
+              instanceId: instance.instanceId,
+              ...(kernelId ? { kernelId } : {}),
+            }),
+        },
       ).catch((err) => {
         const msg = err instanceof Error ? err.message : String(err);
         this.logger.error(emitterId, undefined, `auto-extract: ${msg}`);
@@ -432,6 +994,20 @@ export class Session {
     return this.eventBus.observe((event, emitterId) => {
       if (!emitterId) return;
 
+      if (event.type === "runtime:instance-removed") {
+        const removedId = (event.payload as { agentInstanceId?: unknown } | undefined)
+          ?.agentInstanceId;
+        if (typeof removedId !== "string") return;
+        for (const [key, info] of this.delegations) {
+          if (info.targetInstanceId !== removedId) continue;
+          this.finishDelegation(key, info, {
+            aborted: true,
+            error: "delegated runtime instance was removed",
+          });
+        }
+        return;
+      }
+
       // Capture every agent's latest assistant text so a completion callback
       // can relay the teammate's actual output (not just "done"). Cheap string
       // write per turn; kept for all agents since `delegations` membership can
@@ -443,74 +1019,131 @@ export class Session {
       }
 
       if (event.type !== "hook:turnEnd") return;
-      const payload = (event.payload ?? {}) as { aborted?: boolean; error?: string; stopReason?: string };
-      this._resolveDelegation(emitterId, { aborted: payload.aborted, error: payload.error });
+      const info = this.delegations.get(emitterId);
+      if (!info) return;
+      const payload = (event.payload ?? {}) as {
+        aborted?: boolean;
+        error?: string;
+        stopReason?: string;
+        delegationId?: string;
+        sourceEventId?: string;
+        turnId?: string;
+        agentInstanceId?: string;
+        runtimeEpochId?: string;
+      };
+      // A completion belongs to one accepted delegated delivery, not to an
+      // address or to the first turn-end from that address. All identity
+      // components are required; missing or stale fields are a no-op.
+      if (
+        !info.delegationId ||
+        !info.sourceEventId ||
+        !info.turnId ||
+        !info.targetInstanceId ||
+        !info.targetRuntimeEpochId ||
+        payload.delegationId !== info.delegationId ||
+        payload.sourceEventId !== info.sourceEventId ||
+        payload.turnId !== info.turnId ||
+        payload.agentInstanceId !== info.targetInstanceId ||
+        payload.runtimeEpochId !== info.targetRuntimeEpochId
+      ) return;
+      this.delegations.delete(emitterId);
+      const status = payload.aborted ? "取消" : payload.error ? "失败" : "完成";
+      const detail = payload.error ? `（错误：${String(payload.error).slice(0, 120)}）` : "";
+      // Relay the teammate's actual final output so the delegator can act on it
+      // directly (e.g. apply tsumugi's verify report) instead of stalling to
+      // ask the user to paste it back. Trim to keep the delegator's context
+      // bounded; the full transcript still lives in the teammate's ledger.
+      const result = payload.aborted ? "" : (this.latestAssistantText.get(emitterId) ?? "");
+      this.latestAssistantText.delete(emitterId);
+      const MAX = 8000;
+      const resultBlock = result
+        ? `\n\n--- ${emitterId} 的产出 ---\n${result.length > MAX ? result.slice(0, MAX) + "\n…（已截断，完整内容见该 agent 的对话）" : result}`
+        : "";
+      const callback: import("./types").Event = {
+          source: "agent",
+          type: "message",
+          payload: {
+            content: `✓ ${emitterId} ${status}了你交办的任务${detail}：${info.brief}${resultBlock}`,
+            fromAgent: emitterId,
+          },
+          to: info.delegator,
+          handoff: "turn",
+          durability: "required",
+          ts: Date.now(),
+      };
+      this.eventBus.publish(callback, emitterId);
+      const delegator = this.tree.resolve(info.delegator);
+      if (!delegator) return;
+      void this.supervisor.enqueue(delegator.instanceId, callback).catch((error) => {
+        this.logger.error(
+          info.delegator,
+          undefined,
+          `delegation callback enqueue failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
     });
   }
 
-  /** Resolve (and remove) a pending delegation targeting `targetAgentPath`,
-   *  relaying a completion/abort message back to the delegator. Two call
-   *  sites: `_bindDelegationCallback`'s `hook:turnEnd` observer (normal
-   *  completion) and the Scheduler's `onAgentDetached` hook (target shut
-   *  down / restarted / removed / crashed while a delegation was still
-   *  pending for it). Without the second call site `hook:turnEnd` never
-   *  fires for a target that's gone, so the `delegations` entry leaks
-   *  forever and permanently blocks future delegations to that path via
-   *  `delegationGuard`'s target-busy check. */
-  private _resolveDelegation(
-    targetAgentPath: string,
-    outcome: { aborted?: boolean; error?: unknown },
+  private finishDelegation(
+    key: string,
+    info: DelegationInfo,
+    outcome: { aborted?: boolean; error?: string },
   ): void {
-    const info = this.delegations.get(targetAgentPath);
-    if (!info) return;
-    this.delegations.delete(targetAgentPath);
+    if (this.delegations.get(key) !== info) return;
+    this.delegations.delete(key);
+    this.latestAssistantText.delete(key);
     const status = outcome.aborted ? "取消" : outcome.error ? "失败" : "完成";
-    const detail = outcome.error ? `（错误：${String(outcome.error).slice(0, 120)}）` : "";
-    // Relay the teammate's actual final output so the delegator can act on it
-    // directly (e.g. apply tsumugi's verify report) instead of stalling to
-    // ask the user to paste it back. Trim to keep the delegator's context
-    // bounded; the full transcript still lives in the teammate's ledger.
-    const result = outcome.aborted ? "" : (this.latestAssistantText.get(targetAgentPath) ?? "");
-    this.latestAssistantText.delete(targetAgentPath);
-    const MAX = 8000;
-    const resultBlock = result
-      ? `\n\n--- ${targetAgentPath} 的产出 ---\n${result.length > MAX ? result.slice(0, MAX) + "\n…（已截断，完整内容见该 agent 的对话）" : result}`
+    const detail = outcome.error
+      ? `（错误：${String(outcome.error).slice(0, 120)}）`
       : "";
-    // emit (not publish) — `to` routes the event into the delegator's
-    // per-agent queue. Without queue routing the delegator's run-loop
-    // (waitForEvent → drainQueue) never wakes and the message is lost.
-    // durability: "required" — the delegator's queue can independently fill
-    // up with ordinary UI/tool messages; this callback must not be FIFO-
-    // evicted along with them, or the delegator never learns the teammate
-    // finished (see EventQueue's MAX_EVENTS overflow eviction).
-    this.eventBus.emit(
-      {
-        source: "agent",
-        type: "message",
-        payload: {
-          content: `✓ ${targetAgentPath} ${status}了你交办的任务${detail}：${info.brief}${resultBlock}`,
-          fromAgent: targetAgentPath,
-        },
-        to: info.delegator,
-        handoff: "turn",
-        durability: "required",
-        ts: Date.now(),
+    const callback: import("./types").Event = {
+      source: "agent",
+      type: "message",
+      payload: {
+        content: `✓ ${key} ${status}了你交办的任务${detail}：${info.brief}`,
+        fromAgent: key,
+        ...(info.delegationId ? { delegationId: info.delegationId } : {}),
+        ...(info.sourceEventId ? { sourceEventId: info.sourceEventId } : {}),
+        ...(info.targetInstanceId ? { targetInstanceId: info.targetInstanceId } : {}),
+        ...(info.targetRuntimeEpochId
+          ? { targetRuntimeEpochId: info.targetRuntimeEpochId }
+          : {}),
       },
-      targetAgentPath,
-    );
+      to: info.delegator,
+      handoff: "turn",
+      durability: "required",
+      ts: Date.now(),
+    };
+    this.eventBus.publish(callback, key);
+    const delegator = this.tree.resolve(info.delegator);
+    if (!delegator) return;
+    void this.supervisor.enqueue(delegator.instanceId, callback).catch((error) => {
+      this.logger.error(
+        info.delegator,
+        undefined,
+        `delegation callback enqueue failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  }
+
+  /** Explicit detach/restart/remove cleanup for the legacy Scheduler
+   * projection. RuntimeSupervisor removals use the instance-id path above;
+   * this address path exists only for callers still using Scheduler. */
+  private finishDelegationsForTarget(agentPath: string): void {
+    for (const [key, info] of this.delegations) {
+      if (key !== agentPath) continue;
+      this.finishDelegation(key, info, {
+        aborted: true,
+        error: "delegated target was detached",
+      });
+    }
   }
 
   // ─── EventBus → agent_command routing ────────────────────────────────────
 
-  /** 镜像 agenteam ref `attachSchedulerListeners`：观察总线上的 `agent_command`
-   *  事件，把它桥到 `scheduler.getAgent(to).queueCommand(...)`。target 优先取
-   *  `event.to`，缺省回退到 `payload.agentId` —— UI 发的事件通常用 payload.agentId
-   *  避免触发 EventBus.route() 的 inbound message 路径（payload 模式是纯 metadata
-   *  容器，不会被 route() 转发到目标 queue）。
-   *
-   *  duck-type 检查 `queueCommand` 函数存在 —— Session 不 import ConsciousAgent
-   *  类型（plan §3.6：Session 不反向依赖 conscious-agent.ts），让 ScriptAgent /
-   *  BaseAgent 静默 ignore 这种事件。 */
+  /** Route control-plane agent_command events into the one runtime controller. */
   private _bindAgentCommandRouting(): () => void {
     return this.eventBus.observe((event) => {
       if (event.type !== "agent_command") return;
@@ -518,28 +1151,36 @@ export class Session {
       const targetPath =
         (event.to as string | undefined) ?? (payload.agentId as string | undefined);
       if (!targetPath) return;
-      const agent = this.scheduler.getAgent(targetPath);
-      if (!agent) return;
-      const handler = (agent as unknown as { queueCommand?: unknown }).queueCommand;
-      if (typeof handler !== "function") return;       // ScriptAgent etc.
       const toolName = payload.toolName as string | undefined;
       if (!toolName) return;
-      const args = (payload.args as Record<string, string> | undefined) ?? {};
-      const reason = (payload.reason as string | undefined) ?? undefined;
       const interrupt = (payload.interrupt as boolean | undefined) ?? true;
+      const instance = this.tree.resolve(targetPath);
+      if (!instance) return;
       try {
-        (handler as (
-          n: string,
-          a: Record<string, string>,
-          r: string | undefined,
-          i: boolean,
-        ) => void).call(agent, toolName, args, reason, interrupt);
+        if (interrupt) {
+          this.supervisor.interruptTurn(
+            instance.instanceId,
+            (payload.reason as string | undefined) ?? "agent command",
+          );
+        }
+        void this.supervisor.enqueue(instance.instanceId, {
+          ...event,
+          to: this.tree.addressOf(instance),
+        }).catch((error) => {
+          this.logger.error(
+            targetPath,
+            undefined,
+            `agent_command "${toolName}" failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
       } catch (err) {
         const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
         this.logger.error(
           targetPath,
           undefined,
-          `agent_command queueCommand "${toolName}" failed: ${msg}`,
+          `agent_command "${toolName}" failed: ${msg}`,
         );
       }
     });
@@ -547,12 +1188,16 @@ export class Session {
 
   private readonly _busUnsubs: Array<() => void>;
 
-  // ─── final settle → host-owned artifact resolution ──────────────────────
-
+  /** Reconcile terminal turns already persisted before this Session was
+   * reopened.  The scan is deliberately ledger-only: the injected resolver
+   * owns all workspace/file attribution and this layer only supplies the
+   * causal turn boundary. */
   private async _reconcileArtifactTurns(): Promise<void> {
-    if (!this.artifactResolver) return;
+    if (!this.artifactResolver || this.disposed) return;
     const paths = new Set<string>(this.ledgers.keys());
-    for (const node of this.tree.list()) paths.add(node.path);
+    for (const instance of this.runtimeTree.list()) {
+      paths.add(this.tree.addressOf(instance));
+    }
 
     for (const agentPath of paths) {
       let events: Array<import("../ledger/types").StoredEvent>;
@@ -561,7 +1206,6 @@ export class Session {
       } catch {
         continue;
       }
-
       const starts = new Map<string, {
         startedAt: number;
         checkpointMsgId?: string;
@@ -570,8 +1214,9 @@ export class Session {
       }>();
       const resolved = new Set<string>();
       const permissionAskCalls = new Set<string>();
+
       for (const event of events) {
-        const payload = event.payload ?? {};
+        const payload = (event.payload ?? {}) as Record<string, unknown>;
         if (event.type === "artifact:resolved" && typeof payload.artifactId === "string") {
           resolved.add(payload.artifactId);
           continue;
@@ -591,7 +1236,8 @@ export class Session {
         }
         if (event.type === "hook:toolCall") {
           const name = typeof payload.name === "string" ? payload.name : undefined;
-          const turnId = event.history?.turnId ?? (typeof payload.turnId === "string" ? payload.turnId : undefined);
+          const turnId = event.history?.turnId
+            ?? (typeof payload.turnId === "string" ? payload.turnId : undefined);
           if (turnId && name && canonicalToolName(name) === "ask_user") {
             const nested = payload.toolCall && typeof payload.toolCall === "object"
               ? payload.toolCall as Record<string, unknown>
@@ -601,37 +1247,35 @@ export class Session {
               : typeof payload.toolCallId === "string"
                 ? payload.toolCallId
                 : typeof nested?.id === "string" ? nested.id : `anonymous:${event.ts}`;
-            const pendingKey = `${turnId}:${callId}`;
-            if (payload.permissionPrompt === true) permissionAskCalls.add(pendingKey);
+            const key = `${turnId}:${callId}`;
+            if (payload.permissionPrompt === true) permissionAskCalls.add(key);
             const start = starts.get(turnId);
             if (start) start.waitingForInput = true;
           }
           continue;
         }
         if (event.type === "hook:toolResult") {
-          const turnId = event.history?.turnId ?? (typeof payload.turnId === "string" ? payload.turnId : undefined);
-          if (turnId) {
-            const start = starts.get(turnId);
-            const callId = typeof payload.callId === "string"
-              ? payload.callId
-              : typeof payload.toolCallId === "string" ? payload.toolCallId : undefined;
-            const pendingKeys = [...permissionAskCalls].filter((key) => key.startsWith(`${turnId}:`));
-            const matchedKey = callId
-              ? `${turnId}:${callId}`
-              : pendingKeys.length === 1 ? pendingKeys[0] : undefined;
-            const permissionPrompt = matchedKey ? permissionAskCalls.has(matchedKey) : false;
-            if (matchedKey) permissionAskCalls.delete(matchedKey);
-            const resolved = permissionPrompt
-              ? payload.error === undefined && payload.ok !== false
-              : askToolResultResolved(payload);
-            if (start && start.waitingForInput && !resolved) {
-              // An expired/invalid Ask result is not a final settle. Keep the
-              // turn blocked so recovery cannot manufacture an artifact.
-              start.waitingForInput = true;
-            } else if (start) {
-              start.waitingForInput = false;
-            }
-          }
+          const turnId = event.history?.turnId
+            ?? (typeof payload.turnId === "string" ? payload.turnId : undefined);
+          if (!turnId) continue;
+          const start = starts.get(turnId);
+          const callId = typeof payload.callId === "string"
+            ? payload.callId
+            : typeof payload.toolCallId === "string" ? payload.toolCallId : undefined;
+          const pendingKeys = [...permissionAskCalls]
+            .filter((key) => key.startsWith(`${turnId}:`));
+          const matchedKey = callId
+            ? `${turnId}:${callId}`
+            : pendingKeys.length === 1 ? pendingKeys[0] : undefined;
+          const permissionPrompt = matchedKey
+            ? permissionAskCalls.has(matchedKey)
+            : false;
+          if (matchedKey) permissionAskCalls.delete(matchedKey);
+          const answer = permissionPrompt
+            ? payload.error === undefined && payload.ok !== false
+            : askToolResultResolved(payload);
+          if (start && start.waitingForInput && !answer) start.waitingForInput = true;
+          else if (start) start.waitingForInput = false;
           continue;
         }
         if (event.type !== "hook:turnEnd") continue;
@@ -643,18 +1287,14 @@ export class Session {
         if (!start || !start.eligible || payload.artifactResolutionExpected === false) continue;
         const waitingForInput = payload.aborted !== true
           && (payload.waitingForInput === true || start.waitingForInput);
-        if (waitingForInput) {
-          // Keep the start record through an interaction checkpoint.  A
-          // restarted session may see the eventual ask result and final
-          // turn-end later in the same ledger; deleting it here would make
-          // that recovery path permanently lose the artifact resolution.
-          continue;
-        }
+        if (waitingForInput) continue;
         starts.delete(turnId);
         for (const key of permissionAskCalls) {
           if (key.startsWith(`${turnId}:`)) permissionAskCalls.delete(key);
         }
-        const artifactId = stableArtifactId(this.sid, turnId, start.checkpointMsgId ?? (typeof payload.msgId === "string" ? payload.msgId : undefined));
+        const checkpointMsgId = start.checkpointMsgId
+          ?? (typeof payload.msgId === "string" ? payload.msgId : undefined);
+        const artifactId = stableArtifactId(this.sid, turnId, checkpointMsgId);
         if (resolved.has(artifactId)) continue;
         void this._resolveArtifact({
           sid: this.sid,
@@ -662,9 +1302,7 @@ export class Session {
           projectRoot: this.artifactProjectRoot(),
           ...(this.config.defaultDir ? { game: this.config.defaultDir } : {}),
           turnId,
-          ...((start.checkpointMsgId ?? (typeof payload.msgId === "string" ? payload.msgId : undefined))
-            ? { checkpointMsgId: start.checkpointMsgId ?? (payload.msgId as string) }
-            : {}),
+          ...(checkpointMsgId ? { checkpointMsgId } : {}),
           startedAt: start.startedAt,
           settledAt: event.ts,
           ...(typeof event.seq === "number" ? { anchorSeq: event.seq } : {}),
@@ -675,13 +1313,12 @@ export class Session {
     }
   }
 
-  /** Observe the lifecycle boundary only. File attribution remains in the
-   * resolver, which can use the checkpoint CAS and the WAL as its two sources
-   * of truth; this observer must not inspect the workspace itself. */
+  /** Observe only the lifecycle boundary.  Workspace attribution remains in
+   * the injected resolver, while this observer guarantees one final-settle
+   * invocation per logical turn and preserves AskUser wait semantics. */
   private _bindArtifactResolution(): () => void {
     return this.eventBus.observe((event, emitterId) => {
       if (!emitterId || !this.artifactResolver) return;
-
       if (event.type === "hook:turnStart") {
         const payload = (event.payload ?? {}) as Record<string, unknown>;
         const turnId = typeof payload.turnId === "string" && payload.turnId
@@ -699,7 +1336,6 @@ export class Session {
         this.activeTurnIds.set(emitterId, turnId);
         return;
       }
-
       if (event.type === "hook:toolCall") {
         const payload = (event.payload ?? {}) as Record<string, unknown>;
         const nested = payload.toolCall && typeof payload.toolCall === "object"
@@ -715,34 +1351,37 @@ export class Session {
               ? payload.toolCallId
               : typeof nested?.id === "string" ? nested.id : `anonymous:${event.ts}`;
           this.pendingAskCalls.add(`${emitterId}:${callId}`);
-          if (payload.permissionPrompt === true) this.permissionAskCalls.add(`${emitterId}:${callId}`);
+          if (payload.permissionPrompt === true) {
+            this.permissionAskCalls.add(`${emitterId}:${callId}`);
+          }
         }
         return;
       }
-
       if (event.type === "hook:toolResult") {
         const payload = (event.payload ?? {}) as Record<string, unknown>;
         const callId = typeof payload.callId === "string"
           ? payload.callId
           : typeof payload.toolCallId === "string" ? payload.toolCallId : undefined;
         const turn = this.artifactTurns.get(emitterId);
-        const pendingKeys = [...this.pendingAskCalls].filter((key) => key.startsWith(`${emitterId}:`));
+        const pendingKeys = [...this.pendingAskCalls]
+          .filter((key) => key.startsWith(`${emitterId}:`));
         const matchedKeys = callId
-          ? this.pendingAskCalls.has(`${emitterId}:${callId}`) ? [`${emitterId}:${callId}`] : []
+          ? this.pendingAskCalls.has(`${emitterId}:${callId}`)
+            ? [`${emitterId}:${callId}`]
+            : []
           : pendingKeys;
-        const matchedPending = matchedKeys.length > 0;
-        const permissionPrompt = matchedKeys.length === 1 && this.permissionAskCalls.has(matchedKeys[0]!);
-        const askResult = permissionPrompt
+        const permissionPrompt = matchedKeys.length === 1
+          && this.permissionAskCalls.has(matchedKeys[0]!);
+        const answer = permissionPrompt
           ? payload.error === undefined && payload.ok !== false
           : askToolResultResolved(payload);
         for (const key of matchedKeys) {
           this.pendingAskCalls.delete(key);
           this.permissionAskCalls.delete(key);
         }
-        if (turn && matchedPending) turn.waitingForInput = !askResult;
+        if (turn && matchedKeys.length > 0) turn.waitingForInput = !answer;
         return;
       }
-
       if (event.type !== "hook:turnEnd") return;
       const turn = this.artifactTurns.get(emitterId);
       if (!turn) return;
@@ -752,16 +1391,14 @@ export class Session {
         this.activeTurnIds.delete(emitterId);
         return;
       }
-      const waitingForInput = payload.aborted !== true && (payload.waitingForInput === true
-        || turn.waitingForInput === true
-        || [...this.pendingAskCalls].some((key) => key.startsWith(`${emitterId}:`)));
+      const waitingForInput = payload.aborted !== true
+        && (payload.waitingForInput === true
+          || turn.waitingForInput === true
+          || [...this.pendingAskCalls].some((key) => key.startsWith(`${emitterId}:`)));
       if (waitingForInput) {
-        // This is an interaction checkpoint, not a final settle. Keep the
-        // turn open so the eventual ask reply gets one artifact resolution.
         turn.waitingForInput = true;
         return;
       }
-
       this.artifactTurns.delete(emitterId);
       this.activeTurnIds.delete(emitterId);
       for (const key of this.pendingAskCalls) {
@@ -770,7 +1407,7 @@ export class Session {
       for (const key of this.permissionAskCalls) {
         if (key.startsWith(`${emitterId}:`)) this.permissionAskCalls.delete(key);
       }
-      const context: ArtifactTurnContext = {
+      void this._resolveArtifact({
         sid: this.sid,
         agentId: emitterId,
         projectRoot: this.artifactProjectRoot(),
@@ -782,16 +1419,19 @@ export class Session {
         settledAt: event.ts,
         ...(payload.aborted === true ? { aborted: true } : {}),
         ...(typeof payload.error === "string" ? { error: payload.error } : {}),
-      };
-      void this._resolveArtifact(context);
+      });
     });
   }
 
   private _resolveArtifact(context: ArtifactTurnContext): Promise<void> {
-    const artifactId = stableArtifactId(context.sid ?? this.sid, context.turnId, context.checkpointMsgId);
+    if (!this.artifactResolver) return Promise.resolve();
+    const artifactId = stableArtifactId(
+      context.sid ?? this.sid,
+      context.turnId,
+      context.checkpointMsgId,
+    );
     const existing = this.artifactResolutionInFlight.get(artifactId);
     if (existing) return existing;
-
     const work = (async () => {
       let payload: ArtifactResolvedPayload;
       try {
@@ -821,19 +1461,16 @@ export class Session {
           resolution: { kind: "unavailable", reason, reliableCandidatePaths: [], summary },
         };
       }
-
       const ledger = this.getOrCreateLedger(context.agentId);
       const prior = await ledger.readAllEvents();
-      if (prior.some((event) => event.type === "artifact:resolved" && event.payload?.artifactId === payload.artifactId)) return;
-
+      if (prior.some((event) => event.type === "artifact:resolved"
+        && event.payload?.artifactId === payload.artifactId)) return;
       const event: Event = {
         type: "artifact:resolved",
         source: "host:artifact-deriver",
         ts: Date.now(),
         payload: payload as unknown as Record<string, unknown>,
       };
-      // Append confirmation comes before live broadcast. The persistence
-      // observer below skips this host-owned source to avoid a second WAL row.
       ledger.append(event, context.agentId, {
         eventId: `artifact:${payload.artifactId}`,
         turnId: payload.turnId,
@@ -857,13 +1494,16 @@ export class Session {
   private _bindLedgerPersistence(): () => void {
     return this.eventBus.observe((event, emitterId) => {
       if (event.type.startsWith("stream:")) return;
+      // Runtime lifecycle has its own required canonical EventStore writes.
+      // These additive wire projections must not create a second fact.
+      if (event.type.startsWith("runtime:")) return;
       // file-activity:* 是给 UI / file-activity-ledger 的信号事件，不是对话事件 ——
       // 已经写入 `<sid>/file-activity.jsonl`，再写一份到 per-agent EventLedger 只
       // 是双倍噪声 + LLM 历史污染。用专门的 LLM slot（file-activity-recent）按需
       // 注入，比每个 write 自动塞 prompt 更可控。
       if (event.type.startsWith("file-activity:")) return;
-      // `_resolveArtifact` appends its WAL row synchronously before publishing
-      // the live event. Re-appending here would make replay show duplicates.
+      // _resolveArtifact persists this host-owned event before broadcasting;
+      // do not append a second WAL row from the general observer.
       if (event.type === "artifact:resolved" && event.source === "host:artifact-deriver") return;
 
       if (event.type === "hook:turnStart" && emitterId) {
@@ -882,12 +1522,24 @@ export class Session {
       if (event.to && event.isBlocked?.()) return;
       for (const agentPath of candidates) {
         try {
-          const turnId = this.activeTurnIds.get(agentPath);
-          this.getOrCreateLedger(agentPath).append(
-            event,
-            emitterId,
-            turnId ? { turnId } : undefined,
-          );
+          const instance = this.tree.resolve(agentPath);
+          const store = instance
+            ? this.supervisor.getEventStore(instance.instanceId)
+            : undefined;
+          if (store) {
+            // Bus observers are synchronous and ContextWindow may read this
+            // event in the same tick. EventStore still owns the ledger/path;
+            // required lifecycle writes continue through its durability queue.
+            const turnId = this.activeTurnIds.get(agentPath);
+            store.ledger.append(event, emitterId, turnId ? { turnId } : undefined);
+          } else {
+            const turnId = this.activeTurnIds.get(agentPath);
+            this.getOrCreateLedger(agentPath).append(
+              event,
+              emitterId,
+              turnId ? { turnId } : undefined,
+            );
+          }
         } catch (err) {
           const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
           this.logger.error(agentPath, undefined, `WAL append "${event.type}" failed: ${msg}`);
@@ -897,13 +1549,75 @@ export class Session {
     });
   }
 
+  private _bindRuntimeTreeEvents(): () => void {
+    return this.runtimeTree.onChange((change) => {
+      const instance = change.instance;
+      const address = this.tree.addressOf(instance);
+      const kind =
+        change.kind === "inserted"
+          ? "runtime:instance-added"
+          : change.kind === "removed"
+            ? "runtime:instance-removed"
+            : "runtime:instance-state-changed";
+      this.eventBus.publish(
+        {
+          source: "runtime",
+          type: kind,
+          payload: {
+            sid: this.sid,
+            agentInstanceId: instance.instanceId,
+            runtimeEpochId: instance.runtimeEpochId,
+            parentInstanceId: instance.parentInstanceId,
+            lifetime: instance.lifetime,
+            ...(instance.residentPath
+              ? { residentPath: instance.residentPath }
+              : {}),
+            templateRef: instance.templateRef,
+            displayName:
+              instance.template.definition.displayName ??
+              instance.template.definition.id,
+            state: instance.state,
+            address,
+            ...(change.kind === "removed" && change.reason
+              ? { reason: change.reason }
+              : {}),
+          },
+          ts: Date.now(),
+        },
+        address,
+      );
+    });
+  }
+
   // ─── Per-agent ledger lookup ─────────────────────────────────────────────
 
   /** Lazy-init per-agent ledger。SessionManager / agentFactory 可以提前 prime。 */
   getOrCreateLedger(agentPath: string): EventLedger {
+    const instance = this.tree.resolve(agentPath);
+    if (instance) {
+      const runtimeLedger = this.supervisor.getEventStore(instance.instanceId)?.ledger;
+      if (runtimeLedger) {
+        this.ledgers.set(agentPath, runtimeLedger);
+        return runtimeLedger;
+      }
+    }
     let ledger = this.ledgers.get(agentPath);
     if (!ledger) {
-      ledger = new EventLedger(this.sid, agentPath, this.init.paths);
+      const layer = this.init.paths.session(this.sid).agent(agentPath);
+      ledger = new EventLedger(
+        {
+          ownerInstanceId: agentPath,
+          runtimeEpochId: `legacy:${this.sid}:${agentPath}`,
+          storeId: `legacy:${this.sid}:${agentPath}`,
+          locator: {
+            relativeDir: relative(this.paths.root(), layer.eventsDir()),
+          },
+        },
+        {
+          eventsDir: layer.eventsDir(),
+          blobsDir: layer.eventLedgerBlobs(),
+        },
+      );
       this.ledgers.set(agentPath, ledger);
     }
     return ledger;
@@ -916,6 +1630,7 @@ export class Session {
    *  rm the agent dir / ledger file —— that belongs to a future fs-mutation
    *  command path（`destroy_subagent`）, not Scheduler's lifecycle removal. */
   freeAgentState(agentPath: string): void {
+    this.finishDelegationsForTarget(agentPath);
     this.blackboard.removeAll(agentPath);
     this.ledgers.delete(agentPath);
   }
@@ -924,9 +1639,9 @@ export class Session {
 
   /** Soft dispose —— SessionManager.close 调，**不**删盘。
    *
-   *  顺序对齐 ref `Scheduler.destroyRuntime`（agenteam-os-ref scheduler.ts:470）：
+   *  Runtime 释放顺序：
    *    1. _busUnsub                    ← 先停 ledger persistence observer
-   *    2. scheduler.shutdown()         ← ref `shutdownAll`，等 agents 全停
+   *    2. supervisor.shutdown()        ← 等所有实例停止并 flush
    *    3. kitReloadCoordinator.stopWatching()
    *    4. tree.dispose()               ← ref `agentTree.stopWatching`
    *    5. blackboard.flush() + ledgers.clear()
@@ -940,9 +1655,10 @@ export class Session {
     this.disposed = true;
 
     for (let i = this._busUnsubs.length - 1; i >= 0; i--) this._busUnsubs[i]();
-    await this.scheduler.shutdown();
+    await this.supervisor.shutdown();
     this.kitReloadCoordinator.stopWatching();
-    await this.tree.dispose();
+    this.memoryTemplates.clear();
+    this.templateCatalog.unregisterByLifetime("session");
     this.blackboard.flush();
     this.ledgers.clear();
     this.fileActivity.dispose();
@@ -951,4 +1667,13 @@ export class Session {
     clearUiStateForSession(this.sid); // 清本会话的 UI 语义操作层 lease + manifest 缓存
     await this.logger.close();
   }
+}
+
+function isRuntimeEvent(value: unknown): value is import("./types").Event {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<import("./types").Event>;
+  return typeof candidate.source === "string"
+    && typeof candidate.type === "string"
+    && typeof candidate.ts === "number"
+    && Boolean(candidate.payload && typeof candidate.payload === "object");
 }

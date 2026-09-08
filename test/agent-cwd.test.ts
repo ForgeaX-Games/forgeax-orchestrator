@@ -5,9 +5,9 @@
  *  injected SessionLayout reports as `sessionWorkDir(sid)` (studio = the bound
  *  game dir). These tests lock the new seam + its graceful-degradation contract:
  *    (a) workDir exists           → ctx.cwd === sessionWorkDir
- *    (b) workDir missing          → ctx.cwd falls back to agentDir (no throw)
+ *    (b) workDir missing          → ctx.cwd falls back to Session root (no throw)
  *    (c) fs.resolve('.') === cwd  (fallback chain)
- *    (e) sessionWorkDir throws    → ctx.cwd falls back to agentDir (no throw out of attach)
+ *    (e) sessionWorkDir throws    → ctx.cwd falls back to Session root (no throw)
  *    (g) cwd is a non-empty absolute string
  */
 
@@ -56,8 +56,7 @@ describe("agentContext.cwd ← layout.sessionWorkDir (normal)", () => {
     const workDir = join(projectRoot, ".forgeax", "games", "test-game");
     mkdirSync(workDir, { recursive: true });
     const { session, sid } = await bootSession(new FlatSessionLayout(sessionsRoot, workDir));
-    await session.scheduler.attachAgent("root");
-    const agent = session.scheduler.getAgent("root");
+    const agent = await session.initializeAgentHost("root");
     expect(agent).not.toBeNull();
     expect(agent!.agentContext.cwd).toBe(workDir);
     await getSessionManagerClose(sid);
@@ -67,8 +66,7 @@ describe("agentContext.cwd ← layout.sessionWorkDir (normal)", () => {
     const workDir = join(projectRoot, ".forgeax", "games", "chain");
     mkdirSync(workDir, { recursive: true });
     const { session, sid } = await bootSession(new FlatSessionLayout(sessionsRoot, workDir));
-    await session.scheduler.attachAgent("root");
-    const agent = session.scheduler.getAgent("root");
+    const agent = await session.initializeAgentHost("root");
     expect(agent!.agentContext.fs.resolve(".")).toBe(agent!.agentContext.cwd);
     await getSessionManagerClose(sid);
   });
@@ -77,8 +75,7 @@ describe("agentContext.cwd ← layout.sessionWorkDir (normal)", () => {
     const workDir = join(projectRoot, ".forgeax", "games", "diag");
     mkdirSync(workDir, { recursive: true });
     const { session, sid } = await bootSession(new FlatSessionLayout(sessionsRoot, workDir));
-    await session.scheduler.attachAgent("root");
-    const cwd = session.scheduler.getAgent("root")!.agentContext.cwd;
+    const cwd = (await session.initializeAgentHost("root")).agentContext.cwd;
     expect(typeof cwd).toBe("string");
     expect(cwd.length).toBeGreaterThan(0);
     expect(cwd.startsWith("/")).toBe(true);
@@ -87,17 +84,18 @@ describe("agentContext.cwd ← layout.sessionWorkDir (normal)", () => {
 });
 
 describe("agentContext.cwd ← layout.sessionWorkDir (graceful fallback, no throw)", () => {
-  test("(b) workDir missing → ctx.cwd falls back to agentDir", async () => {
+  test("(b) workDir missing → ctx.cwd falls back to Session root", async () => {
     const ghost = join(projectRoot, ".forgeax", "games", "ghost"); // never created
     const { session, sid } = await bootSession(new FlatSessionLayout(sessionsRoot, ghost));
-    await session.scheduler.attachAgent("root");
-    const agent = session.scheduler.getAgent("root");
+    const agent = await session.initializeAgentHost("root");
     expect(agent).not.toBeNull();
-    expect(agent!.agentContext.cwd).toBe(getPathManager().session(sid).agent("root").root());
+    expect(agent!.agentContext.cwd).toBe(
+      session.paths.root(),
+    );
     await getSessionManagerClose(sid);
   });
 
-  test("(e) sessionWorkDir throws → ctx.cwd falls back to agentDir (no throw out of attach)", async () => {
+  test("(e) sessionWorkDir throws → ctx.cwd falls back to Session root", async () => {
     const throwing: SessionLayout = {
       allocate(s) {
         const r = join(sessionsRoot, s);
@@ -109,10 +107,11 @@ describe("agentContext.cwd ← layout.sessionWorkDir (graceful fallback, no thro
       listSessionIds() { return []; },
     };
     const { session, sid } = await bootSession(throwing);
-    await session.scheduler.attachAgent("root");
-    const agent = session.scheduler.getAgent("root");
+    const agent = await session.initializeAgentHost("root");
     expect(agent).not.toBeNull();
-    expect(agent!.agentContext.cwd).toBe(getPathManager().session(sid).agent("root").root());
+    expect(agent!.agentContext.cwd).toBe(
+      session.paths.root(),
+    );
     await getSessionManagerClose(sid);
   });
 });

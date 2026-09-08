@@ -39,22 +39,82 @@ afterEach(() => {
 
 describe('ActionCatalog', () => {
 
+  test('状态前置条件经构建存活,且首批声明只描述世界状态', () => {
+    const preconditions = (id: string) =>
+      (catalogGet(id) as ActionCatalogEntry & { preconditions?: readonly string[] } | undefined)?.preconditions;
+
+    expect(preconditions('extension.open')).toEqual([
+      'The target extension must contribute an available singleton page.',
+    ]);
+    expect(preconditions('role.open')).toEqual([
+      'When id is provided, it must identify a role in the current roster.',
+      'When id is provided, an active chat session must exist for the role binding.',
+    ]);
+    expect(preconditions('game.switch')).toEqual([
+      'The requested slug must identify an existing game.',
+    ]);
+    expect(preconditions('overlay.open')).toEqual([
+      'The requested id must identify an overlay currently registered by the product shell.',
+    ]);
+    expect(preconditions('role.create')).toEqual([
+      'The requested id must not already exist in the role roster.',
+    ]);
+    expect(preconditions('game.create')).toEqual([
+      'The requested slug must not already identify an existing game.',
+    ]);
+    expect(preconditions('panel.toggle_sidebar')).toBeUndefined();
+  });
+
+  test('三条已知 description 只解释能力,不夹带操作顺序', () => {
+    expect(catalogGet('extension.open')?.description).toBe(
+      'Open the Page contributed by a specific extension id. Discover valid ids via extension.list.',
+    );
+    expect(catalogGet('role.list')?.description).toBe(
+      'List all currently dispatchable roles (plugin agents + built-ins). Returns { count, roles:[{id,role,displayName,source}] }.',
+    );
+    expect(catalogGet('game.create')?.description).toBe(
+      'Create a new game (project) from the template and give it its own dedicated chat session. The action does not switch the UI to the new game.',
+    );
+  });
+
+  test('preconditions 非空字符串数组以外的形状全部拒绝,且失败不替换现有目录', () => {
+    const before = catalogAll();
+    const base = before[0]!;
+    const invalidValues: unknown[] = ['ready', [], [1], [''], ['   ']];
+
+    for (const [index, preconditions] of invalidValues.entries()) {
+      expect(() => buildActionCatalog([{ ...base, id: `invalid.preconditions.${index}`, preconditions }]))
+        .toThrow(/preconditions/);
+      expect(catalogAll()).toBe(before);
+    }
+  });
+
+  test('preconditions 由构建器复制并冻结,调用方不能在发布后改写目录事实', () => {
+    const source = ['The world must be ready.'];
+    buildActionCatalog([{ ...catalogAll()[0], id: 'frozen.preconditions', preconditions: source }]);
+    const stored = (catalogGet('frozen.preconditions') as ActionCatalogEntry & {
+      preconditions?: readonly string[];
+    }).preconditions!;
+
+    expect(stored).toEqual(['The world must be ready.']);
+    expect(stored).not.toBe(source);
+    expect(Object.isFrozen(stored)).toBe(true);
+    source[0] = 'mutated';
+    expect(stored).toEqual(['The world must be ready.']);
+  });
+
   test('door 门位事实经构建原样存活 —— 白名单丢弃会让咽喉改道整条失效', () => {
     // 2026-08-05 实测:compileEntry 白名单没放行 door,catalogGet 拿不到别名事实,
     // findVisibleDoor 配不出 game.switch 的门,ui_act_game_switch 又走回无头直调。
     buildActionCatalog(undefined, registryOptions());
     expect(catalogGet('game.switch')?.door).toEqual({ menuCommandId: 'game.pick' });
-    // 2026-08-06 rail 死门下线:host.sidebar 无发布者,railTab/railMode 声明会把
-    // agent 以最高置信度指向必死的 open('rail:...')。撤声明后这两个能力回到
-    // "门位未知"的诚实态;rail 重新发布前,这里断言它们**不许**带 door 事实。
     expect(catalogGet('role.open')?.door).toBeUndefined();
-    expect(catalogGet('app.set_mode')?.door).toBeUndefined();
   });
-  test('atomically assembles all 25 trusted action declarations', () => {
+  test('atomically assembles all 23 trusted action declarations', () => {
     const catalog = catalogAll();
 
-    expect(catalog).toHaveLength(25);
-    expect(new Set(catalog.map((entry) => entry.id)).size).toBe(25);
+    expect(catalog).toHaveLength(23);
+    expect(new Set(catalog.map((entry) => entry.id)).size).toBe(23);
     expect(catalogGet('role.create')).toMatchObject({
       capability: 'delegate',
       surface: 'both',
@@ -72,7 +132,7 @@ describe('ActionCatalog', () => {
       firstClass: true,
     });
     expect(catalogGet('panel.toggle_sidebar')?.schema).toBeUndefined();
-    expect(catalogFirstClass()).toHaveLength(14);
+    expect(catalogFirstClass()).toHaveLength(12);
     expect(JSON.parse(JSON.stringify(catalog))).toEqual(catalog);
     expect(catalog.every((entry) => !('run' in entry) && !('available' in entry))).toBe(true);
   });
@@ -167,10 +227,10 @@ describe('ActionCatalog', () => {
     const duplicate = { ...before[0] };
 
     expect(() => buildActionCatalog([...before, duplicate])).toThrow(
-      'ActionCatalog: duplicate action id "app.set_mode"',
+      'ActionCatalog: duplicate action id "panel.toggle_sidebar"',
     );
     expect(catalogAll()).toBe(before);
-    expect(catalogAll()).toHaveLength(25);
+    expect(catalogAll()).toHaveLength(23);
   });
 
   test('rejects schemas that are not pure JSON objects without replacing the catalog', () => {
@@ -195,7 +255,7 @@ describe('ActionCatalog', () => {
     ])).toThrow(/ActionCatalog: action "invalid\.schema\.sparse" schema contains a non-JSON value/);
 
     expect(catalogAll()).toBe(before);
-    expect(catalogAll()).toHaveLength(25);
+    expect(catalogAll()).toHaveLength(23);
   });
 
   test('preserves JSON __proto__ keys without mutating object prototypes', () => {
@@ -230,18 +290,17 @@ describe('ActionCatalog', () => {
   test('publishes deeply frozen arrays, entries, and schemas', () => {
     const all = catalogAll();
     const firstClass = catalogFirstClass();
-    const entry = catalogGet('app.set_mode')!;
+    const entry = catalogGet('extension.open')!;
     const schema = entry.schema!;
     const properties = schema.properties as Record<string, unknown>;
-    const mode = properties.mode as Record<string, unknown>;
+    const extensionId = properties.extensionId as Record<string, unknown>;
 
     expect(Object.isFrozen(all)).toBe(true);
     expect(Object.isFrozen(firstClass)).toBe(true);
     expect(Object.isFrozen(entry)).toBe(true);
     expect(Object.isFrozen(schema)).toBe(true);
     expect(Object.isFrozen(properties)).toBe(true);
-    expect(Object.isFrozen(mode)).toBe(true);
-    expect(Object.isFrozen(mode.enum)).toBe(true);
+    expect(Object.isFrozen(extensionId)).toBe(true);
 
     expect(() => {
       (all as ActionCatalogEntry[]).push(entry);
@@ -250,14 +309,11 @@ describe('ActionCatalog', () => {
       (entry as { title: string }).title = 'mutated';
     }).toThrow();
     expect(() => {
-      mode.type = 'number';
+      extensionId.type = 'number';
     }).toThrow();
 
-    expect(catalogAll()).toHaveLength(25);
-    expect(catalogGet('app.set_mode')?.title).toBe('切换主模式');
-    expect((catalogGet('app.set_mode')?.schema?.properties as Record<string, unknown>).mode).toEqual({
-      type: 'string',
-      enum: ['scene', 'ai'],
-    });
+    expect(catalogAll()).toHaveLength(23);
+    expect(catalogGet('extension.open')?.title).toBe('打开扩展页面');
+    expect((catalogGet('extension.open')?.schema?.properties as Record<string, unknown>).extensionId).toEqual({ type: 'string' });
   });
 });

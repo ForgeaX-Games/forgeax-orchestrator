@@ -22,6 +22,7 @@ import type { Session } from "../core/session";
 import type { PreparedHistory } from "@forgeax/agent-runtime";
 import { randomUUID } from "node:crypto";
 import { canonicalToolName } from "./canonical-tool-name";
+import { projectToolCallMessage, projectToolResultMessage } from "../history/tool-result-projector";
 
 export interface KernelTurnRecord {
   /** 本轮用户输入文本(渲染 user 气泡)。 */
@@ -192,33 +193,56 @@ export function transcribeKernelTurn(
     }
     if (t.kind === "call") {
       const name = canonicalToolName(t.name);
-      callNames.set(t.callId, name);
+      if (t.callId && name) callNames.set(t.callId, name);
+      const ts = Date.now();
       append(
         ev({
           type: "hook:toolCall",
-          ts: Date.now(),
+          ts,
           source: `agent:${ap}`,
-          payload: { name, ...(name !== t.name ? { rawName: t.name } : {}), args: t.args, callId: t.callId, toolCall: { id: t.callId, name, arguments: t.args } },
+          payload: {
+            name,
+            ...(name !== t.name ? { rawName: t.name } : {}),
+            args: t.args,
+            callId: t.callId,
+            toolCall: { id: t.callId, name, arguments: t.args },
+            // The UI-facing fields above remain unchanged. This canonical
+            // assistant message is the model-history projection consumed by
+            // ContextWindow and llmMessagesToTurnHistory.
+            llmMessage: projectToolCallMessage({ callId: t.callId, toolName: name, args: t.args, ts }),
+          },
         }),
         ap,
       );
     } else {
+      const name = callNames.get(t.callId);
+      const ts = Date.now();
       append(
         ev({
           type: "hook:toolResult",
-          ts: Date.now(),
+          ts,
           source: `agent:${ap}`,
           payload: {
             // Preserve the call name for replay consumers (notably the
             // host-owned artifact semantic projection). Older transcriptions
             // left this blank, which made a valid deliver_summary result
             // disappear after refresh.
-            name: callNames.get(t.callId) ?? "",
+            name: name ?? "",
             callId: t.callId,
             ok: t.ok,
             durationMs: 0,
             ...(t.result !== undefined ? { result: t.result } : {}),
             ...(t.ok ? {} : { error: t.error ?? "tool failed" }),
+            // Keep faithful `result` for UI/audit while adding the bounded,
+            // canonical model-visible projection for the next native turn.
+            llmMessage: projectToolResultMessage({
+              callId: t.callId,
+              toolName: name,
+              result: t.result,
+              ok: t.ok,
+              error: t.error,
+              ts,
+            }),
           },
         }),
         ap,

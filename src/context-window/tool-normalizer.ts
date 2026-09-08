@@ -2,7 +2,7 @@
  *
  *  与 agenteam ref 1:1：provider 层用 createPending / createToolResult；
  *  context-window replay 走 normalizeHistory（drop raw tool dups + 把死掉的 pending
- *  转 interrupted）；ConsciousAgent 在重启恢复路径上调 buildPersistentToolRepair
+ *  转 interrupted）；Runtime bootstrap 恢复路径上调 buildPersistentToolRepair
  *  把 interrupted 转成 synthetic 落盘。 */
 
 import type { ContentPart } from "../core/types.js";

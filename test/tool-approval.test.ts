@@ -2,7 +2,7 @@
  *  用真 EventBus + 真 permission-registry(模块级 Map,单进程安全),模拟 UI 回执。 */
 import { describe, expect, test } from 'bun:test';
 import { EventBus } from '../src/core/event-bus';
-import { resolvePermission } from '../src/core/permission-registry';
+import { denyPermissionsForSession, resolvePermission } from '../src/core/permission-registry';
 import {
   requestToolApproval,
   applyRememberOnReply,
@@ -56,6 +56,77 @@ describe('requestToolApproval — 弹卡往返', () => {
 
   test('用户拒绝 → false', async () => {
     expect(await approveFlow({ sid: 'sid-deny', capability: 'exec', reply: false })).toBe(false);
+  });
+
+  test('同步 resolver 在 permission:request publish observer 中也能完成 allow', async () => {
+    const sid = 'sid-sync-resolve';
+    const bus = new EventBus();
+    let resolvedEvent = false;
+    bus.observe((event) => {
+      if (event.type === 'permission:request') {
+        const reqId = (event.payload as { reqId: string }).reqId;
+        expect(resolvePermission(reqId, true)).toBe(true);
+      }
+      if (event.type === 'permission:resolved') resolvedEvent = true;
+    });
+
+    await expect(requestToolApproval({
+      eventBus: bus,
+      sid,
+      agent: 'forge',
+      toolName: 'Bash',
+      capability: 'exec',
+      args: { command: 'echo sync' },
+    })).resolves.toBe(true);
+    expect(resolvedEvent).toBe(true);
+  });
+
+  test('同步 resolver 在 permission:request publish observer 中也能完成 deny', async () => {
+    const sid = 'sid-sync-deny';
+    const bus = new EventBus();
+    let resolvedEvent = false;
+    bus.observe((event) => {
+      if (event.type === 'permission:request') {
+        const reqId = (event.payload as { reqId: string }).reqId;
+        expect(resolvePermission(reqId, false)).toBe(true);
+      }
+      if (event.type === 'permission:resolved') resolvedEvent = true;
+    });
+
+    await expect(requestToolApproval({
+      eventBus: bus,
+      sid,
+      agent: 'forge',
+      toolName: 'Bash',
+      capability: 'exec',
+      args: { command: 'echo sync-deny' },
+    })).resolves.toBe(false);
+    expect(resolvedEvent).toBe(true);
+  });
+
+  test('同步 abort/deny cleanup 在 publish observer 中也能 fail closed', async () => {
+    const sid = 'sid-sync-abort';
+    const bus = new EventBus();
+    let reqId = '';
+    let resolvedEvent = false;
+    bus.observe((event) => {
+      if (event.type === 'permission:request') {
+        reqId = (event.payload as { reqId: string }).reqId;
+        expect(denyPermissionsForSession(sid, 'forge')).toEqual([reqId]);
+      }
+      if (event.type === 'permission:resolved') resolvedEvent = true;
+    });
+
+    await expect(requestToolApproval({
+      eventBus: bus,
+      sid,
+      agent: 'forge',
+      toolName: 'Bash',
+      capability: 'exec',
+      args: { command: 'echo abort' },
+    })).resolves.toBe(false);
+    expect(resolvedEvent).toBe(true);
+    expect(resolvePermission(reqId, true)).toBe(false);
   });
 });
 

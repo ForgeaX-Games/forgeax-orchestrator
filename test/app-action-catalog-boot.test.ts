@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createForgeaxApp } from '../src/app';
@@ -16,6 +16,11 @@ afterEach(() => {
 
 test('package root exports the ActionCatalog grandfather constant by identity', () => {
   expect(PACKAGE_GRANDFATHER_IDS).toBe(HEADLESS_ACTION_GRANDFATHER_IDS);
+});
+
+test('createForgeaxApp wires packaged orchestrator resources into PathManager', () => {
+  const source = readFileSync(join(import.meta.dir, '../src/app.ts'), 'utf8');
+  expect(source).toContain("builtinRoot: ctx.resourceRoot ? join(ctx.resourceRoot, 'builtin') : undefined");
 });
 
 test('createForgeaxApp fails before filesystem boot when the headless registry is invalid', async () => {

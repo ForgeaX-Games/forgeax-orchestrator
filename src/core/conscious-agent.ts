@@ -50,6 +50,9 @@ import { sleep } from "../utils";
 import { ContextEngine } from "../kits/slot/context-engine";
 import { runToolBatch as runToolBatchKit } from "../kits/tool/tool-batch-runner";
 import { runKernelTurn } from "./kernel-turn";
+import { visibleAgentManagementToolsFromConfig } from "../kits/agent-management-visibility";
+import { withAgentHostToolDefinitions } from "../tools/agent-host-tool-surface";
+import { isValidSummonAgentId } from "../kernel/summon-agent";
 import { kernelEnabled } from "../kernel/kernel-mode";
 import { randomUUID } from "node:crypto";
 
@@ -355,6 +358,24 @@ export interface ConsciousAgentInitConfig extends BaseAgentInitConfig {
   refreshTools?: () => Promise<void>;
 }
 
+/**
+ * Native EventBus messages may be coalesced into one kernel turn. Keep the
+ * last well-formed specialist selection. A missing field is a legacy event
+ * and leaves the current selection alone; an explicit null clears it. Any
+ * malformed present value fails closed by clearing rather than inheriting a
+ * prior queued message's specialist.
+ */
+export function lastValidSummonAgentId(events: readonly Event[]): string | undefined {
+  let selected: string | undefined;
+  for (const event of events) {
+    const payload = event.payload as Record<string, unknown> | undefined;
+    if (!payload || !Object.prototype.hasOwnProperty.call(payload, 'summonAgentId')) continue;
+    const value = payload.summonAgentId;
+    selected = isValidSummonAgentId(value) ? value : undefined;
+  }
+  return selected;
+}
+
 export class ConsciousAgent extends BaseAgent {
   private readonly provider: LLMProvider;
   readonly contextWindow: ContextWindow;
@@ -590,14 +611,21 @@ export class ConsciousAgent extends BaseAgent {
           .map((e) => ((e.payload as { replyLanguage?: unknown })?.replyLanguage))
           .filter((v): v is 'en' | 'zh' => v === 'en' || v === 'zh')
           .pop();
+        const summonAgentId = lastValidSummonAgentId(events);
         const mc = this.modelRoutingHints.order(
           resolveModelsConfig(this.agentJson, this.sessionDefaultModels),
         );
         const model = Array.isArray(mc.model) ? mc.model[0] : mc.model ?? undefined;
         // 把本 agent 的 host-tools(过 condition)映射成 ToolSpec → 经 MCP 桥下发内核。
-        const hostTools = this.getToolsFn()
+        const hostTools = withAgentHostToolDefinitions(this.getToolsFn(), this.agentContext)
           .filter((t) => !t.condition || t.condition(this.agentContext, t))
           .map((t) => ({ name: bareName(t.name), description: t.description, inputSchema: t.input_schema }));
+        // The agent_manage bridge is session-scoped. A standalone ConsciousAgent
+        // may still have an in-process tool registry, but without a sid there is
+        // no host bridge identity that can execute the advertised tools.
+        const visibleAgentManagementTools = this.sid
+          ? visibleAgentManagementToolsFromConfig(this.agentJson.kits)
+          : [];
         tt("kernel.invoke", { agent: this.agentPath, turn: this.currentTurn, sid: this.sid, model, tools: hostTools.length });
         const { error } = await runKernelTurn({
           agentId: this.agentPath,
@@ -614,9 +642,11 @@ export class ConsciousAgent extends BaseAgent {
           signal,
           turn: this.currentTurn,
           tools: hostTools,
+          visibleAgentManagementTools,
           ...(attachments.length ? { attachments } : {}),
           ...(traceparent ? { traceparent } : {}),
           ...(replyLanguage ? { replyLanguage } : {}),
+          ...(summonAgentId ? { summonAgentId } : {}),
           ...(model ? { model } : {}),
         });
         tt("kernel.returned", { agent: this.agentPath, turn: this.currentTurn, aborted: signal.aborted, error });
@@ -772,7 +802,7 @@ export class ConsciousAgent extends BaseAgent {
   private async executeCommand(
     toolName: string, args: Record<string, string>, reason: string | undefined, signal: AbortSignal,
   ): Promise<void> {
-    const tools = this.getToolsFn();
+    const tools = withAgentHostToolDefinitions(this.getToolsFn(), this.agentContext);
     const tool = tools.find((t) => t.name === toolName || bareName(t.name) === toolName);
     if (!tool) {
       console.warn(`command: unknown tool '${toolName}'`);

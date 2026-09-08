@@ -1,7 +1,7 @@
 // Agent 命名规范 —— 所有界面统一成「中文职能·英文名」+ 灰字「英文职能」。
 //
 // 数据来源是 plugin 的 card：card.cnTitle(中文职能) / card.name(英文名/人名) /
-// card.enTitle(英文职能)。两个 API（/api/workbench/agents 与 /api/bus/plugins）
+// card.enTitle(英文职能)。两个 API（/api/agents 与 /api/bus/plugins）
 // 都用这里算出的 { title, sub }，把「格式决策」收敛到一处，避免前端各处各自拼。
 //
 // 退化规则（缺字段时仍可读）：

@@ -28,6 +28,7 @@ import {
 } from '../src/kernel/codex-mcp';
 import {
   materializeForgeaxToolsRuntime,
+  resolveForgeaxToolsServerEntry,
   type ForgeaxToolsRuntime,
 } from '../src/kernel/mcp/forgeax-tools-runtime';
 import {
@@ -193,6 +194,27 @@ describe('codex-mcp — validateCodexMcpConfig', () => {
 // ─── runtime materializer ────────────────────────────────────────────
 
 describe('forgeax-tools-runtime — materialize', () => {
+  test('desktop runtime can override the child MCP entry with a staged file', () => {
+    expect(resolveForgeaxToolsServerEntry({
+      FORGEAX_TOOLS_SERVER_ENTRY: '/Applications/ForgeaX Studio.app/Contents/Resources/fxt.mjs',
+    })).toBe('/Applications/ForgeaX Studio.app/Contents/Resources/fxt.mjs');
+  });
+
+  test('desktop runtime launches fxt with the packaged Bun executable', async () => {
+    const previous = process.env.FORGEAX_BUN_EXECUTABLE;
+    process.env.FORGEAX_BUN_EXECUTABLE = '/Applications/ForgeaX Studio.app/Contents/Resources/sidecars/bun';
+    try {
+      const rt = await materializeForgeaxToolsRuntime(req({ tools: [{ name: 'echo' }] as TurnRequest['tools'] }), {
+        runtimeId: 'packaged-bun',
+      });
+      expect(rt?.command).toBe('/Applications/ForgeaX Studio.app/Contents/Resources/sidecars/bun');
+      await rt?.cleanup();
+    } finally {
+      if (previous === undefined) delete process.env.FORGEAX_BUN_EXECUTABLE;
+      else process.env.FORGEAX_BUN_EXECUTABLE = previous;
+    }
+  });
+
   test('empty tools → undefined (no MCP)', async () => {
     expect(await materializeForgeaxToolsRuntime(req({ tools: [] }), { runtimeId: 'x' })).toBeUndefined();
   });

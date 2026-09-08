@@ -15,12 +15,15 @@ import { resolve } from "node:path";
 import { initPathManager, resetPathManager } from "../src/fs/path-manager";
 import { initSessionManager, resetSessionManager, getSessionManager } from "../src/core/session-manager";
 import { transcribeKernelTurn } from "../src/kernel/transcribe-turn";
+import { ContextWindow } from "../src/context-window/context-window";
+import { llmMessagesToTurnHistory } from "../src/kernel/llm-history";
 import {
   appliedKernelMutationRecords,
   captureKernelMutationIntents,
 } from "../src/kernel/kernel-file-activity";
 
 let userRoot: string;
+const ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 beforeEach(async () => {
   userRoot = mkdtempSync(resolve(tmpdir(), "forgeax-transcribe-"));
@@ -125,6 +128,119 @@ describe("transcribeKernelTurn — host-owned, kernel-agnostic ledger", () => {
     // ★ key 修复证据:绝不落到 root(旧 depth-1 启发式的去处)。
     const rootLedger = await session.getOrCreateLedger("root").readAllEvents();
     expect(rootLedger).toHaveLength(0);
+  });
+
+  test("native tool result projects image through ContextWindow into TurnMessage history", async () => {
+    const session = await getSessionManager().create({ displayName: "native-tool-history" });
+    const image = { type: "image" as const, data: ONE_PIXEL_PNG, mimeType: "image/png" };
+
+    transcribeKernelTurn(session, "forge", {
+      message: "capture the current UI",
+      asstText: "The screenshot is available.",
+      thinkingText: "",
+      stopReason: "end_turn",
+      providerId: "forgeax-core",
+      toolEvents: [
+        { kind: "call", callId: "shot-1", name: "ui_screenshot", args: { target: "app" } },
+        { kind: "result", callId: "shot-1", ok: true, result: [image] },
+      ],
+    });
+
+    const ledger = session.getOrCreateLedger("forge");
+    const events = await ledger.readAllEvents();
+    const call = events.find((event) => event.type === "hook:toolCall");
+    const result = events.find((event) => event.type === "hook:toolResult");
+    const resultPayload = result?.payload as {
+      result?: unknown;
+      llmMessage?: {
+        role?: string;
+        toolCallId?: string;
+        toolName?: string;
+        content?: Array<{ type?: string; data?: string; mimeType?: string }>;
+      };
+    };
+    expect(resultPayload.result).toEqual([image]);
+    expect(resultPayload.llmMessage).toMatchObject({
+      role: "tool",
+      toolCallId: "shot-1",
+      toolName: "ui_screenshot",
+      toolStatus: "completed",
+      content: [image],
+    });
+    expect((call?.payload as { llmMessage?: { role?: string; toolCalls?: Array<{ id?: string; name?: string; arguments?: unknown }> } })?.llmMessage).toMatchObject({
+      role: "assistant",
+      toolCalls: [{ id: "shot-1", name: "ui_screenshot", arguments: { target: "app" } }],
+    });
+
+    const messages = await new ContextWindow("forge", ledger).buildPrompt();
+    const assistant = messages.find((message) => message.role === "assistant" && message.toolCalls?.some((tool) => tool.id === "shot-1"));
+    const tool = messages.find((message) => message.role === "tool" && message.toolCallId === "shot-1");
+    expect(assistant?.toolCalls).toEqual([{ id: "shot-1", name: "ui_screenshot", arguments: { target: "app" } }]);
+    expect(tool?.content).toEqual([image]);
+
+    const history = llmMessagesToTurnHistory(messages);
+    expect(history.find((message) => message.role === "assistant")).toMatchObject({
+      role: "assistant",
+      toolCalls: [{ callId: "shot-1", name: "ui_screenshot", args: { target: "app" } }],
+    });
+    expect(history.find((message) => message.role === "tool")).toEqual({
+      role: "tool",
+      callId: "shot-1",
+      ok: true,
+      result: [image],
+    });
+  });
+
+  test("legacy text tool result remains visible in native history", async () => {
+    const session = await getSessionManager().create({ displayName: "legacy-tool-history" });
+    transcribeKernelTurn(session, "forge", {
+      message: "run the text tool",
+      asstText: "done",
+      thinkingText: "",
+      stopReason: "end_turn",
+      toolEvents: [
+        { kind: "call", callId: "text-1", name: "echo", args: { text: "hello" } },
+        { kind: "result", callId: "text-1", ok: true, result: "hello from the tool" },
+      ],
+    });
+
+    const messages = await new ContextWindow("forge", session.getOrCreateLedger("forge")).buildPrompt();
+    const tool = messages.find((message) => message.role === "tool" && message.toolCallId === "text-1");
+    expect(tool?.content).toEqual([{ type: "text", text: "hello from the tool" }]);
+    expect(llmMessagesToTurnHistory(messages)).toContainEqual({
+      role: "tool",
+      callId: "text-1",
+      ok: true,
+      result: "hello from the tool",
+    });
+  });
+
+  test("multiple native calls before results form one assistant tool-call batch", async () => {
+    const session = await getSessionManager().create({ displayName: "native-tool-batch" });
+    transcribeKernelTurn(session, "forge", {
+      message: "inspect both surfaces",
+      asstText: "both inspected",
+      thinkingText: "",
+      stopReason: "end_turn",
+      toolEvents: [
+        { kind: "call", callId: "c1", name: "ui_snapshot", args: { target: "app" } },
+        { kind: "call", callId: "c2", name: "ui_screenshot", args: { target: "app" } },
+        { kind: "result", callId: "c1", ok: true, result: "state" },
+        { kind: "result", callId: "c2", ok: true, result: "frame" },
+      ],
+    });
+
+    const messages = await new ContextWindow("forge", session.getOrCreateLedger("forge")).buildPrompt();
+    const assistant = messages.find((message) => message.role === "assistant" && message.toolCalls?.some((tool) => tool.id === "c1"));
+    expect(assistant?.toolCalls).toEqual([
+      { id: "c1", name: "ui_snapshot", arguments: { target: "app" } },
+      { id: "c2", name: "ui_screenshot", arguments: { target: "app" } },
+    ]);
+    expect(messages.filter((message) => message.role === "tool").map((message) => message.toolCallId)).toEqual(["c1", "c2"]);
+    expect(llmMessagesToTurnHistory(messages).filter((message) => message.role === "tool")).toEqual([
+      { role: "tool", callId: "c1", ok: true, result: "state" },
+      { role: "tool", callId: "c2", ok: true, result: "frame" },
+    ]);
   });
 
   test("durable attachment context survives history while visible bubble stays original and base64 is absent", async () => {

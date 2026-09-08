@@ -14,6 +14,8 @@
 // disk-only catalog. Never throws; surfaces a structured `lastError` to UI for
 // diagnostics.
 
+import { createHash } from 'node:crypto';
+
 export interface LiveCatalogResult {
   ids: string[];
   fetchedAt: number;
@@ -39,14 +41,16 @@ interface CacheEntry {
 
 const TTL_MS = 60_000;
 const cache = new Map<string, CacheEntry>();
+let generation = 0;
 
-/** Test-only: drop all cached entries. */
-export function _resetLiveCatalogCache(): void {
+/** Invalidate discovery after credentials change or an explicit refresh. */
+export function invalidateLiveCatalogCache(): void {
+  generation++;
   cache.clear();
 }
 
 function cacheKey(baseUrl: string, apiKey: string): string {
-  return `${baseUrl}::${apiKey.slice(-6)}`;
+  return `${baseUrl}::${createHash('sha256').update(apiKey).digest('hex')}`;
 }
 
 /** Strip trailing slash + optional `/v1` so Settings values of either
@@ -62,6 +66,7 @@ export async function fetchLiveCatalog(opts: FetchLiveCatalogOpts = {}): Promise
   const baseUrl = normalizeProxyBase(opts.baseUrl ?? process.env.LITELLM_PROXY_BASE_URL ?? '');
   const apiKey = opts.apiKey ?? process.env.LITELLM_PROXY_KEY ?? '';
   const now = Date.now();
+  const requestGeneration = generation;
 
   if (!baseUrl || !apiKey) {
     return { ids: [], fetchedAt: now, fromCache: false, source: 'disabled' };
@@ -94,7 +99,7 @@ export async function fetchLiveCatalog(opts: FetchLiveCatalogOpts = {}): Promise
     const ids = Array.isArray(body.data)
       ? body.data.map((m) => m?.id).filter((id): id is string => typeof id === 'string' && id.length > 0)
       : [];
-    cache.set(key, { ids, fetchedAt: now });
+    if (requestGeneration === generation) cache.set(key, { ids, fetchedAt: now });
     return { ids, fetchedAt: now, fromCache: false, source: 'live' };
   } catch (err) {
     return {

@@ -6,6 +6,13 @@ import { compactCurrentSession } from "../../../../src/context-window/summary-co
 const DEFAULT_THRESHOLD = 0.85;
 const MAX_CONSECUTIVE_FAILURES = 3;
 
+export function isKernelManagedAssistantPayload(payload: Record<string, unknown>): boolean {
+  return (
+    (typeof payload.kernelId === "string" && payload.kernelId.trim().length > 0)
+    || (typeof payload.providerId === "string" && payload.providerId.trim().length > 0)
+  );
+}
+
 export default function autoCompaction(ctx: AgentContext): PluginSource {
   const config = ctx.getAgentJson().kits?.config?.compact as Record<string, unknown> | undefined;
   const threshold = (config?.threshold as number | undefined) ?? DEFAULT_THRESHOLD;
@@ -91,9 +98,16 @@ export default function autoCompaction(ctx: AgentContext): PluginSource {
         if (compacting) return;
 
         const payload = event.payload as Record<string, unknown>;
+        // CLI/app-server kernels own their context window and publish canonical
+        // compact_boundary events back through the kernel bridge. Running the
+        // legacy in-process summarizer as well both duplicates that policy and,
+        // in desktop Kit bundles, tries to use an unrelated provider registry.
+        if (isKernelManagedAssistantPayload(payload)) return;
         const usage = payload.usage as { inputTokens?: number; outputTokens?: number } | undefined;
         if (!usage) return;
 
+        // usage 是当前 turn 的完整上下文消耗。不要跨 turn 累加，也不要把
+        // cacheRead 再加一次（cached tokens 已包含在 inputTokens 中）。
         const totalTokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
         if (totalTokens <= 0) return;
 

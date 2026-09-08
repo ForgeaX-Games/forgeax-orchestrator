@@ -1,20 +1,20 @@
 /**
- * cc-profile npc_text **npc_text Claude-Code-isms npc_text**(adaptor profile)npc_text
+ * cc-profile — **所有 Claude-Code-isms 的归口**(adaptor profile)。
  *
- * npc_text R4(B2):npc_text spine npc_textCC npc_text(argv flagsnpc_textpermission-mode
- * npc_textstop-reason npc_textMCP-ismsnpc_textstream-json wirenpc_textKernelEvent npc_text)npc_text
- * npc_text,`claude-code-kernel.ts` npc_text
- * `packages/kernel-adaptors/claude-code` npc_text,npc_text + claude-code-kernel.tsnpc_text
- * npc_text,spine npc_text(@forgeax/agent-runtime)npc_text
+ * 设计 R4(B2):内核 spine 必须中立——CC 专属词汇(argv flags、permission-mode
+ * 枚举、stop-reason 映射、MCP-isms、stream-json wire→KernelEvent 映射)一律锁在
+ * 本文件里,`claude-code-kernel.ts` 只剩一根薄脊梁去调用它们。日后整包外迁到
+ * `packages/kernel-adaptors/claude-code` 时,搬的就是「本文件 + claude-code-kernel.ts」
+ * 这一对,spine 上的中立类型(@forgeax/agent-runtime)不动。
  *
- * npc_text CC-isms:
+ * 锁在这里的 CC-isms:
  *  - {@link buildCcArgs}      `-p / --output-format stream-json / --permission-mode /
  *                              --session-id|--resume / --model / --append-system-prompt`
  *  - {@link buildMcpArgs}     `--mcp-config / --permission-prompt-tool / --allowedTools`
- *  - {@link toCcPermissionMode} npc_text PermissionMode npc_text CC npc_text permission-mode npc_text
- *  - {@link chatEventToKernel} wire ChatEvent npc_text npc_text KernelEvent
- *  - {@link wireStopToKernel}  CC stop-reason npc_text npc_text TurnDoneReason
- *  - {@link ccSessionExists}   CC on-disk session npc_text(npc_text resume vs npc_text)
+ *  - {@link toCcPermissionMode} 中立 PermissionMode → CC 的 permission-mode 枚举
+ *  - {@link chatEventToKernel} wire ChatEvent → 中立 KernelEvent
+ *  - {@link wireStopToKernel}  CC stop-reason → 中立 TurnDoneReason
+ *  - {@link ccSessionExists}   CC on-disk session 探测(决定 resume vs 新建)
  */
 import type {
   KernelEvent,
@@ -30,22 +30,31 @@ import { spawn } from 'node:child_process';
 import { existsSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
+import {
+  resolveBundledBunExecutable,
+  resolvePermissionServerLaunch,
+} from '../cli-providers/mcp/permission-server-entry';
 import type { ChatEvent } from '../cli-providers/types';
 import { defaultProjectRoot } from '@forgeax/platform-io';
+import { buildKernelTask } from './kernel-context';
 import { isProjectMcpToolName, readProjectMcpServers } from './project-mcp';
+import {
+  FXT_BUILTIN_TOOLS,
+  resolveForgeaxToolsServerEntry,
+} from './mcp/forgeax-tools-runtime';
 import { canonicalToolFields } from './canonical-tool-name';
 
 const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
 
-// npc_text npc_text(CC-isms) npc_text
-// npc_text = stream-json npc_text:`<binary> -p --input-format stream-json
-// --output-format stream-json --verbose` npc_text `initialize` control_request,
-// npc_text `models` npc_text TUI `/model` npc_text(CLI npc_text/npc_text/
-// env npc_text,npc_text list npc_text,SDK npc_text getAvailableModels npc_text)npc_text LLM npc_text
-// cbc npc_text cc npc_text,npc_text({@link probeStreamJsonModels})npc_text
-// npc_text(npc_text + last-known npc_text)npc_text
+// ─── 模型目录(CC-isms) ──────────────────────────────────────────────
+// 真实通道 = stream-json 控制协议:`<binary> -p --input-format stream-json
+// --output-format stream-json --verbose` 起进程后发 `initialize` control_request,
+// 响应里的 `models` 就是 TUI `/model` 展示的同一份列表(CLI 内部按订阅/企业配置/
+// env 现算,无独立 list 子命令,SDK 的 getAvailableModels 也走这条)。零 LLM 调用。
+// cbc 是 cc 近同源分叉,同协议直接复用({@link probeStreamJsonModels})。
+// 下方静态表只是回退链最后一层兜底(探测 + last-known 都失败时)。
 
-export const CLAUDE_CODE_DRIVER_LABEL = 'claude-code npc_text subscription runtime npc_text no local cost';
+export const CLAUDE_CODE_DRIVER_LABEL = 'claude-code · subscription runtime · no local cost';
 
 export const CLAUDE_CODE_FALLBACK_MODELS = [
   'opus',
@@ -55,8 +64,8 @@ export const CLAUDE_CODE_FALLBACK_MODELS = [
   'claude-4.6-sonnet-medium',
 ];
 
-/** initialize npc_textcc npc_text `value/displayName/description`,
- *  cbc(npc_text)npc_text `id/name` npc_text npc_text */
+/** initialize 响应里的单个模型条目。cc 用 `value/displayName/description`,
+ *  cbc(分叉)用 `id/name` —— 两种拼写都接。 */
 interface StreamJsonModelRow {
   id?: string;
   value?: string;
@@ -66,14 +75,14 @@ interface StreamJsonModelRow {
 }
 
 /**
- * npc_text stream-json npc_text CLI npc_text(cc npc_text cbc npc_text)npc_text
+ * 经 stream-json 控制面向 CLI 要真实模型目录(cc 与 cbc 共用)。
  *
- * npc_text:initialize npc_text `account`(npc_text token)npc_text npc_text**npc_text
- * models npc_text**,npc_text,npc_text/npc_text(last-known npc_text
- * npc_text,npc_text account)npc_text
+ * 安全:initialize 响应还带 `account`(内含登录 token)—— 本函数**只取
+ * models 数组**,其余字段一律丢弃,绝不落盘/打日志(last-known 持久化的
+ * 是本函数返回的裁剪结果,不含 account)。
  *
- * npc_text:npc_text SIGTERM;stdin npc_text(npc_text EOF
- * npc_text,npc_text kill npc_text)npc_text
+ * 生命周期:拿到响应或超时即 SIGTERM;stdin 保持打开(部分版本收到 EOF
+ * 会在应答前退出,由 kill 统一收口)。
  */
 export function probeStreamJsonModels(binary: string, timeoutMs = 15000): Promise<KernelModelInfo[]> {
   return new Promise((resolve, reject) => {
@@ -142,36 +151,36 @@ export function probeStreamJsonModels(binary: string, timeoutMs = 15000): Promis
       }
     });
 
-    child.stdin?.on('error', () => { /* EPIPE npc_text finish npc_text */ });
+    child.stdin?.on('error', () => { /* EPIPE — finish 已统一收口 */ });
     child.stdin?.write(JSON.stringify({ type: 'control_request', request_id: reqId, request: { subtype: 'initialize' } }) + '\n');
   });
 }
 
-// npc_text per-turn permission gate registry(B-4) npc_text
+// ─── per-turn permission gate registry(B-4) ────────────────────────────
 //
-// npc_text(honest):headless CC npc_text**npc_text**npc_textspawn npc_text
-// `mcp/permission-server.mjs`(permission-prompt npc_text)npc_text CLI npc_text HTTP npc_text
-// `POST /:sid/permission-request`(npc_text `api/sessions.ts`),npc_text + npc_text
-// npc_text/npc_text `TurnRequest.requestPermission` npc_text**npc_text**
-// (compose-turn-request.ts npc_text)npc_text
+// 现状(honest):headless CC 的权限闭环是**跨进程**的——spawn 出的
+// `mcp/permission-server.mjs`(permission-prompt 工具)在 CLI 要权限时 HTTP 调
+// `POST /:sid/permission-request`(在 `api/sessions.ts`),那里弹审批卡 + 阻塞等
+// 用户点「允许/拒绝」。中立的 `TurnRequest.requestPermission` 闸**此前从未被消费**
+// (compose-turn-request.ts 也没填它)。
 //
-// npc_text:CC npc_text runTurn npc_text,npc_text
-// `req.requestPermission`,npc_text {@link registerTurnGate} npc_text in-process
-// npc_text Map(npc_text=npc_text sid)npc_text**npc_text**:`/:sid/permission-request`
-// npc_text(api/sessions.ts)npc_text {@link consultTurnGate} npc_text(allow/
-// deny)npc_text,npc_text;npc_text(npc_text/npc_text)npc_text + npc_text
-// npc_text checkTool/requestPermission npc_text CC npc_text
-// `turn-gate.test.ts` npc_text(npc_text)npc_text
+// 这里把缺口补到「我这一侧能补的最深」:CC 内核 runTurn 时,若编排层提供了
+// `req.requestPermission`,就经 {@link registerTurnGate} 把它登记进这个 in-process
+// 单进程 Map(键=真实 sid)。跨文件那一步**已接线**:`/:sid/permission-request`
+// 处理器(api/sessions.ts)进卡前先 {@link consultTurnGate} 咨询本闸——命中(allow/
+// deny)直接回执,免去弹卡;未命中(无内核闸/非内核路径)再回落到现有「弹卡 + 阻塞」。
+// 至此「编排层 checkTool/requestPermission 成为 CC 内核唯一闸」闭合。接线由
+// `turn-gate.test.ts` 的回归守卫钉住(防再次被静默删)。
 //
-// npc_text Bun npc_text;npc_text sid npc_text turn,npc_text sid npc_text(npc_text
-// permission-registry npc_text owner.sid npc_text)npc_text
+// 单进程 Bun 安全;一个 sid 同时只跑一轮 turn,故按 sid 键足够(与
+// permission-registry 的 owner.sid 同口径)。
 
 const _turnGates = new Map<
   string,
   (call: PermissionCall) => Promise<PermissionDecision>
 >();
 
-/** npc_text(npc_text=npc_text sid)npc_text(sid npc_text gate)npc_text */
+/** 登记本轮的中立权限闸(键=真实 sid)。返回是否真的登记了(sid 非空且有 gate)。 */
 export function registerTurnGate(
   sid: string,
   gate: (call: PermissionCall) => Promise<PermissionDecision>,
@@ -181,14 +190,14 @@ export function registerTurnGate(
   return true;
 }
 
-/** npc_text sid npc_text(turn npc_text/npc_text,npc_text)npc_text */
+/** 释放某 sid 的权限闸(turn 结束/中断时调用,幂等)。 */
 export function releaseTurnGate(sid: string): void {
   if (sid) _turnGates.delete(sid);
 }
 
-/** npc_text(api/sessions.ts npc_text /:sid/permission-request)npc_text:
- *  npc_text {@link PermissionDecision},npc_text undefined(npc_text)npc_text
- *  npc_text HTTP npc_text = npc_text(npc_text)npc_text */
+/** 供权限回执端(api/sessions.ts 的 /:sid/permission-request)优先咨询的入口:
+ *  命中则返回中立 {@link PermissionDecision},未命中返回 undefined(回落弹卡)。
+ *  尚未在该 HTTP 端接线时本函数无人调用 = 现有行为不变(诚实标注的剩余深度)。 */
 export async function consultTurnGate(
   sid: string,
   call: PermissionCall,
@@ -198,22 +207,23 @@ export async function consultTurnGate(
   try {
     return await gate(call);
   } catch (e) {
-    // fail closed:npc_text npc_text deny(npc_text)npc_text
+    // fail closed:闸抛错 → deny(绝不静默放行)。
     return { behavior: 'deny', message: `permission gate error: ${(e as Error).message}` };
   }
 }
 
-/** CC headless npc_text `--permission-mode` npc_text(CC-ism,npc_text profile npc_text)npc_text */
+/** CC headless 的 `--permission-mode` 取值枚举(CC-ism,只活在 profile 里)。 */
 export type CcPermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
 
 /**
- * npc_text {@link PermissionMode} npc_text CC `--permission-mode` npc_text(B2:spine npc_text CC npc_text)npc_text
- *   gated        npc_text 'default'           npc_text
- *   autoEdits    npc_text 'acceptEdits'       npc_text
- *   planning     npc_text 'plan'              npc_text
- *   unrestricted npc_text 'bypassPermissions' npc_text
+ * 中立 {@link PermissionMode} → CC `--permission-mode` 枚举(B2:spine 不出现 CC 词汇)。
+ * 已翻译的 CC 值也原样返回，供 kernel 的 pending-mode 路径安全复用。
+ *   gated        → 'default'           每个工具都走闸
+ *   autoEdits    → 'acceptEdits'       自动放行编辑
+ *   planning     → 'plan'              只规划不执行
+ *   unrestricted → 'bypassPermissions' 绕过闸
  */
-export function toCcPermissionMode(mode: PermissionMode): CcPermissionMode {
+export function toCcPermissionMode(mode: PermissionMode | CcPermissionMode): CcPermissionMode {
   switch (mode) {
     case 'gated':
       return 'default';
@@ -223,46 +233,60 @@ export function toCcPermissionMode(mode: PermissionMode): CcPermissionMode {
       return 'plan';
     case 'unrestricted':
       return 'bypassPermissions';
+    case 'default':
+    case 'acceptEdits':
+    case 'plan':
+    case 'bypassPermissions':
+      return mode;
   }
 }
 
-/** cc 能兑现的档位 = 中立轴四档全支持(`--permission-mode` 原生四值一一对应)。
- *  设置页的下拉选项由本表派生,故 UI 永远只列该内核真能兑现的档。 */
 export const CC_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = [
-  'gated',
-  'autoEdits',
-  'planning',
-  'unrestricted',
+  'gated', 'autoEdits', 'planning', 'unrestricted',
 ];
 
-/** cc 默认档 —— **派生**自全内核默认,不独立持值;改默认去 permission-config.ts 那一处。
- *
- *  headless 无 MCP permission-prompt(见 buildMcpArgs),故默认档必须自足放行:
- *  基线 `unrestricted`(→ `bypassPermissions`)下 `permissions.deny` 与 PreToolUse
- *  hook 仍然生效(实测结论见 permission-config.ts 的默认档注释),收窄靠它们。 */
 export const CC_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
 
-/** session npc_text:UUID threadId npc_text `--session-id`,npc_text `--resume`npc_text
- *  npc_text argv npc_text + npc_text/npc_text(npc_text startedThreadIds)npc_text */
+/** session 续接策略:UUID threadId 首次 `--session-id`,后续 `--resume`。
+ *  返回 argv 片段 + 是否「已起过/磁盘已有」(供调用方记入 startedThreadIds)。 */
 export function buildSessionArgs(
   tid: string | undefined,
   projectRoot: string,
   startedThreadIds: ReadonlySet<string>,
-): { args: string[]; threadId?: string } {
+): { args: string[]; threadId?: string; fresh: boolean } {
   const t = tid?.trim();
-  if (!t || !/^[0-9a-f-]{36}$/i.test(t)) return { args: [] };
+  if (!t || !/^[0-9a-f-]{36}$/i.test(t)) return { args: [], fresh: true };
   if (startedThreadIds.has(t) || ccSessionExists(projectRoot, t)) {
-    return { args: ['--resume', t], threadId: t };
+    return { args: ['--resume', t], threadId: t, fresh: false };
   }
-  return { args: ['--session-id', t], threadId: t };
+  return { args: ['--session-id', t], threadId: t, fresh: true };
+}
+
+/** Exact stdin payload used by stream-json and persistent CC transports. */
+export function buildCcInput(req: TurnRequest): string {
+  return req.systemPrompt.dynamicSuffix?.trim()
+    ? `${req.input.text}\n\n${req.systemPrompt.dynamicSuffix.trim()}`
+    : req.input.text;
+}
+
+/** Persistent stream-json variant: reuse one-shot capability flags, remove the
+ * positional prompt, and let the caller send the structured stdin payload. */
+export function buildCcPersistentArgs(
+  req: TurnRequest,
+  projectRoot: string,
+  sessionArgs: string[],
+  permissionMode: PermissionMode = req.permissionMode ?? CC_DEFAULT_PERMISSION_MODE,
+): string[] {
+  const oneShot = buildCcArgs(req, projectRoot, sessionArgs, toCcPermissionMode(permissionMode));
+  return [...oneShot.slice(0, -1), '--input-format', 'stream-json'];
 }
 
 /**
- * systemPrompt npc_text argv:npc_text charter(+persona)**npc_text**,npc_text `mode` npc_text flagnpc_text
- *   - replace npc_text `--system-prompt-file <path>`(npc_text prompt)
- *   - append/npc_text npc_text `--append-system-prompt-file <path>`(npc_text,npc_text)
- * npc_text file npc_text inline npc_text:charter+npc_text,inline npc_text argv npc_text
- * npc_text npc_text npc_text inline `--append-system-prompt <text>`(npc_text)npc_text
+ * systemPrompt 注入 argv:把组合好的 charter(+persona)**写临时文件**,按 `mode` 取 flag——
+ *   - replace → `--system-prompt-file <path>`(完全替换内核默认 prompt)
+ *   - append/缺省 → `--append-system-prompt-file <path>`(保留默认身份,追加)
+ * 走 file 变体而非 inline 的理由:charter+分层记忆可能很长,inline 进 argv 有长度上限风险。
+ * 临时文件写失败 → 降级回 inline `--append-system-prompt <text>`(不崩、不静默丢身份)。
  */
 function buildSystemPromptArgs(text: string, mode: 'append' | 'replace', key: string): string[] {
   try {
@@ -272,18 +296,18 @@ function buildSystemPromptArgs(text: string, mode: 'append' | 'replace', key: st
       ? ['--system-prompt-file', path]
       : ['--append-system-prompt-file', path];
   } catch {
-    // npc_text:replace npc_text append inline(headless npc_text),npc_text
+    // 降级:replace 也只能退回 append inline(headless 无其它替换通道),诚实标注。
     return ['--append-system-prompt', text];
   }
 }
 
 /**
- * npc_text argv(npc_text toolPolicy npc_text CC `--tools` / `--disallowedTools`)npc_text
- *   - allow npc_text `--tools a,b,c`(npc_text**npc_text**npc_text;CC npc_text)
- *   - deny  npc_text `--disallowedTools a b npc_text`(npc_text;CC npc_text)
- * npc_text opaque npc_text(spine npc_text,npc_text contract)npc_text npc_text npc_text npc_text npc_text
- * npc_text**npc_text `--flag` npc_text**npc_text(npc_text buildCcArgs npc_text),
- * npc_text `--disallowedTools` npc_text messagenpc_text
+ * 工具面策略 argv(中立 toolPolicy → CC `--tools` / `--disallowedTools`)。
+ *   - allow → `--tools a,b,c`(限制**内置**工具的独占白名单;CC 收逗号分隔单值)
+ *   - deny  → `--disallowedTools a b …`(从模型上下文移除;CC 变长数组)
+ * 名字 opaque 透传(spine 不解释,见 contract)。缺省 ⇒ 返回空 ⇒ 今日行为不变。
+ * 调用方必须把本片段放在**会被后续 `--flag` 终止**的位置(见 buildCcArgs 排序注释),
+ * 否则变长 `--disallowedTools` 会吞掉尾随的位置参数 message。
  */
 function buildToolPolicyArgs(policy: TurnRequest['toolPolicy']): string[] {
   const out: string[] = [];
@@ -294,9 +318,9 @@ function buildToolPolicyArgs(policy: TurnRequest['toolPolicy']): string[] {
   return out;
 }
 
-/** npc_text argv:`--max-turns`(agentic npc_text)+ `--max-budget-usd`(npc_text spawn npc_text)npc_text
- *  npc_text `req.budget`(maxTurns/maxBudgetUsd)npc_text npc_text npc_text npc_text npc_text(npc_text)npc_text
- *  npc_text:npc_text claude **npc_text**npc_text/npc_text,npc_text sidecar cred-vault npc_text(R3-05)npc_text */
+/** 预算硬闸 argv:`--max-turns`(agentic 轮数上限)+ `--max-budget-usd`(本次 spawn 花费上限)。
+ *  来自中立 `req.budget`(maxTurns/maxBudgetUsd)。缺省 ⇒ 空 ⇒ 无上限(今日行为)。
+ *  注:这是 claude **原生**轮数/预算闸,与 sidecar cred-vault 的跨进程预算熔断(R3-05)互补。 */
 function buildBudgetArgs(budget: TurnRequest['budget']): string[] {
   const out: string[] = [];
   if (typeof budget?.maxTurns === 'number' && budget.maxTurns > 0) out.push('--max-turns', String(budget.maxTurns));
@@ -304,36 +328,38 @@ function buildBudgetArgs(budget: TurnRequest['budget']): string[] {
   return out;
 }
 
-/** npc_text argv:`--fallback-model a,b`(npc_text/npc_text)npc_textopaque npc_text */
+/** 模型级联回退 argv:`--fallback-model a,b`(主模型过载/退役时按序回退)。opaque 透传。 */
 function buildFallbackArgs(models: TurnRequest['fallbackModels']): string[] {
   const list = models?.filter((m) => typeof m === 'string' && m.trim());
   return list && list.length ? ['--fallback-model', list.join(',')] : [];
 }
 
-/** Hermetic mode is a trust boundary, not a latency switch.
- * Imported/untrusted packs must not inherit operator capabilities; own Studio
- * turns must retain Claude's native MCP, plugin, skill, CLAUDE.md, hooks and
- * settings so the external capability manager remains semantically intact.
+/**
+ * hermetic 隔离 argv —— **仅 `trustTier === 'imported'`**(不可信 pack)启用:
+ *   - `--strict-mcp-config`   只用本进程 `--mcp-config`(forgeax perm/fxt),忽略 operator 全局/项目 MCP。
+ *   - `--setting-sources ''`  不加载 operator 的 user/project/local settings、CLAUDE.md、hooks/skills/plugins。
+ * 编排层已用 composeTurnRequest 全权组装身份+工具,imported claude 不该再继承宿主机配置(防漂移/泄漏)。
+ * own/builtin(forge)**不启用**(可信 + 需要 operator 完整环境)→ 零回归。env-scrub + cred-proxy
+ * 是凭据层,本片段补**配置层**,共同构成 imported 沙箱。`--setting-sources ''` 真二进制接受 = 加载零来源。
  */
 function buildHermeticArgs(trustTier: TurnRequest['trustTier']): string[] {
-  if (trustTier === 'imported') return ['--strict-mcp-config', '--setting-sources', ''];
-  return [];
+  return trustTier === 'imported' ? ['--strict-mcp-config', '--setting-sources', ''] : [];
 }
 
 /**
- * settings.permissions npc_text argv(046 npc_text3):npc_text `hooks.PreToolUse` npc_text
- * settings JSON npc_text,`--settings <path>` npc_text npc_text hook npc_text forgeax
- * npc_text(`/:sid/hook-gate`,settings npc_text;ask npc_text Studio npc_text)npc_text
- * npc_text CC **npc_text**npc_text(Bash/Write/Editnpc_text CC npc_text)npc_text
- * npc_text acceptEdits npc_text permission-prompt npc_text(npc_textB)npc_text
- * npc_text 2026-07-14:`--settings` npc_text PreToolUse npc_text headless `-p` npc_textdeny npc_text
+ * settings.permissions 拦截面 argv(046 楔子3):把一个只含 `hooks.PreToolUse` 的
+ * settings JSON 写临时文件,`--settings <path>` 注入 —— hook 命令同步回调 forgeax
+ * 决策端点(`/:sid/hook-gate`,settings 规则求值;ask 弹 Studio 审批卡阻塞)。
+ * 这补上 CC **内置**工具(Bash/Write/Edit…在 CC 子进程内自执行)的拦截缺口——
+ * 尤其 acceptEdits 基线下文件编辑不过 permission-prompt 的盲区(墙B)。
+ * 实测 2026-07-14:`--settings` 注入的 PreToolUse 在 headless `-p` 下真触发、deny 强制。
  *
- * npc_text argv(port/sid/agent;npc_text,npc_text shell env npc_text)npc_texttimeout 600s
- * (>= npc_text 10min server npc_text;hook npc_text 9.5min fetch npc_text)npc_text
- * npc_text npc_text npc_text(npc_text:npc_text hook npc_text,tier npc_text + permission-prompt npc_text,npc_text)npc_text
+ * 上下文全经 argv(port/sid/agent;跨平台,不依赖 shell env 前缀)。timeout 600s
+ * (>= 端点弹卡的 10min server 侧超时的大头;hook 脚本自留 9.5min fetch 上限先超)。
+ * 写失败 → 返回空(降级:无 hook 拦截面,tier 闸 + permission-prompt 基线仍在,不崩)。
  *
- * npc_text imported npc_text `--setting-sources ''` npc_text user/project/local npc_text,`--settings`
- * flag npc_text npc_text npc_text,imported npc_text best-effort npc_text
+ * ⚠️ imported 的 `--setting-sources ''` 只裁 user/project/local 三源,`--settings`
+ * flag 是独立源 —— 但两者叠加行为未实测,imported 路径按 best-effort 标注。
  */
 function buildHookSettingsArgs(realSid: string, agentId: string, key: string): string[] {
   if (!realSid) return [];
@@ -349,65 +375,61 @@ function buildHookSettingsArgs(realSid: string, agentId: string, key: string): s
     writeFileSync(path, JSON.stringify(settings));
     return ['--settings', path];
   } catch {
-    return []; // npc_text:npc_text(npc_text,npc_text)npc_text
+    return []; // 降级:无规则拦截面(诚实少一层,不假装有)。
   }
 }
 
 /**
- * npc_text TurnRequest npc_text `claude -p` argv(systemPrompt npc_text composeTurnRequest)npc_text
- * `permissionMode` 收**中立**档位(缺省 {@link CC_DEFAULT_PERMISSION_MODE}),方言翻译
- * 只发生在本函数内一次({@link toCcPermissionMode})—— 调用方(kernel)不碰 CC-ism。
+ * 从中立 TurnRequest 拼 `claude -p` argv(systemPrompt 来自编排层 composeTurnRequest)。
+ * `permissionMode` 缺省时先用 `req.permissionMode`，再用
+ * {@link CC_DEFAULT_PERMISSION_MODE};传入则覆盖。这样漏传独立档位参数时不会
+ * 静默落到某个旧的宽松档位，翻译只在本 profile 内发生。
  */
 export function buildCcArgs(
   req: TurnRequest,
   projectRoot: string,
   sessionArgs: string[],
-  // 缺省先看 `req.permissionMode` 再落默认档 —— **fail-safe**:漏传第 4 参的调用方
-  // 会拿到本轮请求的档位,而不是静默跳到最高放行档(权限相关的默认必须往紧的方向兜)。
-  permissionMode: PermissionMode = req.permissionMode ?? CC_DEFAULT_PERMISSION_MODE,
+  permissionMode: PermissionMode | CcPermissionMode = req.permissionMode ?? CC_DEFAULT_PERMISSION_MODE,
+  bootstrapContext = false,
 ): string[] {
+  const ccPermissionMode = toCcPermissionMode(permissionMode);
   const sp = req.systemPrompt;
   const systemPrompt = sp.persona?.trim()
     ? `${sp.charter}\n\n---\n\n## Persona\n\n${sp.persona.trim()}`
     : sp.charter;
 
-  // MCP:npc_text(permission-prompt npc_text forgeax MCP)+ npc_text(fxt server)npc_text
+  // MCP:权限闸(permission-prompt → forgeax MCP)+ 编排层声明的工具(fxt server)。
   const tid = req.session.threadId?.trim();
   const mcpArgs = buildMcpArgs(req, tid || '', projectRoot);
 
-  // npc_text(--tools/--disallowedTools)npc_text mcpArgs npc_textsystemPromptArgs npc_text
-  // systemPromptArgs npc_text `--*-system-prompt*` flag npc_text,npc_text `--disallowedTools`,
-  // npc_text messagenpc_text
+  // 工具面策略(--tools/--disallowedTools)。放在 mcpArgs 之后、systemPromptArgs 之前——
+  // systemPromptArgs 必以 `--*-system-prompt*` flag 打头,稳妥终止变长 `--disallowedTools`,
+  // 避免吞掉末尾位置参数 message。
   const toolPolicyArgs = buildToolPolicyArgs(req.toolPolicy);
 
-  // Hermetic flags apply only to imported/untrusted turns; they are not a
-  // global performance optimization and must not hide native capabilities.
+  // hermetic 隔离(仅 imported)+ 预算硬闸 + 模型级联回退。
   const hermeticArgs = buildHermeticArgs(req.trustTier);
   const budgetArgs = buildBudgetArgs(req.budget);
   const fallbackArgs = buildFallbackArgs(req.fallbackModels);
 
-  // systemPrompt npc_text(replace/append),npc_text inlinenpc_textkey npc_text+npc_text
+  // systemPrompt 经临时文件(replace/append),写失败降级 inline。key 求稳定+不串台。
   const spKey = req.hostSessionId?.trim() || tid || req.session.agentId?.trim() || 'x';
   const systemPromptArgs = buildSystemPromptArgs(systemPrompt, sp.mode ?? 'append', spKey);
 
-  // settings.permissions npc_text(046 npc_text3):PreToolUse hook npc_text forgeax npc_text
+  // settings.permissions 拦截面(046 楔子3):PreToolUse hook 回调 forgeax 决策端点。
   const realSid = req.hostSessionId?.trim() || tid || '';
   const hookSettingsArgs = buildHookSettingsArgs(realSid, req.session.agentId?.trim() || 'forge', spKey);
 
-  // npc_text(dynamicSuffix npc_text user npc_text,npc_text system prompt)npc_text
-  const message = buildCcInput(req);
+  // 新建私有 session 时引入宿主选择的上下文；resume 时不重复灌入。
+  const message = buildKernelTask(req, bootstrapContext);
 
   return [
     '-p',
     '--output-format=stream-json',
     '--include-partial-messages',
     '--verbose',
-    // Claude moves only machine/session-specific sections of its default
-    // prompt into the first user payload. The native MCP/plugin/skill surface
-    // and the appended CLAUDE.md/system prompt remain enabled; this keeps the
-    // stable capability prefix reusable without disabling any capability.
     '--exclude-dynamic-system-prompt-sections',
-    '--permission-mode', toCcPermissionMode(permissionMode),
+    '--permission-mode', ccPermissionMode,
     ...hermeticArgs,
     ...hookSettingsArgs,
     ...mcpArgs,
@@ -421,36 +443,14 @@ export function buildCcArgs(
   ];
 }
 
-/** The exact user payload used by both one-shot and persistent stream-json turns. */
-export function buildCcInput(req: TurnRequest): string {
-  return req.systemPrompt.dynamicSuffix?.trim()
-    ? `${req.input.text}\n\n${req.systemPrompt.dynamicSuffix.trim()}`
-    : req.input.text;
-}
-
-/**
- * Persistent variant of {@link buildCcArgs}. It keeps every capability,
- * permission, MCP, plugin and settings flag, removes the one-shot positional
- * message, and switches stdin to Claude's documented stream-json protocol.
- */
-export function buildCcPersistentArgs(
-  req: TurnRequest,
-  projectRoot: string,
-  sessionArgs: string[],
-  permissionMode: PermissionMode = req.permissionMode ?? CC_DEFAULT_PERMISSION_MODE,
-): string[] {
-  const oneShot = buildCcArgs(req, projectRoot, sessionArgs, permissionMode);
-  return [...oneShot.slice(0, -1), '--input-format', 'stream-json'];
-}
-
-/** npc_text thread npc_text on-disk session npc_text(npc_text resume vs npc_text,npc_text)npc_text */
+/** 是否已有该 thread 的 on-disk session 文件(决定 resume vs 新建,重启安全)。 */
 export function ccSessionExists(cwd: string, tid: string): boolean {
   try {
     // CC encodes the project cwd into its on-disk dir name by replacing path
     // punctuation with '-'. Must cover Windows separators/drive too (`\` and
-    // `:`), else e.g. `C:\Users\me\proj` npc_text wrong dir, the probe misses an
-    // existing session, and the next turn re-issues `--session-id` npc_text CC errors
-    // "Session ID npc_text is already in use". Matches CC: `C:\Users\npc_text` npc_text `C--Users-npc_text`.
+    // `:`), else e.g. `C:\Users\me\proj` → wrong dir, the probe misses an
+    // existing session, and the next turn re-issues `--session-id` → CC errors
+    // "Session ID … is already in use". Matches CC: `C:\Users\…` → `C--Users-…`.
     const encoded = cwd.replace(/[/\\.:]/g, '-');
     return existsSync(resolvePath(homedir(), '.claude', 'projects', encoded, `${tid}.jsonl`));
   } catch {
@@ -458,22 +458,29 @@ export function ccSessionExists(cwd: string, tid: string): boolean {
   }
 }
 
-/** npc_text MCP npc_text + npc_text/npc_text flags:
- *   - permission server `forgeax`(npc_text sid npc_text)npc_text `--permission-prompt-tool mcp__forgeax__approve`
- *   - npc_text server `fxt`(npc_text)npc_text `--allowedTools mcp__fxt__<tool>...`(npc_text)
- *  npc_text server npc_text npc_text(npc_text permission-mode npc_text)npc_text */
-export function buildMcpArgs(req: TurnRequest, permSid: string, projectRoot = defaultProjectRoot()): string[] {
+/** 组合 MCP 配置 + 权限/放行 flags:
+ *   - permission server `forgeax`(有 sid 时)→ `--permission-prompt-tool mcp__forgeax__approve`
+ *   - 工具 server `fxt`(编排层声明了工具时)→ `--allowedTools mcp__fxt__<tool>...`(权限归编排层)
+ *  无任何 server → 返回空(靠 permission-mode 兜底)。 */
+export function buildMcpArgs(
+  req: TurnRequest,
+  permSid: string,
+  projectRoot = defaultProjectRoot(),
+): string[] {
   const mcpServers: Record<string, unknown> = {};
   const flags: string[] = [];
 
   if (permSid) {
-    // npc_text**npc_text sid**(UI npc_text sid),npc_text threadId(permSid=uuidv5)npc_text
-    // npc_text /api/sessions/<uuid>/permission-request npc_text session npc_text npc_text deny,Bash npc_text
-    // npc_text(ship-gate npc_text#2 parity npc_text)npc_texthostSessionId = compose npc_text sidnpc_text
+    // 权限卡必须路由到**真实 sid**(UI 监听的 sid),而非合成的 threadId(permSid=uuidv5)——
+    // 否则 /api/sessions/<uuid>/permission-request 命不中任何 session → 一律 deny,Bash 等需审批
+    // 的工具在内核模式下全废(ship-gate 闸#2 parity 真缺口)。hostSessionId = compose 透传的真 sid。
     const realSid = req.hostSessionId?.trim() || permSid;
+    const permissionServer = resolvePermissionServerLaunch(
+      resolvePath(import.meta.dirname, '../cli-providers/mcp/permission-server.mjs'),
+    );
     mcpServers.forgeax = {
-      command: process.execPath,
-      args: [resolvePath(import.meta.dirname, '../cli-providers/mcp/permission-server.mjs')],
+      command: permissionServer.command,
+      args: [permissionServer.entry],
       env: {
         FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
         FORGEAX_SID: realSid,
@@ -485,31 +492,30 @@ export function buildMcpArgs(req: TurnRequest, permSid: string, projectRoot = de
 
   if (req.tools.length > 0) {
     const env: Record<string, string> = {
-      FORGEAX_PROJECT_ROOT: defaultProjectRoot(),
-      // FORGEAX_SOUL_AGENT npc_text memory_search npc_text soul npc_text
+      FORGEAX_PROJECT_ROOT: projectRoot,
+      // FORGEAX_SOUL_AGENT 让 memory_search 定位该 soul 的分层记忆库。
       FORGEAX_SOUL_AGENT: req.session.agentId?.trim() || 'default',
-      // npc_text + npc_text sid + agentPath:**npc_text**npc_text host-tool npc_text,npc_text
-      // npc_text(query_world/capture_frame)npc_text HTTP npc_text /:sid/perception-querynpc_text
-      // threadId npc_text UUID,npc_text agent / session npc_text hostSessionIdnpc_text
+      // 回调基址 + 真实 sid + agentPath:**始终下发**——除 host-tool 桥外,内置感知
+      // 工具(query_world/capture_frame)也要 HTTP 回打 /:sid/perception-query。
+      // threadId 已是合成 UUID,故定位活 agent / session 用 hostSessionId。
       FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
       FORGEAX_SID: req.hostSessionId?.trim() || permSid,
       FORGEAX_AGENT: req.session.agentId?.trim() || 'forge',
+      // The fxt process is a per-turn registry. Native project providers mount
+      // their own MCP config; the fxt child must never start a second copy.
       FORGEAX_FXT_EXPOSE: req.tools.map((tool) => tool.name).join(','),
-      // Claude's own/default turns mount project MCP natively below. Imported
-      // turns keep the same tools in the fxt specs so the host trust gate is
-      // the only execution path. The fxt child itself never spawns project
-      // servers, preventing duplicate MCP processes in either case.
       FORGEAX_DISABLE_PROJECT_MCP: '1',
     };
 
-    // T-A host-tool npc_text:npc_text MCPnpc_textHTTP npc_text
-    // npc_text fxt server(npc_text = echo + R6 memory_search/remember/soul_create + legacy
-    // rented-CLI list_games/query_world/capture_frame npc_text mcp server npc_text,npc_text host-tool npc_text)npc_text
-    const BUILTIN_FXT = new Set(['echo', 'list_games', 'memory_search', 'remember', 'soul_create', 'npc_wire', 'query_world', 'capture_frame']);
+    // T-A host-tool 桥:非内置工具经 MCP→HTTP 回调宿主执行。把它们的规格写临时文件
+    // 给 fxt server。The shared runtime set tracks the fxt server's actual
+    // builtins; these two compose-owned adoption names are handled by the same
+    // ForgeaX builtin surface and must not be misclassified as arbitrary specs.
+    const BUILTIN_FXT = new Set([...FXT_BUILTIN_TOOLS, 'soul_create', 'npc_wire']);
     const nativeProjectMcp = req.trustTier !== 'imported';
-    const bridged = req.tools.filter((t) =>
-      !BUILTIN_FXT.has(t.name)
-      && (!nativeProjectMcp || !isProjectMcpToolName(t.name, projectRoot)),
+    const bridged = req.tools.filter((tool) =>
+      !BUILTIN_FXT.has(tool.name)
+      && (!nativeProjectMcp || !isProjectMcpToolName(tool.name, projectRoot)),
     );
     if (bridged.length > 0) {
       try {
@@ -517,13 +523,13 @@ export function buildMcpArgs(req: TurnRequest, permSid: string, projectRoot = de
         writeFileSync(specsPath, JSON.stringify(bridged));
         env.FORGEAX_TOOL_SPECS_FILE = specsPath;
       } catch {
-        /* specs npc_text npc_text npc_text(npc_text,npc_text) */
+        /* specs 写失败 → 只暴露内置工具(降级,不崩) */
       }
     }
 
     mcpServers.fxt = {
-      command: process.execPath,
-      args: [resolvePath(import.meta.dirname, 'mcp/forgeax-tools-server.mjs')],
+      command: resolveBundledBunExecutable(),
+      args: [resolveForgeaxToolsServerEntry()],
       env,
     };
     const requestedProjectServers = new Set(
@@ -543,8 +549,8 @@ export function buildMcpArgs(req: TurnRequest, permSid: string, projectRoot = de
       };
       projectServerKeys.set(normalizedServer, server.name);
     }
-    // npc_text npc_text headless npc_text(= npc_text)npc_text
-    // `--allowedTools <tools...>` npc_text:npc_text argv npc_text
+    // Native project tools are allowed under their real MCP server name. All
+    // other tools use the fxt namespace and therefore cross the host bridge.
     const allowedTools = req.tools.flatMap((tool) => {
       const fxtName = `mcp__fxt__${tool.name}`;
       if (!tool.name.startsWith('mcp__')) return [fxtName];
@@ -566,14 +572,18 @@ export function buildMcpArgs(req: TurnRequest, permSid: string, projectRoot = de
   }
 }
 
-/** wire ChatEvent(claude stream-json npc_text mapClaudeEvent npc_text)npc_text npc_text KernelEventnpc_text */
+/** wire ChatEvent(claude stream-json 经 mapClaudeEvent 后)→ 中立 KernelEvent。 */
 export function* chatEventToKernel(ev: ChatEvent): Generator<KernelEvent> {
   switch (ev.type) {
     case 'token':
       yield { kind: 'message.delta', role: 'assistant', text: ev.text };
       return;
     case 'thinking':
-      yield { kind: 'thinking.delta', text: ev.text, visibility: ev.visibility ?? 'private_reasoning' };
+      yield {
+        kind: 'thinking.delta',
+        text: ev.text,
+        visibility: ev.visibility ?? 'private_reasoning',
+      };
       return;
     case 'tool-call':
       yield {
@@ -624,7 +634,7 @@ export function* chatEventToKernel(ev: ChatEvent): Generator<KernelEvent> {
   }
 }
 
-/** CC stop-reason npc_text npc_text TurnDoneReasonnpc_text */
+/** CC stop-reason → 中立 TurnDoneReason。 */
 export function wireStopToKernel(s: 'end_turn' | 'tool_use' | 'max_tokens' | 'cancelled'): TurnDoneReason {
   switch (s) {
     case 'end_turn': return 'stop';

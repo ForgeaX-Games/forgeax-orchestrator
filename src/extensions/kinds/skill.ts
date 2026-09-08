@@ -6,7 +6,7 @@
  * SkillDefinition contract that downstream resolvers/runners expect.
  *
  * Lookup-only at this phase — the runner lands in D4. Both kind=skill and
- * kind=workbench/agent plugins can declare `provides.skills`, so this loader
+ * schema-v2 extensions and legacy agent plugins can declare skills, so this loader
  * runs against any merged manifest and emits one entry per skill found.
  */
 import { dirname } from 'node:path';
@@ -52,8 +52,7 @@ export function loadSkills(
 ): { entries: RegistryEntry[]; issues: KindLoadIssue[] } {
   const out: { entries: RegistryEntry[]; issues: KindLoadIssue[] } = { entries: [], issues: [] };
   const m = merged.manifest;
-  const provides = m.provides as ProvidesWithSkills | undefined;
-  const skills = provides?.skills;
+  const skills = merged.normalizedManifest.contributes.skills;
   if (!skills?.length) return out;
 
   for (const s of skills) {

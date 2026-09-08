@@ -17,25 +17,17 @@
  */
 
 import { Hono } from 'hono';
-import { readFileSync } from 'node:fs';
 import { getSessionManager } from '../core/session-manager';
-import { findMarketplaceManifest } from './lib/marketplace-manifest';
-import { defaultProjectRoot } from '@forgeax/platform-io';
+import { loadBrand } from '../brand';
 
-/** Read marketplace manifest once per request to identify the orchestrator
- *  (`default: true`). Tree-depth alone can't tell us — `delegate_to_subagent`
+/** Read the Brand-owned main assistant id. Tree-depth alone can't tell us — `delegate_to_subagent`
  *  attaches sub-agents as siblings of the root, so every node lands at
  *  depth 1. Returns the set of orchestrator ids; usually a single name. */
 function readMainAgentIds(): Set<string> {
   const out = new Set<string>();
   try {
-    const found = findMarketplaceManifest(defaultProjectRoot());
-    if (!found.path) return out;
-    const raw = readFileSync(found.path, 'utf-8');
-    const manifest = JSON.parse(raw) as { agents?: Array<{ id: string; default?: boolean }> };
-    for (const a of manifest.agents ?? []) {
-      if (a.default && a.id) out.add(a.id);
-    }
+    const id = loadBrand().config.assistant.agent.id;
+    if (id) out.add(id);
   } catch { /* ignore — fall back to no main marker */ }
   return out;
 }
@@ -71,7 +63,7 @@ export function createThreadsRouter(): Hono {
     //       have since been detached, and gives us firstSeenAt/lastSeenAt).
     // AgentsPanel keys agents by marketplace id (`forge`, `suzu`, …). The
     // tree path's last segment is the canonical agent id — same convention
-    // workbench.ts already uses for ledger bucketing.
+    // page.ts already uses for ledger bucketing.
     type Row = { id: string; role: 'main' | 'sub'; firstSeenAt: number; lastSeenAt: number; runCount: number };
     const byId = new Map<string, Row>();
     const mainIds = readMainAgentIds();

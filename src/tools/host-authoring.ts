@@ -1,7 +1,7 @@
 /**
  * host-authoring —— tool handler 的「宿主编排能力」缝(GAP 5)。
  *
- *  背景:产品层的 authoring 工具(如 `team:create_role`)是 marketplace 插件,
+ *  背景:产品层的 authoring 工具(如 `team:create_role`)是独立 extension,
  *  其 handler 经 `await import(entry.backend)` 跑在宿主(cli)进程里,**但 ESM 裸
  *  说明符从插件目录向上解析,解析不到 `@forgeax/*`**(实测 ERR_MODULE_NOT_FOUND)。
  *  所以 handler 拿不到 parseManifest / writeAgentPack / reloadExtensions —— 一切
@@ -10,7 +10,7 @@
  *  本模块把「铸造一个 agent-pack」这件通用 authoring 事收敛成一个 host 能力:
  *    - 组装 manifest(spec → forgeax-extension.json kind:agent)
  *    - parseManifest 自验(fail fast,§Schema-as-Contract)
- *    - 双名字空间撞名查重(plugin snapshot + marketplace legacy) —— 否则新角色会
+ *    - extension snapshot 撞名查重 —— 否则新角色会
  *      **静默遮蔽**内建角色(resolvePersonaForAgent 是 plugin-first)
  *    - 调 platform-io 的纯 IO primitive writeAgentPack 落盘(user/project,目录存在即拒)
  *  以及 reloadExtensions(让刚落盘的角色进 snapshot → 下一轮 roster 自动带上)。
@@ -22,16 +22,13 @@ import { parseManifest, pickI18n, type I18nString } from '@forgeax/types';
 import {
   writeAgentPack,
   defaultProjectRoot,
-  assetRoot,
   type AgentPackScope,
 } from '@forgeax/platform-io';
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
 import { reloadExtensions } from '../extensions/registry';
 import { listAgents } from '../agents/loader';
 import { isValidAgentName } from '../core/agent-scaffold';
 
-/** 产品工具喂进来的角色规格(与 wb-team-forge 的 create-role.args.json 对齐)。 */
+/** 产品工具喂进来的角色规格(与 team-forge 的 create-role.args.json 对齐)。 */
 export interface AgentPackSpec {
   /** 单段 [a-zA-Z0-9_-];会被小写化作 plugin id 段与 agent id。 */
   id: string;
@@ -64,55 +61,21 @@ export interface RosterEntry {
   id: string;
   role: string;
   displayName: string;
-  source: 'plugin' | 'marketplace';
+  source: 'plugin';
 }
 
 export interface HostAuthoring {
   /** 重扫插件层(builtin/user/project),刷新 snapshot。让刚落盘的 agent-pack 生效。 */
   reloadExtensions(): Promise<void>;
-  /** 兼容 marketplace 插件工具(wb-team-forge tools.mjs 等)沿用的旧方法名,勿删。 */
+  /** 兼容 extension 工具沿用的旧方法名。 */
   reloadPlugins(): Promise<void>;
   /** 组装 + 自验 + 撞名查重 + 落盘一个 agent-pack。不 reload(调用方自行决定)。 */
   createAgentPack(spec: AgentPackSpec): Promise<CreateAgentPackResult>;
-  /** 当前可派单角色(plugin agents + marketplace legacy)的合集,供 list_roles。 */
+  /** 当前可派单 extension agents 的合集,供 list_roles。 */
   listRoles(): RosterEntry[];
 }
 
 const DEFAULT_COLOR = '#8B95A5';
-
-/** 复制 subagent_roster 的 marketplace 根查找(自包含,避免依赖 loader 私有函数)。 */
-function findMarketplaceRoot(): string | null {
-  const root = defaultProjectRoot();
-  const candidates = [
-    resolve(assetRoot(), 'marketplace'),
-    resolve(root, 'packages/marketplace'),
-    resolve(root, '../packages/marketplace'),
-    resolve(root, '../../packages/marketplace'),
-    resolve(root, 'marketplace'),
-    resolve(root, '../marketplace'),
-  ];
-  return candidates.find((p) => existsSync(join(p, 'manifest.json'))) ?? null;
-}
-
-interface MarketplaceLegacyAgent {
-  id: string;
-  role?: string;
-  cardName?: I18nString;
-  card?: { name?: I18nString };
-  displayName?: I18nString;
-}
-
-function readMarketplaceAgents(): MarketplaceLegacyAgent[] {
-  const mp = findMarketplaceRoot();
-  if (!mp) return [];
-  try {
-    const raw = readFileSync(join(mp, 'manifest.json'), 'utf-8');
-    const parsed = JSON.parse(raw) as { agents?: MarketplaceLegacyAgent[] };
-    return parsed.agents ?? [];
-  } catch {
-    return [];
-  }
-}
 
 function collectRoster(): RosterEntry[] {
   const rows: RosterEntry[] = [];
@@ -126,17 +89,6 @@ function collectRoster(): RosterEntry[] {
       role: e.definition.role,
       displayName: pickI18n(e.definition.card.name, 'zh') || id,
       source: 'plugin',
-    });
-  }
-  for (const a of readMarketplaceAgents()) {
-    if (!a.id || seen.has(a.id)) continue;
-    seen.add(a.id);
-    rows.push({
-      id: a.id,
-      role: a.role ?? 'peer',
-      displayName:
-        pickI18n(a.card?.name ?? a.cardName ?? a.displayName, 'zh') || a.id,
-      source: 'marketplace',
     });
   }
   return rows;
@@ -213,7 +165,7 @@ export function createHostAuthoring(): HostAuthoring {
       if (typeof spec.persona !== 'string' || !spec.persona.trim()) {
         return { ok: false, code: 'bad_input', error: 'persona is required and must be non-empty' };
       }
-      // 双名字空间撞名查重:plugin snapshot + marketplace legacy。撞任一 → 拒,
+      // Extension snapshot 撞名查重。撞名即拒,
       // 不静默覆盖(照 fork.ts 的 {code:'exists'} 幂等策略)。
       const existing = new Set(collectRoster().map((r) => r.id));
       if (existing.has(id)) {

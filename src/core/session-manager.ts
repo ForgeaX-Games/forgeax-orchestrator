@@ -3,15 +3,12 @@
  *  与 agenteam ref 的差异（plan §3.1.1 / §3.1.2 / §4.x）：
  *  - **进程单例**：`initSessionManager(pm) / getSessionManager()`；多 cli attach 必
  *    须命中同一个 Session 实例（同一个 EventBus / Ledger）。
- *  - **不包 scheduler 启停**：`open()` 只 hydrate 内存态（构造 Session、扫 tree、
- *    回放 blackboard），不开火 scheduler；caller 自己决定 `s.scheduler.start()`。
- *  - **agent factory 在 SessionManager 这层装配**：把 ledger / sessionDefaultModels
- *    / kit （本轮空）注入打包，作为 SessionInitConfig.agentFactory 给 Session。
- *    ConsciousAgent 不直接被 Scheduler 依赖（plan §3.6）。
+ *  - `open()` 构造 Session，并一次性 bootstrap resident RuntimeTree。
+ *  - Agent lifecycle 由 Session 内的 RuntimeSupervisor 唯一持有。
  *  - **create only builds an empty session container**: writes session.json +
  *    blackboard.json, never writes any agent.json. Agents are created via a separate
- *    path (spawn / hand-write agent.json); AgentTree only grows nodes when it sees
- *    agent.json. The agent's working directory is the session's `sessionWorkDir`
+ *    path. Resident definitions are loaded only during bootstrap/reload. The
+ *    Agent working directory is the Session's `sessionWorkDir`
  *    (studio = its permanently-bound game dir), injected as `agentContext.cwd`.
  *  - **permanent binding (plan B PR2)**: a session is bound to its game at create
  *    time by the injected SessionLayout (path-as-SSOT). There is no `setDefaultDir`
@@ -22,16 +19,10 @@
  *  接口：create / open / close / delete / list / bootAutoStart。 */
 
 import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { ConsciousAgent } from "./conscious-agent";
 import { Session } from "./session";
 import { setSessionManager, peekSessionManager, clearSessionManager } from "./session-registry";
-import type { AgentFactory } from "./scheduler";
-import type { BaseAgent } from "./base-agent";
-import { AGENT_DEFAULTS } from "../defaults/agent-json";
-import { deepMerge } from "../utils/deep-merge";
 import {
   Logger,
   setGlobalLogger,
@@ -42,7 +33,7 @@ import {
   detachConsoleEventEmitter,
   getLogContext,
 } from "./logger";
-import type { AgentJson, ModelsConfig, SessionConfig } from "./types";
+import type { ModelsConfig, SessionConfig } from "./types";
 import type { PathManagerAPI } from "../fs/types";
 import { createOrGetFSWatcher } from "../fs/watcher";
 import { recoverAgentLedger } from "../ledger/ledger-recovery";
@@ -62,9 +53,11 @@ export interface CreateSessionOpts {
   timezone?: string;
   /** 缺省 true；显式 false 才跳过 boot autoStart。 */
   autoStart?: boolean;
-  /** Optional product-provided immutable scope for the new session. Generic
-   *  layouts ignore it; scoped layouts validate and bind it at allocation. */
+  runtimeEventsRoot?: string;
+  /** Optional product scope passed to the active SessionLayout. */
   scope?: string;
+  /** Internal bootstrap hook: write resident templates before RuntimeTree scan. */
+  prepareResidentDefinitions?: (sid: string) => void | Promise<void>;
 }
 
 export interface SessionListEntry {
@@ -196,7 +189,7 @@ export class SessionManager {
       : [...this.map.values()];
 
     for (const session of ordered) {
-      const agent = session.scheduler.getAgent(agentId);
+      const agent = session.getAgentHost(agentId);
       if (!agent) continue;
       if (toAgent) {
         // withModelFeedback：进 agent 自己 inbox，下一 turn 的 prompt 看得到。
@@ -228,15 +221,17 @@ export class SessionManager {
       defaultModels: opts.defaultModels,
       timezone: opts.timezone,
       autoStart: opts.autoStart ?? true,
+      runtimeEventsRoot: opts.runtimeEventsRoot ?? "runtime-events",
     };
     writeFileSync(layer.configFile(), JSON.stringify(persisted, null, 2) + "\n", "utf-8");
 
     // 2) blackboard.json（空）
     writeFileSync(join(layer.root(), "blackboard.json"), "{}\n", "utf-8");
+    await opts.prepareResidentDefinitions?.(sid);
 
     // 3) 内存态 Session —— config.defaultDir 派生自绑定 workDir(供 readers)。
     const config: SessionConfig = { ...persisted, defaultDir: basename(workDir) };
-    const session = this._buildSession(sid, config);
+    const session = await this._buildSession(sid, config);
     this.map.set(sid, session);
     this.lru.touch(sid);
     await this._evictIfNeeded();
@@ -261,8 +256,12 @@ export class SessionManager {
     }
     const persisted = JSON.parse(readFileSync(layer.configFile(), "utf-8")) as SessionConfig;
     // defaultDir 派生自绑定路径(path-as-SSOT),不从盘读。
-    const config: SessionConfig = { ...persisted, defaultDir: this._deriveSlug(sid) };
-    const session = this._buildSession(sid, config);
+    const config: SessionConfig = {
+      ...persisted,
+      runtimeEventsRoot: persisted.runtimeEventsRoot ?? "runtime-events",
+      defaultDir: this._deriveSlug(sid),
+    };
+    const session = await this._buildSession(sid, config);
     this.map.set(sid, session);
     this.lru.touch(sid);
     await this._evictIfNeeded();
@@ -355,7 +354,13 @@ export class SessionManager {
       } else {
         try {
           const agentsMtime = newestMtimeUnder(join(sessionDir, "agents"));
-          lastActivityAt = agentsMtime > 0 ? agentsMtime : statSync(sessionDir).mtimeMs;
+          const runtimeMtime = newestMtimeUnder(
+            join(sessionDir, cfg.runtimeEventsRoot ?? "runtime-events"),
+          );
+          const historyMtime = Math.max(agentsMtime, runtimeMtime);
+          lastActivityAt = historyMtime > 0
+            ? historyMtime
+            : statSync(sessionDir).mtimeMs;
           if (!live) this._activityCache.set(sessionDir, lastActivityAt);
         } catch { /* skip — leave undefined, don't cache the error */ }
       }
@@ -381,8 +386,7 @@ export class SessionManager {
     this.paths.migrateLegacyIntoProject(sid);
   }
 
-  /** Server boot 扫 sessions/，对 autoStart !== false 的全 open。caller 自己决定
-   *  `s.scheduler.start()`（plan §4.5）。 */
+  /** Server boot 扫 sessions/，对 autoStart !== false 的 Session 完成 bootstrap。 */
   async bootAutoStart(): Promise<Session[]> {
     const opened: Session[] = [];
     for (const entry of this.list()) {
@@ -397,24 +401,38 @@ export class SessionManager {
 
   // ─── Internals ──────────────────────────────────────────────────────
 
-  /** 装配 agent factory + 构造 Session。Factory 负责读 agent.json、调
-   *  `session.getOrCreateLedger(agentPath)` 注入 ledger，构造 ConsciousAgent。 */
-  private _buildSession(sid: string, config: SessionConfig): Session {
-    let session!: Session;
-    const factory: AgentFactory = async (agentPath: string): Promise<BaseAgent> => {
-      const agentJson = await this._readAgentJson(sid, agentPath);
-      const ledger = session.getOrCreateLedger(agentPath);
+  /** Build and atomically bootstrap the one in-memory RuntimeTree. */
+  private async _buildSession(sid: string, config: SessionConfig): Promise<Session> {
+    const session = new Session({
+      sid,
+      paths: this.paths,
+      config,
+      artifactResolver: getArtifactResolver(),
+    });
 
-      // Recovery：reload / 崩溃重启后第一次 attach 时扫 ledger，把任何
-      // 「hook:turnStart 没等到对应 turnEnd 就被掐断」的孤立 turn 补一条
-      // 合成 turnEnd（aborted: true）。走 publish 不直接 append：
-      //   - `_bindLedgerPersistence` observer 自动把它写到 WAL（避免双写）
-      //   - WS hub observer 把这条 turnEnd 推给前端，前端 isStreaming 立刻清
+    // 把 session.logger 接入 console bridge router —— 此后**在该 sid scope 下跑**
+    // 的所有 console.* 都落 `<sid>/logs/debug.log` + latest.log。session.dispose
+    // 里会反注册（见 close()）。
+    registerSessionLogger(sid, session.logger);
+    try {
+      await session.initializeRuntime();
+    } catch (error) {
+      unregisterSessionLogger(sid);
+      await session.dispose().catch(() => {});
+      throw error;
+    }
+
+    for (const instance of session.runtimeTree.list()) {
+      const agentPath = session.tree.addressOf(instance);
       try {
+        const eventStore = session.supervisor.getEventStore(instance.instanceId);
+        if (!eventStore) {
+          throw new Error(`runtime EventStore missing for ${instance.instanceId}`);
+        }
         await recoverAgentLedger(
           agentPath,
-          () => ledger.readAllEvents(),
-          (ev) => session.eventBus.publish(ev, agentPath),
+          () => eventStore.ledger.readAllEvents(),
+          (event) => session.eventBus.publish(event, agentPath),
         );
       } catch (err: any) {
         session.logger.error(
@@ -423,89 +441,7 @@ export class SessionManager {
           `ledger recovery failed: ${err?.message ?? err}`,
         );
       }
-
-      // Agent cwd = the session's bound working directory (studio = its game dir),
-      // resolved from the injected SessionLayout (path-as-SSOT) — no stored slug.
-      // Missing/invalid → undefined → agent falls back to agentDir. Never throw
-      // here: that would kill agentFactory before ConsciousAgent ctor, leaving no
-      // per-agent queue → user_input drops silently. Graceful Degradation: a
-      // missing work dir must not brick the chat path; agentDir is a fine fallback.
-      let sessionCwd: string | undefined;
-      try {
-        const workDir = this.paths.sessionWorkDir(sid);
-        if (existsSync(workDir)) {
-          sessionCwd = workDir;
-        } else {
-          session.logger.warn(
-            agentPath,
-            undefined,
-            `session workDir "${workDir}" does not exist; falling back to agentDir`,
-          );
-        }
-      } catch (err: any) {
-        session.logger.warn(
-          agentPath,
-          undefined,
-          `session workDir resolution failed (${err?.message ?? err}); falling back to agentDir`,
-        );
-      }
-
-      return new ConsciousAgent({
-        agentPath,
-        sid,
-        agentDir: this.paths.session(sid).agent(agentPath).root(),
-        agentJson,
-        eventBus: session.eventBus,
-        blackboard: session.blackboard,
-        tree: session.tree,
-        ledger,
-        sessionCwd,
-        sessionDefaultModels: session.config.defaultModels,
-        fsWatcher: createOrGetFSWatcher(),
-        fileRecorder: {
-          ledger: session.fileActivity,
-          locks: session.fileLocks,
-          /** EventBus 派 `file-activity:start` / `file-activity:done`，emitterId =
-           *  agentPath，使 system-event-log filter（only emitterId == null）跳过
-           *  这条事件 —— 它已经写到 file-activity.jsonl，再写一遍 global-events 就
-           *  双倍噪声。observers（WsHub / ledger persistence）照常收到。 */
-          emit: (record, kind) => {
-            session.eventBus.publish(
-              {
-                source: `agent:${record.agentPath}`,
-                type: `file-activity:${kind}` as const,
-                payload: record as unknown as Record<string, unknown>,
-                ts: record.ts,
-              },
-              record.agentPath,
-            );
-          },
-        },
-        // assemblePrompt / runToolBatch / getTools 不注入，走 BaseAgent kits
-        // 子系统默认（ContextEngine + toolRegistry.list + tool-batch-runner）。
-        //
-        // refreshTools **被 override** —— 默认 `reloadKitKind("tools")` 只盲刷
-        // 当前 agent 的 tools；这里换成 `kitReloadCoordinator.flushReloads()`，
-        // 它会用 combined-hash 比对 4 层（builtin/user/session/agent）所有
-        // tool+slot+plugin 文件，**只对真改动**的 kit 触发对应 agent 的 reload，
-        // 顺带把 ScriptAgent src/index.ts hot-create / revival 也覆盖。这条
-        // polling 路径是 ref 设计 fs.watch 不可靠时的 fallback，bun + node
-        // 在 inotify race 上的差异都被它兜底。
-        refreshTools: () => session.kitReloadCoordinator.flushReloads().then(() => undefined),
-      });
-    };
-    session = new Session({
-      sid,
-      paths: this.paths,
-      config,
-      agentFactory: factory,
-      artifactResolver: getArtifactResolver(),
-    });
-
-    // 把 session.logger 接入 console bridge router —— 此后**在该 sid scope 下跑**
-    // 的所有 console.* 都落 `<sid>/logs/debug.log` + latest.log。session.dispose
-    // 里会反注册（见 close()）。
-    registerSessionLogger(sid, session.logger);
+    }
 
     // Watch session.json for hot-reload of defaultModels / autoStart. defaultDir
     // is NOT persisted (permanent binding, derived from path) — preserve the
@@ -514,7 +450,11 @@ export class SessionManager {
     createOrGetFSWatcher().watchFile(configFile, () => {
       try {
         const updated = JSON.parse(readFileSync(configFile, "utf-8")) as SessionConfig;
-        session.config = { ...updated, defaultDir: session.config.defaultDir };
+        session.config = {
+          ...updated,
+          runtimeEventsRoot: session.config.runtimeEventsRoot,
+          defaultDir: session.config.defaultDir,
+        };
       } catch (err: any) {
         process.stderr.write(`[session-manager] session.json reload failed for '${sid}': ${err?.message ?? err}\n`);
       }
@@ -529,22 +469,6 @@ export class SessionManager {
     try { return basename(this.paths.sessionWorkDir(sid)); } catch { return undefined; }
   }
 
-  /** 读 + AGENT_DEFAULTS deep-merge。文件缺失时返回空 merge（让 BaseAgent 走全默认）。 */
-  private async _readAgentJson(sid: string, agentPath: string): Promise<AgentJson> {
-    const file = this.paths.session(sid).agent(agentPath).agentJson();
-    let raw: Record<string, unknown> = {};
-    try {
-      const txt = await readFile(file, "utf-8");
-      raw = JSON.parse(txt) as Record<string, unknown>;
-    } catch {
-      // 缺文件 / 损坏 → 全默认
-    }
-    return deepMerge(
-      AGENT_DEFAULTS as unknown as Record<string, unknown>,
-      raw,
-    ) as unknown as AgentJson;
-  }
-
   /** 纯 LRU 末位淘汰 —— attach 状态由 caller 自行用 server 通信查（如 WsHub），
    *  SessionManager 不再持任何 client ref-count，以免凭空构造一个 attach 概念。
    *  close() 是软释放，被踢的 sid 在下一次 open() 时会从盘上 hydrate 回来。
@@ -554,7 +478,10 @@ export class SessionManager {
     const victims = this.lru.victimsBeyondLimit(this.map.size);
     await Promise.all(
       victims
-        .filter((sid) => this.map.has(sid))
+        .filter((sid) => {
+          const session = this.map.get(sid);
+          return Boolean(session?.supervisor.lease.canEvict);
+        })
         .map((sid) => this.close(sid).catch(() => {})),
     );
   }

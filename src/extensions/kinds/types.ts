@@ -2,7 +2,7 @@
  * Phase B2 — KindLoader registry contracts.
  *
  * Each Kind owns one slice of derived state computed from a merged manifest:
- *   workbench  → tab metadata for the Sidebar/MainArea strip
+ *   Page/activity metadata stays in normalized manifest contributions.
  *   skill      → SkillDefinition (lookup-only; runner lands in Phase D)
  *   agent      → AgentDefinition (lookup; loader.composeSystemPrompt in B5)
  *
@@ -14,22 +14,11 @@ import type {
   AgentDefinition,
   ResolvedAgentDefinition,
   SkillDefinition,
-  ExtensionManifest,
+  AnyExtensionManifest,
 } from '@forgeax/types';
 import type { ExtensionOrigin } from '../scanner';
 import type { CliProviderEntry } from './cli-provider';
 import type { ToolEntry } from './tool';
-
-export interface WorkbenchEntry {
-  extensionId: string;
-  origin: ExtensionOrigin;
-  workbenchId: string;
-  position: number;
-  panelSize: 'sm' | 'md' | 'lg';
-  hidden: boolean;
-  surface?: string;
-  hasStandalone: boolean;
-}
 
 export interface AgentEntry {
   extensionId: string;
@@ -53,19 +42,18 @@ export interface SkillEntry {
 }
 
 export interface KindLoadIssue {
-  kind: 'workbench' | 'agent' | 'skill' | 'cli-provider' | 'model-binding' | 'tool';
+  kind: 'agent' | 'skill' | 'cli-provider' | 'model-binding' | 'tool';
   extensionId: string;
   reason: string;
 }
 
 export interface KindRegistry {
-  workbench: WorkbenchEntry[];
   agents: AgentEntry[];
   skills: SkillEntry[];
   /** Phase C3 — cli-provider entries (real loader). */
   cliProviders: CliProviderEntry[];
   /** Stub registry reserved for Phase D (model-binding still kind-stub). */
-  modelBindings: Array<{ extensionId: string; manifest: ExtensionManifest }>;
+  modelBindings: Array<{ extensionId: string; manifest: AnyExtensionManifest }>;
   /** Phase D1 — flat list of every tool from every kind's `provides.tools[]`. */
   tools: ToolEntry[];
   issues: KindLoadIssue[];
@@ -73,7 +61,6 @@ export interface KindRegistry {
 
 export function emptyKindRegistry(): KindRegistry {
   return {
-    workbench: [],
     agents: [],
     skills: [],
     cliProviders: [],

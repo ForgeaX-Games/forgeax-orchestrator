@@ -31,6 +31,11 @@ export interface InstalledEntry {
   source?: string;
   sha256?: string;
   ts: string;
+  /** Append-only lifecycle transition. Missing means a pre-v2 install row. */
+  action?: 'install' | 'upgrade' | 'disable' | 'enable' | 'remove';
+  /** State after this transition. Missing means enabled for legacy rows. */
+  state?: 'enabled' | 'disabled' | 'removed';
+  archivePath?: string;
 }
 
 export interface TrustAckEntry {

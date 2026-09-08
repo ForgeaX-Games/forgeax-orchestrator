@@ -3,7 +3,7 @@
  *  设计意图（docs/v2-vision/.../03-AGENT-SKILL-PLUGIN-TRINITY.md）：
  *  插件在 forgeax-extension.json 的 `provides.tools[]` 里声明的工具（带
  *  `exposedToAI: true`）应当**自动**进入 agent 的 LLM 工具清单，由 LLM 通过
- *  对话自由调用 —— 无需每个 workbench 团队手写一份 builtin/kits/<x> 的 HTTP 桥。
+ *  对话自由调用 —— 无需每个扩展团队手写一份 builtin/kits/<x> 的 HTTP 桥。
  *
  *  此前这个桥从未落地：LLM 只能看到 Kit ToolRegistry（builtin/kits 下的 tools）里的
  *  工具，Host ToolRegistry（清单声明 + /api/tools/call）里的工具对 LLM 不可见。
@@ -12,7 +12,7 @@
  *  本插件就是那台“机顶盒”：作为 `plugins` kind 在 tools kind 之前加载，于
  *  `start()` 时枚举 Host 侧 `listTools()`，按 agent 的 allow/deny 白名单筛出
  *  `exposedToAI` 工具，桥接成标准 `ToolDefinition` 动态 register 进 agent 的
- *  tools registry —— 之后 ConsciousAgent.getTools()=toolRegistry.list() 自然
+ *  tools registry —— 之后 RuntimeAgentHost 从 toolRegistry.list() 自然
  *  带上它们，喂给 LLM。execute 时以 caller.kind='ai' 转调 Host `callTool`，
  *  复用宿主侧的权限门（exposedToAI / requireConfirm 二次确认 / pause 等）。
  *
@@ -21,7 +21,7 @@
  *  缺省 **opt-in / deny-all**：allow=[] —— 即一个 agent 默认不注入任何宿主工具，
  *  只有在其 manifest 的 `provides.agent.tools[]`（经 sessions 注入到 agent.json
  *  `kits.config['host-tools'].allow`）显式声明后才注入对应工具。这样避免把全平台
- *  几十个 exposedToAI 工具一股脑堆给每个 agent，让“哪个角色能调哪些 workbench
+ *  几十个 exposedToAI 工具一股脑堆给每个 agent，让“哪个角色能调哪些扩展
  *  能力”成为可审计的显式声明（符合 03-TRINITY 的 per-agent composeToolset 意图）。 */
 
 import { readFileSync } from "node:fs";
@@ -36,10 +36,10 @@ import {
 import { markHostToolDefinition } from "../../../../src/kernel/host-tool-confirmation";
 import { basename } from "node:path";
 import {
-  callWorkbenchAgentTool,
-  hasWorkbenchAgentTool,
-  listWorkbenchAgentTools,
-} from "../../../../src/workbench/agent-tools";
+  callExtensionAgentTool,
+  hasExtensionAgentTool,
+  listExtensionAgentTools,
+} from "../../../../src/extension-host/agent-tools";
 
 /** 迁移护栏：这些前缀的 Host 工具仍由各自的 legacy builtin kit 提供（bare 名），
  *  默认 deny 以免“桥接版 + kit 版”双份列给 LLM 造成混淆。等对应 kit 退役后，
@@ -90,16 +90,9 @@ function toInputSchema(argsSchema: unknown): ToolDefinition["input_schema"] {
   return { type: "object", properties: {} };
 }
 
-/** 从 agentDir 抽 sessionId（`<root>/sessions/<sid>/...`）。抽不到则返回 undefined
- *  —— caller.sessionId 是可选的，仅用于 ledger / 事件归类。 */
-function sessionIdFromDir(agentDir: string): string | undefined {
-  const m = agentDir.match(/\/sessions\/([^/]+)\//);
-  return m ? m[1] : undefined;
-}
-
 /** 把单个 Host 工具描述符桥接成标准 ToolDefinition。 */
 function bridgeTool(d: ToolDescriptor, ctx: AgentContext): ToolDefinition {
-  const sessionId = sessionIdFromDir(ctx.agentDir);
+  const sessionId = ctx.sid;
   return markHostToolDefinition({
     // LLM tool-name 受 Anthropic/OpenAI 约束 `^[a-zA-Z0-9_-]{1,128}$`：':' 和 '.'
     // 都非法（toolId 如 "lowpoly:pipeline.applyBatch" 含两者）。把非法字符映射成
@@ -108,8 +101,8 @@ function bridgeTool(d: ToolDescriptor, ctx: AgentContext): ToolDefinition {
     description: d.description ?? d.id,
     input_schema: toInputSchema(d.argsSchema),
     async execute(args) {
-      if (hasWorkbenchAgentTool(d.id)) {
-        const result = await callWorkbenchAgentTool({
+      if (d.extensionId === "@forgeax/extension-host" && hasExtensionAgentTool(d.id)) {
+        const result = await callExtensionAgentTool({
           gameId: basename(ctx.cwd),
           toolId: d.id,
           args,
@@ -170,11 +163,21 @@ export default function hostToolBridge(ctx: AgentContext): PluginSource {
     const legacy = descriptors.filter(
       (d) => d.exposedToAI && d.hasHandler && matchesAny(d.id, allow) && !matchesAny(d.id, deny),
     );
-    const shared = listWorkbenchAgentTools()
-      .filter((d) => matchesAny(d.id, allow) && !matchesAny(d.id, deny))
+    const legacyIds = new Set(legacy.map((d) => d.id));
+    const shared = listExtensionAgentTools()
+      // The product extension host and the orchestrator registry can both
+      // project the same declared tool.  Prefer the registry descriptor when
+      // it exists: it carries requireConfirm and its callTool path enforces
+      // the AI confirmation gate.  The shared list remains for genuine
+      // extension-host-only tools that have no registry declaration.
+      .filter((d) =>
+        !legacyIds.has(d.id)
+        && matchesAny(d.id, allow)
+        && !matchesAny(d.id, deny),
+      )
       .map((d): ToolDescriptor => ({
         id: d.id,
-        extensionId: "@forgeax/workbench-host",
+        extensionId: "@forgeax/extension-host",
         description: d.description,
         exposedToAI: true,
         hasHandler: true,

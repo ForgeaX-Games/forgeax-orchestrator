@@ -1,6 +1,6 @@
 /** sandbox/terminal —— PTY-backed 进程 spawn 接口预留。
  *
- *  本轮（C10）**只留 interface，不实现 body**。ConsciousAgent / tool 层未来要给
+ *  本轮（C10）**只留 interface，不实现 body**。RuntimeAgentHost / tool 层未来要给
  *  agent 一个长连接 shell（执行交互式命令、tail logs、热重载脚本）时统一走这个
  *  抽象，避免直接绑定 `node-pty` / `child_process`。
  *
@@ -55,7 +55,7 @@ export interface TerminalHandle {
 
 // ─── TerminalManager 接口（plan §3.12）─────────────────────────────────────
 
-/** 给 ConsciousAgent / tool 实现 spawn 长连接进程用的统一出口。
+/** 给 RuntimeAgentHost / tool 实现 spawn 长连接进程用的统一出口。
  *
  *  实现（后续 sandbox stage 落地）：spawn 在 sandbox 容器里跑（docker exec -it
  *  + node-pty），未启用 sandbox 时降级宿主机 PTY；handle 回调和 abort signal

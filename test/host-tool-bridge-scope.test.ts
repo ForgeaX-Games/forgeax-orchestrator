@@ -24,15 +24,17 @@ afterEach(() => {
 
 test('C10: 写豁免作用域 = session 绑定 game(config.defaultDir),非全局 active', async () => {
   let capturedScope: unknown = '__UNSET__';
-  const fakeAgent = { agentContext: { tools: { list: () => [] } } };
+  const fakeAgent = { agentContext: { tools: { list: () => [{ name: "Write" }] } } };
   const boundSession = {
     config: { defaultDir: 'bound-A' }, // 该 session 永久绑定 game A
     eventBus: { publish: () => {} },
-    scheduler: { getAgent: () => fakeAgent },
+    tree: { resolve: () => ({ templateRef: 'tpl_fake' }) },
+    templateCatalog: { get: () => ({ trust: 'imported' }) },
+    initializeAgentHost: async () => fakeAgent,
+    getAgentHost: () => fakeAgent,
   };
   const deps: Partial<HostToolBridgeDeps> = {
     getSessionManager: (() => ({ peek: () => boundSession, open: async () => boundSession })) as unknown as HostToolBridgeDeps['getSessionManager'],
-    loadAgentRecord: (async () => ({ trustTier: 'imported' })) as unknown as HostToolBridgeDeps['loadAgentRecord'],
     checkKernelTool: ((_tier: unknown, _name: unknown, ctx: { activeGame?: string }) => {
       capturedScope = ctx.activeGame;
       return { allow: true, outcome: 'allow' };

@@ -2,7 +2,7 @@
  *  对应 session 的日志,**且穿透 streamSSE 流体**(turn-trace 的真实落点)。
  *
  *  这是 "turn-trace 没被持久化" 的回归测试:根因是内核 chat 路径绕开了老
- *  Scheduler 的 runWithSession,handler/流体里的 console.debug 落 user-root
+ *  Session runtime 的 runWithSession，handler/流体里的 console.debug 落 user-root
  *  fallback 而非 <sid>/logs/debug.log。中间件补上 sid 作用域后应路由正确。 */
 
 import { afterEach, describe, expect, test } from "bun:test";

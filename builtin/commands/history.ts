@@ -15,7 +15,7 @@
 //   fetch_session_events   args[0]=sid, args[1]=agentPath                          hasQuery
 //   fetch_blob             args[0]=sid, args[1]=agentPath, args[2]=sha256(16hex)   hasQuery
 //
-// compact_boundary：当前 ConsciousAgent 还没真接 compaction tool，但 user 已经
+// compact_boundary：当前 Kernel runtime 还没真接 compaction tool，但 user 已经
 // 说"未来会加回来的，目前可以假设他已经有了" —— 反扫一旦遇 type==="compact_boundary"
 // 就停。盘上没这种 event 时，反扫读完所有 shard 返回全量。
 
@@ -126,7 +126,7 @@ const history: CommandModule = {
         throw new Error(`${name}: agentPath is not a safe relative path`);
       }
       // 不走 sm.open —— fetch_session_events 只读盘，不需要 attach session
-      // 实例（agentTree / scheduler 等都不需要）；跟 ref `sessions.ts` 同样
+      // 实例（RuntimeTree / Supervisor 等都不需要）；跟 ref `sessions.ts` 同样
       // 是「外部展示 surface」走 fs 直读，不动 runtime state。
       const eventsDir = ctx.paths.session(sid).agent(agentPath).eventsDir();
       return serializeJsonl(readEventsFromTailRaw(eventsDir, hasCompactBoundary));

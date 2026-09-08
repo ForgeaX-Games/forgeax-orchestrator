@@ -94,6 +94,30 @@ export interface PushSubsetResult {
   path: string;
 }
 
+export interface GitPathUploadFile {
+  sourcePath: string;
+  name: string;
+}
+
+export interface PushFilesToPathParams {
+  remoteUrl: string;
+  authHeader?: string;
+  branch: string;
+  destinationPath: string;
+  files: GitPathUploadFile[];
+  commitMessage: string;
+  committer?: { name: string; email: string };
+  maxAttempts?: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export interface PushFilesToPathResult {
+  commit: string;
+  filesChanged: number;
+  skipped: boolean;
+  path: string;
+}
+
 const DEFAULT_COMMITTER = { name: "forgeax-upload", email: "upload@forgeax.local" };
 
 /** Build the `Authorization` header value for a GitHub PAT over HTTPS. */
@@ -357,6 +381,125 @@ export async function pushSubset(params: PushSubsetParams): Promise<PushSubsetRe
     };
   } finally {
     rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+/** Commit a bounded set of local files into one explicit repository directory.
+ * Used by product flows that share the hardened Git transport but do not use the
+ * timestamped workspace-snapshot schema. */
+export async function pushFilesToPath(params: PushFilesToPathParams): Promise<PushFilesToPathResult> {
+  const {
+    remoteUrl,
+    authHeader,
+    branch,
+    destinationPath,
+    files,
+    commitMessage,
+    committer = DEFAULT_COMMITTER,
+    maxAttempts = 5,
+    sleep = defaultSleep,
+  } = params;
+  validateRepoPath(destinationPath, 'destination path');
+  if (files.length === 0) throw new GitUploadError('empty-set', 'nothing to upload');
+  const names = new Set<string>();
+  for (const file of files) {
+    validateRepoPath(file.name, 'file name', false);
+    if (names.has(file.name)) throw new GitUploadError('git-failed', `duplicate upload file name: ${file.name}`);
+    names.add(file.name);
+  }
+
+  const secrets: string[] = [];
+  if (authHeader) {
+    secrets.push(authHeader);
+    secrets.push(authHeader.replace(/^basic\s+/i, ''));
+  }
+
+  const staging = mkdtempSync(join(tmpdir(), 'forgeax-upload-'));
+  try {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await git(['clone', '--no-tags', '--sparse', '--filter=blob:none', remoteUrl, staging], {
+          cwd: tmpdir(), authHeader, secrets,
+        });
+        break;
+      } catch (error) {
+        const gitError = error as GitUploadError;
+        if (gitError.kind !== 'offline' || attempt >= 2) throw gitError;
+        rmSync(staging, { recursive: true, force: true });
+        mkdirSync(staging, { recursive: true });
+        await sleep(1000 * (attempt + 1));
+      }
+    }
+    await git(['sparse-checkout', 'set', destinationPath], { cwd: staging, authHeader, secrets });
+
+    const hasBranch = await branchExistsOnRemote(staging, branch, authHeader, secrets);
+    if (hasBranch) {
+      await git(['checkout', '-B', branch, `origin/${branch}`], { cwd: staging, authHeader, secrets });
+    } else {
+      await git(['symbolic-ref', 'HEAD', `refs/heads/${branch}`], { cwd: staging, authHeader, secrets });
+      await git(['read-tree', '--empty'], { cwd: staging, authHeader, secrets });
+      for (const name of readdirSync(staging)) {
+        if (name !== '.git') rmSync(join(staging, name), { recursive: true, force: true });
+      }
+    }
+
+    const destination = join(staging, ...destinationPath.split('/'));
+    mkdirSync(destination, { recursive: true });
+    const repoPaths: string[] = [];
+    for (const file of files) {
+      copyFileSync(file.sourcePath, join(destination, file.name));
+      repoPaths.push(`${destinationPath}/${file.name}`);
+    }
+    await git(['add', '-f', '--sparse', '--', ...repoPaths], { cwd: staging, authHeader, secrets });
+    const staged = (await git(['diff', '--cached', '--name-only'], { cwd: staging, authHeader, secrets }))
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const escaped = staged.find((path) => !path.startsWith(`${destinationPath}/`));
+    if (escaped) throw new GitUploadError('git-failed', `internal: staged path escaped destination: ${escaped}`);
+    if (staged.length === 0) {
+      const commit = (await git(['rev-parse', 'HEAD'], { cwd: staging, authHeader, secrets })).trim();
+      return { commit, filesChanged: 0, skipped: true, path: destinationPath };
+    }
+
+    await git([
+      '-c', `user.name=${committer.name}`,
+      '-c', `user.email=${committer.email}`,
+      'commit', '-m', commitMessage,
+    ], { cwd: staging, authHeader, secrets });
+    await pushWithBackoff({
+      staging,
+      branch,
+      namespace: destinationPath,
+      authHeader,
+      secrets,
+      maxAttempts,
+      sleep,
+    });
+    const commit = (await git(['rev-parse', 'HEAD'], { cwd: staging, authHeader, secrets })).trim();
+    return { commit, filesChanged: staged.length, skipped: false, path: destinationPath };
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+function validateRepoPath(value: string, label: string, allowSegments = true): void {
+  const segments = value.split('/');
+  if (
+    !value ||
+    value.startsWith('/') ||
+    value.endsWith('/') ||
+    value.includes('\\') ||
+    (!allowSegments && segments.length !== 1) ||
+    segments.some((segment) => (
+      !segment ||
+      segment === '.' ||
+      segment === '..' ||
+      segment === '.git' ||
+      !/^[A-Za-z0-9._-]+$/.test(segment)
+    ))
+  ) {
+    throw new GitUploadError('git-failed', `invalid ${label}: ${value || '<empty>'}`);
   }
 }
 

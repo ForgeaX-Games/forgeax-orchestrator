@@ -47,9 +47,10 @@ export class LedgerHistorySource implements HistorySource {
       const message = messageOf(row.event);
       if (!message) continue;
       const payload = row.event.payload ?? {};
-      const kernelId = row.event.history?.origin?.kernelId
+      const history = row.event.history as { origin?: { kernelId?: string }; turnId?: string } | undefined;
+      const kernelId = history?.origin?.kernelId
         ?? (typeof payload.providerId === 'string' ? payload.providerId : undefined);
-      const turnId = row.event.history?.turnId
+      const turnId = history?.turnId
         ?? (typeof payload.turnId === 'string' ? payload.turnId : `${row.cursor.shard}:${row.cursor.line}`);
       const boundary = row.event.type === 'compaction.applied' || row.event.type === 'compaction.revoked'
         ? 'compaction'

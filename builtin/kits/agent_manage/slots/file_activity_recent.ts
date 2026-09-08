@@ -76,9 +76,7 @@ function renderActivity(records: FileActivityRecord[], ctx: AgentContext): strin
     ].join("\n");
   }
   const sessionRoot = ctx.pathManager.session(ctx.tree.sid).root();
-  // ctx.cwd is the resolved game root when defaultDir is set; otherwise = agentDir.
-  // Either way it gives a useful relative anchor for the listing.
-  const gameRoot = ctx.cwd && ctx.cwd !== ctx.agentDir ? ctx.cwd : undefined;
+  const gameRoot = ctx.cwd || undefined;
   const now = Date.now();
   const lines: string[] = [];
   lines.push("# Recent file activity (this session)");
@@ -107,7 +105,7 @@ function renderActivity(records: FileActivityRecord[], ctx: AgentContext): strin
   return lines.join("\n");
 }
 
-/** Slot factory. ConsciousAgent runs this on every prompt assembly when
+/** Slot factory. RuntimeAgentHost runs this on every prompt assembly when
  *  cacheHint=dynamic — read cost = one statSync + 64KB tail read. Cheap. */
 export default function fileActivityRecentSlot(ctx: AgentContext): ContextSlot {
   return {

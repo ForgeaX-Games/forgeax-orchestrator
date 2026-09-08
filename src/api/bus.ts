@@ -1,6 +1,6 @@
 /**
  * /api/bus —— interface 还期望的最小 bus 路由（wu-tian807 R2 重写已删原 src/bus,
- * 但前端 Sidebar / BuildBadge / WorkbenchMode / BusAdminPanel / lib/surface.ts 还在调）。
+ * 但前端 Sidebar / BuildBadge / Page / BusAdminPanel / lib/surface.ts 还在调）。
  *
  * 这里不是恢复完整 Bus runtime,只是把 plugin manifest 读出来 + ui/surfaces 当
  * stub 返回空,让 UI 在 R3 重写 sidebar 之前不会因为 404 把工作区清空。
@@ -25,7 +25,7 @@ export function createBusRouter(): Hono {
 
   // ui/surfaces —— Map-backed live store. dual-modality 入口:
   //   - 插件 panel.tsx 走 POST/PUT/GET 注册自身 + 上报 snapshot + poll pending
-  //   - AI tool handler (/api/wb/character/*) 走 dispatchToSurface() 在
+  //   - AI tool handler (/api/extensions/character/*) 走 dispatchToSurface() 在
   //     pending 队列里挂 action,等 panel 下一轮 poll 拉走 → 渲染端调 __ceInvoke
   //   两路汇合在同一个 Map<surfaceId, SurfaceRecord>,不持久化(进程重启即清)。
   //
@@ -443,7 +443,7 @@ export function multiPageHint(pages: number): string {
 /**
  * Enqueue an action for `surfaceId`. Returns the token panel will ack with.
  * Throws if the surface isn't registered yet — caller decides whether to
- * surface that to AI or buffer and retry. Used by /api/wb/character/* tool
+ * surface that to AI or buffer and retry. Used by /api/extensions/character/* tool
  * handlers AND by the HTTP POST /ui/surfaces/:id/dispatch endpoint.
  */
 export function dispatchToSurface(surfaceId: string, action: string, args: unknown): string {

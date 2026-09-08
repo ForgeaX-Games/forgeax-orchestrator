@@ -66,7 +66,7 @@ function normalizeToolDefinition(
   // re-asserted after the narrowing checks above.
   return {
     ...def,
-    name: exposedName,                              // qualified — LLM bare-mapping happens in ConsciousAgent
+    name: exposedName,                              // qualified — RuntimeAgentHost maps LLM-facing bare names
     description: def.description,
     input_schema: def.input_schema,
     execute: def.execute,

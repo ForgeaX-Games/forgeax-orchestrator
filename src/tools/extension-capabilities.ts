@@ -1,16 +1,60 @@
-import type {
-  ExtensionCapabilityControl,
-  ExtensionCapabilityInvocationContext,
-  ExtensionCapabilityProvider,
-  ScopedExtensionCapabilities,
-} from '@forgeax/types';
-export type {
-  ExtensionCapabilityControl,
-  ExtensionCapabilityInvocationContext,
-  ExtensionCapabilityInvocationOptions,
-  ExtensionCapabilityProvider,
-  ScopedExtensionCapabilities,
-} from '@forgeax/types';
+import type { ToolCall } from '@forgeax/types';
+
+/**
+ * The published 0.1.x types package predates extension-origin callers. Keep
+ * the compatibility widening at this orchestrator boundary so the runtime
+ * can carry its identity without pretending that the legacy ToolCall schema
+ * validates it. Once the public contract is released with the wider caller
+ * union this local alias can collapse back to the published type.
+ */
+export type ExtensionCaller = ToolCall['caller'] | {
+  readonly kind: 'extension';
+  readonly extensionId: string;
+  readonly instanceId: string;
+  readonly sessionId?: string;
+  readonly threadId?: string;
+};
+
+export type ExtensionToolCall = Omit<ToolCall, 'caller'> & {
+  readonly caller: ExtensionCaller;
+};
+
+export interface ExtensionCapabilityInvocationOptions {
+  readonly requestId?: string;
+}
+
+export interface ExtensionCapabilityInvocationContext {
+  readonly caller: ExtensionCaller;
+  readonly toolId: string;
+  readonly env: Readonly<Record<string, string | undefined>>;
+  readonly cwd: string;
+  readonly projectRoot: string;
+  readonly game?: string;
+}
+
+export interface ExtensionCapabilityProvider {
+  readonly capabilityId: string;
+  readonly version: number;
+  invoke(
+    input: unknown,
+    options: ExtensionCapabilityInvocationOptions,
+    context: ExtensionCapabilityInvocationContext,
+  ): Promise<unknown>;
+}
+
+export interface ExtensionCapabilityControl {
+  registerProvider(provider: ExtensionCapabilityProvider): void;
+}
+
+export interface ScopedExtensionCapabilities {
+  has(capabilityId: string, version: number): boolean;
+  invoke(
+    capabilityId: string,
+    version: number,
+    input: unknown,
+    options?: ExtensionCapabilityInvocationOptions,
+  ): Promise<unknown>;
+}
 
 export class ExtensionCapabilityError extends Error {
   readonly code: 'CAPABILITY_UNAVAILABLE' | 'CAPABILITY_AMBIGUOUS';

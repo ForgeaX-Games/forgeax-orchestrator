@@ -11,8 +11,8 @@ import { createSettingsRouter } from '../src/api/settings';
 // 16 base keys + FORGEAX_UPLOAD_GITHUB_TOKEN + FORGEAX_UPLOAD_REPO +
 // FORGEAX_UPLOAD_BRANCH (workspace upload, 2026-07-09; repo is user-configurable —
 // users may upload to any repo their token can write, the shared org repo is just
-// the default) = 19.
-const EXPECTED_ALLOWED_COUNT = 19;
+// the default) + 4 feedback-delivery keys = 23.
+const EXPECTED_ALLOWED_COUNT = 23;
 describe('PUT /api/settings/env — SAFE_ENV_KEYS allowlist', () => {
   async function putEnv(body: unknown): Promise<Response> {
     const r = createSettingsRouter();
@@ -40,6 +40,12 @@ describe('PUT /api/settings/env — SAFE_ENV_KEYS allowlist', () => {
     expect(j.allowed).toContain('FORGEAX_UPLOAD_GITHUB_TOKEN');
     expect(j.allowed).toContain('FORGEAX_UPLOAD_BRANCH');
     expect(j.allowed).toContain('FORGEAX_UPLOAD_REPO');
+    expect(j.allowed).toContain('FORGEAX_FEEDBACK_GITHUB_TOKEN');
+    expect(j.allowed).toContain('FORGEAX_FEEDBACK_DATA_REPO');
+    expect(j.allowed).toContain('FORGEAX_FEEDBACK_ISSUES_REPO');
+    expect(j.allowed).not.toContain('FORGEAX_FEEDBACK_ARCHIVE_PUBLIC_KEY');
+    expect(j.allowed).not.toContain('FORGEAX_FEEDBACK_ARCHIVE_KEY_ID');
+    expect(j.allowed).toContain('FORGEAX_FEEDBACK_TRIAGE_MODEL');
     expect(j.allowed.length).toBe(EXPECTED_ALLOWED_COUNT);
   });
 

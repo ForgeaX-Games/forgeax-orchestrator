@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   RoundDeliveryEnricher,
   type RoundDeliverySession,
@@ -270,7 +270,10 @@ describe("RoundDeliveryEnricher", () => {
     await mkdir(join(fixture.gameDir, "src"), { recursive: true });
     await writeFile(file, "written after checkpoint failure\n");
     await fixture.protocolAnchor(null);
-    fixture.ledger.events.push(toolEvent(110, "Write", { file_path: file }));
+    fixture.ledger.events.push({
+      ...toolEvent(110, "Write", { file_path: file }),
+      history: { eventId: "missing-manifest-write", turnId: "missing-manifest-turn" },
+    });
 
     const result = await fixture.enricher().resolveTurn({
       ...fixture.context,
@@ -541,6 +544,139 @@ describe("RoundDeliveryEnricher", () => {
       expect(result.resolution.reliableCandidatePaths).toEqual(["src/conflict.ts"]);
     }
   });
+
+  it("inherits a delegated teammate's applied game file on the parent artifact", async () => {
+    const contents = "glb-bytes\n";
+    const { fixture, file } = await protocolGameWithNewFile("furnace-hero.glb", contents);
+    fixture.ledger.events.push(delegateEvent(110, "gen3d", "parent-turn"));
+    fixture.activity.push(teammateWrite({
+      ts: 120,
+      agentPath: "gen3d",
+      path: file,
+      turnId: "gen3d-turn",
+      contents,
+    }));
+
+    const result = await fixture.enricher().resolveTurn(settle(fixture, "parent-turn"));
+
+    expect(result.resolution.kind).toBe("summary");
+    if (result.resolution.kind === "summary") {
+      expect(result.resolution.summary.files.map((entry) => entry.path)).toEqual(["furnace-hero.glb"]);
+      expect(result.resolution.summary.agents).toEqual(["forge", "gen3d"]);
+    }
+  });
+
+  it("inherits delegated files when the parent dispatch was on an earlier turn in the same checkpoint window", async () => {
+    const contents = "glb-bytes\n";
+    const { fixture, file } = await protocolGameWithNewFile("furnace-hero.glb", contents);
+    fixture.ledger.events.push(
+      delegateEvent(105, "gen3d", "dispatch-turn"),
+      {
+        type: "hook:toolCall",
+        ts: 150,
+        source: "agent:forge",
+        emitterId: "forge",
+        history: { eventId: "list-assets-1", turnId: "callback-turn" },
+        payload: { name: "list-assets", args: {} },
+      },
+    );
+    fixture.activity.push(teammateWrite({
+      ts: 130,
+      agentPath: "gen3d",
+      path: file,
+      turnId: "gen3d-turn",
+      contents,
+    }));
+
+    const result = await fixture.enricher().resolveTurn(settle(fixture, "callback-turn"));
+
+    expect(result.resolution.kind).toBe("summary");
+    if (result.resolution.kind === "summary") {
+      expect(result.resolution.summary.files.map((entry) => entry.path)).toEqual(["furnace-hero.glb"]);
+      expect(result.resolution.summary.agents).toEqual(["forge", "gen3d"]);
+    }
+  });
+
+  it("does not attribute a teammate write that the parent never delegated", async () => {
+    const contents = "glb-bytes\n";
+    const { fixture, file } = await protocolGameWithNewFile("furnace-hero.glb", contents);
+    fixture.activity.push(teammateWrite({
+      ts: 120,
+      agentPath: "gen3d",
+      path: file,
+      turnId: "gen3d-solo-turn",
+      contents,
+    }));
+
+    const result = await fixture.enricher().resolveTurn(settle(fixture, "parent-turn"));
+
+    expect(result.resolution.kind).toBe("unavailable");
+    if (result.resolution.kind === "unavailable") {
+      expect(result.resolution.reason).toContain("attributed");
+    }
+  });
+
+  it("does not inherit a parallel teammate the parent did not name", async () => {
+    const glbContents = "glb-bytes\n";
+    const ioriContents = "iori-wrote\n";
+    const fixture = await makeFixture("base\n");
+    const glb = join(fixture.gameDir, "furnace-hero.glb");
+    const ioriFile = join(fixture.gameDir, "iori-note.md");
+    const base = await fixture.store.snapshot(fixture.gameDir);
+    await writeFile(glb, glbContents);
+    await writeFile(ioriFile, ioriContents);
+    await fixture.protocolAnchor(base.id);
+    fixture.session.tree = { list: () => [{ path: "forge" }, { path: "gen3d" }, { path: "iori" }] };
+    fixture.session.ledgers.set("gen3d", { readAllEvents: async () => [] });
+    fixture.session.ledgers.set("iori", { readAllEvents: async () => [] });
+    fixture.ledger.events.push(delegateEvent(110, "gen3d", "parent-turn"));
+    fixture.activity.push(
+      teammateWrite({
+        ts: 120,
+        agentPath: "gen3d",
+        path: glb,
+        turnId: "gen3d-turn",
+        contents: glbContents,
+      }),
+      teammateWrite({
+        ts: 121,
+        agentPath: "iori",
+        path: ioriFile,
+        turnId: "iori-turn",
+        contents: ioriContents,
+      }),
+    );
+
+    const result = await fixture.enricher().resolveTurn(settle(fixture, "parent-turn"));
+
+    expect(result.resolution.kind).toBe("summary");
+    if (result.resolution.kind === "summary") {
+      expect(result.resolution.summary.files.map((entry) => entry.path)).toEqual(["furnace-hero.glb"]);
+      expect(result.resolution.summary.agents).toEqual(["forge", "gen3d"]);
+    }
+  });
+
+  it("does not inherit a delegated teammate's intent-only file-activity", async () => {
+    const contents = "glb-bytes\n";
+    const { fixture, file } = await protocolGameWithNewFile("furnace-hero.glb", contents);
+    fixture.ledger.events.push(delegateEvent(110, "gen3d", "parent-turn"));
+    fixture.activity.push({
+      ts: 120,
+      agentPath: "gen3d",
+      op: "write",
+      path: file,
+      isCreate: true,
+      phase: "intent",
+      turnId: "gen3d-turn",
+    });
+
+    const result = await fixture.enricher().resolveTurn(settle(fixture, "parent-turn"));
+
+    expect(result.resolution.kind).toBe("unavailable");
+    if (result.resolution.kind === "unavailable") {
+      expect(result.resolution.reason).toContain("attributed");
+    }
+  });
 });
 
 interface Fixture {
@@ -583,7 +719,20 @@ async function makeFixture(initialContent: string): Promise<Fixture> {
     ledgers: new Map([["forge", { readAllEvents: async () => ledger.events }]]),
     tree: { list: () => [{ path: "forge" }] },
     getOrCreateLedger: () => ({ readAllEvents: async () => ledger.events }),
-    fileActivity: { query: () => activity },
+    fileActivity: {
+      query(opts) {
+        const limit = Math.max(1, Math.min(opts?.limit ?? 50, 1000));
+        const matched: Fixture["activity"] = [];
+        for (let i = activity.length - 1; i >= 0; i--) {
+          const rec = activity[i]!;
+          if (opts?.agent && rec.agentPath !== opts.agent) continue;
+          if (opts?.sinceTs != null && rec.ts < opts.sinceTs) continue;
+          matched.push(rec);
+          if (matched.length >= limit) break;
+        }
+        return matched;
+      },
+    },
   };
   const context = {
     sid,
@@ -644,4 +793,60 @@ function toolEvent(ts: number, name: string, args: Record<string, unknown>): Sto
     emitterId: "forge",
     payload: { name, args },
   };
+}
+
+function delegateEvent(ts: number, teammate: string, turnId: string): StoredEvent {
+  return {
+    type: "hook:toolCall",
+    ts,
+    source: "agent:forge",
+    emitterId: "forge",
+    history: { eventId: `delegate-${teammate}-${ts}`, turnId },
+    payload: {
+      name: "delegate_to_subagent",
+      args: { agent: teammate, message: `ask ${teammate}` },
+    },
+  };
+}
+
+function teammateWrite(opts: {
+  ts: number;
+  agentPath: string;
+  path: string;
+  turnId: string;
+  contents: string;
+}): Fixture["activity"][number] {
+  return {
+    ts: opts.ts,
+    agentPath: opts.agentPath,
+    op: "write",
+    path: opts.path,
+    isCreate: true,
+    phase: "applied",
+    turnId: opts.turnId,
+    hash: sha256(opts.contents),
+  };
+}
+
+function settle(fixture: Fixture, turnId: string) {
+  return {
+    ...fixture.context,
+    turnId,
+    checkpointMsgId: "msg-1",
+    startedAt: 100,
+    settledAt: 180,
+  };
+}
+
+async function protocolGameWithNewFile(
+  relativePath: string,
+  contents: string,
+): Promise<{ fixture: Fixture; file: string }> {
+  const fixture = await makeFixture("base\n");
+  const file = join(fixture.gameDir, relativePath);
+  await mkdir(dirname(file), { recursive: true });
+  const base = await fixture.store.snapshot(fixture.gameDir);
+  await writeFile(file, contents);
+  await fixture.protocolAnchor(base.id);
+  return { fixture, file };
 }

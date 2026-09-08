@@ -34,6 +34,17 @@ export const EXCLUDE_SEGMENTS: readonly string[] = [
   "checkpoints",    // content-addressed rewind blobs — multi-GB, regenerable, blows GitHub's 100MB blob cap
 ];
 
+/** Top-level `.forgeax` entries that hold the user's own project content rather
+ *  than runtime diagnostics. The feedback PRD §5 attaches the `.forgeax`
+ *  directory but states "不含项目内容", so a report carries the environment,
+ *  session, trajectory, log and screenshot material and leaves the games and
+ *  the source workspace behind. Matched at the top level only: these are
+ *  directory identities, not names that should be denied at any depth. */
+export const EXCLUDE_PROJECT_CONTENT_ROOTS: readonly string[] = [
+  "games",                // user projects: sources, assets, their own .git
+  "ide-source-workspace",  // mounted source checkout, not diagnostics
+];
+
 /** Files excluded by exact basename — known runtime / secret-bearing files,
  *  plus the upload feature's own local bookkeeping. */
 export const EXCLUDE_BASENAMES: readonly string[] = [
@@ -64,11 +75,23 @@ export function isBackupDir(name: string): boolean {
 
 /** Should this posix RELATIVE path (under `.forgeax`) be excluded? The one
  *  predicate shared by the walk and any deny check. */
-export function isExcluded(relPath: string): boolean {
+export interface WorkspaceEgressPathOptions {
+  /** Feedback diagnostics retain logs/debug after staging redaction; /upload does not. */
+  includeDiagnosticLogs?: boolean;
+  /** Feedback drops the user's own project content (PRD §5 "不含项目内容");
+   *  /upload exists to carry the workspace and keeps it. */
+  excludeProjectContent?: boolean;
+}
+
+export function isExcluded(relPath: string, opts: WorkspaceEgressPathOptions = {}): boolean {
   const segs = relPath.split("/").filter(Boolean);
   if (segs.length === 0) return false;
+  if (opts.excludeProjectContent && EXCLUDE_PROJECT_CONTENT_ROOTS.includes(segs[0]!)) return true;
   for (const seg of segs) {
-    if (EXCLUDE_SEGMENTS.includes(seg)) return true;
+    if (EXCLUDE_SEGMENTS.includes(seg)) {
+      if (opts.includeDiagnosticLogs && (seg === "logs" || seg === "debug")) continue;
+      return true;
+    }
     if (isBackupDir(seg)) return true;
   }
   const base = segs[segs.length - 1]!;
@@ -102,7 +125,7 @@ export interface WalkResult {
   totalBytes: number;
 }
 
-export interface WalkOptions {
+export interface WalkOptions extends WorkspaceEgressPathOptions {
   maxFileBytes?: number;
 }
 
@@ -122,13 +145,13 @@ export function walkUploadTree(srcRoot: string, opts: WalkOptions = {}): WalkRes
   }
 
   for (const name of topEntries) {
-    if (isExcluded(name)) continue;
-    walk(join(srcRoot, name), name, out, maxBytes);
+    if (isExcluded(name, opts)) continue;
+    walk(join(srcRoot, name), name, out, maxBytes, opts);
   }
   return out;
 }
 
-function walk(abs: string, rel: string, out: WalkResult, maxBytes: number): void {
+function walk(abs: string, rel: string, out: WalkResult, maxBytes: number, opts: WalkOptions): void {
   let st;
   try {
     st = lstatSync(abs);
@@ -156,8 +179,8 @@ function walk(abs: string, rel: string, out: WalkResult, maxBytes: number): void
     }
     for (const name of children) {
       const childRel = `${rel}/${name}`;
-      if (isExcluded(childRel)) continue;
-      walk(join(abs, name), childRel, out, maxBytes);
+      if (isExcluded(childRel, opts)) continue;
+      walk(join(abs, name), childRel, out, maxBytes, opts);
     }
     return;
   }
@@ -191,6 +214,10 @@ const SECRET_PATTERNS: { kind: string; re: RegExp }[] = [
   { kind: "jwt-bearer", re: /bearer\s+eyJ[A-Za-z0-9_-]{10,}/i },
 ];
 
+const PRIVATE_KEY_BLOCK = /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/gi;
+const INLINE_SENSITIVE_ASSIGNMENT = /\b([A-Za-z0-9_.-]*(?:api[_-]?key|token|secret|password|passwd|authorization|cookie|credential|private[_-]?key|access[_-]?key)[A-Za-z0-9_.-]*)\s*([=:])\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\r\n]+)/gi;
+const REDACTED = "[REDACTED]";
+
 export interface SecretHit {
   rel: string;
   kind: string;
@@ -202,6 +229,7 @@ export interface SecretHit {
 export function sensitiveEnvLiterals(env: NodeJS.ProcessEnv = process.env): string[] {
   const keys = [
     "FORGEAX_UPLOAD_GITHUB_TOKEN",
+    "FORGEAX_FEEDBACK_GITHUB_TOKEN",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "OPENAI_API_KEY",
@@ -225,7 +253,106 @@ export function scanContentForSecrets(rel: string, content: string, literals: st
   for (const lit of literals) {
     if (content.includes(lit)) hits.push({ rel, kind: "env-secret-literal" });
   }
+  INLINE_SENSITIVE_ASSIGNMENT.lastIndex = 0;
+  for (const match of content.matchAll(INLINE_SENSITIVE_ASSIGNMENT)) {
+    if (shouldRedactAssignedValue(match[3] ?? "", match[1] ?? "")) {
+      hits.push({ rel, kind: "sensitive-assignment" });
+      break;
+    }
+  }
   return hits;
+}
+
+export interface RedactedEgressText {
+  value: string;
+  kinds: string[];
+}
+
+/** Redact known credential material in a staging copy. The source file is untouched. */
+export function redactSecretsInText(content: string, literals: string[]): RedactedEgressText {
+  const kinds = new Set<string>();
+  let value = content.replace(PRIVATE_KEY_BLOCK, () => {
+    kinds.add("private-key-pem");
+    return REDACTED;
+  });
+  for (const { kind, re } of SECRET_PATTERNS) {
+    const flags = re.flags.includes("g") ? re.flags : `${re.flags}g`;
+    value = value.replace(new RegExp(re.source, flags), () => {
+      kinds.add(kind);
+      return REDACTED;
+    });
+  }
+  for (const literal of literals) {
+    if (!literal || !value.includes(literal)) continue;
+    kinds.add("env-secret-literal");
+    value = value.split(literal).join(REDACTED);
+  }
+  INLINE_SENSITIVE_ASSIGNMENT.lastIndex = 0;
+  value = value.replace(INLINE_SENSITIVE_ASSIGNMENT, (match, key: string, separator: string, raw: string) => {
+    if (!shouldRedactAssignedValue(raw, key)) return match;
+    kinds.add("sensitive-assignment");
+    return `${key}${separator}${REDACTED}`;
+  });
+  return { value, kinds: [...kinds].sort() };
+}
+
+/**
+ * Does an assigned value look like a credential?
+ *
+ * The key name is only a hint about intent, never proof: `credentials =
+ * "include"` is a fetch option and `token: string` is a type annotation, while
+ * a real key can sit behind any name at all. Judging by key name mis-redacted
+ * 11 of 12 benign values and missed 5 of 12 real credentials, so the decision
+ * is made on the value's own shape:
+ *
+ *   1. a known issuer prefix (exact, covers the mainstream services)
+ *   2. bare hex, but only where the key name says it is a credential — git
+ *      shas and file digests share that shape and are diagnostic signal
+ *   3. an entropy fallback for house formats, with the shapes that merely look
+ *      random (paths, URLs, UUIDs, versions, template literals) excluded
+ */
+function shouldRedactAssignedValue(raw: string, key = ""): boolean {
+  const value = raw.replace(/^["']|["']$/g, "").trim();
+  // Our own sentinel: redaction must converge, or a cleaned file fails the very
+  // gate it was cleaned for. Prefix, not equality — minified code leaves the
+  // sentinel glued to what follows (`authorization:[REDACTED]+t`).
+  if (value.startsWith(REDACTED)) return false;
+  for (const { re } of SECRET_PATTERNS) if (new RegExp(re.source, re.flags.replace("g", "")).test(value)) return true;
+  if (BARE_HEX.test(value)) return CREDENTIAL_KEY.test(key);
+  return looksHighEntropySecret(value);
+}
+
+/** Long unbroken hex: a credential when the key says so, a digest otherwise. */
+const BARE_HEX = /^[0-9a-f]{32,}$/i;
+
+/** Key names that assert the value is a credential rather than a digest. */
+const CREDENTIAL_KEY = /(api[_-]?key|token|secret|password|passwd|credential|private[_-]?key|access[_-]?key|auth)/i;
+
+/** Shapes that are random-looking by nature and carry no secret. */
+const NOT_A_SECRET = [
+  /[$}{()\[\]<>]/,                                     // expressions, template literals
+  /process\.env|require\(|import\s/,                    // indirection, not a literal
+  /:\/\//,                                             // URLs
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, // UUID
+];
+
+function looksHighEntropySecret(value: string): boolean {
+  if (value.length < 24) return false;
+  if (value.startsWith("/") || value.startsWith("./") || value.startsWith("~") || value.startsWith("#")) return false;
+  if (/^[*x.\-_\u2022\u00b7]+$/.test(value)) return false;          // placeholders
+  for (const re of NOT_A_SECRET) if (re.test(value)) return false;
+  if (/^[\d.\-a-z]+$/.test(value) && /\d+\.\d+/.test(value)) return false; // versions
+  const words = value.split(/[-_\s.]+/);
+  if (words.length >= 3 && words.every((word) => /^[a-z]{2,12}$/.test(word))) return false; // prose
+  const unique = new Set(value);
+  if (unique.size / value.length < 0.4) return false;
+  let entropy = 0;
+  for (const char of unique) {
+    const p = value.split(char).length - 1;
+    entropy -= (p / value.length) * Math.log2(p / value.length);
+  }
+  const classes = Number(/[a-z]/.test(value)) + Number(/[A-Z]/.test(value)) + Number(/\d/.test(value));
+  return entropy >= 3.6 && classes >= 2;
 }
 
 /** Scan already-read bytes. Archive construction reuses this so every source file

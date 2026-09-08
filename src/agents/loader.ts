@@ -14,20 +14,22 @@
  *
  * See docs/v2-vision/architecture-evolution/03-AGENT-SKILL-PLUGIN-TRINITY.md §2.2/§2.3.
  */
-import { existsSync, statSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve, basename } from 'node:path';
 import type { SkillRef } from '@forgeax/types';
 import { pickI18n } from '@forgeax/types';
 import type { AgentEntry, SkillEntry } from '../extensions/kinds';
 import { getExtensionSnapshot } from '../extensions/registry';
-import { defaultProjectRoot } from '@forgeax/platform-io';
-import { assetRoot } from '@forgeax/platform-io';
+import { loadBrand } from '../brand';
 import {
   memLangFromPersonaFile,
   pickMemoryFilesForLang,
   type MemLang,
 } from './memory-locale';
+import { parseSkillFrontmatter } from './skill-frontmatter';
+
+export { parseSkillFrontmatter } from './skill-frontmatter';
 
 export interface ComposedSystemPrompt {
   agentId: string;
@@ -46,6 +48,26 @@ export interface ComposedSystemPrompt {
   /** Combined string (persona + skill index + skills + memory). */
   text: string;
   warnings: string[];
+}
+
+export interface ResolvedExternalSkillSource {
+  id: string;
+  path: string;
+  description?: string;
+  executor: 'prompt' | 'typescript' | 'python';
+}
+
+export interface ResolvedExternalAgentTemplate {
+  personaPath: string;
+  /** Absolute path to author-provided memory seeds, when present. */
+  memoryDir?: string;
+  /** Concrete sources for the Agent's declared default skills. */
+  skillSources: ResolvedExternalSkillSource[];
+  /** Host tool allow-list carried by the external Agent definition. */
+  tools?: string[];
+  source: 'plugin' | 'brand';
+  origin?: AgentEntry['origin'];
+  trustTier: 'own' | 'imported';
 }
 
 export function listAgents(): AgentEntry[] {
@@ -85,11 +107,23 @@ export function resolveSkill(
 export async function composeSystemPrompt(agentId: string): Promise<ComposedSystemPrompt | null> {
   const entry = lookupAgent(agentId);
   if (!entry) {
-    // Fallback: legacy peers in packages/marketplace/manifest.json that haven't
-    // been migrated to plugin scaffolds yet (kotone, iro, tsumugi, cc-coder,
-    // forge, iori, suzu). Read marketplace.json + peerFile/personaFiles so
-    // those agents still produce a persona prompt.
-    return composeFromMarketplaceManifest(agentId);
+    const brand = resolveBrandAssistantTemplate(agentId);
+    if (!brand) return null;
+    try {
+      const persona = await readFile(brand.personaPath, 'utf-8');
+      return {
+        agentId,
+        extensionId: 'brand:assistant',
+        persona,
+        skillSections: [],
+        skillIndex: [],
+        memorySections: [],
+        text: persona.trim(),
+        warnings: [],
+      };
+    } catch {
+      return null;
+    }
   }
   const warnings: string[] = [];
 
@@ -191,38 +225,6 @@ export async function composeSystemPrompt(agentId: string): Promise<ComposedSyst
   };
 }
 
-/** Strip an agentskills.io-style YAML frontmatter block from a SKILL.md body.
- *  Returns just the markdown content; the frontmatter is metadata for the
- *  loader, not for the LLM. We do a minimal parse — no YAML lib — because
- *  the spec only has two fields (`name`, `description`) and the frontmatter
- *  is delimited by `---\\n` on its own line.
- *
- *  Also surfaces parsed `name`/`description` so callers can prefer the
- *  frontmatter over a possibly-stale manifest mirror (SSOT on disk). */
-export function parseSkillFrontmatter(raw: string): {
-  body: string;
-  name?: string;
-  description?: string;
-} {
-  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
-  if (!m) return { body: raw };
-  const body = raw.slice(m[0].length);
-  const block = m[1];
-  let name: string | undefined;
-  let description: string | undefined;
-  for (const line of block.split(/\r?\n/)) {
-    const kv = line.match(/^(name|description)\s*:\s*(.*)$/);
-    if (!kv) continue;
-    let v = kv[2].trim();
-    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-      v = v.slice(1, -1);
-    }
-    if (kv[1] === 'name') name = v;
-    else description = v;
-  }
-  return { body, name, description };
-}
-
 function resolveMemoryDir(extensionDir: string, raw: string): string {
   if (raw.startsWith('/')) return raw;
   return resolve(extensionDir, raw);
@@ -261,114 +263,34 @@ async function loadMemoryDir(
   return out;
 }
 
-interface MarketplaceManifestAgent {
-  id: string;
-  role?: string;
-  peerFile?: string;
-  personaFiles?: { zh?: string; en?: string };
-  /** Host 工具白名单 glob(如 ["gen3d:*","team:*"])。历史上是死字段:marketplace
-   *  legacy 分支从不透传它,host-tools 桥拿不到 → Forge(legacy agent)看不见任何
-   *  host 工具 allow。resolvePersonaForAgent 现已透传(GAP 4 修复),救活此字段。 */
-  tools?: string[];
-}
-
-// Memoize: marketplace location does not change without a server restart, and
-// composeSystemPrompt / resolvePersonaForAgent both call this on every chat
-// session boot. Without the cache that's 5 existsSync probes per boot, twice
-// (manifest and persona resolution paths).
-let _mpRootCache: { root: string; result: string | null } | null = null;
-function findMarketplaceRoot(): string | null {
-  const root = defaultProjectRoot();
-  if (_mpRootCache && _mpRootCache.root === root) return _mpRootCache.result;
-  const candidates = [
-    // Host-bundled marketplace root (has manifest.json). assetRoot() = `packages/`
-    // in dev, `<Resources>/resources/` in the packaged .app. Without this the
-    // packaged build can't find the marketplace → agent persona/skill
-    // composition silently degrades.
-    resolve(assetRoot(), 'marketplace'),
-    resolve(root, 'packages/marketplace'),
-    resolve(root, '../packages/marketplace'),
-    resolve(root, '../../packages/marketplace'),
-    resolve(root, 'marketplace'),
-    resolve(root, '../marketplace'),
-  ];
-  const result = candidates.find((p) => existsSync(join(p, 'manifest.json'))) ?? null;
-  _mpRootCache = { root, result };
-  return result;
-}
-
-// Manifest cache keyed by absolute path + mtime — invalidates automatically
-// when the marketplace submodule is updated (mtime bump on disk). Both
-// composeFromMarketplaceManifest and resolvePersonaForAgent shared a parse
-// previously, so two independent reads per boot. With the cache they share.
-interface MarketplaceManifest { agents?: MarketplaceManifestAgent[] }
-const _manifestCache = new Map<string, { mtime: number; parsed: MarketplaceManifest }>();
-async function readMarketplaceManifest(mpRoot: string): Promise<MarketplaceManifest | null> {
-  const path = join(mpRoot, 'manifest.json');
-  let mtime = 0;
-  try { mtime = statSync(path).mtimeMs; } catch { return null; }
-  const hit = _manifestCache.get(path);
-  if (hit && hit.mtime === mtime) return hit.parsed;
+function resolveBrandAssistantTemplate(agentId: string): ResolvedExternalAgentTemplate | null {
   try {
-    const parsed = JSON.parse(await readFile(path, 'utf-8')) as MarketplaceManifest;
-    _manifestCache.set(path, { mtime, parsed });
-    return parsed;
+    const { config, packDir } = loadBrand();
+    const agent = config.assistant.agent;
+    if (agent.id !== agentId) return null;
+    const personaPath = resolve(packDir, agent.personaFiles.zh ?? agent.personaFiles.en);
+    if (!existsSync(personaPath)) return null;
+    return {
+      personaPath,
+      skillSources: [],
+      tools: agent.tools,
+      source: 'brand',
+      trustTier: 'own',
+    };
   } catch {
     return null;
   }
 }
 
-async function composeFromMarketplaceManifest(agentId: string): Promise<ComposedSystemPrompt | null> {
-  const mpRoot = findMarketplaceRoot();
-  if (!mpRoot) return null;
-  const manifest = await readMarketplaceManifest(mpRoot);
-  if (!manifest) return null;
-  const a = (manifest.agents ?? []).find((x) => x.id === agentId);
-  if (!a) return null;
-  const personaRel = a.peerFile ?? a.personaFiles?.zh ?? a.personaFiles?.en;
-  if (!personaRel) return null;
-  let persona = '';
-  const warnings: string[] = [];
-  try {
-    persona = await readFile(join(mpRoot, personaRel), 'utf-8');
-  } catch (e) {
-    warnings.push(`persona file unreadable: ${(e as Error).message}`);
-    return null;
-  }
-  return {
-    agentId,
-    extensionId: 'marketplace:legacy',
-    persona,
-    skillSections: [],
-    skillIndex: [],
-    memorySections: [],
-    text: persona.trim(),
-    warnings,
-  };
-}
-
-/** Resolve `agentId` (marketplace persona / plugin agent id) → absolute
+/** Resolve `agentId` (Brand assistant / plugin agent id) → absolute
  *  persona-file path. Used by /api/sessions/:sid/messages auto-scaffolding
- *  to pre-populate `agent.json::personaFile` so the persona slot kit can
- *  surface the persona on first turn. Returns null if the id isn't a known
- *  plugin agent and isn't in marketplace/manifest.json (caller should fall
+ *  to pre-populate `agent.json::personaFile` so AgentTemplateLoader can
+ *  freeze the persona for the first turn. Returns null if the id isn't a known
+ *  plugin agent and isn't the Brand assistant (caller should fall
  *  through to the plain "route to root" path). */
-export async function resolvePersonaForAgent(agentId: string): Promise<{
-  personaPath: string;
-  /** Absolute path to the agent's long-term memory dir, if declared and on
-   *  disk. The slot-path persona kit and the auto-scaffold writers both
-   *  pre-populate `agent.json::memoryDir` with this so the memory slot can
-   *  read it without re-walking the plugin registry every turn. */
-  memoryDir?: string;
-  /** Host 工具白名单 glob（manifest `provides.agent.tools`）。host-tools 桥据此
-   *  决定把哪些 exposedToAI 宿主工具注入此 agent 的对话工具清单。 */
-  tools?: string[];
-  source: 'plugin' | 'marketplace';
-  /** Extension origin is authoritative for trust: built-in is host-owned;
-   *  user-installed and project-specific extensions remain imported. Legacy marketplace personas have no
-   *  extension origin and therefore stay imported. */
-  origin?: AgentEntry['origin'];
-} | null> {
+export async function resolveExternalAgentTemplate(
+  agentId: string,
+): Promise<ResolvedExternalAgentTemplate | null> {
   // 1) Plugin agents — entry.personaPath is already absolute.
   const plugin = lookupAgent(agentId);
   if (plugin && plugin.personaPath && existsSync(plugin.personaPath)) {
@@ -383,26 +305,71 @@ export async function resolvePersonaForAgent(agentId: string): Promise<{
     return {
       personaPath: plugin.personaPath,
       memoryDir,
+      skillSources: await resolveExternalSkillSources(plugin),
       tools: plugin.definition.tools,
       source: 'plugin',
       origin: plugin.origin,
+      trustTier: plugin.origin === 'builtin' ? 'own' : 'imported',
     };
   }
-  // 2) Legacy peers in marketplace/manifest.json.
-  const mpRoot = findMarketplaceRoot();
-  if (!mpRoot) return null;
-  const manifest = await readMarketplaceManifest(mpRoot);
-  if (!manifest) return null;
-  const a = (manifest.agents ?? []).find((x) => x.id === agentId);
-  if (!a) return null;
-  const personaRel = a.peerFile ?? a.personaFiles?.zh ?? a.personaFiles?.en;
-  if (!personaRel) return null;
-  const abs = join(mpRoot, personaRel);
-  if (!existsSync(abs)) return null;
-  // GAP 4 修复:透传 marketplace legacy agent 的 tools glob。此前只有 plugin 分支
-  // 回 tools,legacy(Forge 等)恒无 → host-tools 桥注入空 allow。现透传后,
-  // manifest.json 里 forge 的 "tools":["gen3d:*","character:*","team:*"] 生效。
-  return { personaPath: abs, tools: a.tools, source: 'marketplace' };
+  // 2) Product-owned main assistant from the active Brand pack.
+  return resolveBrandAssistantTemplate(agentId);
+}
+
+/** Compatibility name for pre-template callers.
+ *
+ * New materialization/bootstrap code must use resolveExternalAgentTemplate so
+ * it cannot accidentally treat the returned skills/memory/tools as persona
+ * decoration. */
+export async function resolvePersonaForAgent(
+  agentId: string,
+): Promise<ResolvedExternalAgentTemplate | null> {
+  return resolveExternalAgentTemplate(agentId);
+}
+
+/** Resolve extension defaultSkills once at template materialization/bootstrap.
+ *
+ * The returned paths are persisted in resident agent.json and subsequently
+ * loaded by AgentTemplateLoader. Runtime turns therefore never need to look up
+ * the global extension registry by agent id. */
+async function resolveExternalSkillSources(
+  agent: AgentEntry,
+): Promise<ResolvedExternalSkillSource[]> {
+  const refs = (agent.definition.defaultSkills ?? []) as SkillRef[];
+  const lang = agent.definition.defaultLang ?? 'zh';
+  const result: ResolvedExternalSkillSource[] = [];
+  const seen = new Set<string>();
+  for (const ref of refs) {
+    const skill = resolveSkill(ref, agent.extensionId);
+    if (!skill || seen.has(skill.definition.id)) continue;
+    seen.add(skill.definition.id);
+    const definition = skill.definition;
+    let description =
+      pickI18n(definition.description, lang) ||
+      pickI18n(definition.displayName, lang) ||
+      '';
+    const path = resolveSkillFile(skill.originDir, definition.entry.file);
+    if (!description && definition.entry.kind === 'prompt') {
+      try {
+        description = parseSkillFrontmatter(await readFile(path, 'utf-8')).description ?? '';
+      } catch {
+        // The template loader will skip an unreadable body. Keep the index
+        // entry so the persisted definition remains faithful to the manifest.
+      }
+    }
+    result.push({
+      id: definition.id,
+      path,
+      ...(description ? { description } : {}),
+      executor:
+        definition.entry.kind === 'ts'
+          ? 'typescript'
+          : definition.entry.kind === 'py'
+            ? 'python'
+            : 'prompt',
+    });
+  }
+  return result;
 }
 
 function extensionDirOf(extensionId: string): string | null {

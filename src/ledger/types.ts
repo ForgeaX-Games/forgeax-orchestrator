@@ -9,6 +9,7 @@
  *  context-window 模块，这里独立持有一份。 */
 
 export interface StoredEvent {
+  eventId?: string;
   type: string;
   ts: number;
   source?: string;
@@ -21,10 +22,40 @@ export interface StoredEvent {
   seq?: number;
   /** Session generation id — seq is only comparable within the same sgen. */
   sgen?: string;
+  owner?: EventOwner;
+  runtimeEpochId?: string;
   history?: {
-    eventId: string;
+    eventId?: string;
     turnId?: string;
     origin?: { kernelId: string; laneId: string; epoch: number };
   };
+  agentInstanceId?: string;
   [key: string]: unknown;
 }
+
+export type EventStoreId = string;
+
+export interface EventStoreLocator {
+  /** Relative to the owning Session root. Never accepted from Agent input. */
+  readonly relativeDir: string;
+}
+
+export interface InstanceEventBinding {
+  readonly ownerInstanceId: string;
+  readonly runtimeEpochId: string;
+  readonly storeId: EventStoreId;
+  readonly locator: EventStoreLocator;
+}
+
+export interface ResolvedEventStorePaths {
+  readonly eventsDir: string;
+  readonly blobsDir: string;
+}
+
+export type EventOwner =
+  | {
+      readonly kind: "agent";
+      readonly instanceId: string;
+      readonly runtimeEpochId: string;
+    }
+  | { readonly kind: "session" };

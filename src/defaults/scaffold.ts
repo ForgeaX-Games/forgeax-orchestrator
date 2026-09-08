@@ -5,22 +5,15 @@
  *
  *  约束：
  *  - 只补缺，不覆盖：用户改过的 models.json 永远不动。
- *  - copy 自源码仓库的 packages/server/src/defaults/models.json。
+ *  - 默认模型目录作为模块数据嵌入构建产物，standalone 二进制不依赖源码路径。
  *  - agent.json 不走 copy 路径 —— 由 SessionManager.create / spawn_subagent 把
  *    AGENT_DEFAULTS 与调用方参数 deep-merge 后写盘。 */
 
-import { existsSync } from "node:fs";
-import { copyFile, mkdir } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { mkdir, writeFile } from "node:fs/promises";
 import type { PathManagerAPI } from "../fs/types";
+import defaultModels from "./models.json";
 
-/** 当前文件所在目录。Bun + Node 双兼容（Bun 有 import.meta.dirname，Node 有 import.meta.url）。 */
-function defaultsDir(): string {
-  const dir = (import.meta as unknown as { dir?: string }).dir;
-  if (typeof dir === "string") return dir;
-  return dirname(fileURLToPath(import.meta.url));
-}
+const DEFAULT_MODELS_JSON = `${JSON.stringify(defaultModels, null, 2)}\n`;
 
 export interface ScaffoldResult {
   /** 实际 copy 过去的相对文件名集合（已存在的不计）。 */
@@ -31,17 +24,20 @@ export async function ensureUserDirDefaults(pm: PathManagerAPI): Promise<Scaffol
   const keyDir = pm.user().keyDir();
   await mkdir(keyDir, { recursive: true });
 
-  const seedDir = defaultsDir();
   const created: string[] = [];
 
-  const targets: Array<{ name: string; src: string; dst: string }> = [
-    { name: "models.json", src: resolve(seedDir, "models.json"), dst: pm.user().modelsFile() },
+  const targets: Array<{ name: string; contents: string; dst: string }> = [
+    { name: "models.json", contents: DEFAULT_MODELS_JSON, dst: pm.user().modelsFile() },
   ];
 
   for (const t of targets) {
-    if (existsSync(t.dst)) continue;
-    await copyFile(t.src, t.dst);
-    created.push(t.name);
+    try {
+      await writeFile(t.dst, t.contents, { flag: "wx" });
+      created.push(t.name);
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") continue;
+      throw error;
+    }
   }
 
   return { created };

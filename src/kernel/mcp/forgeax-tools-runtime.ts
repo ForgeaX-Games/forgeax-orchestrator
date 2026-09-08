@@ -32,6 +32,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { isProjectMcpToolName } from '../project-mcp';
+import { resolveBundledBunExecutable } from '../../cli-providers/mcp/permission-server-entry';
 
 /** Tools the `fxt` MCP server implements locally (not host-bridged). Kept in
  *  sync with `forgeax-tools-server.mjs`'s builtin `TOOLS` map. Exported as the
@@ -84,6 +85,19 @@ export interface MaterializeOptions {
 }
 
 const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
+
+/** Resolve the stdio MCP entry outside the compiled server sidecar. Bun embeds
+ * source modules under /$bunfs/root, but a child Bun process cannot execute
+ * that virtual path. Desktop packaging therefore stages the entry as a real
+ * resource and injects its absolute path. */
+export function resolveForgeaxToolsServerEntry(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const staged = env.FORGEAX_TOOLS_SERVER_ENTRY?.trim();
+  return staged
+    ? resolvePath(staged)
+    : resolvePath(import.meta.dirname, 'forgeax-tools-server.mjs');
+}
 
 /** Deduplicate tool names, preserving first-seen order. */
 function dedupeToolNames(tools: readonly ToolSpec[]): string[] {
@@ -177,8 +191,8 @@ export async function materializeForgeaxToolsRuntime(
   if (options.disableUiBridge) env.FORGEAX_DISABLE_UI_BRIDGE = '1';
 
   return {
-    command: process.execPath,
-    args: [resolvePath(import.meta.dirname, 'forgeax-tools-server.mjs')],
+    command: resolveBundledBunExecutable(),
+    args: [resolveForgeaxToolsServerEntry()],
     enabledTools,
     env,
     dir,

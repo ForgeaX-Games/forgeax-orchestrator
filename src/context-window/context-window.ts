@@ -6,7 +6,7 @@
  *  - **ledger**：`EventLedger`（per-agent WAL）—— 取 `readAllEvents` /
  *    `readFromTail`；ContextWindow 不直接持 SessionManager。
  *  - **blackboard**：可选；不给就 idle anchor 永远是 undefined → 视作 idle，
- *    每次都会跑 microCompact。生产路径 ConsciousAgent 必给。
+ *    每次都会跑 microCompact。生产 Runtime host 必给。
  *
  *  Pipeline（plan §3.8）：
  *    history-pipeline (eventsToMessages)

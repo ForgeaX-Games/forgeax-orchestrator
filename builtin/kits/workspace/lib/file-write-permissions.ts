@@ -1,7 +1,7 @@
 /** canWritePath —— write_file / edit_file / multi_edit / apply_patch 的统一闸门。
  *
  *  策略（**严格 allowlist**——只放行下面这些，其余一律拒）：
- *    1. agent 自身的 agentDir（memory / lessons / scenes / kit override / 进度文件）。
+ *    1. agent 实例自己的 runtimeStateRoot。
  *    2. 游戏工作区：
  *       - <projectRoot>/.forgeax/games/**  —— 规范路径
  *       - <projectRoot>/games/**           —— 旧版 fallback（safe-path 仍白名单）
@@ -14,7 +14,7 @@
  *
  *  之前这里是「黑名单 + 其余开放」，导致 agent 可以往 projectRoot 外面（如
  *  `<repo父目录>/gomoku/index.html`）随便写——把 charter prompt 的约束架空了。
- *  现在 prompt 契约（game_charter slot / claude-code append）+ 这道硬闸门双保险。
+ *  现在 prompt 契约（统一 host system prompt）+ 这道硬闸门双保险。
  */
 
 import { isAbsolute, normalize, sep, resolve as resolvePath } from "node:path";
@@ -30,13 +30,12 @@ export function canWritePath(absPath: string, ctx: AgentContext): boolean {
   if (!isAbsolute(absPath)) return false;
   const target = normalize(absPath);
 
-  // Builtin is never writable, even if it happens to sit under agentDir.
+  // Builtin is never writable, even if it happens to sit under runtime state.
   const builtin = ctx.pathManager.builtin().root();
   if (isUnder(target, builtin)) return false;
 
-  // (1) The agent's own scaffold dir — memory, lessons/scenes, progress, kit
-  //     overrides. Always writable.
-  if (ctx.agentDir && isUnder(target, normalize(ctx.agentDir))) return true;
+  // (1) The instance-owned runtime state is writable. The template root is not.
+  if (isUnder(target, normalize(ctx.runtimeStateRoot))) return true;
 
   // (2) Game workspaces. The canonical root is exactly the pathManager's
   //     gamesDir (= <projectRoot>/.forgeax/games) — use it DIRECTLY, no

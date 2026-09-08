@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Hono } from 'hono';
 import type { AgentKernel, KernelEvent, TurnRequest } from '@forgeax/agent-runtime';
-import { registerKernel } from '@forgeax/agent-runtime';
+import { registerKernel, unregisterKernel } from '@forgeax/agent-runtime';
 import type { TelemetryRecord } from '@forgeax/types';
 import { createCliRouter } from '../src/api/cli/chat';
 import { setHostTelemetry } from '../src/kernel/host-telemetry';
@@ -71,6 +71,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  unregisterKernel(KERNEL_ID);
   setHostTelemetry(null);
   resetPathManager();
   if (savedKernelEnv === undefined) delete process.env.FORGEAX_KERNEL; else process.env.FORGEAX_KERNEL = savedKernelEnv;
@@ -97,6 +98,25 @@ async function runTurn(): Promise<Array<{ event: string; data: Record<string, un
 }
 
 describe('CLI 桥:工具事件 → tracer,信封不出墙', () => {
+  test('rejects malformed summonAgentId before a kernel turn starts', async () => {
+    const res = await app.request('/api/cli/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: 'hi', agentId: 'forge', providerOverride: KERNEL_ID, summonAgentId: 'mochi/evil' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, error: expect.stringContaining('summonAgentId') });
+  });
+
+  test('accepts an explicit null summonAgentId as a clear', async () => {
+    const res = await app.request('/api/cli/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: 'hi', agentId: 'forge', providerOverride: KERNEL_ID, summonAgentId: null }),
+    });
+    expect(res.status).toBe(200);
+  });
+
   test('连接键进了 tool span 的 attrs', async () => {
     await runTurn();
     const toolSpans = telemetry.filter((r) => {

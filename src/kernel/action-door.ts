@@ -8,7 +8,7 @@
  * 设计纪律(2026-08-05 重写)——**对账只消费事实,不携带 per-entry 指南**:
  *  - 事实来源三路:菜单树投影(host.menubar,叶子带 commandId/args,动态子菜单带
  *    childCommandId/childIdFromArg)、rail 投影(host.sidebar entries,当前无发布者
- *    恒 null,仅 workbench 对账在其真实在场时消费)、catalog 条目自己声明的 door
+ *    恒 null,仅 page 对账在其真实在场时消费)、catalog 条目自己声明的 door
  *    事实(menuCommandId 别名)。
  *  - 提示语只按**类**存在(有门/无门/未知/仅网格可达),内容由事实填充。
  *  - 空投影 ≠ 无门。菜单投影缺席时输出"未知",绝不指控 headless —— 上一版按空集
@@ -55,7 +55,7 @@ export interface DoorSources {
   /** host.menubar 投影的菜单树。 */
   menus?: unknown;
   /** host.sidebar 投影的 rail entries。2026-08-06 现状:该面无发布者(上游 Page
-   *  重构后 rail 未接入 surface 总线),生产恒 null;仅 workbench 插件对账在它
+   *  重构后 rail 未接入 surface 总线),生产恒 null;仅 page 插件对账在它
    *  真实存在时消费 —— 空时按"未知"处理,绝不当"无门"。 */
   rail?: Array<{ id?: unknown; label?: unknown }> | null;
   /** catalog 条目声明的门位事实(action-catalog.ts `door` 字段)。 */
@@ -84,7 +84,7 @@ const HINTS = {
     + '如需可见执行,请让用户手动操作,或改用与菜单项等价的参数调用。',
   railGridOnly: (label: string) =>
     `「${label}」已安装,但不在 rail 的固定分类清单里 —— rail 和「更多插件」里都看不到它。`
-    + '用户仍可从**工作台网格**点到它(打开任一插件后点右上角 × 返回工作台,再点对应 tile)。'
+    + '用户仍可从**扩展网格**点到它(打开任一扩展后点右上角 × 返回扩展列表,再点对应 tile)。'
     + '教路径时请教这一条真实存在的;并把"未收录进 rail 分类"作为产品缺口反馈给用户。',
 } as const;
 
@@ -159,31 +159,6 @@ export function findVisibleDoor(
   const fact = src.fact ?? {};
   const args = actionArgs && typeof actionArgs === 'object' ? (actionArgs as Record<string, unknown>) : {};
 
-  // 2026-08-06 删除 railMode/railTab 分支:railMode 此前**不查任何投影**就返回最高
-  // 置信度 found + rail: 路径,而 host.sidebar 全树零发布者 —— open('rail:...') 必死,
-  // 文案还让 agent 请用户"打开页面"(页面明明开着)。同文件 railTab 分支做了核实
-  // 降级、railMode 却没有,是同一文件里的双标准。rail 重新接入总线后再恢复,恢复
-  // 入口:action-catalog 的 door 校验会对 railTab/railMode 大声报错。
-
-  // ── workbench 插件门:rail entries 精确对账;不在 rail ≠ 点不到(工作台网格兜底) ──
-  if ((actionId === 'workbench.open_plugin' || actionId === 'workbench.open') && Array.isArray(src.rail)) {
-    const wanted = [args.extensionId, args.tab, args.id].find((v) => typeof v === 'string' && v) as string | undefined;
-    if (wanted) {
-      const slug = wanted.replace(/^.*\//, '');
-      const entry = src.rail.find((row) => typeof row.id === 'string'
-        && (row.id === wanted || row.id === `wb:${slug}` || String(row.id).replace(/^wb:/, '') === slug.replace(/^wb-/, '')));
-      if (entry && typeof entry.id === 'string') {
-        const path = `rail:${entry.id}`;
-        return { visible: true, path, certainty: 'found', hint: HINTS.found(path) };
-      }
-      const label = typeof args.extensionId === 'string' ? args.extensionId : wanted;
-      // 2026-08-05 修正:上一版在这里指控"孤儿界面,用户自己点不到"。经实测工作台
-      // 网格(installed − hidden)列出全部插件且 tile 可点 —— "不在 rail" 只证明
-      // 不在 rail,不证明不可达。只对一个账源就下"没有"的结论,是本文件修过两次的病。
-      return { visible: true, certainty: 'found', hint: HINTS.railGridOnly(label) };
-    }
-  }
-
   // ── 菜单门:actionId 本身,或 catalog 别名事实(同能力双 id) ──
   if (src.menus === null || src.menus === undefined) {
     return { visible: false, certainty: 'unknown', hint: HINTS.unknown };
@@ -221,7 +196,7 @@ export function findVisibleDoor(
   // `role.` 在列(2026-08-06):它的门(rail 的 Agents 页签)在**界面上真实可见**,
   // 只是 rail 未接入 surface 总线、AI 无法沿它可见执行 —— 这是"门位未知",不是
   // "没有门";说成 headless 就是对着用户看得见的按钮说"屏幕上不会有变化"。
-  const SHELL_WIDGET_PREFIXES = ['app.', 'panel.', 'console.', 'network.', 'session.', 'sessions.', 'workbench.', 'role.'];
+  const SHELL_WIDGET_PREFIXES = ['app.', 'panel.', 'console.', 'network.', 'session.', 'sessions.', 'extension.', 'role.'];
   if (SHELL_WIDGET_PREFIXES.some((prefix) => actionId.startsWith(prefix))) {
     return { visible: false, certainty: 'unknown', hint: HINTS.shellWidget };
   }

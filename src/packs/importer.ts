@@ -19,12 +19,13 @@
  * already carries `signed: false` + a warning when the pack is unsigned, so
  * UIs can stop gating here and gain proof-of-origin in a later patch.
  */
-import { mkdirSync, rmSync, readdirSync, statSync, readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
+import { mkdirSync, rmSync, readdirSync, statSync, readFileSync, writeFileSync, copyFileSync, existsSync, renameSync } from 'node:fs';
 import { runCapture } from '../lib/node-spawn';
-import { join, dirname } from 'node:path';
-import { tmpdir } from 'node:os';
+import { basename, join, dirname } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { ManifestSchema, type ExtensionManifest } from '@forgeax/types';
+import { defaultProjectRoot } from '@forgeax/platform-io';
 import { getExtensionSnapshot } from '../extensions/registry';
 import {
   FxpackManifestSchema,
@@ -34,6 +35,8 @@ import {
   type FxpackInspectFailure,
   type FxpackInstallInput,
   type FxpackInstallResult,
+  type FxpackLifecycleInput,
+  type FxpackLifecycleResult,
 } from './types';
 import { recordInstall, recordTrust } from './ledger';
 import { verifyStaging } from './signing';
@@ -71,6 +74,27 @@ function copyTree(src: string, dest: string): void {
   }
 }
 
+/** Copy before mutating the live tree, then swap sibling directories. */
+function replaceTreeAtomically(src: string, dest: string): void {
+  const parent = dirname(dest);
+  const stem = basename(dest);
+  const transactionId = crypto.randomUUID();
+  const staged = join(parent, `.${stem}.install-${transactionId}`);
+  const backup = join(parent, `.${stem}.backup-${transactionId}`);
+  mkdirSync(parent, { recursive: true });
+  copyTree(src, staged);
+  const hadExisting = existsSync(dest);
+  try {
+    if (hadExisting) renameSync(dest, backup);
+    renameSync(staged, dest);
+  } catch (error) {
+    rmSync(staged, { recursive: true, force: true });
+    if (hadExisting && existsSync(backup) && !existsSync(dest)) renameSync(backup, dest);
+    throw error;
+  }
+  rmSync(backup, { recursive: true, force: true });
+}
+
 function walk(root: string, out: string[] = [], rel = ''): string[] {
   for (const entry of readdirSync(root)) {
     const abs = join(root, entry);
@@ -93,6 +117,110 @@ function loadExtensionManifest(srcDir: string): ExtensionManifest {
   return parsed.data;
 }
 
+const EXTENSION_SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/;
+
+function extensionSlug(id: string): string | null {
+  const slug = id.slice(id.lastIndexOf('/') + 1);
+  return EXTENSION_SLUG_RE.test(slug) ? slug : null;
+}
+
+function lifecycleRoot(origin: FxpackLifecycleInput['destinationOrigin']): string {
+  return origin === 'user' ? homedir() : defaultProjectRoot();
+}
+
+function installedManifest(dir: string, expectedId: string): ExtensionManifest | null {
+  if (!existsSync(dir)) return null;
+  try {
+    const manifest = loadExtensionManifest(dir);
+    return manifest.id === expectedId ? manifest : null;
+  } catch {
+    return null;
+  }
+}
+
+function recordLifecycle(
+  input: FxpackLifecycleInput,
+  destRoot: string,
+  manifest: ExtensionManifest,
+  action: 'disable' | 'enable' | 'remove',
+  state: 'enabled' | 'disabled' | 'removed',
+  archivePath?: string,
+): void {
+  recordInstall(destRoot, {
+    id: input.id,
+    slug: extensionSlug(input.id)!,
+    version: manifest.version,
+    origin: input.destinationOrigin,
+    ts: new Date().toISOString(),
+    action,
+    state,
+    ...(archivePath === undefined ? {} : { archivePath }),
+  });
+}
+
+export function disableInstalledExtension(input: FxpackLifecycleInput): FxpackLifecycleResult {
+  const slug = extensionSlug(input.id);
+  if (!slug) return { ok: false, code: 'bad_input', error: 'a valid extension id is required' };
+  const destRoot = lifecycleRoot(input.destinationOrigin);
+  const active = join(destRoot, '.forgeax', 'extensions', slug);
+  const disabled = join(destRoot, '.forgeax', 'extensions-disabled', slug);
+  const manifest = installedManifest(active, input.id);
+  if (!manifest) return { ok: false, code: 'not_found', error: `enabled extension not found: ${input.id}` };
+  if (existsSync(disabled)) return { ok: false, code: 'conflict', error: `disabled extension already exists: ${input.id}` };
+  try {
+    mkdirSync(dirname(disabled), { recursive: true });
+    renameSync(active, disabled);
+    recordLifecycle(input, destRoot, manifest, 'disable', 'disabled');
+    return { ok: true, id: input.id, state: 'disabled', path: disabled };
+  } catch (error) {
+    return { ok: false, code: 'lifecycle_error', error: (error as Error).message };
+  }
+}
+
+export function enableInstalledExtension(input: FxpackLifecycleInput): FxpackLifecycleResult {
+  const slug = extensionSlug(input.id);
+  if (!slug) return { ok: false, code: 'bad_input', error: 'a valid extension id is required' };
+  const destRoot = lifecycleRoot(input.destinationOrigin);
+  const active = join(destRoot, '.forgeax', 'extensions', slug);
+  const disabled = join(destRoot, '.forgeax', 'extensions-disabled', slug);
+  const manifest = installedManifest(disabled, input.id);
+  if (!manifest) return { ok: false, code: 'not_found', error: `disabled extension not found: ${input.id}` };
+  if (existsSync(active)) return { ok: false, code: 'conflict', error: `enabled extension already exists: ${input.id}` };
+  try {
+    mkdirSync(dirname(active), { recursive: true });
+    renameSync(disabled, active);
+    recordLifecycle(input, destRoot, manifest, 'enable', 'enabled');
+    return { ok: true, id: input.id, state: 'enabled', path: active };
+  } catch (error) {
+    return { ok: false, code: 'lifecycle_error', error: (error as Error).message };
+  }
+}
+
+export function removeInstalledExtension(input: FxpackLifecycleInput): FxpackLifecycleResult {
+  const slug = extensionSlug(input.id);
+  if (!slug) return { ok: false, code: 'bad_input', error: 'a valid extension id is required' };
+  const destRoot = lifecycleRoot(input.destinationOrigin);
+  const active = join(destRoot, '.forgeax', 'extensions', slug);
+  const disabled = join(destRoot, '.forgeax', 'extensions-disabled', slug);
+  const source = existsSync(active) ? active : disabled;
+  const manifest = installedManifest(source, input.id);
+  if (!manifest) return { ok: false, code: 'not_found', error: `installed extension not found: ${input.id}` };
+  const archivePath = join(
+    destRoot,
+    '.forgeax',
+    'extensions-removed',
+    `${slug}-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`,
+  );
+  try {
+    mkdirSync(dirname(archivePath), { recursive: true });
+    renameSync(source, archivePath);
+    recordLifecycle(input, destRoot, manifest, 'remove', 'removed', archivePath);
+    return { ok: true, id: input.id, state: 'removed', archivePath };
+  } catch (error) {
+    return { ok: false, code: 'lifecycle_error', error: (error as Error).message };
+  }
+}
+
 function detectConflicts(
   newPlugins: Array<{ id: string; version: string }>,
 ): FxpackTrustDescriptor['conflicts'] {
@@ -103,7 +231,9 @@ function detectConflicts(
     if (hit) {
       out.push({
         id: np.id,
-        existingOrigin: hit.origin,
+        // npm-declared origin collapses to builtin for this trust descriptor
+        // (3-value contract predates the npm origin); both are first-party.
+        existingOrigin: hit.origin === 'npm' ? 'builtin' : hit.origin === 'dev' ? 'project' : hit.origin,
         existingVersion: hit.manifest.version,
         newVersion: np.version,
       });
@@ -291,7 +421,8 @@ export async function installPack(input: FxpackInstallInput): Promise<FxpackInst
       const slash = entry.id.indexOf('/');
       const slug = slash >= 0 ? entry.id.slice(slash + 1) : entry.id;
       const destDir = join(extensionsRoot, slug);
-      if (existsSync(destDir)) {
+      const hadExisting = existsSync(destDir);
+      if (hadExisting) {
         if (policy === 'skip') {
           skipped.push(entry.id);
           continue;
@@ -312,10 +443,9 @@ export async function installPack(input: FxpackInstallInput): Promise<FxpackInst
           });
           continue;
         }
-        // overwrite
-        rmSync(destDir, { recursive: true, force: true });
+        // overwrite is an upgrade. The copy below stages before swapping.
       }
-      copyTree(srcDir, destDir);
+      replaceTreeAtomically(srcDir, destDir);
       installed.push(entry.id);
       recordInstall(input.destRoot, {
         id: entry.id,
@@ -325,6 +455,8 @@ export async function installPack(input: FxpackInstallInput): Promise<FxpackInst
         source: sourceTag,
         sha256: packSha,
         ts: new Date().toISOString(),
+        action: hadExisting ? 'upgrade' : 'install',
+        state: 'enabled',
       });
     }
 
@@ -363,4 +495,10 @@ export async function installPack(input: FxpackInstallInput): Promise<FxpackInst
   }
 }
 
-export type { FxpackInstallInput, FxpackInstallResult, FxpackTrustDescriptor } from './types';
+export type {
+  FxpackInstallInput,
+  FxpackInstallResult,
+  FxpackLifecycleInput,
+  FxpackLifecycleResult,
+  FxpackTrustDescriptor,
+} from './types';

@@ -65,7 +65,7 @@ describe('mapCodexEvent — item 级映射', () => {
     const evs = run([
       { type: 'item.completed', item: { id: 'r1', type: 'reasoning', text: 'let me think' } },
     ]);
-    expect(evs).toEqual([{ kind: 'thinking.delta', text: 'let me think' }]);
+    expect(evs).toEqual([{ kind: 'thinking.delta', text: 'let me think', visibility: 'public_summary' }]);
   });
 
   test('command_execution started→tool.call, completed→tool.result(ok)', () => {

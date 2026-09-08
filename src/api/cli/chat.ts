@@ -1,37 +1,40 @@
-/** POST /api/cli/chat —— 临时 SSE 桥，让 interface 还能跟 claude-code 聊天。
+/** POST /api/cli/chat —— 兼容旧 interface 的 SSE 桥。
  *
  *  R3 阶段定位（参考 docs/features/internal-loop-completion-plan.md §5）：
- *  - **独立 REST 分支**，不走 commands transport。
- *  - 标 `Deprecation: true` + `Sunset: forgeax-v1.0` —— 等原生 ScriptAgent /
- *    commands `attach_script_agent` 跑通后，这条整片下线。
- *  - 简化版砍掉旧实现的 runs / threads / event-log / SessionStore 持久化层；
- *    只保留 "POST 一句话 → SSE 一回合 → done/error 终止" 的最小核心。多轮上下文
- *    继续靠 claude-code 自带的 `--session-id` / `--resume`（provider 内部维持
- *    `startedThreadIds` set），threadId 由 caller（interface）提供。
+ *  - 带 `sessionId` 的请求进入统一 RuntimeController / AgentInstance 生命周期，
+ *    本路由只把 Runtime EventBus 投影回旧 ChatEvent SSE 协议。
+ *  - 不带 `sessionId`、无法寻址 RuntimeTree 的独立调用暂保留直接 Kernel fallback。
+ *  - 标 `Deprecation: true` + `Sunset: forgeax-v1.0` —— RuntimeTree 的统一
+ *    Kernel 路径完全接管且旧客户端迁完后，这条兼容协议整体下线。
+ *  - 多轮上下文由 RuntimeHost 的 ContextSnapshot 提供；Kernel 可以继续维护私有
+ *    thread/session，并自行决定如何使用宿主提供的上下文。
  *
  *  请求体（与旧 chat.ts 子集兼容）：
  *    {
  *      message: string,           // 必填
  *      threadId?: string,         // UUID v4；缺则 provider 每次起独立 session（无续上下文）
- *      agentId?: string,          // 暂时只用于日志
- *      providerOverride?: string, // UI 选的内核 id(claude-code / codex / forgeax-core);内核路径据此 resolveKernel
- *      model?: string             // 可选：所选内核认可的显式模型；未传则用该 CLI 的当前模型
+ *      agentId?: string,          // 带 sessionId 时用于寻址 RuntimeTree 实例；简单名且树里
+ *                                 // 没有 → 尝试 ensureResidentAgent（对齐 POST /messages）；
+ *                                 // 仍解析不到 → 404（不会静默摔到别的 resident）；
+ *                                 // 不带 sessionId 时仅用于日志
+ *      providerOverride?: string  // UI 选的内核 id(claude-code / codex / forgeax-core);内核路径据此 resolveKernel
  *    }
  *
  *  响应：text/event-stream，每条事件 `event: <type>\ndata: <json>\n\n`。
  *  事件类型来自 ChatEvent union（token / thinking / tool-call / tool-result / done / error）。
  */
 
-import { randomUUID } from "node:crypto";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import {
   getDefaultProvider,
   getProvider,
   listProviders,
+  resolveProvider,
 } from "../../cli-providers/registry";
 import type { ChatEvent, ChatRequest } from "../../cli-providers/types";
-import type { Session } from "../../core/session";
+import { AgentMaterializationError, type Session } from "../../core/session";
+import type { Event } from "../../core/types";
 import { deprecation } from "../lib/deprecation";
 import { getSessionManager } from "../../core/session-manager";
 import { getCheckpointManager } from "../../checkpoint/checkpoint-manager";
@@ -40,42 +43,43 @@ import { readFile } from "node:fs/promises";
 import { CliEventBridge } from "../../observatory/cli-event-bridge";
 import { denyPermissionsForSession } from "../../core/permission-registry";
 // M1 内核路径(FORGEAX_KERNEL=kernel):chat → 内核契约 → wire,前端零改。
-import { composeTurnRequest } from "../../kernel/compose-turn-request";
-import { ProjectMcpNativeOwnershipBusyError } from "../../kernel/project-mcp";
-import { hostToolSpecsForAgent } from "../lib/host-tools-for-agent";
+import { composeTurnRequest, type ComposeInput } from "../../kernel/compose-turn-request";
+import { runWithHistoryResync } from "../../kernel/history-resync";
+import {
+  hostToolSurfaceForAgent,
+} from "../lib/host-tools-for-agent";
 import { resolveKernel, listAvailableKernels } from "../../kernel/resolve-kernel";
 import { toKernelErrorPayload } from "../../kernel/kernel-unavailable";
 import { toWireEvents, newWireFoldState } from "../../kernel/to-wire-events";
 import type { AgentKernel } from "@forgeax/agent-runtime";
 import { kernelEnabled } from "../../kernel/kernel-mode";
+import { isValidSummonAgentId } from "../../kernel/summon-agent";
 import { transcribeKernelTurn } from "../../kernel/transcribe-turn";
 import { hostTelemetryEnabled } from "../../kernel/host-telemetry";
-import { startCliKernelTurn, unwrapMcpResultEnvelope, type CliKernelTurnTrace } from "../../kernel/cli-kernel-trace";
-import { deriveThreadId } from "../../lib/thread-id";
+import {
+  startCliKernelTurn,
+  unwrapMcpResultEnvelope,
+  type CliKernelTurnTrace,
+} from "../../kernel/cli-kernel-trace";
 import { tt, ttEnabled } from "../../lib/turn-trace";
 import { formatCacheHitRatio } from "../../lib/cache-ratio";
-import { getExtensionSnapshot } from "../../extensions/registry";
-import { emptyCapabilitySnapshot } from "@forgeax/types";
-import { listAllCommands } from "../../commands/runner";
-import { commandCapabilities } from "../../capabilities/adapters";
-import { getSessionManager as getCapabilitySessionManager } from "../../core/session-manager";
-import { commonCapabilityRoots } from "../../capabilities/common-roots";
-import { listCommonMcpServers } from "../../capabilities/mcp-catalog";
-import {
-  appliedKernelMutationRecords,
-  captureKernelMutationIntents,
-  type KernelMutationIntent,
-} from "../../kernel/kernel-file-activity";
+import { randomUUID } from "node:crypto";
+import { resolve as resolvePath } from "node:path";
+import { prepareUserAttachmentPayload } from "../../message/materialize-user-attachments";
+import { orchestrationProfileOf } from "../../kernel/kernel-profile";
+import { Hook } from "../../hooks/types";
+import { hasProjectMcpServers, projectMcpExecutionMode } from "../../kernel/project-mcp";
+import { defaultProjectRoot } from "@forgeax/platform-io";
 
 interface ChatBody {
   message?: string;
-  /** Client message id used as the host-owned checkpoint foreign key. */
-  messageId?: string;
+  /** Client-generated id used by the initiating UI to suppress its WS echo. */
+  clientMsgId?: string;
   agentId?: string;
   threadId?: string;
   sessionId?: string;
   providerOverride?: string;
-  /** Selected kernel model. Never inherit a different kernel's agent model. */
+  /** Composer-selected model for this rented-kernel turn. */
   model?: string;
   /** Doc 05 section 7 -- per-call id for `POST /api/cli/cancel`. */
   callId?: string;
@@ -87,9 +91,9 @@ interface ChatBody {
   attachments?: Array<Record<string, unknown>>;
   /** 本轮期望回复语言(UI 结算)。透传进 composeTurnRequest → dynamicSuffix 指令。 */
   replyLanguage?: "en" | "zh";
-  /** 浏览器 `ui.request` span 的 W3C traceparent —— 服务端的 kernel.turn 挂在它下面,
-   *  链才连得起 `ui.send → ui.request → kernel.turn → agent.run → tool`。
-   *  缺失时服务端自建 root trace(链仍成立,只是少了浏览器那两段),**不伪造父 id**。 */
+  /** UI specialist hint; null explicitly clears it. */
+  summonAgentId?: string | null;
+  /** Browser ui.request W3C parent span for the CLI kernel trace. */
   traceparent?: string;
 }
 
@@ -98,38 +102,398 @@ interface CancelBody {
   providerOverride?: string;
 }
 
-type PrewarmableKernel = AgentKernel & {
-  prewarm?: (req: import('@forgeax/agent-runtime').TurnRequest) => Promise<{
-    warmed: boolean;
-    reused: boolean;
-  }>;
-};
+export function normalizeChatModelOverride(model: unknown): string | undefined {
+  if (typeof model !== "string") return undefined;
+  return model.trim() || undefined;
+}
+
+export function normalizeClientMessageId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return value.trim() || undefined;
+}
 
 const DEPRECATION_NOTICE = deprecation({
   sunset: "forgeax-v1.0",
-  reason: "cli-provider bridge is temporary; will be replaced by commands.attach_script_agent + ScriptAgent",
-  migration: "/api/commands/attach_script_agent/execute (planned R5)",
+  reason: "cli-provider bridge is temporary; migrate to Kernel-backed RuntimeTree agents",
+  migration: "/api/sessions/:sid/messages",
 });
+
+/** Native project-MCP ownership is acquired by the first real turn. Prewarm
+ * must not create a competing owner or force an asynchronous handoff. */
+export function shouldDeferNativeProjectMcpPrewarm(
+  kernelId: string,
+  trustTier: "own" | "imported" | undefined,
+  projectRoot: string = defaultProjectRoot(),
+): boolean {
+  return projectMcpExecutionMode(kernelId, trustTier) === "native"
+    && hasProjectMcpServers(projectRoot);
+}
+
+const runtimeCliCalls = new Map<
+  string,
+  { session: Session; agentPath: string }
+>();
+
+class RuntimeChatEventQueue {
+  private readonly items: ChatEvent[] = [];
+  private waiter: (() => void) | null = null;
+  private ended = false;
+
+  push(event: ChatEvent): void {
+    if (this.ended) return;
+    this.items.push(event);
+    this.wake();
+  }
+
+  end(): void {
+    this.ended = true;
+    this.wake();
+  }
+
+  async next(): Promise<ChatEvent | undefined> {
+    while (this.items.length === 0 && !this.ended) {
+      await new Promise<void>((resolve) => {
+        this.waiter = resolve;
+      });
+    }
+    return this.items.shift();
+  }
+
+  private wake(): void {
+    const waiter = this.waiter;
+    this.waiter = null;
+    waiter?.();
+  }
+}
+
+async function runSessionRuntimeChat(
+  c: Context,
+  body: ChatBody & { sessionId: string },
+  message: string,
+) {
+  const session = await getSessionManager().open(body.sessionId);
+  const requestedAgent = body.agentId?.trim();
+  // Explicit agentId: try the same lazy-materialization bridge POST /messages
+  // uses for simple persona names. Nested paths / fullIds still require an
+  // already-live node. Never silently fall through to a different resident.
+  if (requestedAgent) {
+    let resolved = session.tree.resolve(requestedAgent);
+    if (!resolved && !requestedAgent.includes("/") && !requestedAgent.includes("#")) {
+      try {
+        await session.ensureResidentAgent(requestedAgent);
+        resolved = session.tree.resolve(requestedAgent);
+      } catch (error) {
+        if (error instanceof AgentMaterializationError) {
+          return c.json(
+            { ok: false, error: error.message, code: "no_agent" },
+            error.status,
+          );
+        }
+        throw error;
+      }
+    }
+    if (!resolved) {
+      return c.json(
+        { ok: false, error: `runtime agent not found: ${requestedAgent}`, code: "no_agent" },
+        404,
+      );
+    }
+  }
+  const targetInstance =
+    (requestedAgent ? session.tree.resolve(requestedAgent) : undefined) ??
+    session.runtimeTree.list().find((instance) => instance.lifetime === "resident");
+  if (!targetInstance) {
+    return c.json(
+      { ok: false, error: "session has no runtime agent", code: "no_agent" },
+      409,
+    );
+  }
+  const agentPath = session.tree.addressOf(targetInstance);
+  await session.initializeAgentHost(agentPath);
+
+  const kernelId = normalizeKernelId(body.providerOverride) ??
+    targetInstance.template.definition.kernelId;
+  let selectedKernel: AgentKernel;
+  try {
+    selectedKernel = resolveKernel(agentPath, kernelId);
+  } catch (error) {
+    return c.json(await toKernelErrorPayload(null, error), 503);
+  }
+
+  const callId =
+    typeof body.callId === "string" && body.callId.trim()
+      ? body.callId.trim()
+      : randomUUID();
+  const checkpoint = getCheckpointManager();
+  try {
+    await checkpoint.finalizePending(session);
+  } catch (error) {
+    console.warn(
+      `[cli/chat] finalizePending failed: ${(error as Error).message}`,
+    );
+  }
+  try {
+    await checkpoint.snapshotForMessage(session, callId);
+  } catch (error) {
+    console.warn(
+      `[cli/chat] snapshotForMessage failed: ${(error as Error).message}`,
+    );
+  }
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = prepareUserAttachmentPayload({
+      content: message,
+      payload: {
+        ...(Array.isArray(body.attachments) && body.attachments.length
+          ? { attachments: body.attachments }
+          : {}),
+      },
+      uploadDir: resolvePath(
+        getPathManager().session(body.sessionId).root(),
+        "uploads",
+      ),
+      nativeAttachmentKinds:
+        orchestrationProfileOf(selectedKernel).nativeAttachmentKinds,
+    });
+  } catch (error) {
+    payload = {
+      content: message,
+      contextContent:
+        `${message}\n\n[Attachments could not be prepared: ${
+          error instanceof Error ? error.message : String(error)
+        }]`,
+    };
+  }
+  const selectedModel = normalizeChatModelOverride(body.model);
+  const clientMsgId = normalizeClientMessageId(body.clientMsgId);
+  payload = {
+    ...payload,
+    msgId: callId,
+    ...(clientMsgId ? { clientMsgId } : {}),
+    kernelId: selectedKernel.id,
+    ...(selectedModel ? { model: selectedModel } : {}),
+    ...(body.replyLanguage ? { replyLanguage: body.replyLanguage } : {}),
+  };
+  const input: Event = {
+    source: "user",
+    type: "user_input",
+    payload,
+    to: agentPath,
+    handoff: "turn",
+    ts: Date.now(),
+  };
+
+  return streamSSE(c, async (sse) => {
+    const queue = new RuntimeChatEventQueue();
+    let usage:
+      | {
+          inputTokens?: number;
+          outputTokens?: number;
+          cacheReadTokens?: number;
+          cacheCreationTokens?: number;
+        }
+      | undefined;
+    let timedOut = false;
+    const unsubscribe = session.eventBus.observe((event, emitterId) => {
+      if (emitterId !== agentPath) return;
+      const eventPayload = (event.payload ?? {}) as Record<string, unknown>;
+      if (eventPayload.turnId !== callId) return;
+      const providerId =
+        typeof eventPayload.providerId === "string"
+          ? eventPayload.providerId
+          : selectedKernel.id;
+
+      if (event.type === Hook.StreamLLM) {
+        const chunk = eventPayload.chunk as
+          | Record<string, unknown>
+          | undefined;
+        if (chunk?.type === "text" && typeof chunk.text === "string") {
+          queue.push({ type: "token", text: chunk.text, providerId });
+        } else if (
+          chunk?.type === "thinking" &&
+          typeof chunk.text === "string"
+        ) {
+          queue.push({ type: "thinking", text: chunk.text, providerId });
+        } else if (
+          chunk?.type === "tool_call" &&
+          typeof chunk.id === "string" &&
+          typeof chunk.name === "string"
+        ) {
+          queue.push({
+            type: "tool-call",
+            callId: chunk.id,
+            name: chunk.name,
+            args: parseToolArgs(chunk.arguments),
+            providerId,
+          });
+        } else if (
+          chunk?.type === "tool_call_delta" &&
+          typeof chunk.id === "string" &&
+          typeof chunk.name === "string"
+        ) {
+          queue.push({
+            type: "tool-call-delta",
+            callId: chunk.id,
+            name: chunk.name,
+            argumentsDelta:
+              typeof chunk.arguments_delta === "string"
+                ? chunk.arguments_delta
+                : "",
+            providerId,
+          });
+        } else if (chunk?.type === "usage") {
+          usage = {
+            inputTokens:
+              typeof chunk.inputTokens === "number"
+                ? chunk.inputTokens
+                : undefined,
+            outputTokens:
+              typeof chunk.outputTokens === "number"
+                ? chunk.outputTokens
+                : undefined,
+          };
+        }
+        return;
+      }
+
+      if (event.type === Hook.ToolResult) {
+        const callId =
+          typeof eventPayload.callId === "string"
+            ? eventPayload.callId
+            : typeof eventPayload.toolCallId === "string"
+              ? eventPayload.toolCallId
+              : "";
+        if (callId) {
+          queue.push({
+            type: "tool-result",
+            callId,
+            ok: eventPayload.ok !== false && !eventPayload.error,
+            ...(eventPayload.result !== undefined
+              ? { result: eventPayload.result }
+              : {}),
+            ...(eventPayload.error
+              ? { error: String(eventPayload.error) }
+              : {}),
+            providerId,
+          });
+        }
+        return;
+      }
+
+      if (event.type === Hook.AssistantMessage) {
+        const turnUsage = eventPayload.usage as
+          | Record<string, unknown>
+          | undefined;
+        if (turnUsage) {
+          usage = {
+            inputTokens: numberOrUndefined(turnUsage.inputTokens),
+            outputTokens: numberOrUndefined(turnUsage.outputTokens),
+            cacheReadTokens: numberOrUndefined(turnUsage.cacheReadTokens),
+            cacheCreationTokens: numberOrUndefined(
+              turnUsage.cacheWriteTokens ??
+                turnUsage.cacheCreationTokens,
+            ),
+          };
+        }
+        return;
+      }
+
+      if (event.type === Hook.TurnEnd) {
+        if (timedOut) {
+          queue.push({
+            type: "error",
+            code: "driver-timeout",
+            message: `runtime turn timed out after ${body.timeoutMs}ms`,
+            providerId,
+          });
+        } else if (eventPayload.error) {
+          queue.push({
+            type: "error",
+            code: "turn_failed",
+            message: String(eventPayload.error),
+            providerId,
+          });
+        } else {
+          queue.push({
+            type: "done",
+            stopReason:
+              eventPayload.aborted === true ? "cancelled" : "end_turn",
+            ...(usage ? { usage } : {}),
+            providerId,
+          });
+        }
+        queue.end();
+      }
+    });
+
+    const onAbort = () => {
+      session.interruptRuntime(agentPath, "CLI SSE request aborted");
+    };
+    c.req.raw.signal.addEventListener("abort", onAbort, { once: true });
+    const timeout =
+      typeof body.timeoutMs === "number" && body.timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            session.interruptRuntime(
+              agentPath,
+              `runtime turn timed out after ${body.timeoutMs}ms`,
+            );
+          }, body.timeoutMs)
+        : undefined;
+
+    runtimeCliCalls.set(callId, { session, agentPath });
+    session.eventBus.publish(input);
+    const completion = session.enqueueAgent(agentPath, input).catch((error) => {
+      queue.push({
+        type: "error",
+        code: "turn_failed",
+        message: error instanceof Error ? error.message : String(error),
+        providerId: selectedKernel.id,
+      });
+      queue.end();
+    });
+
+    try {
+      while (true) {
+        const event = await queue.next();
+        if (!event) break;
+        await sse.writeSSE({
+          event: event.type,
+          data: JSON.stringify(event),
+        });
+      }
+      await completion;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      runtimeCliCalls.delete(callId);
+      unsubscribe();
+      c.req.raw.signal.removeEventListener("abort", onAbort);
+    }
+  });
+}
+
+function normalizeKernelId(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  return trimmed === "forgeax" ? "forgeax-core" : trimmed;
+}
+
+function parseToolArgs(value: unknown): unknown {
+  if (typeof value !== "string") return value ?? {};
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" ? value : undefined;
+}
 
 export function createCliRouter() {
   const r = new Hono();
-
-  const boundedProbe = async <T extends { ok: boolean; detail?: string }>(
-    probe: () => Promise<T>,
-    timeoutMs = 6000,
-  ): Promise<T> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      return await Promise.race([
-        probe(),
-        new Promise<T>((resolve) => {
-          timer = setTimeout(() => resolve({ ok: false, detail: `probe timed out after ${timeoutMs}ms` } as T), timeoutMs);
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  };
 
   // 所有 /api/cli/* 端点统一带 Deprecation header。
   r.use("*", DEPRECATION_NOTICE);
@@ -138,7 +502,7 @@ export function createCliRouter() {
   r.get("/health", async (c) => {
     const providers = listProviders();
     const snaps = await Promise.all(providers.map(async (p) => {
-      const h = await boundedProbe(() => p.health(1500));
+      const h = await p.health(1500);
       return { id: p.id, ok: h.ok, detail: h.detail, capabilities: p.capabilities };
     }));
     // 总体 ok 以 cli-provider(默认对话路径)为准 —— 第三方内核(codex/cursor)未装/
@@ -149,23 +513,20 @@ export function createCliRouter() {
     // 列表(按 id 去重,claude-code 已由 cli-provider 覆盖则跳过),与能跑的集合一致。
     if (kernelEnabled()) {
       const seen = new Set(snaps.map((s) => s.id));
-      const kernels = listAvailableKernels().filter((k) => !seen.has(k.id));
-      const kernelSnaps = await Promise.all(kernels.map(async (k) => {
+      for (const k of listAvailableKernels()) {
+        if (seen.has(k.id)) continue;
         let h: { ok: boolean; detail?: string };
         try {
-          // Some installed CLIs (notably Kimi and Cursor) perform a short
-          // first-run bootstrap even for their non-interactive help probe.
-          // The kernel owns a 10s child timeout; do not let the health route's
-          // old 6s wrapper report a healthy binary as unavailable.
-          h = await boundedProbe(() => k.probe(), 15000);
+          h = await k.probe();
         } catch (e) {
           h = { ok: false, detail: (e as Error).message };
         }
+        seen.add(k.id);
         // 把 KernelCapabilities 映射成 picker 期望的 ProviderCapabilities 形:
         // 内核经 threadId resume(sessions=true);子 agent 走编排层 handoff 而非内核内
         // (subAgents=false,保守);无 JSONL 回放语义。
         const cap = k.capabilities;
-        return {
+        snaps.push({
           id: k.id,
           ok: h.ok,
           detail: h.detail,
@@ -176,16 +537,9 @@ export function createCliRouter() {
             subAgents: false,
             sessions: true,
             jsonlReplay: false,
-            checkpoint: {
-              mode: k.id === "forgeax-core" ? "native" : "host-compatible",
-              code: true,
-              conversation: true,
-              privateHistory: false,
-            },
           },
-        };
-      }));
-      snaps.push(...kernelSnaps);
+        });
+      }
     }
     if (snaps.length === 0) {
       return c.json({ ok: false, providers: [], detail: "no cli-provider registered" }, 503);
@@ -193,90 +547,66 @@ export function createCliRouter() {
     return c.json({ ok: overallOk, providers: snaps });
   });
 
-  /** Kernel picker discovery: shared catalog + kernel-native catalog. */
-  r.get("/capabilities", async (c) => {
-    const kernelId = c.req.query("kernel")?.trim();
-    if (!kernelId) return c.json({ ok: false, error: "missing kernel query" }, 400);
-    try {
-      const kernel = resolveKernel("", kernelId);
-      const snapshot = getExtensionSnapshot().capabilities ?? emptyCapabilitySnapshot();
-      const commands = await listAllCommands({
-        sm: getCapabilitySessionManager(),
-        paths: getPathManager(),
-      });
-      const native = kernel.listCapabilities
-        ? await kernel.listCapabilities()
-        : { kernelId: kernel.id, capabilities: [] };
-      return c.json({
-        kernelId: kernel.id,
-        shared: {
-          generation: snapshot.generation,
-          capabilities: [...snapshot.capabilities, ...commandCapabilities(commands, snapshot.generation)],
-          mcp: listCommonMcpServers(),
-          roots: commonCapabilityRoots(),
-        },
-        native,
-      });
-    } catch (error) {
-      return c.json({ ok: false, error: (error as Error).message }, 404);
-    }
-  });
-
-  /**
-   * Warm an idle session-scoped CLI transport before the first user turn.
-   * This endpoint never sends a hidden model prompt: the kernel only starts
-   * its persistent process with the exact capability/permission surface that
-   * the following real turn will use. Kernels without that optional transport
-   * capability return a successful no-op so the UI remains kernel-agnostic.
-   */
+  // POST /api/cli/warm — lightweight readiness probe used by the Composer
+  // before the first real turn. It must never create a chat session or spawn a
+  // model turn; probe the same kernel/provider that /chat will select.
   r.post("/warm", async (c) => {
-    let raw: Record<string, unknown>;
+    let body: { agentId?: string; providerOverride?: string } = {};
     try {
-      raw = (await c.req.json()) as Record<string, unknown>;
+      const parsed = await c.req.json();
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        body = parsed as typeof body;
+      }
     } catch {
-      return c.json({ ok: false, error: "invalid JSON body" }, 400);
+      // The warm request is intentionally body-optional for older clients.
     }
-    const agentId = typeof raw.agentId === 'string' && raw.agentId.trim() ? raw.agentId.trim() : 'forge';
-    const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId.trim() : '';
-    const requestedThreadId = typeof raw.threadId === 'string' && raw.threadId.trim()
-      ? raw.threadId.trim()
-      : sessionId;
-    // The host session id is a routing/permission identity. The provider
-    // session identity is a separate SSOT and must include the agent, or two
-    // agents in one Studio session can resume the same native conversation.
-    const threadId = sessionId ? deriveThreadId(sessionId, agentId) : requestedThreadId;
-    if (!sessionId || !threadId) return c.json({ ok: false, error: 'sessionId and threadId are required' }, 400);
-    const providerOverride = typeof raw.providerOverride === 'string' ? raw.providerOverride.trim() : undefined;
+    const requested = typeof body.providerOverride === "string"
+      ? body.providerOverride.trim()
+      : "";
 
-    let selectedKernel: AgentKernel;
-    try {
-      selectedKernel = resolveKernel(agentId, providerOverride);
-    } catch (error) {
-      return c.json({ ok: false, error: (error as Error).message }, 503);
-    }
-    const prewarm = (selectedKernel as PrewarmableKernel).prewarm;
-    if (typeof prewarm !== 'function') {
-      return c.json({ ok: true, kernelId: selectedKernel.id, warmed: false, reused: false, reason: 'kernel-does-not-support-prewarm' });
+    if (kernelEnabled()) {
+      try {
+        const kernel = resolveKernel(
+          body.agentId ?? "default",
+          requested ? normalizeKernelId(requested) : undefined,
+        );
+        const health = await kernel.probe();
+        return c.json({
+          ok: health.ok,
+          providerId: kernel.id,
+          ...(health.detail ? { detail: health.detail } : {}),
+        }, health.ok ? 200 : 503);
+      } catch (error) {
+        return c.json({
+          ok: false,
+          providerId: normalizeKernelId(requested) ?? requested,
+          error: error instanceof Error ? error.message : String(error),
+        }, 503);
+      }
     }
 
+    const provider = requested
+      ? getProvider(requested)
+      : resolveProvider(body.agentId);
+    if (!provider) {
+      return c.json({
+        ok: false,
+        error: requested ? `no cli-provider registered: ${requested}` : "no cli-provider registered",
+      }, 503);
+    }
     try {
-      const extraTools = hostToolSpecsForAgent(sessionId, agentId);
-      const turnReq = await composeTurnRequest({
-        // This text is never sent to the kernel. It only gives the composer a
-        // complete TurnRequest so prewarm uses the same native settings,
-        // MCP/plugin/skill catalog and permission hook as the real turn.
-        message: '',
-        prewarm: true,
-        agentId,
-        kernel: selectedKernel,
-        threadId,
-        sessionId,
-        ...(extraTools.length ? { extraTools } : {}),
-      });
-      const result = await prewarm.call(selectedKernel, turnReq);
-      return c.json({ ok: true, kernelId: selectedKernel.id, ...result });
+      const health = await provider.health(1500);
+      return c.json({
+        ok: health.ok,
+        providerId: provider.id,
+        ...(health.detail ? { detail: health.detail } : {}),
+      }, health.ok ? 200 : 503);
     } catch (error) {
-      return c.json({ ok: false, kernelId: selectedKernel.id, error: (error as Error).message }, 503);
+      return c.json({
+        ok: false,
+        providerId: provider.id,
+        error: error instanceof Error ? error.message : String(error),
+      }, 503);
     }
   });
 
@@ -291,6 +621,16 @@ export function createCliRouter() {
     if (typeof message !== "string" || !message.trim()) {
       return c.json({ ok: false, error: "message (non-empty string) required" }, 400);
     }
+    if (
+      body.summonAgentId !== undefined &&
+      body.summonAgentId !== null &&
+      !isValidSummonAgentId(body.summonAgentId)
+    ) {
+      return c.json(
+        { ok: false, error: "summonAgentId must match /^[A-Za-z0-9_-]+$/" },
+        400,
+      );
+    }
 
     // 写时迁移(plan B PR2-compat):若这是对一个 pre-PR2 老 session 发新消息,先把整份
     // 老 session 目录搬进当前项目 games/<slug>/sessions/<sid>/,确保新老记录都落项目下。
@@ -303,24 +643,26 @@ export function createCliRouter() {
     // ── M1:新内核路径(FORGEAX_KERNEL=kernel)。compose → resolveKernel.runTurn →
     //    toWireEvents → SSE。前端按 event 名消费,零改。旧 cli-provider 路径见下方(默认 fallback)。
     if (kernelEnabled()) {
+      // Session-scoped callers share the exact RuntimeController lifecycle used
+      // by POST /api/sessions/:sid/messages. This route only projects Runtime
+      // events back to the legacy SSE wire. Standalone callers without a
+      // session keep the direct compatibility path below.
+      if (body.sessionId) {
+        return runSessionRuntimeChat(
+          c,
+          { ...body, sessionId: body.sessionId },
+          message,
+        );
+      }
       const callId = typeof body.callId === "string" && body.callId.trim() ? body.callId.trim() : undefined;
-      // 一次生成、两处使用:compose 写进 manifest,转录写进 hook:turnStart。
-      // 这是"哪条工具面对应真正执行的那一轮"的连接键。
-      const turnAttemptId = randomUUID();
       const agentId = body.agentId ?? "default";
-      const sessionId = body.sessionId?.trim() || undefined;
-      // UI historically sent the raw Studio sid as threadId. Keep accepting
-      // that wire shape, but never use it as the provider-native key when a
-      // host session is present: the canonical key is (sid, agentId).
-      const threadId = sessionId ? deriveThreadId(sessionId, agentId) : body.threadId?.trim() || undefined;
-      const checkpointMsgId = body.sessionId
-        ? (typeof body.messageId === "string" && body.messageId.trim() ? body.messageId.trim() : randomUUID())
-        : undefined;
       // 该 agent 的插件 host-tools(exposedToAI + 命中 agent.json host-tools allow)→
       // extraTools 下发内核。conscious-agent 路径经 kits 桥自带这步;/api/cli/chat
       // (租用内核聊天入口)此前漏了它,导致 team + gen3d 等插件工具对 cbc/cc/codex
       // 不可见。与桥同一套 allow 规则,无需活着的 conscious agent。
-      const extraTools = hostToolSpecsForAgent(body.sessionId, agentId);
+      const hostToolSurface = hostToolSurfaceForAgent(body.sessionId, agentId);
+      const extraTools = hostToolSurface.specs;
+      const visibleAgentManagementTools = hostToolSurface.visibleAgentManagementTools;
       // Resolve before compose: the selected kernel owns attachment/history semantics.
       let selectedKernel: AgentKernel;
       try {
@@ -329,50 +671,22 @@ export function createCliRouter() {
         const payload = await toKernelErrorPayload(null, err);
         return c.json(payload, 503);
       }
-      const composeInput = {
+      const selectedModel = normalizeChatModelOverride(body.model);
+      const composeInput: ComposeInput = {
         message,
         agentId,
-        turnAttemptId,
         kernel: selectedKernel,
-        threadId,
-        sessionId,
+        threadId: body.threadId,
+        sessionId: body.sessionId,
         callId,
-        ...(typeof body.model === 'string' && body.model.trim() ? { model: body.model.trim() } : {}),
+        ...(selectedModel ? { model: selectedModel } : {}),
         ...(extraTools.length ? { extraTools } : {}),
+        visibleAgentManagementTools,
         ...(Array.isArray(body.attachments) && body.attachments.length ? { attachments: body.attachments } : {}),
         ...(body.replyLanguage === "en" || body.replyLanguage === "zh" ? { replyLanguage: body.replyLanguage } : {}),
-      } satisfies Parameters<typeof composeTurnRequest>[0];
-      let turnReq: Awaited<ReturnType<typeof composeTurnRequest>>;
-      let composeError: unknown;
-      // A host MCP pool may still be draining while a native Claude/Cursor
-      // transport hands ownership back. Retry that bounded transition once;
-      // never spin or resend the user's model turn.
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        try {
-          turnReq = await composeTurnRequest(composeInput);
-          composeError = undefined;
-          break;
-        } catch (error) {
-          composeError = error;
-          if (!(error instanceof ProjectMcpNativeOwnershipBusyError) || attempt !== 0) break;
-          await new Promise((resolve) => setTimeout(resolve, 250));
-        }
-      }
-      if (composeError !== undefined) {
-        const messageText = composeError instanceof Error ? composeError.message : String(composeError);
-        if (composeError instanceof ProjectMcpNativeOwnershipBusyError) {
-          return c.json({
-            code: 'project_mcp_native_busy',
-            message: 'Project MCP is switching ownership between host and native transports; retry this turn.',
-            retryable: true,
-            retryAfterMs: 250,
-          }, 409);
-        }
-        if (messageText.includes('history_unavailable')) {
-          return c.json({ code: 'history_unavailable', message: 'Unable to sync shared history; the turn was not sent.', retryable: true }, 409);
-        }
-        throw composeError;
-      }
+        ...(isValidSummonAgentId(body.summonAgentId) ? { summonAgentId: body.summonAgentId } : {}),
+      };
+      let turnReq = await composeTurnRequest(composeInput);
 
       // 历史持久化(host-owned,核心目标):内核每轮的 KernelEvent 流由编排层**转录**进
       // per-agent 账本 —— 与具体内核(claude-code / codex / forgeax-core)无关,账本是
@@ -404,101 +718,58 @@ export function createCliRouter() {
         try { await getCheckpointManager().finalizePending(persistSession); } catch (e) {
           console.warn(`[cli/chat] finalizePending failed: ${(e as Error).message}`);
         }
-        if (checkpointMsgId) {
-          try {
-            await getCheckpointManager().snapshotForMessage(persistSession, checkpointMsgId, {
-              providerId: selectedKernel.id,
-              checkpointMode: selectedKernel.id === "forgeax-core" ? "native" : "host-compatible",
-            });
-          } catch (e) {
-            console.warn(`[cli/chat] checkpoint snapshot failed: ${(e as Error).message}`);
-          }
-        }
       }
 
-      const turnStartedAt = Date.now();
       return streamSSE(c, async (sse) => {
         const ac = new AbortController();
-        const sseStartedAt = Date.now();
-        let sseTokenFirstSeen = false;
         const onAbort = () => ac.abort();
         c.req.raw.signal.addEventListener("abort", onAbort);
         const fold = newWireFoldState();
         // accumulate the turn for the WAL write in `finally`.
-        // Keep the post-tool conclusion separate from the ordered process
-        // slices. This lets refresh reproduce assistant text/tool/result order
-        // without duplicating the same text in the final assistant message.
-        let pendingAssistantText = "";
+        let asstText = "";
         let thinkingText = "";
-        let publicSummaryText = "";
-        const processEvents: Array<
-          | { kind: "assistant_text"; text: string }
-          | { kind: "public_summary"; text: string }
-          | { kind: "call"; callId: string; name: string; args: unknown }
-          | { kind: "result"; callId: string; ok: boolean; result?: unknown; error?: string }
-        > = [];
         let stopReason: "end_turn" | "tool_use" | "max_tokens" | "cancelled" = "end_turn";
         let usage: unknown;
         const toolEvents: Array<
           | { kind: "call"; callId: string; name: string; args: unknown }
           | { kind: "result"; callId: string; ok: boolean; result?: unknown; error?: string }
         > = [];
-        // Rented kernels execute local-capable tools in their own process, so
-        // those writes bypass Session's AgentFs recorder. Capture an intent at
-        // tool-call time and append applied evidence after a successful result
-        // before the artifact resolver runs.
-        const kernelMutationIntents = new Map<string, KernelMutationIntent[]>();
         // 内核 id 即 wire/账本的 providerId(claude-code / codex / forgeax-core)。
         // 在 try 外声明,让 finally 的账本转录也能拿到(刷新后据此还原来源 badge)。
         let providerId = "claude-code";
-        // 第 2 层全链路 trace(2026-08-06 外审):此前**只有** core/kernel-turn.ts 那条路
-        // 装了 kernel.turn span,而模型选择器里显式选 CLI 内核时走的是本路由 —— 于是
-        // 真实会话 0 个 span。磁盘实证:codex 35 个会话仅 5 个有 trace(那 5 个走原生
-        // 入口)。护栏/观测只装一个执行口、另一口整条绕开,这个病本工作流已犯过两次;
-        // 这里与 runKernelTurn 同名同形补上第二口。
-        let cliTrace: CliKernelTurnTrace | null = null;
-        let kernelRunFailed = false;
-        let kernelRunError: unknown;
         // 在 try 外声明,让 catch 能拿到内核去 probe(区分「内核不可用」与「运行时报错」)。
         // resolveKernel 抛错(unknown-id / not-registered)时它保持 null,由 err 自身分类。
         let kernel: AgentKernel | null = selectedKernel;
+        let cliTrace: CliKernelTurnTrace | null = null;
+        let kernelRunFailed = false;
+        let kernelRunError: unknown;
         try {
           if (selectedKernel.id !== "forgeax-core" && hostTelemetryEnabled()) {
-            const tp = typeof body.traceparent === "string" && body.traceparent.trim() ? body.traceparent.trim() : undefined;
             cliTrace = startCliKernelTurn({
               kernelId: selectedKernel.id,
               agentId,
               ...(body.sessionId?.trim() ? { sid: body.sessionId.trim() } : {}),
-              ...(tp ? { traceparent: tp } : {}),
+              ...(body.traceparent?.trim() ? { traceparent: body.traceparent.trim() } : {}),
             });
           }
-        } catch { /* 遥测绝不反噬聊天主流程 */ }
+        } catch {
+          // Telemetry must never make the compatibility route fail.
+        }
         try {
           providerId = selectedKernel.id;
-          for await (const kev of kernel.runTurn(turnReq, ac.signal)) {
-            // x.* 观测事件在 wire 层没有对应类型(toWireEvents 对它们返回 []),
-            // 所以必须在这里单独落账 —— 否则**在租用内核实际走的这条路径上**它们被
-            // 静默丢弃。2026-08-05 终审实测:codex 会话账本里 x.kernel.thread 零命中,
-            // 而它承载的正是"本会话 ↔ 哪份内核转录"这个不落盘就永久丢失的指针。
-            // native 路径由 core/kernel-turn.ts 负责同样的事,两条路各管各的。
-            // 2026-08-06(外审#四):直写 ledger,不再经 eventBus.publish —— bus 的
-            // tree 门在 agent 未 scaffold 时 `candidates.length === 0` 就静默 return,
-            // 这条指针会无声消失。x.tools.manifest 走的就是 append 直写,同一 PR 里
-            // 知道正确做法却对新事件用了错的那套 —— 现在两条对齐。
-            const kind = (kev as { kind?: unknown }).kind;
-            if (typeof kind === 'string' && kind.startsWith('x.') && persistSession && persistAgent) {
-              try {
-                persistSession.getOrCreateLedger(persistAgent).append(
-                  { type: kind, ts: Date.now(), source: `agent:${persistAgent}`, payload: kev as unknown as Record<string, unknown> },
-                  persistAgent,
-                );
-              } catch { /* 观测通道绝不影响主流程 */ }
-            }
+          for await (const kev of runWithHistoryResync({
+            initial: turnReq,
+            retrySnapshot: async () => {
+              turnReq = await composeTurnRequest({ ...composeInput, forceSnapshot: true });
+              return turnReq;
+            },
+            run: (request) => kernel.runTurn(request, ac.signal),
+          })) {
             for (const wire of toWireEvents(kev, fold)) {
               let out: ChatEvent = { ...wire, providerId };
-              // 工具结果必须在**写进 SSE 之前**处理:先把连接键取给 span,再把 MCP 信封剥掉。
-              // 顺序反了就白做 —— 前端 store 只认字符串 result,信封一旦发出去,工具卡的正文
-              // 就整段消失。剥的逻辑与 core/kernel-turn.ts 共用同一份(两个执行口从不各写各的)。
+              // The MCP adapter's envelope is an internal transport shape:
+              // take its toolExecutionId for the span, then expose only the
+              // tool's actual text to the legacy SSE/WAL consumers.
               if (out.type === "tool-result") {
                 cliTrace?.onToolResult(out.callId, out.ok, out.result, out.error);
                 out = { ...out, result: unwrapMcpResultEnvelope(out.result) };
@@ -507,69 +778,21 @@ export function createCliRouter() {
               // code:'protocol' 的裸串)在这里统一翻成友好文案:probe 内核确认是否真不可用,
               // 是 → kernel_unavailable + 成因指引;否 → 保留原 code(真·运行时报错)。
               if (out.type === "error") {
+                kernelRunFailed = true;
+                kernelRunError = new Error(out.message);
                 const payload = await toKernelErrorPayload(kernel, { message: out.message }, out.code);
                 await sse.writeSSE({ event: "error", data: JSON.stringify({ ...payload, providerId }) });
                 return;
               }
               await sse.writeSSE({ event: out.type, data: JSON.stringify(out) });
               switch (out.type) {
-                case "token":
-                  if (!sseTokenFirstSeen) {
-                    sseTokenFirstSeen = true;
-                    tt("sse.token-first", { ms: Date.now() - sseStartedAt, provider: providerId });
-                  }
-                  pendingAssistantText += out.text ?? "";
-                  break;
-                case "thinking": {
-                  if (out.visibility === "public_summary") {
-                    const text = out.text ?? "";
-                    publicSummaryText += text;
-                    const last = processEvents[processEvents.length - 1];
-                    if (last?.kind === "public_summary") last.text += text;
-                    else if (text) processEvents.push({ kind: "public_summary", text });
-                  } else {
-                    thinkingText += out.text ?? "";
-                  }
-                  break;
-                }
-                // 第 4 层 tool span —— 与 core/kernel-turn.ts 调同一个状态机(cli-kernel-trace)。
-                // 观测异常由该模块内部吞掉,这里不再包一层,免得两口的降级策略各写各的又走偏。
-                // (tool-result 的 onToolResult 在上面 writeSSE 之前已调,此处只落账本。)
-                case "tool-call": {
-                  if (pendingAssistantText.trim()) {
-                    processEvents.push({ kind: "assistant_text", text: pendingAssistantText });
-                    pendingAssistantText = "";
-                  }
+                case "token": asstText += out.text ?? ""; break;
+                case "thinking": thinkingText += out.text ?? ""; break;
+                case "tool-call":
                   cliTrace?.onToolCall(out.callId, out.name);
-                  const event = { kind: "call" as const, callId: out.callId, name: out.name, args: out.args };
-                  if (persistSession) {
-                    const intents = captureKernelMutationIntents(
-                      out.name,
-                      out.args,
-                      persistSession.artifactProjectRoot(),
-                    );
-                    if (intents.length) kernelMutationIntents.set(out.callId, intents);
-                  }
-                  toolEvents.push(event);
-                  processEvents.push(event);
+                  toolEvents.push({ kind: "call", callId: out.callId, name: out.name, args: out.args });
                   break;
-                }
-                case "tool-result": {
-                  const event = { kind: "result" as const, callId: out.callId, ok: out.ok, result: out.result, error: out.error };
-                  if (out.ok && persistSession && persistAgent) {
-                    const intents = kernelMutationIntents.get(out.callId) ?? [];
-                    for (const record of appliedKernelMutationRecords(intents, {
-                      agentPath: persistAgent,
-                      toolCallId: out.callId,
-                    })) {
-                      persistSession.fileActivity.append(record);
-                    }
-                  }
-                  kernelMutationIntents.delete(out.callId);
-                  toolEvents.push(event);
-                  processEvents.push(event);
-                  break;
-                }
+                case "tool-result": toolEvents.push({ kind: "result", callId: out.callId, ok: out.ok, result: out.result, error: out.error }); break;
                 case "done": {
                   stopReason = out.stopReason; usage = out.usage;
                   // 缓存命中率打点(还原老 studio 的 cachedRatio,迁移遗失)。
@@ -603,43 +826,54 @@ export function createCliRouter() {
           // 单一翻译点:内核不可用(resolveKernel 抛 KernelUnavailableError,或 probe 判定
           // 内核 down)→ 友好 kernel_unavailable + 成因;真·运行时报错(网络/LLM/工具)→
           // 保留原样并标 turn_failed,不再被 catch-all 一律误标成 kernel_unavailable。
-          const retryCode = err && typeof err.code === 'string' ? err.code : undefined;
-          const payload = await toKernelErrorPayload(kernel, err, retryCode);
+          const rawCode = err && typeof err.code === "string" ? err.code : undefined;
+          const payload = await toKernelErrorPayload(kernel, err, rawCode);
           await sse.writeSSE({ event: "error", data: JSON.stringify({ ...payload, providerId }) });
         } finally {
-          // span 必须在 finally 收口:抛异常/被 abort 时也要收。收不了口的 kernel.turn
-          // 是这套 trace 用来定位「卡在内核」的信号,漏收会变成误报源。
           try {
-            const u = usage as { inputTokens?: unknown; outputTokens?: unknown } | undefined;
-            const traceUsage = u && typeof u.inputTokens === "number" && Number.isFinite(u.inputTokens)
-              && typeof u.outputTokens === "number" && Number.isFinite(u.outputTokens)
-              ? { inputTokens: u.inputTokens, outputTokens: u.outputTokens }
+            const traceUsage = usage as
+              | { inputTokens?: unknown; outputTokens?: unknown }
+              | undefined;
+            const normalizedUsage = traceUsage &&
+              typeof traceUsage.inputTokens === "number" &&
+              Number.isFinite(traceUsage.inputTokens) &&
+              typeof traceUsage.outputTokens === "number" &&
+              Number.isFinite(traceUsage.outputTokens)
+              ? {
+                  inputTokens: traceUsage.inputTokens,
+                  outputTokens: traceUsage.outputTokens,
+                }
               : undefined;
             const cancelled = stopReason === "cancelled" || ac.signal.aborted;
             cliTrace?.end({
               ok: !kernelRunFailed && !cancelled,
               reason: stopReason,
-              ...(typeof turnReq.model === "string" && turnReq.model ? { model: turnReq.model } : {}),
-              ...(traceUsage ? { usage: traceUsage } : {}),
+              ...(typeof turnReq.model === "string" && turnReq.model
+                ? { model: turnReq.model }
+                : {}),
+              ...(normalizedUsage ? { usage: normalizedUsage } : {}),
               ...(kernelRunFailed
-                ? { error: kernelRunError instanceof Error ? kernelRunError.message : String(kernelRunError) }
+                ? {
+                    error: kernelRunError instanceof Error
+                      ? kernelRunError.message
+                      : String(kernelRunError),
+                  }
                 : {}),
             });
-          } catch { /* 遥测收口失败静默降级 */ }
+          } catch {
+            // Telemetry close is best-effort and must not affect the turn.
+          }
           c.req.raw.signal.removeEventListener("abort", onAbort);
           // Transcribe the kernel turn into the host-owned ledger (kernel-agnostic,
           // keyed to `persistAgent` = the agentId the UI replays with). Direct WAL
           // write, not via eventBus → no WS double-render against the SSE above.
           if (persistSession && persistAgent) {
             try {
-              const transcript = transcribeKernelTurn(persistSession, persistAgent, {
+              transcribeKernelTurn(persistSession, persistAgent, {
                 message,
-                ...(checkpointMsgId ? { msgId: checkpointMsgId } : {}),
                 contextText: turnReq.input.text,
-                startedAt: turnStartedAt,
-                asstText: pendingAssistantText,
+                asstText,
                 thinkingText,
-                publicSummaryText,
                 stopReason,
                 providerId,
                 ...(usage ? { usage } : {}),
@@ -647,23 +881,8 @@ export function createCliRouter() {
                 ...(turnReq.input.attachments?.length
                   ? { attachments: turnReq.input.attachments as Array<Record<string, unknown>> }
                   : {}),
-                ...(turnReq.historyPlan ? { historyPlan: turnReq.historyPlan } : {}),
                 toolEvents,
-                processEvents,
               });
-              if (transcript) {
-                await persistSession.resolveArtifactTurn({
-                  sid: persistSession.sid,
-                  agentId: persistAgent,
-                  projectRoot: persistSession.artifactProjectRoot(),
-                  ...(persistSession.config.defaultDir ? { game: persistSession.config.defaultDir } : {}),
-                  turnId: transcript.turnId,
-                  ...(checkpointMsgId ? { checkpointMsgId } : {}),
-                  startedAt: transcript.startedAt,
-                  settledAt: transcript.settledAt,
-                  ...(stopReason === "cancelled" ? { aborted: true } : {}),
-                });
-              }
             } catch (e) {
               console.warn(`[cli/chat] ledger write failed: ${(e as Error).message}`);
             }
@@ -696,9 +915,6 @@ export function createCliRouter() {
       callId: typeof body.callId === "string" && body.callId.trim() ? body.callId.trim() : undefined,
       timeoutMs: typeof body.timeoutMs === "number" && body.timeoutMs > 0 ? body.timeoutMs : undefined,
     };
-    const legacyCheckpointMsgId = req.sessionId
-      ? (typeof body.messageId === "string" && body.messageId.trim() ? body.messageId.trim() : randomUUID())
-      : undefined;
 
     // Stamp the resolved provider on the response stream so the cancel route
     // (which only sees callId) can short-circuit when the registry shape
@@ -718,27 +934,24 @@ export function createCliRouter() {
         try { await getCheckpointManager().finalizePending(session); } catch (e) {
           console.warn(`[cli/chat] finalizePending failed: ${(e as Error).message}`);
         }
-        if (legacyCheckpointMsgId) {
-          try {
-            await getCheckpointManager().snapshotForMessage(session, legacyCheckpointMsgId, {
-              providerId: provider.id,
-              checkpointMode: "host-compatible",
-            });
-          } catch (e) {
-            console.warn(`[cli/chat] checkpoint snapshot failed: ${(e as Error).message}`);
-          }
+        // Keep the legacy provider bridge on the same message-anchor contract
+        // as the RuntimeTree path.  The provider path is still used when the
+        // compatibility switch is enabled, so omitting this snapshot makes a
+        // CLI turn invisible to code rewind even though the next message can
+        // finalize a pending rewind.
+        try {
+          await getCheckpointManager().snapshotForMessage(
+            session,
+            req.callId?.trim() || randomUUID(),
+          );
+        } catch (e) {
+          console.warn(`[cli/chat] snapshotForMessage failed: ${(e as Error).message}`);
         }
         const node = session.tree.list().find((n) => n.display === req.agentId)
           ?? session.tree.list().find((n) => n.depth === 1)
           ?? null;
         const agentPath = node?.path ?? req.agentId;
-        bridge = new CliEventBridge({
-          session,
-          agentPath,
-          model: provider.id,
-          message,
-          ...(legacyCheckpointMsgId ? { msgId: legacyCheckpointMsgId } : {}),
-        });
+        bridge = new CliEventBridge({ session, agentPath, model: provider.id });
 
         // Per-agent model selection: the ModelPicker writes the user's choice to
         // `agent.json::models.model` (via the `set_agent_models` command). That
@@ -859,6 +1072,18 @@ export function createCliRouter() {
     const callId = typeof body.callId === "string" ? body.callId.trim() : "";
     if (!callId) {
       return c.json({ ok: false, error: "callId (non-empty string) required" }, 400);
+    }
+    const runtimeCall = runtimeCliCalls.get(callId);
+    if (runtimeCall) {
+      runtimeCall.session.interruptRuntime(
+        runtimeCall.agentPath,
+        "cancelled by /api/cli/cancel",
+      );
+      return c.json({
+        ok: true,
+        callId,
+        providerId: normalizeKernelId(body.providerOverride) ?? null,
+      });
     }
     const provider = body.providerOverride
       ? getProvider(body.providerOverride)

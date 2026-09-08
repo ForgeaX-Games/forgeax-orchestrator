@@ -3,7 +3,7 @@
  *  与 agenteam ref 的差异（plan §3.x）：
  *  - ref 的 fallback 是 `agenteam.json::models`（全局配置文件）；forgeax 的 fallback
  *    是 `session.json::defaultModels`（每个 session 自己的默认）。
- *  - 由 caller（ConsciousAgent / summary-compaction）传入 sessionDefaults，避免
+ *  - 由 caller（RuntimeAgentHost / summary-compaction）传入 sessionDefaults，避免
  *    runtime 层级再搞 readFileSync 同步 IO。
  *
  *  解析链：

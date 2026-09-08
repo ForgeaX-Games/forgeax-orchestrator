@@ -2,18 +2,16 @@
 //
 // The slim extension list the shell strip consumes (formerly api/bus.ts
 // loadExtensionList, ADR 0025 M3): manifest snapshot -> UI-facing ExtensionInfo
-// items, with dev-port overrides + stable workbench-position sort. Served by
+// items, with dev-port overrides + stable Activity order. Served by
 // GET /api/extensions/list (api/extensions.ts).
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { scanAllExtensionOrigins } from './scanner';
 import type { ExtensionOrigin } from './scanner';
-import { mergeManifests } from './merger';
 import type { MergedManifest } from './merger';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { computeAgentNaming, pickPersonName } from '../api/lib/agent-naming';
-import { normalizeManifest, type ExtensionManifestV2 } from '@forgeax/types';
+import type { ExtensionManifestV2 } from '@forgeax/types';
 
 interface ExtensionManifest {
   schemaVersion?: number;
@@ -25,22 +23,13 @@ interface ExtensionManifest {
   icon?: string;
   experimental?: boolean;
   provides?: {
-    workbench?: {
-      id?: string;
-      icon?: string;
-      position?: number;
-      panelSize?: 'sm' | 'md' | 'lg';
-      hidden?: boolean;
-      preferredAgent?: string;
-    };
     modelBinding?: {
       channel: string;
       vendor: string;
       models?: string[];
       roles?: string[];
     };
-    /** M4 — workbench extension's bundled persona family (same shape as
-     *  the singular `agent` entries; slim projection only needs id/role). */
+    /** Bundled persona family; slim projection only needs id/role. */
     agents?: Array<{ id?: string; role?: string }>;
     skills?: Array<{ id: string; trigger?: string }>;
     tools?: Array<{ id: string; exposedToAI?: boolean }>;
@@ -97,17 +86,12 @@ export interface ExtensionInfo {
   experimental?: boolean;
   /** Canonical manifest-v2 contribution catalog for browser hosts. */
   contributes?: ExtensionManifestV2['contributes'];
-  workbench?: ExtensionManifest['provides'] extends infer P
-    ? P extends { workbench?: infer W }
-      ? W
-      : never
-    : never;
   modelBinding?: ExtensionManifest['provides'] extends infer P
     ? P extends { modelBinding?: infer M }
       ? M
       : never
     : never;
-  /** M4 — bundled persona family of a workbench extension (id/role only). */
+  /** Bundled persona family (id/role only). */
   agents?: Array<{ id: string; role: string }>;
   skills?: Array<{ id: string; trigger: string }>;
   tools?: Array<{ id: string; exposedToAI?: boolean }>;
@@ -149,6 +133,11 @@ export interface ExtensionInfo {
    *  the absolute `originPath`, which would leak the host's home directory to
    *  the shell strip. The UI rebuilds a filesystem path from `origin` + this. */
   source: { origin: ExtensionOrigin; relativeManifestPath: string };
+  frontendUrl?: string;
+  moduleUrl?: string;
+  allowedOrigin?: string;
+  runtimeMode?: 'native-module' | 'embedded' | 'standalone';
+  registryGeneration?: number;
   entry?: {
     frontend?: string;
     standalone?: {
@@ -230,15 +219,12 @@ function relativeManifestPathFrom(originPath: string): string {
  *  origin-relative manifest path — never the absolute originPath. */
 export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionInfo | null {
   const m = mergedManifest.manifest as ExtensionManifest;
-  if (!m.id || !m.version || !m.kind || !m.displayName) return null;
-  let normalized = mergedManifest.normalizedManifest;
-  if (!normalized) {
-    try { normalized = normalizeManifest(mergedManifest.manifest); } catch { /* legacy test/projection without full schema */ }
-  }
+  if (!m.id || !m.version || !m.displayName) return null;
+  const normalized = mergedManifest.normalizedManifest;
       const slim: ExtensionInfo = {
         id: m.id,
         version: m.version,
-        kind: m.kind,
+        kind: m.kind ?? normalized.categories?.[0] ?? 'extension',
         displayName: m.displayName,
         description: m.description,
         icon: m.icon,
@@ -249,51 +235,35 @@ export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionI
           relativeManifestPath: relativeManifestPathFrom(mergedManifest.originPath),
         },
       };
-      if (m.provides?.workbench) {
-        slim.workbench = {
-          id: m.provides.workbench.id ?? m.id,
-          icon: m.provides.workbench.icon ?? m.icon,
-          position: m.provides.workbench.position,
-          panelSize: m.provides.workbench.panelSize,
-          hidden: m.provides.workbench.hidden,
-          ...(m.provides.workbench.preferredAgent
-            ? { preferredAgent: m.provides.workbench.preferredAgent }
-            : {}),
-        } as ExtensionInfo['workbench'];
-      }
-      if (m.provides?.modelBinding) {
+      const modelBinding = normalized.contributes.modelBindings?.[0];
+      if (modelBinding) {
         slim.modelBinding = {
-          channel: m.provides.modelBinding.channel,
-          vendor: m.provides.modelBinding.vendor,
-          models: m.provides.modelBinding.models ?? [],
-          roles: m.provides.modelBinding.roles,
+          channel: modelBinding.channel,
+          vendor: modelBinding.vendor,
+          models: modelBinding.models ?? [],
+          roles: modelBinding.roles,
         } as ExtensionInfo['modelBinding'];
       }
-      if (m.provides?.skills?.length) {
-        slim.skills = m.provides.skills.map((s) => ({
+      if (normalized.contributes.skills?.length) {
+        slim.skills = normalized.contributes.skills.map((s) => ({
           id: s.id,
           trigger: s.trigger ?? `/${s.id}`,
         }));
       }
-      if (m.provides?.tools?.length) {
-        slim.tools = m.provides.tools.map((t) => ({
+      if (normalized.contributes.tools?.length) {
+        slim.tools = normalized.contributes.tools.map((t) => ({
           id: t.id,
           exposedToAI: t.exposedToAI,
         }));
       }
-      if (m.provides?.events?.length) {
-        slim.events = m.provides.events.map((e) => ({ name: e.name }));
+      if (normalized.contributes.events?.length) {
+        slim.events = normalized.contributes.events.map((e) => ({ name: e.name }));
       }
-      // M4: workbench extension carrying its own persona family — surface a
-      // slim id/role list (counts + Settings display; full defs live in the
-      // agents kind registry).
-      if (m.provides?.agents?.length) {
-        slim.agents = m.provides.agents
-          .filter((a): a is { id: string; role?: string } => Boolean(a.id))
-          .map((a) => ({ id: a.id, role: a.role ?? 'unknown' }));
+      if (normalized.contributes.agents?.length) {
+        slim.agents = normalized.contributes.agents.map((agent) => ({ id: agent.id, role: agent.role }));
       }
-      if (m.provides?.agent) {
-        const a = m.provides.agent;
+      const a = normalized.contributes.agents?.[0];
+      if (a) {
         slim.agent = {
           id: a.id ?? m.id,
           role: a.role ?? 'unknown',
@@ -317,8 +287,8 @@ export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionI
           fallback,
         });
       }
-      if (m.provides?.cliProvider) {
-        const cp = m.provides.cliProvider;
+      const cp = normalized.contributes.cliProviders?.[0];
+      if (cp) {
         slim.cliProvider = {
           id: cp.id,
           displayName: cp.displayName ?? cp.id,
@@ -331,6 +301,15 @@ export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionI
             sessions: Boolean(cp.capabilities?.sessions),
           },
         };
+      }
+      if (mergedManifest.runtime) {
+        slim.moduleUrl = mergedManifest.runtime.moduleUrl;
+        if (mergedManifest.runtime.allowedOrigin) slim.allowedOrigin = mergedManifest.runtime.allowedOrigin;
+        slim.runtimeMode = 'native-module';
+      } else if (m.entry?.standalone) {
+        slim.runtimeMode = 'standalone';
+      } else if (m.entry?.frontend) {
+        slim.runtimeMode = 'embedded';
       }
       if (m.entry?.frontend || m.entry?.standalone) {
         slim.entry = {};
@@ -351,24 +330,38 @@ export function projectExtensionInfo(mergedManifest: MergedManifest): ExtensionI
  *  without spinning up a disk scan. */
 export const projectExtensionInfoForTest = projectExtensionInfo;
 
-export async function loadExtensionList(): Promise<ExtensionInfo[]> {
-  const scan = await scanAllExtensionOrigins();
-  const merged = mergeManifests(scan.found);
+function projectExtensionList(
+  manifests: readonly MergedManifest[],
+  registryGeneration = 0,
+): ExtensionInfo[] {
   const items: ExtensionInfo[] = [];
-  for (const mergedManifest of merged.manifests) {
+  for (const mergedManifest of manifests) {
     const slim = projectExtensionInfo(mergedManifest);
-    if (slim) items.push(slim);
+    if (slim) {
+      slim.registryGeneration = registryGeneration;
+      items.push(slim);
+    }
   }
 
   applyExtensionDevPortOverrides(items, loadExtensionDevPortOverrides());
 
-  // Stable sort by workbench position, then id, so the UI strip is deterministic.
+  // Stable sort by launcher order, then id, so the Activity rail is deterministic.
   items.sort((a, b) => {
-    const ap = a.workbench?.position ?? 999;
-    const bp = b.workbench?.position ?? 999;
+    const ap = a.contributes?.activities?.[0]?.order ?? 999;
+    const bp = b.contributes?.activities?.[0]?.order ?? 999;
     if (ap !== bp) return ap - bp;
     return a.id.localeCompare(b.id);
   });
 
   return items;
+}
+
+/** Test hook — project the same authoritative manifest set used by the API. */
+export const projectExtensionListForTest = projectExtensionList;
+
+export function loadExtensionList(
+  manifests: readonly MergedManifest[],
+  registryGeneration = 0,
+): ExtensionInfo[] {
+  return projectExtensionList(manifests, registryGeneration);
 }

@@ -28,9 +28,13 @@ export interface BrandConfig {
   assistant: {
     name: string;
     avatarSrc?: string | null;
-    personaOverride?: {
-      zh?: string | null;
-      en?: string | null;
+    agent: {
+      id: string;
+      personaFiles: {
+        zh: string;
+        en?: string;
+      };
+      tools?: string[];
     };
     cardName?: {
       zh?: string;

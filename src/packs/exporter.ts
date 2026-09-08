@@ -20,7 +20,7 @@ import { mkdirSync, rmSync, readdirSync, statSync, readFileSync, writeFileSync, 
 import { runCapture } from '../lib/node-spawn';
 import { join, dirname, relative, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
-import { ManifestSchema, type ExtensionManifest } from '@forgeax/types';
+import { AnyManifestSchema, normalizeManifest, type AnyExtensionManifest } from '@forgeax/types';
 import { getExtensionSnapshot } from '../extensions/registry';
 import {
   type FxpackExportInput,
@@ -167,10 +167,10 @@ function copyTree(src: string, dest: string): void {
   }
 }
 
-function loadExtensionManifest(srcDir: string): ExtensionManifest {
+function loadExtensionManifest(srcDir: string): AnyExtensionManifest {
   const path = join(srcDir, 'forgeax-extension.json');
   const raw = JSON.parse(readFileSync(path, 'utf-8'));
-  const parsed = ManifestSchema.safeParse(raw);
+  const parsed = AnyManifestSchema.safeParse(raw);
   if (!parsed.success) {
     throw Object.assign(new Error(`plugin manifest invalid: ${parsed.error.issues.map((i) => i.message).join('; ')}`), {
       code: 'lint_error',
@@ -194,7 +194,7 @@ function loadExtensionManifest(srcDir: string): ExtensionManifest {
  */
 function computeBundleClosure(
   inputPlugins: Array<{ id: string; srcDir: string }>,
-  manifests: Record<string, ExtensionManifest>,
+  manifests: Record<string, AnyExtensionManifest>,
 ): { add: Array<{ id: string; srcDir: string }>; missing: string[] } {
   const haveIds = new Set(inputPlugins.map((p) => p.id));
   const refs = new Set<string>();
@@ -206,8 +206,8 @@ function computeBundleClosure(
       if (dep.optional) continue;
       refs.add(dep.id);
     }
-    if (m.kind === 'agent') {
-      const ds = m.provides.agent.defaultSkills ?? [];
+    for (const agent of normalizeManifest(m).contributes.agents ?? []) {
+      const ds = agent.defaultSkills ?? [];
       for (const ref of ds) {
         if (
           ref &&
@@ -241,14 +241,14 @@ function computeBundleClosure(
     }
     const srcDir = dirname(hit.originPath);
     add.push({ id, srcDir });
-    manifests[id] = hit.manifest;
+    manifests[id] = hit.normalizedManifest;
     // walk transitively
     for (const dep of hit.manifest.dependencies ?? []) {
       if (dep.optional) continue;
       if (!visited.has(dep.id)) queue.push(dep.id);
     }
-    if (hit.manifest.kind === 'agent') {
-      const ds = hit.manifest.provides.agent.defaultSkills ?? [];
+    for (const agent of hit.normalizedManifest.contributes.agents ?? []) {
+      const ds = agent.defaultSkills ?? [];
       for (const ref of ds) {
         if (
           ref &&
@@ -292,13 +292,13 @@ export function closureFrom(rootId: string): ClosureResult {
   const missing: string[] = [];
   const queue: string[] = [];
 
-  const enqueueDeps = (m: ExtensionManifest): void => {
+  const enqueueDeps = (m: AnyExtensionManifest): void => {
     for (const dep of m.dependencies ?? []) {
       if (dep.optional) continue;
       if (!visited.has(dep.id)) queue.push(dep.id);
     }
-    if (m.kind === 'agent') {
-      const ds = m.provides.agent.defaultSkills ?? [];
+    for (const agent of normalizeManifest(m).contributes.agents ?? []) {
+      const ds = agent.defaultSkills ?? [];
       for (const ref of ds) {
         if (
           ref &&
@@ -313,7 +313,7 @@ export function closureFrom(rootId: string): ClosureResult {
     }
   };
 
-  enqueueDeps(root.manifest);
+  enqueueDeps(root.normalizedManifest);
   while (queue.length) {
     const id = queue.shift()!;
     if (visited.has(id)) continue;
@@ -324,7 +324,7 @@ export function closureFrom(rootId: string): ClosureResult {
       continue;
     }
     order.push(id);
-    enqueueDeps(hit.manifest);
+    enqueueDeps(hit.normalizedManifest);
   }
   return { ids: order, missing };
 }
@@ -358,10 +358,10 @@ export async function exportPack(input: FxpackExportInput): Promise<FxpackExport
   }
 
   const allFindings: LintFinding[] = [];
-  const manifests: Record<string, ExtensionManifest> = {};
+  const manifests: Record<string, AnyExtensionManifest> = {};
   const plugins: Array<{ id: string; srcDir: string }> = [...input.plugins];
   for (const p of plugins) {
-    let m: ExtensionManifest;
+    let m: AnyExtensionManifest;
     try {
       m = loadExtensionManifest(p.srcDir);
     } catch (e) {
@@ -440,7 +440,7 @@ export async function exportPack(input: FxpackExportInput): Promise<FxpackExport
         ?? (plugins.length === 1 ? plugins[0].id : undefined),
       contains: plugins.map((p) => ({
         id: p.id,
-        kind: manifests[p.id].kind,
+        kind: normalizeManifest(manifests[p.id]).categories?.[0] ?? 'extension',
         version: manifests[p.id].version,
       })),
       requires: input.bundleMeta.requires,
@@ -499,7 +499,7 @@ function pickName(v: unknown): string | undefined {
   return undefined;
 }
 
-function buildReadme(m: FxpackManifest, plugins: ExtensionManifest[]): string {
+function buildReadme(m: FxpackManifest, plugins: AnyExtensionManifest[]): string {
   const title = m.title.en ?? m.title.zh ?? m.id;
   const lines: string[] = [
     `# ${title}`,
@@ -515,7 +515,7 @@ function buildReadme(m: FxpackManifest, plugins: ExtensionManifest[]): string {
   ];
   for (const p of plugins) {
     const dn = pickName(p.displayName) ?? p.id;
-    lines.push(`- **${dn}** — \`${p.id}\` v${p.version} (${p.kind})`);
+    lines.push(`- **${dn}** — \`${p.id}\` v${p.version} (${normalizeManifest(p).categories?.[0] ?? 'extension'})`);
   }
   lines.push('', '## Install', '', '```bash', 'forgeax pack install ./<this-file>.fxpack', '```');
   return lines.join('\n');

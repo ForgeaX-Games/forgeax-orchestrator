@@ -14,15 +14,16 @@
  *
  * 生命周期:**per-session 复用 serve 进程 + 连接**(冷启动优化,2026-06-20)。serve 本就支持
  * 「一连接多轮」(`startServe` 起常驻 RPC server、kernel 按连接建、runTurn 可多次调用),故 adapter
- * 不再每轮 spawn→reap,而是按 session(`hostSessionId||threadId||agentId||'forge'`)缓存 serve
- * 进程,跨轮复用;**只首轮付一次冷启**,后续轮直接复用同一进程/连接。
+ * 不再每轮 spawn→reap,而是按运行实例 threadId
+ * (`threadId||hostSessionId||agentId||'forge'`)缓存 serve 进程,跨该实例的 turn
+ * 复用；不同 AgentInstance/runtimeEpoch 不共享 continuation 或 serve session。
  *   - idle 回收:一个 session 无在飞轮且静默超过 `FORGEAX_CORE_SERVE_IDLE_MS`(默认 5min)→
  *     `shutdownSession` 回收(对位评审稿 §231 的 idle 回收策略)。
  *   - 软取消:cancel/interrupt 走 serve 的 RPC 控制面(serve 端 abort 在飞 turn),**不杀进程**
  *     (进程留给后续轮复用);硬回收只在 idle/崩溃时发生。
  *   - 崩溃自愈:serve 崩 → `sidecar.onExit` + request 掉线 reject → 驱逐死 session,下一轮
  *     `runTurn` 自动重新 spawn(评审稿 §221 的「自动重起」语义,落到 session 粒度)。
- *   - bg peer 语义不变:facade 仍**每轮**建 scheduler(轮间语义),复用的只是「进程+连接」,
+ *   - bg peer 语义不变:facade 仍**每轮**建内部执行器(轮间语义),复用的只是「进程+连接」,
  *     不引入评审稿 §172 的「peer 跨轮存活」行为变化——这是有意的最小改动取舍。
  *   - 逃生闸:`FORGEAX_CORE_SERVE_REUSE=off` → 回退旧 per-turn spawn→run→reap 路径。
  * 崩溃隔离:serve 崩不影响 server,sidecar reap 并回 ExitInfo。
@@ -44,8 +45,13 @@ import {
   getKernel,
   registerKernel,
 } from '@forgeax/agent-runtime';
+import {
+  resolveAsk,
+  setExternalAskReplyResolver,
+  type AskReply,
+  type AskReplyIdentity,
+} from '../core/ask-user-registry';
 import { NATIVE_KERNEL_PROFILE } from './kernel-profile';
-import { toWire } from './forgeax-core-wire';
 import {
   CORE_DEFAULT_PERMISSION_MODE,
   CORE_SUPPORTED_PERMISSION_MODES,
@@ -83,6 +89,12 @@ function resolveCoreServeEntry(): string {
 }
 const CORE_SERVE_ENTRY = resolveCoreServeEntry();
 
+/** Compatibility export for callers that tune the serve spawn timeout. */
+export function coreServeSpawnTimeoutMs(): number {
+  const raw = Number(process.env.FORGEAX_CORE_SERVE_SPAWN_TIMEOUT_MS ?? 30_000);
+  return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
+}
+
 /** core --serve 的运行时启动命令:Node 下 `node --import tsx core.ts`,Bun 下 `bun core.ts`
  *  (双运行时;使外部宿主 studio 无需 bun 即可拉起 core 子进程)。 */
 function coreLaunch(endpoint: string): { cmd: string; args: string[] } {
@@ -100,13 +112,6 @@ function serveIdleMs(): number {
 /** per-session 复用开关。`off` → 回退旧 per-turn spawn→run→reap(逃生闸)。默认开(use-time 读)。 */
 function serveReuseEnabled(): boolean {
   return (process.env.FORGEAX_CORE_SERVE_REUSE ?? '').trim() !== 'off';
-}
-
-/** forgeax-core serve 冷启动窗口。Node + Docker 首次加载完整 CLI bundle 可能明显
- *  超过旧的 8s；与 agent-host 冷启动窗口保持同一默认值，且允许部署侧按机器性能覆盖。 */
-export function coreServeSpawnTimeoutMs(): number {
-  const value = Number(process.env.FORGEAX_CORE_SERVE_SPAWN_TIMEOUT_MS);
-  return Number.isFinite(value) && value > 0 ? value : 30_000;
 }
 
 export interface CreateForgeaxCoreKernelOpts {
@@ -138,11 +143,7 @@ function deriveSock(sessionId: string): string {
 }
 
 /** 连 serve endpoint;serve 刚 spawn 需片刻才 listen → 重试到 deadline。 */
-async function connectWithRetry(
-  sock: string,
-  signal: AbortSignal,
-  deadlineMs = coreServeSpawnTimeoutMs(),
-): Promise<RpcConnection> {
+async function connectWithRetry(sock: string, signal: AbortSignal, deadlineMs = 8000): Promise<RpcConnection> {
   const end = Date.now() + deadlineMs;
   for (;;) {
     if (signal.aborted) throw new Error('aborted before forgeax-core serve ready');
@@ -156,8 +157,30 @@ async function connectWithRetry(
   }
 }
 
-/** TurnRequest → 可序列化线上子集(去函数:requestPermission/hooks)。
- *  实现搬到 ./forgeax-core-wire(白名单值得被独立单测钉住,见该文件注释)。 */
+/** TurnRequest → 可序列化线上子集(去函数:requestPermission/hooks)。 */
+function toWire(req: TurnRequest): Record<string, unknown> {
+  return {
+    session: req.session,
+    turnId: req.turnId,
+    callId: req.callId,
+    input: req.input,
+    context: req.context,
+    history: req.history,
+    systemPrompt: req.systemPrompt,
+    tools: req.tools,
+    toolsRevision: req.toolsRevision,
+    liveHostContext: req.liveHostContext,
+    toolPolicy: req.toolPolicy,
+    budget: req.budget,
+    model: req.model,
+    fallbackModels: req.fallbackModels,
+    trustTier: req.trustTier,
+    hostSessionId: req.hostSessionId,
+    // 全链路 trace:把上游 W3C traceparent 透过 unix-socket 带进 sidecar,
+    //   sidecar 的 kernel.turn 据此挂成上游 span 的 child(否则在边界被丢)。
+    traceparent: req.traceparent,
+  };
+}
 
 /** 一轮的事件 push→pull sink(单连接多轮:按 callId 路由 notify)。 */
 interface TurnSink {
@@ -183,6 +206,13 @@ interface ServeSession {
   closing: boolean;
 }
 
+interface PendingHostedAsk {
+  sid: string;
+  agentPath: string;
+  questionIds: string[];
+  resolve: (result: string) => void;
+}
+
 async function readServeCapabilities(conn: RpcConnection): Promise<Set<string>> {
   const pong = await conn.request('ping') as { capabilities?: unknown };
   return new Set(Array.isArray(pong?.capabilities) ? pong.capabilities.filter((v): v is string => typeof v === 'string') : []);
@@ -204,6 +234,28 @@ class ForgeaxCoreServeKernel implements AgentKernel {
     defaultMode: CORE_DEFAULT_PERMISSION_MODE,
   } as const;
 
+  /** Resolve interactive host-tool asks in the same module graph that owns
+   * the host bridge. The HTTP router calls this only after its local registry
+   * misses, which keeps all in-process/rented-kernel behavior unchanged. */
+  resolveAskReply(
+    sid: string,
+    agentPath: string,
+    values: AskReply | string[],
+    identity: AskReplyIdentity = {},
+  ): boolean {
+    if (resolveAsk(sid, agentPath, values, identity)) return true;
+    const exact = this.pendingHostedAsks.get(`${sid}::${agentPath}`);
+    const sessionMatches = [...this.pendingHostedAsks.values()].filter((entry) => entry.sid === sid);
+    const pending = exact ?? (sessionMatches.length === 1 ? sessionMatches[0] : undefined);
+    if (!pending) return false;
+    this.pendingHostedAsks.delete(`${pending.sid}::${pending.agentPath}`);
+    const grouped = typeof values[0] === 'string'
+      ? [{ questionId: pending.questionIds[0] ?? 'question-1', values: values as string[] }]
+      : values as AskReply;
+    pending.resolve(JSON.stringify({ ok: true, questions: grouped }));
+    return true;
+  }
+
   /** 模型目录 = LLM gateway 目录(disk models.json ∩ LiteLLM live)。原生内核
    *  经 gateway 路由,能跑的模型集合就是 gateway 的集合——委托共享实现
    *  (lib/llm-gateway/gateway-catalog.ts,与无参 list_models 同一份,SSOT)。
@@ -220,6 +272,9 @@ class ForgeaxCoreServeKernel implements AgentKernel {
   private readonly starting = new Map<string, Promise<ServeSession>>();
   /** callId → serve 会话(供 openHandle 软取消寻址)。 */
   private readonly callSession = new Map<string, ServeSession>();
+  /** Adapter-owned blocking asks avoid source/dist registry identity splits in
+   * packaged binaries while keeping the model-facing tool result unchanged. */
+  private readonly pendingHostedAsks = new Map<string, PendingHostedAsk>();
   /** WS 广播(telemetry → 浏览器 viewer);未注入 = noop。 */
   private readonly broadcast: (msg: { type: string; [k: string]: unknown }) => void;
   /** host-side telemetry 落盘 sink。 */
@@ -237,6 +292,8 @@ class ForgeaxCoreServeKernel implements AgentKernel {
         // 不再各算各的路径(方案B PR1 D1:删 projectSessionLogsDir,收口到 PathManager)。
         onError: (err) => tt('adapter.telemetry-sink-error', { err: String(err) }),
       });
+    setExternalAskReplyResolver((sid, agentPath, values, identity) =>
+      this.resolveAskReply(sid, agentPath, values, identity));
   }
 
   /** out-of-band telemetry notify 路由:method==='telemetry' → 消费(落盘+广播)并返 true;
@@ -280,7 +337,26 @@ class ForgeaxCoreServeKernel implements AgentKernel {
   }
 
   private sessionKeyOf(req: TurnRequest): string {
-    return `${req.hostSessionId || req.session.threadId || req.session.agentId || 'forge'}`;
+    return `${req.session.threadId || req.hostSessionId || req.session.agentId || 'forge'}`;
+  }
+
+  private waitForHostedAsk(sid: string, agentPath: string, args: unknown): Promise<string> {
+    const record = args && typeof args === 'object' && !Array.isArray(args)
+      ? args as Record<string, unknown>
+      : {};
+    const rows = Array.isArray(record.questions) ? record.questions : [record];
+    const questionIds = rows.map((row, index) => {
+      const item = row && typeof row === 'object' && !Array.isArray(row)
+        ? row as Record<string, unknown>
+        : {};
+      return typeof item.id === 'string' && item.id.trim() ? item.id.trim() : `question-${index + 1}`;
+    });
+    const key = `${sid}::${agentPath}`;
+    const prior = this.pendingHostedAsks.get(key);
+    if (prior) prior.resolve('(问题已取消)');
+    return new Promise<string>((resolve) => {
+      this.pendingHostedAsks.set(key, { sid, agentPath, questionIds, resolve });
+    });
   }
 
   async *runTurn(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {
@@ -426,15 +502,7 @@ class ForgeaxCoreServeKernel implements AgentKernel {
       },
     });
 
-    let conn: RpcConnection;
-    try {
-      conn = await connectWithRetry(grant.endpoint ?? endpoint, signal);
-    } catch (error) {
-      // 启动失败必须回收 sidecar session；否则子进程稍后才 listen 时会成为孤儿，
-      // 下一轮还可能复用一个宿主已判失败的进程。
-      await sidecar.shutdownSession(sessionId).catch(() => {});
-      throw error;
-    }
+    const conn = await connectWithRetry(grant.endpoint ?? endpoint, signal);
     const capabilities = await readServeCapabilities(conn);
     const s: ServeSession = {
       sessionId,
@@ -470,7 +538,12 @@ class ForgeaxCoreServeKernel implements AgentKernel {
         };
         // p.agentId = facade 透来的本轮真实 agent(委派轮 = mochi 等);桥按它求 trustTier / 弹卡 / 选 context。
         // p.callId = 本轮工具调用 id;透传给宿主桥,供 studio 对齐前端 HITL 卡片的 pending key。
-        return this.hostBridge(p.name, p.args, p.sid ?? s.hostSessionId, p.agentId, p.callId, p.turnCallId);
+        const sid = p.sid ?? s.hostSessionId ?? '';
+        const agentPath = p.agentId ?? 'forge';
+        if (p.name === 'ask_user' || p.name === 'ask_user_question') {
+          return this.waitForHostedAsk(sid, agentPath, p.args);
+        }
+        return this.hostBridge(p.name, p.args, sid, p.agentId, p.callId, p.turnCallId);
       }
       if (method === 'hostTurnSnapshot' && this.hostTurnSnapshot) {
         return this.hostTurnSnapshot(params as Parameters<HostTurnSnapshotProvider>[0]);
@@ -575,13 +648,7 @@ class ForgeaxCoreServeKernel implements AgentKernel {
         cwd: projectRoot, env: stripModelKeys(materializeEnv()),
       },
     });
-    let conn: RpcConnection;
-    try {
-      conn = await connectWithRetry(grant.endpoint ?? endpoint, signal);
-    } catch (error) {
-      await sidecar.shutdownSession(sessionId).catch(() => {});
-      throw error;
-    }
+    const conn = await connectWithRetry(grant.endpoint ?? endpoint, signal);
     const capabilities = await readServeCapabilities(conn);
     if (req.liveHostContext && (!this.hostTurnSnapshot || !capabilities.has('hostTurnSnapshot.v1'))) {
       conn.close();
@@ -618,11 +685,16 @@ class ForgeaxCoreServeKernel implements AgentKernel {
         };
         // p.agentId 优先(facade 透来的本轮真实 agent);缺省回落本轮 req 的 session.agentId。
         // p.callId = 本轮工具调用 id;透传给宿主桥,供 studio 对齐前端 HITL 卡片的 pending key。
+        const sid = p.sid ?? req.hostSessionId ?? '';
+        const agentPath = p.agentId ?? req.session?.agentId ?? 'forge';
+        if (p.name === 'ask_user' || p.name === 'ask_user_question') {
+          return this.waitForHostedAsk(sid, agentPath, p.args);
+        }
         return this.hostBridge(
           p.name,
           p.args,
-          p.sid ?? req.hostSessionId,
-          p.agentId ?? req.session?.agentId,
+          sid,
+          agentPath,
           p.callId,
           p.turnCallId,
         );

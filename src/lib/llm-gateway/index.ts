@@ -22,7 +22,7 @@ import { litellmTransport } from './transports/litellm';
 import { getDefaultRegistry, type ModelRegistry } from './registry';
 
 export * from './types';
-export { fetchLiveCatalog, _resetLiveCatalogCache } from './live-catalog';
+export { fetchLiveCatalog, invalidateLiveCatalogCache } from './live-catalog';
 export {
   ModelRegistry,
   getDefaultRegistry,

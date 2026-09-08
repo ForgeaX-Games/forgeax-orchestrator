@@ -6,6 +6,8 @@ import { initPathManager, resetPathManager, getPathManager } from "../src/fs/pat
 import { initSessionManager, resetSessionManager } from "../src/core/session-manager";
 import type { Event } from "../src/core/types";
 import type { Session } from "../src/core/session";
+import { KitToolLoader } from "../src/kits/tool-loader";
+import { createOrGetFSWatcher } from "../src/fs/watcher";
 
 // Plan §9 烟雾测试：create → publish → ledger 落盘 → close → open → replay.
 // 本轮 kits / tools / directives / model 全没接，没法跑真正的 LLM 回路；
@@ -120,11 +122,9 @@ describe("Session E2E — bus → ledger → reopen → replay", () => {
     await sm.close(session.sid);
   });
 
-  test("裸 mkdir <sid>/agents/<path>/ → AgentTree 立刻识别该目录为 agent 节点（无需 agent.json）", async () => {
-    // 设计前提（用户 2026-05-20 钉死）：**目录就是事实**。AgentTree 用纯
-    // readdirSync 扫盘，不依赖 chokidar，也不要求 agent.json 存在。SessionManager
-    // 在 attach 该 agent 时 _readAgentJson 拿到缺失的 agent.json 会用
-    // AGENT_DEFAULTS 兜底，逻辑等价于"自动 scaffold conscious"。
+  test("Session 初始化后裸 mkdir 不会重构 live RuntimeTree", async () => {
+    // 文件证明 resident 身份，内存证明当前存在。初始化扫描完成后，普通目录
+    // 变化不会绕过 RuntimeSupervisor 注册一个新运行实例。
     const pm = (await import("../src/fs/path-manager")).getPathManager();
     const sm = initSessionManager(pm);
     const session = await createSessionWithRoot(sm, { displayName: "scaffold" });
@@ -132,22 +132,150 @@ describe("Session E2E — bus → ledger → reopen → replay", () => {
     const ioriDir = pm.session(session.sid).agent("root/agents/iori").root();
     mkdirSync(ioriDir, { recursive: true });
 
-    // 同步 readdir，立即可见。display = "iori"，depth = 3（root, agents, iori）。
-    const node = session.tree.get("root/agents/iori");
-    expect(node).toBeDefined();
-    expect(node?.display).toBe("iori");
-    expect(node?.depth).toBe(3);
-
-    // tree.list() 包括 root + iori 两个节点。
+    expect(session.tree.get("root/agents/iori")).toBeUndefined();
+    expect(session.tree.get("root/iori")).toBeUndefined();
     const list = session.tree.list().map((n) => n.path).sort();
-    expect(list).toEqual(["root", "root/agents/iori"]);
+    expect(list).toEqual(["root"]);
 
     await sm.close(session.sid);
   });
 
-  test("kits 子系统接通 BaseAgent：agent-local kits/<kit>/tools/<file>.ts → toolRegistry 出 tool", async () => {
-    // B1.1-B1.9 烟雾：base-loader 真扫盘 + tool-loader createInstance + BaseAgent
-    // .initKits + ConsciousAgent 默认 getTools = this.toolRegistry.list()。
+  test("显式 reload 才重读 resident 配置，保留稳定 instanceId 并换 runtimeEpoch", async () => {
+    const pm = getPathManager();
+    const sm = initSessionManager(pm);
+    const session = await createSessionWithRoot(sm, { displayName: "reload" });
+    const original = session.runtimeTree.findResident("root");
+    expect(original).toBeDefined();
+
+    const child = pm.session(session.sid).agent("root/agents/child");
+    mkdirSync(child.root(), { recursive: true });
+    writeFileSync(child.agentJson(), JSON.stringify({ id: "child" }) + "\n");
+
+    // 配置文件只证明下一次构建的身份；当前内存树不会被 watcher 改写。
+    expect(session.runtimeTree.findResident("root/child")).toBeUndefined();
+    await session.reloadRuntime();
+
+    const reloadedRoot = session.runtimeTree.findResident("root");
+    const reloadedChild = session.runtimeTree.findResident("root/child");
+    expect(reloadedRoot?.instanceId).toBe(original?.instanceId);
+    expect(reloadedRoot?.runtimeEpochId).not.toBe(original?.runtimeEpochId);
+    expect(reloadedChild).toBeDefined();
+    expect(reloadedChild?.parentInstanceId).toBe(reloadedRoot?.instanceId);
+    expect(session.tree.list().map((node) => node.path)).toEqual([
+      "root",
+      "root/child",
+    ]);
+
+    await sm.close(session.sid);
+  });
+
+  test("删除 resident 根会先移除统一内存子树，再递归删除配置并注销模板", async () => {
+    const pm = getPathManager();
+    const sm = initSessionManager(pm);
+    const initial = await sm.create({
+      displayName: "resident-delete",
+      prepareResidentDefinitions: (sid) => {
+        const root = pm.session(sid).agent("root");
+        const child = pm.session(sid).agent("root/agents/child");
+        mkdirSync(root.root(), { recursive: true });
+        mkdirSync(child.root(), { recursive: true });
+        writeFileSync(root.agentJson(), JSON.stringify({ id: "root" }) + "\n");
+        writeFileSync(child.agentJson(), JSON.stringify({ id: "child" }) + "\n");
+      },
+    });
+    const rootInstance = initial.runtimeTree.findResident("root");
+    const childInstance = initial.runtimeTree.findResident("root/child");
+    expect(rootInstance).toBeDefined();
+    expect(childInstance).toBeDefined();
+
+    const rootConfig = pm.session(initial.sid).agent("root").root();
+    const result = await initial.deleteResident("root");
+    expect(result.ok).toBe(true);
+    expect(initial.runtimeTree.size).toBe(0);
+    expect(existsSync(rootConfig)).toBe(false);
+    expect(initial.templateCatalog.get(rootInstance!.templateRef)).toBeUndefined();
+    expect(initial.templateCatalog.get(childInstance!.templateRef)).toBeUndefined();
+
+    await sm.close(initial.sid);
+  });
+
+  test("reload barrier 取消并回收 ephemeral，再原位重建 resident epoch", async () => {
+    const pm = getPathManager();
+    const sm = initSessionManager(pm);
+    const session = await createSessionWithRoot(sm, { displayName: "reload-barrier" });
+    const originalResident = session.runtimeTree.findResident("root")!;
+    const slowPackage = join(userRoot, "external-kits", "slow");
+    mkdirSync(join(slowPackage, "tools"), { recursive: true });
+    writeFileSync(
+      join(slowPackage, "tools", "wait.ts"),
+      `export default {
+        description: "wait until cancelled",
+        input_schema: { type: "object", properties: {} },
+        async execute(_args, ctx) {
+          return new Promise((_resolve, reject) => {
+            ctx.signal.addEventListener("abort", () => reject(new Error("cancelled by reload")), { once: true });
+          });
+        },
+      };\n`,
+    );
+    const templateRef = session.registerMemoryTemplate({
+      sourceId: "test:reload-barrier",
+      entryId: "slow-worker",
+      template: {
+        definition: { id: "slow-worker" },
+        runtimeConfigDefaults: {},
+        resources: {
+          skills: [],
+          kits: [{
+            id: "slow",
+            source: { kind: "directory", path: slowPackage },
+          }],
+          memorySeeds: [],
+        },
+      },
+    });
+    const handle = await session.spawnEphemeral({
+      parentInstanceId: originalResident.instanceId,
+      templateRef,
+    });
+    const turn = session.enqueueAgent(handle.instanceId, {
+      source: "test",
+      type: "agent_command",
+      payload: { toolName: "wait", args: {} },
+      to: handle.instanceId,
+      handoff: "turn",
+      ts: Date.now(),
+    });
+    const runningDeadline = Date.now() + 2_000;
+    while (session.runtimeTree.get(handle.instanceId)?.state !== "running") {
+      if (Date.now() > runningDeadline) {
+        throw new Error("ephemeral did not enter running state");
+      }
+      await Bun.sleep(2);
+    }
+
+    const turnSettled = turn.then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    await session.reloadRuntime();
+    const turnResult = await turnSettled;
+    expect(turnResult.ok).toBe(false);
+    expect(String("error" in turnResult ? turnResult.error : "")).toContain(
+      "Session resident tree reloaded",
+    );
+    expect((await handle.wait()).status).toBe("cancelled");
+    expect(session.runtimeTree.get(handle.instanceId)).toBeUndefined();
+    const reloaded = session.runtimeTree.findResident("root")!;
+    expect(reloaded.instanceId).toBe(originalResident.instanceId);
+    expect(reloaded.runtimeEpochId).not.toBe(originalResident.runtimeEpochId);
+
+    await sm.close(session.sid);
+  });
+
+  test("kits 子系统接通 RuntimeAgentHost：agent-local kits/<kit>/tools/<file>.ts → toolRegistry 出 tool", async () => {
+    // B1.1-B1.9 烟雾：base-loader 真扫盘 + tool-loader createInstance +
+    // RuntimeAgentHost 初始化 Kit，并由 execution snapshot 暴露工具。
     // builtin / user / session 三层留空，只塞 agent-local 一份 echo tool —— visibility
     // 走 "layer === agent → 永远 visible" 分支，不依赖 kits.user/session 开关。
     const pm = (await import("../src/fs/path-manager")).getPathManager();
@@ -169,13 +297,12 @@ describe("Session E2E — bus → ledger → reopen → replay", () => {
     );
 
     // Trigger attachAgent — which calls initKits internally now.
-    await session.scheduler.attachAgent("root");
-    const agent = session.scheduler.getAgent("root");
+    const agent = await session.initializeAgentHost("root");
     expect(agent).not.toBeNull();
     const tools = agent!.agentContext.tools.list();
     expect(tools.length).toBeGreaterThan(0);
     // tool name is qualified: "demo/tools/echo" (LLM-side mapping to bare
-    // happens in ConsciousAgent.process loop, not in registry).
+    // happens in AgentRuntimeController's turn loop, not in registry).
     const echo = tools.find((t) => t.name === "demo/tools/echo");
     expect(echo).toBeDefined();
     expect(typeof echo!.execute).toBe("function");
@@ -183,15 +310,66 @@ describe("Session E2E — bus → ledger → reopen → replay", () => {
     await sm.close(session.sid);
   });
 
+  test("纯内存模板可以引用自定义目录 Kit，不依赖 agent 配置目录", async () => {
+    const pm = getPathManager();
+    const sm = initSessionManager(pm);
+    const session = await createSessionWithRoot(sm, { displayName: "memory-kit" });
+    const externalPackage = join(userRoot, "external-kits", "cute");
+    mkdirSync(join(externalPackage, "tools"), { recursive: true });
+    writeFileSync(
+      join(externalPackage, "tools", "wave.ts"),
+      `export default {
+        description: "wave from external memory template",
+        input_schema: { type: "object", properties: {} },
+        async execute() { return "hello-from-memory-kit"; },
+      };\n`,
+      "utf-8",
+    );
+    const templateRef = session.registerMemoryTemplate({
+      sourceId: "test:memory-kit",
+      entryId: "cute-worker",
+      template: {
+        definition: { id: "cute-worker" },
+        runtimeConfigDefaults: {},
+        resources: {
+          skills: [],
+          kits: [{
+            id: "cute",
+            source: { kind: "directory", path: externalPackage },
+          }],
+          memorySeeds: [],
+        },
+      },
+    });
+    const snapshot = await session.templateCatalog.resolve(templateRef);
+    expect(snapshot.resources.templateRoot).toBeUndefined();
+
+    // 复用一个已初始化 Host 的非生命周期服务，只替换模板捕获的 Kit
+    // SourceRef；loader 不需要也不会反向寻找一个运行实例目录。
+    const residentHost = await session.initializeAgentHost("root");
+    const loader = new KitToolLoader();
+    const tools = await loader.load({
+      ...residentHost.agentContext,
+      instanceId: "eph-memory-kit",
+      runtimeEpochId: "epoch-memory-kit",
+      runtimeStateRoot: join(session.paths.root(), "runtime-state", "agents", "eph-memory-kit"),
+      templateRoot: undefined,
+      kitSources: snapshot.execution.kits,
+      runtimeManaged: true,
+    });
+    const wave = tools.get("cute/tools/wave");
+    expect(wave).toBeDefined();
+    await expect(
+      wave!.execute({}, residentHost.agentContext),
+    ).resolves.toBe("hello-from-memory-kit");
+
+    await sm.close(session.sid);
+  });
+
   test("kits 热更新 polling 路径（flushReloads）：attach 前就已存在 → 改内容 → registry 看到新版本", async () => {
-    // 对齐 ref 设计：flushReloads 的 prev=undefined 只在「这个 kit 目录本身第
-    // 一次被扫到」时只设 baseline 不触发（避免把 initKits 已同步装载过的文件
-    // 误判成 reload）。ADD/DELETE 平时靠 fs.watch，但 polling 同样要兜住它们
-    // ——见下面两个 test；当 fs.watch 在 O_TRUNC+write+close 之类模式上漏 event
-    // 时，让 ConsciousAgent 在 tool batch 之后能可靠拉到新增/修改/删除。
-    //
-    // 因此先把 tool 文件落盘，再 attach（让 initKits 时直接走 _loadInternal
-    // 把 v1 装进 registry），之后改内容再 flushReloads 验证 polling 出新版本。
+    // 先把 tool 文件落盘，再 attach（让 initKits 时直接把 v1 装进
+    // registry），之后改内容再 flushReloads，单独锁住 MODIFY 路径。
+    // watcher-disabled 的 ADD / DELETE 与 turn 边界由下一个 test 覆盖。
     const pm = (await import("../src/fs/path-manager")).getPathManager();
     const sm = initSessionManager(pm);
     const session = await createSessionWithRoot(sm, { displayName: "hot1" });
@@ -210,8 +388,7 @@ describe("Session E2E — bus → ledger → reopen → replay", () => {
       "utf-8",
     );
 
-    await session.scheduler.attachAgent("root");
-    const agent = session.scheduler.getAgent("root")!;
+    const agent = await session.initializeAgentHost("root");
     const v1 = agent.agentContext.tools.list().find((t) => t.name === "hot/tools/ping");
     expect(v1).toBeDefined();
     expect(v1!.description).toBe("v1");
@@ -236,84 +413,117 @@ describe("Session E2E — bus → ledger → reopen → replay", () => {
 
     expect(await session.kitReloadCoordinator.flushReloads()).toBe(false);
 
-    await sm.close(session.sid);
-  });
-
-  test("kits 热更新 polling 路径（flushReloads）：baseline 建立后新增文件（ADD）必须触发 reload", async () => {
-    // ADD 平时靠 fs.watch，但 fs.watch 对 O_TRUNC+write+close 写法一样会丢事件
-    // （见 reload-coordinator.ts 文件头注释），所以 polling 也要兜住 ADD —— 只要
-    // kit 目录已经过至少一轮基线扫描，之后新出现的文件名必须触发对应 kind 的
-    // reload，而不是被当成「首次遇到」静默吞掉。
-    const pm = (await import("../src/fs/path-manager")).getPathManager();
-    const sm = initSessionManager(pm);
-    const session = await createSessionWithRoot(sm, { displayName: "hotadd" });
-
-    const rootLayer = pm.session(session.sid).agent("root");
-    const kitToolsDir = join(rootLayer.resourceDir("kits"), "hot", "tools");
-    mkdirSync(kitToolsDir, { recursive: true });
-    writeFileSync(
-      join(kitToolsDir, "ping.ts"),
-      `export default {
-        description: "ping",
-        input_schema: { type: "object", properties: {} },
-        async execute() { return "pong"; },
-      };\n`,
-      "utf-8",
-    );
-
-    await session.scheduler.attachAgent("root");
-    const agent = session.scheduler.getAgent("root")!;
-
-    // 第一轮只建基线（对齐上一个 test 锁的行为）。
-    expect(await session.kitReloadCoordinator.flushReloads()).toBe(false);
-
-    // 运行期新增一个 tool 文件，不改动已存在的 ping.ts。
-    writeFileSync(
-      join(kitToolsDir, "pong.ts"),
-      `export default {
-        description: "pong",
-        input_schema: { type: "object", properties: {} },
-        async execute() { return "ping"; },
-      };\n`,
-      "utf-8",
-    );
-
-    const triggered = await session.kitReloadCoordinator.flushReloads();
-    expect(triggered).toBe(true);
-    expect(agent.agentContext.tools.list().find((t) => t.name === "hot/tools/pong")).toBeDefined();
+    const acceptedRevision = session.runtimeTree.findResident("root")!
+      .execution.current().revision;
+    writeFileSync(toolPath, "export default { this is invalid TypeScript", "utf-8");
+    await expect(
+      session.kitReloadCoordinator.flushReloads(),
+    ).rejects.toThrow("last-known-good");
+    const stillV2 = agent.agentContext.tools.list()
+      .find((tool) => tool.name === "hot/tools/ping");
+    expect(stillV2?.description).toBe("v2");
+    expect(
+      session.runtimeTree.findResident("root")!.execution.current().revision,
+    ).toBe(acceptedRevision);
 
     await sm.close(session.sid);
   });
 
-  test("kits 热更新 polling 路径（flushReloads）：删除文件（DELETE）必须触发 reload 并从 registry 摘除", async () => {
+  test("统一 Kernel turn-end polling：watcher 漏事件仍下一 turn 生效，坏 revision 不污染已完成 turn", async () => {
     const pm = (await import("../src/fs/path-manager")).getPathManager();
     const sm = initSessionManager(pm);
-    const session = await createSessionWithRoot(sm, { displayName: "hotdel" });
-
+    const session = await createSessionWithRoot(sm, { displayName: "hot-turn-boundary" });
     const rootLayer = pm.session(session.sid).agent("root");
     const kitToolsDir = join(rootLayer.resourceDir("kits"), "hot", "tools");
     mkdirSync(kitToolsDir, { recursive: true });
     const toolPath = join(kitToolsDir, "ping.ts");
+    const writeTool = (version: string) => {
+      writeFileSync(
+        toolPath,
+        `export default {
+          description: "${version}",
+          input_schema: { type: "object", properties: {} },
+          async execute() { return "pong-${version}"; },
+        };\n`,
+        "utf-8",
+      );
+    };
+    const command = (toolName = "hot/tools/ping"): Event => ({
+      source: "user",
+      type: "agent_command",
+      payload: { toolName, args: {} },
+      to: "root",
+      handoff: "turn",
+      ts: Date.now(),
+    });
+
+    writeTool("v1");
+    await session.initializeAgentHost("root");
+    const instance = session.runtimeTree.findResident("root")!;
+
+    // Deliberately remove the per-template watcher: this test must prove the
+    // unified turn-end polling seam itself, not win through fs.watch.
+    createOrGetFSWatcher().unregisterOwner(
+      `kit-source-revision:${session.sid}:${instance.instanceId}`,
+    );
+
+    writeTool("v2");
+    const transition = await session.enqueueAgent("root", command());
+    expect(transition.output).toBe("pong-v1");
+
+    const nextTurn = await session.enqueueAgent("root", command());
+    expect(nextTurn.output).toBe("pong-v2");
+    const acceptedRevision = instance.execution.current().revision;
+
     writeFileSync(
       toolPath,
+      "export default { this is invalid TypeScript",
+      "utf-8",
+    );
+    const invalidTransition = await session.enqueueAgent("root", command());
+    expect(invalidTransition.output).toBe("pong-v2");
+    expect(instance.execution.current().revision).toBe(acceptedRevision);
+
+    writeTool("v3");
+    const recoveryTransition = await session.enqueueAgent("root", command());
+    expect(recoveryTransition.output).toBe("pong-v2");
+    const recovered = await session.enqueueAgent("root", command());
+    expect(recovered.output).toBe("pong-v3");
+
+    const addedPath = join(kitToolsDir, "added.ts");
+    writeFileSync(
+      addedPath,
       `export default {
-        description: "ping",
+        description: "added",
         input_schema: { type: "object", properties: {} },
-        async execute() { return "pong"; },
+        async execute() { return "pong-added"; },
       };\n`,
       "utf-8",
     );
+    const addTransition = await session.enqueueAgent("root", command());
+    expect(addTransition.output).toBe("pong-v3");
+    const added = await session.enqueueAgent(
+      "root",
+      command("hot/tools/added"),
+    );
+    expect(added.output).toBe("pong-added");
 
-    await session.scheduler.attachAgent("root");
-    const agent = session.scheduler.getAgent("root")!;
-    expect(agent.agentContext.tools.list().find((t) => t.name === "hot/tools/ping")).toBeDefined();
-
-    expect(await session.kitReloadCoordinator.flushReloads()).toBe(false);
-
-    rmSync(toolPath);
-    const triggered = await session.kitReloadCoordinator.flushReloads();
-    expect(triggered).toBe(true);
-    expect(agent.agentContext.tools.list().find((t) => t.name === "hot/tools/ping")).toBeUndefined();
+    rmSync(addedPath);
+    const deleteTransition = await session.enqueueAgent(
+      "root",
+      command("hot/tools/added"),
+    );
+    expect(deleteTransition.output).toBe("pong-added");
+    const removed = await session.enqueueAgent(
+      "root",
+      command("hot/tools/added"),
+    );
+    expect(removed.output).toEqual({
+      error: "Unknown tool: hot/tools/added",
+    });
+    expect(instance.instanceId).toBe(
+      session.runtimeTree.findResident("root")!.instanceId,
+    );
 
     await sm.close(session.sid);
   });
@@ -340,7 +550,7 @@ describe("Session E2E — bus → ledger → reopen → replay", () => {
     const session = await createSessionWithRoot(sm, { displayName: "log" });
     const layer = pm.session(session.sid);
 
-    // 业务代码直接调 session.logger.info（plumbing / scheduler 路径）
+    // 业务代码直接调 session.logger.info（runtime plumbing 路径）
     session.logger.info("root", undefined, "session-up");
 
     // console.* 进 SM.logger（user-level）；ALS 包过 → tag 带 agentId
@@ -434,8 +644,7 @@ describe("Session E2E — bus → ledger → reopen → replay", () => {
 
     const session = await createSessionWithRoot(sm, { displayName: "cwd-test" });
 
-    await session.scheduler.attachAgent("root");
-    const agent = session.scheduler.getAgent("root");
+    const agent = await session.initializeAgentHost("root");
     expect(agent).not.toBeNull();
     const ctx = agent!.agentContext;
 

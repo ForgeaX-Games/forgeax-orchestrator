@@ -59,9 +59,14 @@ function collectJsFiles(dir) {
 const dist = join(root, 'dist');
 const files = collectJsFiles(dist);
 const missing = new Map(); // pkg -> [file, spec]
+let sharedAgentRuntimeImport = false;
 
 for (const file of files) {
-  const text = stripNoise(readFileSync(file, 'utf8'));
+  const source = readFileSync(file, 'utf8');
+  if (/(?:from\s+|import\s*\(\s*)["']@forgeax\/agent-runtime["']/u.test(source)) {
+    sharedAgentRuntimeImport = true;
+  }
+  const text = stripNoise(source);
   const re = /(?:from\s+|import\s*\(\s*|export\s+\*\s+from\s+)["']([^"']+)["']/g;
   let m;
   while ((m = re.exec(text))) {
@@ -77,6 +82,11 @@ for (const file of files) {
     list.push(`${file.replace(root + '/', '')}: ${spec}`);
     missing.set(name, list);
   }
+}
+
+if (!sharedAgentRuntimeImport) {
+  console.error('[check-pack-externals] dist must retain @forgeax/agent-runtime as a shared runtime singleton');
+  process.exit(1);
 }
 
 if (missing.size > 0) {

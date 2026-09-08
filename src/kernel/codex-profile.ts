@@ -12,8 +12,7 @@
  *                             -c approval_policy / -s|-c sandbox_mode / -m <model>` + prompt 组装
  *  - {@link buildCodexSingleAgentArgs} Codex 原生多 Agent 工具的进程级关闭参数
  *  - {@link buildCodexAppServerGlobalArgs} app-server 全局参数组装
- *  - {@link toCodexPermission} 中立档位 → `approval_policy`/`sandbox_mode` 方言翻译
- *    (+ {@link CODEX_SUPPORTED_PERMISSION_MODES} 本内核真能兑现的档位表)
+ *  - {@link CODEX_APPROVAL_POLICY} / {@link CODEX_SANDBOX_MODE} 放行模式常量
  *  - JSONL→KernelEvent 映射:re-export 自 codex-mapper.ts(本身已是隔离的 codex-ism)
  *
  * Codex 执行面与 CC 的关键差异(供薄脊梁理解):
@@ -22,16 +21,16 @@
  *    sandbox 走 `-c sandbox_mode=...`)。
  *  - systemPrompt 无 flag → 把 charter+persona 作「指令」前置进 prompt(headless 安全,
  *    不碰仓内 AGENTS.md)。
- *  - headless 放行:`--skip-git-repo-check` + `-c approval_policy=never` + sandbox 档位
- *    (首轮 `-s <mode>` / resume `-c sandbox_mode=<mode>`);`<mode>` 由中立档派生,
- *    默认全权限 = `danger-full-access`,见 {@link toCodexPermission}。
+ *  - headless 放行:`--skip-git-repo-check` + `-c approval_policy=never` +
+ *    按中立权限档位派生的 `-s/-c sandbox_mode`。
  *  - 用量:只有 token(turn.completed.usage),无 $ cost → turn.usage.costUsd 留空。
  *  - 无 per-tool 权限回调(走 sandbox/approval 模式)→ requestPermission 不接。
  */
 import type { PermissionMode, TurnRequest } from '@forgeax/agent-runtime';
-import { DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
+import { buildKernelTask } from './kernel-context';
+import { DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
 
 // ─── 模型目录(Codex-isms) ───────────────────────────────────────────
 // 真实通道 = `codex app-server` JSON-RPC `model/list`(TUI /model 同源),
@@ -47,6 +46,24 @@ export const CODEX_FALLBACK_MODELS = [
   'gpt-5-mini',
 ];
 
+/** Resolve only advertised capabilities for an explicitly App-selected model.
+ * Never carry an unrelated global config effort across a product model switch. */
+export interface CodexModelMetadata {
+  id?: string;
+  model?: string;
+  defaultReasoningEffort?: string;
+  supportedReasoningEfforts?: Array<{ reasoningEffort: string }>;
+}
+export function resolveCodexModelEffort(model: string | undefined, rows: CodexModelMetadata[]): string | undefined {
+  const selected = model?.trim();
+  if (!selected) return undefined;
+  const row = rows.find((entry) => entry.id === selected || entry.model === selected);
+  const supported = row?.supportedReasoningEfforts?.map((entry) => entry.reasoningEffort) ?? [];
+  if (supported.includes('medium')) return 'medium';
+  if (row?.defaultReasoningEffort && supported.includes(row.defaultReasoningEffort)) return row.defaultReasoningEffort;
+  throw new Error(`Codex selected model '${model}' has no advertised compatible reasoning effort; refresh its model catalog before sending.`);
+}
+
 // JSONL→KernelEvent 映射本身就是 codex-ism;经 profile 统一再出口(spine 不直接 import mapper)。
 export {
   createCodexMapperState,
@@ -56,81 +73,48 @@ export {
   type CodexRawEvent,
 } from './codex-mapper';
 
-/** codex headless 的放行姿态 = `approval_policy` + `sandbox_mode` 两个旋钮的组合。
- *  它们不再各自持值,而是由中立档位派生({@link toCodexPermission})—— 本内核的
- *  权限控制点就是这一处翻译 + 下面的 supported 表。 */
+/** headless approval policy:不卡审批(per-tool 权限交给 sandbox)。 */
+export const CODEX_APPROVAL_POLICY = 'never' as const;
+/** autoEdits 的 headless sandbox 基线(首轮 `-s`,resume 经 `-c sandbox_mode=`)。 */
+export const CODEX_SANDBOX_MODE = 'workspace-write' as const;
+
 export interface CodexPermission {
   readonly approvalPolicy: 'never';
   readonly sandboxMode: 'workspace-write' | 'danger-full-access';
 }
 
-/** `codex app-server` 的真实权限旋钮。它不是 `exec` 的薄包装，
- * 因此 thread/turn 的 approvalPolicy 与 sandbox 必须单独翻译。 */
 export interface CodexAppServerPermission {
   readonly approvalPolicy: 'on-request' | 'never';
   readonly sandbox: 'read-only' | 'workspace-write' | 'danger-full-access';
 }
 
-/** 中立档 → app-server thread/turn 参数。 */
 export function toCodexAppServerPermission(mode: PermissionMode): CodexAppServerPermission {
   switch (mode) {
-    case 'unrestricted':
-      return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
-    case 'autoEdits':
-      return { approvalPolicy: 'never', sandbox: 'workspace-write' };
-    case 'gated':
-      return { approvalPolicy: 'on-request', sandbox: 'workspace-write' };
-    case 'planning':
-      return { approvalPolicy: 'on-request', sandbox: 'read-only' };
+    case 'unrestricted': return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
+    case 'autoEdits': return { approvalPolicy: 'never', sandbox: 'workspace-write' };
+    case 'gated': return { approvalPolicy: 'on-request', sandbox: 'workspace-write' };
+    case 'planning': return { approvalPolicy: 'on-request', sandbox: 'read-only' };
   }
 }
 
-/**
- * 中立档位 → codex 方言。
- *   autoEdits    → never + workspace-write   (自动改,但关在工作区里)
- *   unrestricted → never + danger-full-access(全权限,危险方式)
- *
- * `gated` / `planning` **不在支持列表**:codex headless 既无 per-tool 审批闸
- * (`approval_policy` 只有 never 有意义,否则 headless 无人应答会挂),也无只读
- * 强制,给不出这两档。不静默假装 —— 由 supported 表让 UI 只列真能兑现的档。
- */
 export function toCodexPermission(mode: PermissionMode): CodexPermission {
   return mode === 'unrestricted'
-    ? { approvalPolicy: 'never', sandboxMode: 'danger-full-access' }
-    : { approvalPolicy: 'never', sandboxMode: 'workspace-write' };
+    ? { approvalPolicy: CODEX_APPROVAL_POLICY, sandboxMode: 'danger-full-access' }
+    : { approvalPolicy: CODEX_APPROVAL_POLICY, sandboxMode: CODEX_SANDBOX_MODE };
 }
 
-/** codex 能兑现的档位(只两档,见 toCodexPermission 的说明)。 */
 export const CODEX_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = [
-  'autoEdits',
-  'unrestricted',
+  'autoEdits', 'unrestricted',
 ];
 
-/** codex 默认档 —— 派生自全内核默认,不独立持值。
- *
- *  诚实标注:codex 的 `apply_patch` 等编辑路径**不可靠地触发 hook**
- *  (openai/codex#16732),故 hook-gate 在 codex 上不能当作可依赖的收窄面;
- *  该内核的实际收窄靠 `sandbox_mode`(workspace-write 把写限制在工作区)。 */
 export const CODEX_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
 
-/**
- * Codex also has a native `request_user_input` tool whose availability depends
- * on the Codex collaboration mode. ForgeaX does not use that surface: it
- * projects a host-owned `ask_user` dynamic tool through Codex app-server
- * so the question can block and resume through the Studio clarification card.
- *
- * Keep this adapter note conditional on the actual tool projection. A generic
- * Codex consumer that did not advertise `ask_user` must not be told to call a
- * tool it does not have.
- */
 export function buildCodexInstructions(req: TurnRequest): string {
   const sp = req.systemPrompt;
   const base = sp.persona?.trim()
     ? `${sp.charter}\n\n---\n\n## Persona\n\n${sp.persona.trim()}`
     : sp.charter;
-  const hasHostAskUser = req.tools?.some((tool) => tool.name === 'ask_user') ?? false;
-  if (!hasHostAskUser) return base;
-
+  if (!req.tools?.some((tool) => tool.name === 'ask_user')) return base;
   const interaction = [
     '## ForgeaX interaction tools',
     '',
@@ -140,10 +124,29 @@ export function buildCodexInstructions(req: TurnRequest): string {
   return [base, interaction].filter((part) => part?.trim()).join('\n\n---\n\n');
 }
 
+export function buildCodexAppServerTurnInput(req: TurnRequest): Array<Record<string, unknown>> {
+  const input: Array<Record<string, unknown>> = [
+    { type: 'text', text: buildKernelTask(req, true), text_elements: [] },
+  ];
+  for (const attachment of req.input.attachments ?? []) {
+    if (attachment.kind !== 'image' || typeof attachment.path !== 'string' || !attachment.path.trim()) continue;
+    input.push({ type: 'localImage', path: attachment.path });
+  }
+  return input;
+}
+
+function codexImageArgs(req: TurnRequest): string[] {
+  const args: string[] = [];
+  for (const attachment of req.input.attachments ?? []) {
+    if (attachment.kind !== 'image' || typeof attachment.path !== 'string' || !attachment.path.trim()) continue;
+    args.push('--image', attachment.path);
+  }
+  return args;
+}
+
 /**
- * ForgeaX 已经用 agent-tree（`AgentTree` + `Scheduler`）和 `delegate_to_subagent`
- * 工具做统一的 sub-agent 编排，Codex 在这里只是 AgentKernel，不应再向模型暴露
- * 第二套原生 spawn/send/wait 工具。
+ * ForgeaX 已经拥有统一 RuntimeTree 和 ephemeral Agent 编排面，Codex 在这里只是
+ * AgentKernel，不应再向模型暴露第二套原生 spawn/send/wait 工具。
  *
  * 三个覆盖缺一不可：
  * - `multi_agent=false` 关闭当前稳定的 V1 collaboration tools；
@@ -173,45 +176,6 @@ export function buildCodexAppServerGlobalArgs(
     ...(hooksActive ? ['--dangerously-bypass-hook-trust'] : []),
     ...mcpOverrides,
   ];
-}
-
-/**
- * Build the app-server turn input without ever putting image bytes in the
- * JSON-RPC text field. Codex's app-server has a dedicated `localImage` input
- * variant; the path points at the upload materialized by composeTurnRequest.
- *
- * Keeping this projection here is important: `TurnRequest` may still carry
- * untrusted inline data at other API boundaries, but the Codex wire must be
- * path-only or a large image can trip Codex's 1 MiB input-text limit.
- */
-export function buildCodexAppServerTurnInput(
-  req: TurnRequest,
-): Array<Record<string, unknown>> {
-  const sp = req.systemPrompt;
-  const task = sp.dynamicSuffix?.trim()
-    ? `${req.input.text}\n\n${sp.dynamicSuffix.trim()}`
-    : req.input.text;
-  const input: Array<Record<string, unknown>> = [
-    // app-server receives charter/persona through thread/start's
-    // developerInstructions; only send the user task here.
-    { type: 'text', text: task, text_elements: [] },
-  ];
-  for (const attachment of req.input.attachments ?? []) {
-    if (attachment.kind !== 'image' || typeof attachment.path !== 'string' || !attachment.path.trim()) continue;
-    input.push({ type: 'localImage', path: attachment.path });
-  }
-  return input;
-}
-
-function codexImageArgs(req: TurnRequest): string[] {
-  const args: string[] = [];
-  for (const attachment of req.input.attachments ?? []) {
-    if (attachment.kind !== 'image' || typeof attachment.path !== 'string' || !attachment.path.trim()) continue;
-    // Repeat the option so the following prompt can never be consumed as an
-    // additional image path by a variadic CLI parser.
-    args.push('--image', attachment.path);
-  }
-  return args;
 }
 
 // ─── settings.permissions 拦截面(046 楔子3) ─────────────────────────
@@ -273,11 +237,10 @@ export function buildCodexArgs(
   codexThreadId: string | undefined,
   hooksActive = false,
   mcpOverrides: string[] = [],
-  // fail-safe 缺省(同 cc):漏传时走 req.permissionMode。注意越界档的 clamp 在 kernel 侧,
-  // 这里只做翻译 —— 直接调本函数且传了越界档的调用方,由 toCodexPermission 落到 workspace-write。
+  // fail-safe 缺省:漏传独立档位时走 req.permissionMode,再落到全局默认档。
   permissionMode: PermissionMode = req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE,
+  reasoningEffort?: string,
 ): string[] {
-  // 放行姿态:中立档 → codex 两旋钮(唯一翻译处)。越界档由 kernel 侧先 clamp。
   const { approvalPolicy, sandboxMode } = toCodexPermission(permissionMode);
   // 诚实标注(no-op):中立 `systemPrompt.mode` 与 `req.toolPolicy` 在 codex headless **无落点**——
   // codex 无 `--system-prompt(-file)` flag(指令只能前置进 prompt,见下),也无 per-tool 放行/
@@ -287,11 +250,8 @@ export function buildCodexArgs(
   // systemPrompt 安全注入:codex 无 system-prompt flag,且写项目 AGENTS.md 会**覆盖仓内已有
   // AGENTS.md** → 改为把 charter+persona 作为「指令」前置进 prompt(headless 安全,不碰文件)。
   // dynamicSuffix(当轮记忆/感知)以 user 后缀拼在任务后。
-  const sp = req.systemPrompt;
   const instructions = buildCodexInstructions(req);
-  const task = sp.dynamicSuffix?.trim()
-    ? `${req.input.text}\n\n${sp.dynamicSuffix.trim()}`
-    : req.input.text;
+  const task = buildKernelTask(req, !codexThreadId);
   const message = instructions?.trim()
     ? `# Instructions\n\n${instructions.trim()}\n\n# Task\n\n${task}`
     : task;
@@ -301,7 +261,7 @@ export function buildCodexArgs(
   const common = [
     '--json',
     '--skip-git-repo-check',
-    // Codex 只作为单 Agent Kernel；ForgeaX agent-tree 是唯一编排面。
+    // Codex 只作为单 Agent Kernel；ForgeaX RuntimeTree 是唯一编排面。
     ...buildCodexSingleAgentArgs(),
     ...(hooksActive ? ['--dangerously-bypass-hook-trust'] : []),
     '-c',
@@ -310,6 +270,7 @@ export function buildCodexArgs(
     // fxt MCP 注入(本轮工具);无工具轮为空(零回归)。放在 message 位置参数之前。
     ...mcpOverrides,
     ...(req.model ? ['-m', req.model] : []),
+    ...(reasoningEffort ? ['-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`] : []),
   ];
 
   if (codexThreadId) {

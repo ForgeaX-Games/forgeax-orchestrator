@@ -98,6 +98,11 @@ function statStamp(path: string, seen = new Set<string>(), depth = 0): string {
   try {
     if (depth > NATIVE_TREE_DEPTH_LIMIT) return `${path}:depth-limit`;
     const stat = lstatSync(path);
+    // Most entries in skills/plugins are regular files. Their own metadata is
+    // the full fingerprint input, so resolving every one just to establish a
+    // directory/symlink cycle is needless synchronous I/O.
+    if (stat.isFile()) return `${path}:file:${stat.size}:${stat.mtimeMs}`;
+    if (!stat.isDirectory() && !stat.isSymbolicLink()) return `${path}:other:${stat.mtimeMs}`;
     let realPath: string;
     try {
       realPath = realpathSync(path);
@@ -112,8 +117,6 @@ function statStamp(path: string, seen = new Set<string>(), depth = 0): string {
       // the target in place while the warm process keeps the old surface.
       return `${path}:link:${target}\n${statStamp(realPath, seen, depth + 1)}`;
     }
-    if (stat.isFile()) return `${path}:file:${stat.size}:${stat.mtimeMs}`;
-    if (!stat.isDirectory()) return `${path}:other:${stat.mtimeMs}`;
     const nextSeen = new Set(seen);
     nextSeen.add(realPath);
     const entries = readdirSync(path).sort();
@@ -257,6 +260,8 @@ class ClaudeSession<T = unknown> {
   private pendingTurns = 0;
   private readonly controlWaiters = new Map<string, ControlWaiter>();
   private closed = false;
+  /** A failed user-frame write poisons this protocol boundary before queued turns are released. */
+  private unusable = false;
   private stderr = '';
   private readonly idleWaiters = new Set<() => void>();
 
@@ -294,7 +299,7 @@ class ClaudeSession<T = unknown> {
   }
 
   get pid(): number | undefined { return this.transport.pid; }
-  get isAlive(): boolean { return !this.closed; }
+  get isAlive(): boolean { return !this.closed && !this.unusable; }
   get isBusy(): boolean {
     return Boolean(
       (this.current && !this.current.finished)
@@ -348,7 +353,7 @@ class ClaudeSession<T = unknown> {
     const previous = this.turnTail;
     const initialize = (async () => {
       await previous.catch(() => {});
-      if (this.closed) throw new Error('claude session is not alive');
+      if (!this.isAlive) throw new Error('claude session is not alive');
       const requestId = `forgeax-init-${randomUUID()}`;
       const response = new Promise<void>((resolve, reject) => {
         this.controlWaiters.set(requestId, { resolve, reject });
@@ -478,7 +483,7 @@ class ClaudeSession<T = unknown> {
       releaseReservation();
       throw new ClaudeSessionCancelledError();
     }
-    if (this.closed) {
+    if (!this.isAlive) {
       release();
       releaseReservation();
       throw new Error('claude session is not alive');
@@ -510,7 +515,7 @@ class ClaudeSession<T = unknown> {
       // A cancelled turn cannot leave a live process with an unknown protocol
       // boundary. Terminate the whole pooled session and let the next turn use
       // a fresh process.
-      void this.close();
+      void this.close().catch(() => {});
     };
     signal.addEventListener('abort', onAbort, { once: true });
     if (signal.aborted) {
@@ -522,7 +527,14 @@ class ClaudeSession<T = unknown> {
     try {
       await this.transport.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: message } })}\n`);
     } catch (error) {
-      this.finishCurrent(-1, error instanceof Error ? error : new Error(String(error)));
+      const writeError = error instanceof Error ? error : new Error(String(error));
+      // Poison before finishCurrent releases turnTail. Otherwise an already
+      // queued turn can pass the alive check and write to this failed pipe
+      // before the pool's outer catch gets a chance to evict the entry.
+      this.unusable = true;
+      signal.removeEventListener('abort', onAbort);
+      this.finishCurrent(-1, writeError);
+      throw writeError;
     }
 
     const lines = (async function* (): AsyncGenerator<T> {

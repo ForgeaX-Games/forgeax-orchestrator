@@ -4,6 +4,7 @@ import { buildCapabilitySnapshot } from '../src/capabilities/catalog';
 import { projectToolSpecs } from '../src/capabilities/projection';
 import { materializeForgeaxToolsRuntime } from '../src/kernel/mcp/forgeax-tools-runtime';
 import type { MergedManifest } from '../src/extensions/merger';
+import { normalizeManifest } from '@forgeax/types';
 
 describe('shared capability cross-kernel projection', () => {
   it('preserves identity and generation for native and rented projections', async () => {
@@ -23,6 +24,7 @@ describe('shared capability cross-kernel projection', () => {
     };
     const merged: MergedManifest = {
       manifest,
+      normalizedManifest: normalizeManifest(manifest),
       origin: 'builtin',
       originPath: '/tmp/shared-tool/forgeax-extension.json',
       shadowedBy: [],

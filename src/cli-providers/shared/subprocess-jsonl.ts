@@ -8,6 +8,7 @@
 // friendlyPath 已搬到 api/lib/ (commit 64078a4); cli-providers 复活时 reuse 那一份。
 import { spawn } from 'node:child_process';
 import { friendlyPath } from '@forgeax/platform-io';
+import { prepareSpawnInvocation } from '../../lib/node-spawn';
 
 export interface SpawnJsonlOptions {
   /** Absolute path or PATH-resolvable binary name. */
@@ -63,10 +64,12 @@ export function spawnJsonl<T = unknown>(opts: SpawnJsonlOptions): SpawnJsonlResu
   }
 
   const isWindows = process.platform === 'win32';
-  const child = spawn(cmd, args, {
+  const invocation = prepareSpawnInvocation(cmd, args);
+  const child = spawn(invocation.command, invocation.args, {
     cwd: cwd ?? process.cwd(),
     env: childEnv,
-    stdio: [stdin !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     // ★ 关键(POSIX):detached → 子进程 setsid 成新 session/进程组、**脱离控制终端**。
     //   否则 CLI 内核(codebuddy / claude-code 等)作为 server 的后台进程组子进程,一旦碰
     //   控制终端(查终端尺寸/title 等),内核会发 SIGTTOU/SIGTTIN 给**整个进程组**,把 server
@@ -79,11 +82,10 @@ export function spawnJsonl<T = unknown>(opts: SpawnJsonlOptions): SpawnJsonlResu
   child.stdout?.setEncoding('utf8');
   child.stderr?.setEncoding('utf8');
 
-  // Stdin payload + EOF
-  if (stdin !== undefined && child.stdin) {
-    child.stdin.write(stdin);
-    child.stdin.end();
-  }
+  // Own the stdin lifecycle even without a payload. Bun's packaged host can
+  // leave an ignored stdin socket open, blocking Codex exec's read_to_end.
+  // end(payload) flushes any input before sending EOF to the child.
+  child.stdin?.end(stdin);
 
   // detached 后子进程是进程组 leader(pgid==pid):杀**整组**(-pid)一并收掉它 spawn 的孙子
   //   进程,不留孤儿;pid 非法或不允许时回退杀单进程。(-0 会误杀自身组,故严格 pid>0。)

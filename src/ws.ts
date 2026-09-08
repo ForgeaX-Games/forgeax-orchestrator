@@ -14,7 +14,7 @@ export interface WsClientData {
   sgen?: string;
   /**
    * Reverse-proxy mode —— 升级时设置 `proxy.url` 后，由 main.ts 的桥接
-   * 处理把这条连接转发到上游 WS（目前 wb-scene backend :9557 的 /ws/*），
+   * 处理把这条连接转发到上游 WS（目前 scene backend :9557 的 /ws/*），
    * 不进入 hub/session 的 baseHandler 逻辑。
    */
   proxy?: { url: string; protocol?: string };
@@ -156,7 +156,7 @@ export class WsHub {
       if (!session) return;
       for (const emitterId of session.liveTurns.thinkingOnlyEmitterIds()) {
         try {
-          session.scheduler.interruptAgents(emitterId);
+          session.interruptRuntime(emitterId, "viewer disconnected");
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           process.stderr.write(`[ws] thinking-only abort failed sid=${sid} agent=${emitterId}: ${msg}\n`);
@@ -206,7 +206,6 @@ export function createWsHandler(hub: WsHub): WebSocketHandler<WsClientData> {
         // 仍盯着旧(已 dispose 的)eventBus → 实时回复推不到前端(看似卡死)。幂等;非老 session no-op。
         await getSessionManager().prepareForWrite(sid);
         const session = await getSessionManager().open(sid);
-        session.scheduler.start();
 
         // open() 在上面两个 await 后才 resume:若 socket 在 await 期间已关闭,close()→
         // detachSession 早已跑过(此 sid 尚无 sub → no-op),此刻再 attach 会为一条死连接

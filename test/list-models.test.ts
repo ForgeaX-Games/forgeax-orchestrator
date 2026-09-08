@@ -26,7 +26,7 @@ import { resolve } from "node:path";
 import { initPathManager, resetPathManager, getPathManager } from "../src/fs/path-manager";
 import { initSessionManager, resetSessionManager, getSessionManager } from "../src/core/session-manager";
 import models from "../builtin/commands/models";
-import { _resetLiveCatalogCache } from "../src/lib/llm-gateway/live-catalog";
+import { invalidateLiveCatalogCache } from "../src/lib/llm-gateway/live-catalog";
 
 let userRoot: string;
 let prevBaseUrl: string | undefined;
@@ -79,7 +79,7 @@ beforeEach(async () => {
   realFetch = globalThis.fetch;
   resetPathManager();
   await resetSessionManager();
-  _resetLiveCatalogCache();
+  invalidateLiveCatalogCache();
   const pm = initPathManager({ userRoot });
   initSessionManager(pm);
 });
@@ -103,7 +103,7 @@ afterEach(async () => {
   await resetSessionManager();
   resetPathManager();
   rmSync(userRoot, { recursive: true, force: true });
-  _resetLiveCatalogCache();
+  invalidateLiveCatalogCache();
 });
 
 interface ListModelsResp {
@@ -117,6 +117,22 @@ async function callListModels(args: string[] = []): Promise<ListModelsResp> {
 }
 
 describe("list_models — disk + LiteLLM merge", () => {
+  test("refresh discovers newly authorized models before the proxy cache expires", async () => {
+    let ids = ["gpt-5.5"];
+    mockFetch(() => ({ status: 200, body: { data: ids.map((id) => ({ id })) } }));
+    expect((await callListModels()).models.map((m) => m.id)).toEqual(["gpt-5.5"]);
+    ids = ["gpt-5.6"];
+    expect((await callListModels(["", "--refresh"])).models.map((m) => m.id)).toEqual(["gpt-5.6"]);
+  });
+
+  test("keys with the same suffix do not share their authorized model list", async () => {
+    mockFetch(() => ({ status: 200, body: { data: [{ id: "gpt-5.5" }] } }));
+    await callListModels();
+    process.env.LITELLM_PROXY_KEY = "sk-other-1234567890";
+    mockFetch(() => ({ status: 200, body: { data: [{ id: "gpt-5.6" }] } }));
+    expect((await callListModels()).models.map((m) => m.id)).toEqual(["gpt-5.6"]);
+  });
+
   test("disk entries win; live-only entries get defaults + source: 'live'", async () => {
     writeDiskCatalog({
       "claude-opus-4-7": {
