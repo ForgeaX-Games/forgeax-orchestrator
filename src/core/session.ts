@@ -26,6 +26,7 @@ import type { PathManagerAPI, SessionLayerAPI } from "../fs/types";
 import { clearRememberedForSession } from "../kernel/tool-approval";
 import { requestToolApproval } from "../kernel/tool-approval";
 import { checkKernelTool } from "../kernel/trust-gate";
+import { agentToolPermissions, delegatedPermissionParent } from "../kernel/agent-permissions";
 import { loadSettingsPermissionRules } from "../api/lib/permission-settings";
 import { resolveTemplateTrust } from "../agents/agent-template-catalog";
 import { clearUiStateForSession } from "../api/lib/ui-manifest-registry";
@@ -356,6 +357,7 @@ export class Session {
           tree: this.tree,
           ...(sessionCwd ? { sessionCwd } : {}),
           sessionDefaultModels: this.config.defaultModels,
+          permissionParentForTurn: (event) => delegatedPermissionParent(this, instance, event),
           fileRecorder: {
             ledger: this.fileActivity,
             locks: this.fileLocks,
@@ -623,6 +625,7 @@ export class Session {
     );
     const projectRoot = defaultProjectRoot();
     const decision = checkKernelTool(trustTier, toolName, {
+      ...agentToolPermissions(this, instance, projectRoot),
       args,
       projectRoot,
       activeGame: this.config.defaultDir,

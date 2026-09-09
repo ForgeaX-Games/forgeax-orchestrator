@@ -8,11 +8,14 @@
  */
 
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { link, mkdir, rm, writeFile } from "node:fs/promises";
 import { getPathManager } from "../fs/path-manager";
 import { deepMerge } from "../utils/deep-merge";
 import { AGENT_DEFAULTS } from "../defaults/agent-json";
 import { resolveExternalAgentTemplate } from "../agents/loader";
+import { sameResidentResource, snapshotResidentResources } from "../agents/resident-resources";
+import { COORDINATOR_TOOL_GRANTS } from "../agents/tool-grants";
 import type { AgentJson } from "./types";
 
 // ─── 类型 ────────────────────────────────────────────────────────────────────
@@ -110,8 +113,30 @@ export async function ensureAgentScaffold(
           overrides as unknown as Record<string, unknown>,
         ) as unknown as AgentJson)
       : base;
-    await writeFile(layer.agentJson(), JSON.stringify(merged, null, 2) + "\n", "utf-8");
-    scaffolded = true;
+    const external = await resolveExternalAgentTemplate(agentPath.split("/").at(-1)!).catch(() => null);
+    // Capture new-resident identity before replacing installed paths. Once the
+    // persona is local, bootstrap must not infer authority from its leaf name.
+    if (external && merged.personaFile && sameResidentResource(layer.root(), merged.personaFile, external.personaPath)) {
+      if (merged.trustTier === undefined) merged.trustTier = external.trustTier;
+      if (external.source === "brand" && merged.toolGrants === undefined) {
+        merged.toolGrants = structuredClone(COORDINATOR_TOOL_GRANTS);
+      }
+    }
+    const portable = external
+      ? await snapshotResidentResources(layer.root(), merged, external)
+      : merged;
+    const temporary = `${layer.agentJson()}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, JSON.stringify(portable, null, 2) + "\n", { encoding: "utf-8", flag: "wx" });
+      // Publish complete bytes without replacing another concurrent creator.
+      // Both files are in the same directory/filesystem.
+      await link(temporary, layer.agentJson());
+      scaffolded = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    } finally {
+      await rm(temporary, { force: true });
+    }
   }
 
   return { scaffolded };

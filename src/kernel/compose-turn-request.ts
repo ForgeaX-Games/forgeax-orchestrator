@@ -44,6 +44,7 @@ import type { FrozenAgentTemplate } from '../agents/template-types';
 import type { AgentInstance } from '../runtime/types';
 import { getConfiguredModelContextWindows } from '../llm/provider';
 import { resolveTemplateTrust } from '../agents/agent-template-catalog';
+import { pinAgentPermissions } from './agent-permissions';
 import { resolveAgentComposition } from '../agents/resolved-agent-composition';
 import type { SystemBlock } from '../llm/types';
 import type { LedgerReader } from '../context-window/context-window';
@@ -149,6 +150,10 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   const profile = orchestrationProfileOf(input.kernel);
   const runtimeInstance = resolveRuntimeInstance(input.sessionId, input.agentId);
   const runtimeTemplate = runtimeInstance?.template;
+  const permissionSession = input.sessionId ? getSessionManager().peek(input.sessionId) : undefined;
+  const permissions = runtimeInstance && permissionSession
+    ? pinAgentPermissions(permissionSession, runtimeInstance, projectRoot, input.kernel.id)
+    : undefined;
   // charter / environment / note 由注入的产品壳 composer 提供(阶段A §3.2)——编排层不再
   // 硬编码游戏宪章。无注入(standalone game-agnostic cli)⇒ composer 缺省 ⇒ 三段皆空。
   const scopeSlug = sessionScopeSlug(input.sessionId ?? input.threadId) ?? getPathManager().resolveScope();
@@ -417,6 +422,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     // 内核的 fork-extract 机制仍可被编排层驱动;forgeax-core 本无自主记忆=no-op,rented(cc)据此关闭其自带提取。
     memoryAutonomy: false,
     trustTier,
+    ...(permissions ? { permissionMode: permissions.permissionMode } : {}),
     ...(input.sessionId ? { hostSessionId: input.sessionId } : {}),
     ...(input.traceparent ? { traceparent: input.traceparent } : {}),
     ...(model ? { model } : {}),

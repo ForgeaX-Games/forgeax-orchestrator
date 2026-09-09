@@ -1,11 +1,12 @@
 import { COORDINATOR_TOOL_GRANTS } from './tool-grants';
-import { existsSync, realpathSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
-import { defaultProjectRoot } from "@forgeax/platform-io";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import type { AgentJson } from "../core/types";
 import type { ResidentDefinition } from "./resident-definition-store";
 import { resolveExternalAgentTemplate } from "./loader";
+import { sameResidentResource, snapshotResidentResources } from "./resident-resources";
 
 /**
  * Persist extension/marketplace default-skill sources into an existing
@@ -25,7 +26,6 @@ export async function synchronizeResidentExternalSkillSources(
   const config = await readAgentJson(file);
   // Presence means the resident author or a newer materializer already owns
   // this list. Bootstrap migration must never overwrite explicit config.
-  if (config.skillSources !== undefined && config.toolGrants !== undefined) return;
   const configuredPersona =
     typeof config.personaFile === "string" ? config.personaFile.trim() : "";
   if (!configuredPersona) return;
@@ -33,52 +33,33 @@ export async function synchronizeResidentExternalSkillSources(
   const leafId = definition.logicalPath.split("/").at(-1)!;
   const external = await resolveExternalAgentTemplate(leafId).catch(() => null);
   if (!external) return;
-  if (!sameExistingPath(
-    resolveConfiguredPersonaCandidates(definition.templateRoot, configuredPersona),
-    external.personaPath,
-  )) {
+  const samePersona = sameResidentResource(definition.templateRoot, configuredPersona, external.personaPath);
+  const portable = await snapshotResidentResources(definition.templateRoot, config, external);
+  if (!samePersona && portable === config) {
     return;
   }
 
-  if (config.skillSources !== undefined && (config.toolGrants !== undefined || external.source !== "brand")) return;
-
   const nextSources = external.skillSources.map((source) => ({ ...source }));
   const next: AgentJson = {
-    ...config,
-    skillSources: config.skillSources ?? nextSources,
-    ...(config.toolGrants === undefined && external.source === "brand"
+    ...portable,
+    skillSources: portable.skillSources ?? nextSources,
+    ...(samePersona && config.toolGrants === undefined && external.source === "brand"
       ? { toolGrants: structuredClone(COORDINATOR_TOOL_GRANTS) }
       : {}),
   };
-  await writeFile(file, `${JSON.stringify(next, null, 2)}\n`, "utf8");
-}
-
-function resolveConfiguredPersonaCandidates(
-  templateRoot: string,
-  configured: string,
-): string[] {
-  if (isAbsolute(configured)) return [configured];
-  return [
-    resolve(templateRoot, configured),
-    resolve(defaultProjectRoot(), configured),
-  ];
-}
-
-function sameExistingPath(candidates: readonly string[], expected: string): boolean {
-  if (!existsSync(expected)) return false;
-  let canonicalExpected: string;
+  if (JSON.stringify(next) === JSON.stringify(config)) return;
+  // Publish only after all resources exist. A process exit while writing the
+  // temporary file leaves the previous definition intact for the next boot.
+  const temporary = `${file}.${randomUUID()}.tmp`;
   try {
-    canonicalExpected = realpathSync(expected);
-  } catch {
-    return false;
-  }
-  return candidates.some((candidate) => {
-    try {
-      return existsSync(candidate) && realpathSync(candidate) === canonicalExpected;
-    } catch {
-      return false;
+    await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    if (JSON.stringify(await readAgentJson(file)) !== JSON.stringify(config)) {
+      throw new Error(`resident agent.json changed during resource migration: ${file}`);
     }
-  });
+    await rename(temporary, file);
+  } finally {
+    await rm(temporary, { force: true });
+  }
 }
 
 async function readAgentJson(file: string): Promise<AgentJson> {

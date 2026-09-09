@@ -58,6 +58,8 @@ export interface ResolvedExternalSkillSource {
 }
 
 export interface ResolvedExternalAgentTemplate {
+  /** Registry-owned provenance; never inferred from a resident's trust claim. */
+  skillResourceSources?: Array<{ path: string; kind: string; origin?: string }>;
   personaPath: string;
   /** Absolute path to author-provided memory seeds, when present. */
   memoryDir?: string;
@@ -306,6 +308,12 @@ export async function resolveExternalAgentTemplate(
       personaPath: plugin.personaPath,
       memoryDir,
       skillSources: await resolveExternalSkillSources(plugin),
+      skillResourceSources: (plugin.definition.defaultSkills ?? []).flatMap((ref) => {
+        const skill = resolveSkill(ref as SkillRef, plugin.extensionId);
+        return skill
+          ? [{ path: resolveSkillFile(skill.originDir, skill.definition.entry.file), kind: 'plugin', origin: skill.origin }]
+          : [];
+      }),
       tools: plugin.definition.tools,
       source: 'plugin',
       origin: plugin.origin,

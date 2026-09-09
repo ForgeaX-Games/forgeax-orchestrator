@@ -23,7 +23,7 @@ const APPROVAL_TIMEOUT_MS = 10 * 60_000;
 /** 本会话已记住放行的 capability:sid → Set<capability>。session dispose 时清。 */
 const remembered = new Map<string, Set<string>>();
 /** reqId → {sid, agent, capability},供 reply 携带 remember 时回填 remembered。 */
-const pendingCtx = new Map<string, { sid: string; agent: string; capability: string }>();
+const pendingCtx = new Map<string, { sid: string; agent: string; capability: string; remembered: boolean }>();
 
 /** 本会话是否已记住该 capability。 */
 export function isApprovalRemembered(sid: string, capability: string): boolean {
@@ -49,7 +49,10 @@ export function clearRememberedForSession(sid: string): void {
 export function applyRememberOnReply(reqId: string, allow: boolean, remember: boolean): void {
   if (!allow || !remember) return;
   const ctx = pendingCtx.get(reqId);
-  if (ctx) rememberApproval(ctx.sid, ctx.capability);
+  if (ctx) {
+    rememberApproval(ctx.sid, ctx.capability);
+    ctx.remembered = true;
+  }
 }
 
 export interface ApprovalRequest {
@@ -73,7 +76,8 @@ export async function requestToolApproval(req: ApprovalRequest): Promise<boolean
   if (isApprovalRemembered(req.sid, cap)) return true;
 
   const reqId = randomUUID();
-  pendingCtx.set(reqId, { sid: req.sid, agent: req.agent, capability: cap });
+  const context = { sid: req.sid, agent: req.agent, capability: cap, remembered: false };
+  pendingCtx.set(reqId, context);
 
   // Register the resolver before publishing. EventBus observers are allowed
   // to resolve synchronously (including an abort/deny cleanup), so publishing
@@ -108,7 +112,8 @@ export async function requestToolApproval(req: ApprovalRequest): Promise<boolean
     pendingCtx.delete(reqId);
     // 无论 reply/超时/abort,都通知 UI 撤卡,避免残留。
     req.eventBus.publish(
-      { type: 'permission:resolved', ts: Date.now(), source: `agent:${req.agent}`, payload: { reqId, allow } },
+      { type: 'permission:resolved', ts: Date.now(), source: `agent:${req.agent}`,
+        payload: { reqId, allow, capability: cap, remembered: allow && context.remembered } },
       req.agent,
     );
   }

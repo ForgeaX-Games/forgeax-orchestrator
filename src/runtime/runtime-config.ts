@@ -1,6 +1,14 @@
 import type { ModelsConfig } from "../core/types";
+import type { PermissionMode } from '@forgeax/agent-runtime';
+
+export function parseAgentPermissionMode(value: unknown): PermissionMode {
+  if (value === 'gated' || value === 'autoEdits' || value === 'planning' || value === 'unrestricted') return value;
+  throw new Error(`invalid agent permissionMode: ${String(value)}`);
+}
 
 export interface RuntimeConfig {
+  /** Omitted means inherit the live parent execution permission posture. */
+  readonly permissionMode?: PermissionMode;
   readonly models?: ModelsConfig;
   readonly coalesceMs?: number;
   readonly maxIterations?: number;

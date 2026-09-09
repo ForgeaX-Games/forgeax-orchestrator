@@ -1,4 +1,5 @@
 import { parseAgentToolGrants } from './tool-grants';
+import { parseAgentPermissionMode } from '../runtime/runtime-config';
 import {
   existsSync,
   readFileSync,
@@ -52,6 +53,8 @@ export function loadFileSystemAgentTemplate(
     },
     configuration: structuredClone(configuration),
     runtimeConfigDefaults: {
+      ...(config.permissionMode !== undefined
+        ? { permissionMode: parseAgentPermissionMode(config.permissionMode) } : {}),
       ...(config.models ? { models: config.models } : {}),
       ...(typeof config.coalesceMs === "number" ? { coalesceMs: config.coalesceMs } : {}),
       ...(typeof config.maxIterations === "number"

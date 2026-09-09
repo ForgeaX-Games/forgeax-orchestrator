@@ -30,7 +30,7 @@
  * `.outcome` 区分三档以触发弹卡。
  */
 import { resolve, sep } from 'node:path';
-import type { TrustTier } from '@forgeax/agent-runtime';
+import type { PermissionMode, TrustTier } from '@forgeax/agent-runtime';
 import { matchRule, type PermissionRuleSet } from '@forgeax/types';
 import { getUiAction } from '../api/lib/ui-manifest-registry';
 import { ruleLabel } from '../api/lib/permission-settings';
@@ -127,6 +127,9 @@ function decide(outcome: GateOutcome, capability?: Capability, reason?: string):
  *  `projectRoot` = 工作区根(games/** 解析基准);`activeGame` = 当前激活游戏 slug。
  *  全可选——拿不到任何一个就无法证明写在沙箱内 ⇒ fail-closed(deny)。 */
 export interface TrustContext {
+  /** Host-resolved execution defaults; source trust remains the first argument. */
+  permissionBaseline?: TrustTier;
+  permissionMode?: PermissionMode;
   args?: unknown;
   projectRoot?: string;
   /** 当前激活游戏 slug;省略 ⇒ 允许写入任意 `.forgeax/games/<slug>/`(任一游戏)。 */
@@ -161,13 +164,18 @@ export function checkKernelTool(
 
   if (ALWAYS_ALLOW.has(toolName)) return decide('allow');
   // 缺 trustTier → fail-closed 当 imported 处理(不信默认 own)。
-  const tier: TrustTier = trustTier ?? 'imported';
+  const sourceTier: TrustTier = trustTier ?? 'imported';
+  const tier: TrustTier = ctx.permissionBaseline ?? sourceTier;
 
   // ui_invoke(UI 语义操作层):capability 不按工具名子串分类(会恒落 'other',own tier
   // 通配直放 → 分级失效),而按 server ActionCatalog 查表(不信模型或 UI manifest
   // 自报 capability)。Catalog miss 在 dispatcher 前置返回 not_found;这里仅保留
   // defensive fail-closed deny。
-  if (toolName === 'ui_invoke') return checkUiInvoke(tier, ctx);
+  if (toolName === 'ui_invoke') {
+    const sourceDecision = checkUiInvoke(sourceTier, ctx);
+    if (sourceDecision.outcome === 'deny') return sourceDecision;
+    return executionDecision(checkUiInvoke(tier, ctx), toolName, ctx);
+  }
   // ui_snapshot 是只读的 UI 感知取数(无副作用),归 read 直放。显式特判是为了绕开
   // classifyTool 的子串误分类('snapshot' 含 'sh' → 命中 exec),否则 imported 内核
   // 每次只读 snapshot 都会误弹 exec 确认卡。
@@ -179,8 +187,9 @@ export function checkKernelTool(
   const cap = classifyTool(toolName);
 
   // 1) 硬拒(imported credential)——不可放行。
-  if (TIER_DENY[tier].has(cap)) {
-    return decide('deny', cap, `tool "${toolName}" denied for ${tier} pack (capability "${cap}")`);
+  if (TIER_DENY[sourceTier].has(cap) || TIER_DENY[tier].has(cap)) {
+    const deniedTier = TIER_DENY[sourceTier].has(cap) ? sourceTier : tier;
+    return decide('deny', cap, `tool "${toolName}" denied for ${deniedTier} pack (capability "${cap}")`);
   }
 
   // 2) imported 的 write/delete:R2-08 游戏目录作用域 —— 路径能解析(不论目录内/外)→ ask
@@ -188,12 +197,16 @@ export function checkKernelTool(
   //    路径/projectRoot 解析不出 → fail-closed deny(无法证明目标,不能交人盲批)。
   //    注:此步在 settings ask **之前**——unresolvable 的 fail-closed deny 不能被
   //    一条 settings ask 规则翻成「盲批卡」(046 楔子1-补:fail-closed 不变)。
-  if (tier === 'imported' && SCOPED_CAPS.has(cap)) {
+  if ((sourceTier === 'imported' || tier === 'imported') && SCOPED_CAPS.has(cap)) {
     const scope = classifyWriteScope(ctx);
     if (scope.kind === 'unresolvable') return decide('deny', cap, scope.reason);
     const where = scope.kind === 'in-scope' ? 'in active game dir' : `OUTSIDE active game dir → "${scope.target}"`;
-    return decide('ask', cap, `confirm ${cap} ${where}: ${toolName}`);
+    if (tier === 'imported') return executionDecision(decide('ask', cap, `confirm ${cap} ${where}: ${toolName}`), toolName, ctx);
   }
+
+  // Execution restrictions precede ask: planning cannot be approved into a write.
+  const posture = executionDecision(decide('allow', cap), toolName, ctx);
+  if (posture.outcome !== 'allow') return posture;
 
   // 2.5) settings ask —— 强制弹卡(即便 tier 基线会直放;cc 的 ask 语义)。
   const askRule = ctx.rules ? matchRule(ctx.rules.ask, toolName, ctx.args) : undefined;
@@ -222,6 +235,22 @@ export function checkKernelTool(
   //   deny 无回退路径(代价是整包升 own),ask 保留用户否决权 + 本会话 remember(§8/§9)。
   //   ask 的 allow 字段仍为 false → 旧只看 .allow 的调用方依旧不会误自动放行(fail-closed 姿态不变)。
   return decide('ask', cap, `confirm untrusted ${cap} tool: ${toolName}`);
+}
+
+function executionDecision(decision: TrustDecision, toolName: string, ctx: TrustContext): TrustDecision {
+  if (decision.outcome === 'deny') return decision;
+  if (ctx.permissionMode === undefined && ctx.permissionBaseline === undefined) return decision;
+  const cap = decision.capability;
+  if (ctx.permissionMode === 'planning' && cap !== 'read' && cap !== 'delegate') {
+    return decide('deny', cap, `planning mode denies ${toolName}`);
+  }
+  const askRule = ctx.rules ? matchRule(ctx.rules.ask, toolName, ctx.args) : undefined;
+  if (askRule) return decide('ask', cap, `confirm (rule ${ruleLabel(askRule)}): ${toolName}`);
+  if ((ctx.permissionMode === 'gated' && cap !== 'read' && cap !== 'delegate')
+    || (ctx.permissionMode === 'autoEdits' && cap !== 'read' && cap !== 'write' && cap !== 'delegate')) {
+    return decide('ask', cap, `confirm ${ctx.permissionMode}: ${toolName}`);
+  }
+  return decision;
 }
 
 /** 工具入参里可能携带目标路径的字段(按惯例)。 */

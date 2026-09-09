@@ -17,7 +17,8 @@ type DeepRequired<T> = T extends object
 /** `null` 在 ModelsConfig 字段里表示「继承上级 / provider 默认 / 不下发该参数」；
  *  `model` 单独走数组形态（fallback chain），即使只有一个模型也写成 ["..."]，
  *  方便 resolve-models 顺序消费、UI 始终把它当 chain 处理。 */
-export const AGENT_DEFAULTS: DeepRequired<Omit<AgentJson, "trustTier" | "toolGrants">> = {
+// Do not scaffold a permissionMode default: absence is the inheritance contract.
+export const AGENT_DEFAULTS: DeepRequired<Omit<AgentJson, "trustTier" | "toolGrants" | "permissionMode">> = {
   models: {
     model: ["claude-opus-4-8"],
     temperature: null,

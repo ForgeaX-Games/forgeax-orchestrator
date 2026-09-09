@@ -15,6 +15,8 @@
 import { executionToolScope } from '../agents/execution-tool-scope';
 import { getSessionManager } from '../core/session-manager';
 import { checkKernelTool } from './trust-gate';
+import { agentToolPermissions } from './agent-permissions';
+import { loadSettingsPermissionRules } from '../api/lib/permission-settings';
 import { requestToolApproval } from './tool-approval';
 import { executeTool } from '../kits/tool/tool-executor';
 import {
@@ -163,7 +165,11 @@ export function makeInProcessExecuteTool(
     const projectRoot = defaultProjectRoot();
     const scopeGame = session.config?.defaultDir ?? getPathManager().resolveScope();
     // sid 供 ui_invoke 的 per-action catalog projection 查询(见 trust-gate)。
-    const decision = _checkKernelTool(trustTier, name, { args, projectRoot, activeGame: scopeGame, sid });
+    const decision = _checkKernelTool(trustTier, name, {
+      args, projectRoot, activeGame: scopeGame, sid,
+      rules: loadSettingsPermissionRules(projectRoot),
+      ...agentToolPermissions(session, runtimeInstance, projectRoot),
+    });
     tt('htb.decision', { name, agent: agentPath, sid, trustTier, outcome: decision.outcome, cap: decision.capability });
     if (decision.outcome === 'deny') {
       // 信任闸硬拒 —— 审计记录 allow=false。

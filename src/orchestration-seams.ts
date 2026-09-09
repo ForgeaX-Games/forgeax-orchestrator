@@ -163,7 +163,17 @@ export interface UploadDefaults {
  * Omission keeps standalone orchestration independent of host project layout. */
 export type SessionSkillRootProvider = (sessionId: string) => string | undefined;
 
+/** Optional host choice to freeze resident resources independently of their
+ * installation. Hosts own source eligibility and historical path identity;
+ * persistence never grants trust or capabilities. */
+export interface ResidentResourcePolicy {
+  persistence: 'snapshot';
+  acceptsSource(source: { kind: string; origin?: string }): boolean;
+  matchesLegacyPath(configuredPath: string, currentPath: string): boolean;
+}
+
 interface OrchestrationSeams {
+  residentResourcePolicy?: ResidentResourcePolicy;
   sessionSkillRootProvider?: SessionSkillRootProvider;
   systemPromptComposer?: SystemPromptComposer;
   hostTools?: HostToolSpec[];
@@ -188,6 +198,11 @@ let _seams: OrchestrationSeams = {};
 /** Install the injected seams. Called once by createForgeaxApp at boot. */
 export function initOrchestrationSeams(seams: OrchestrationSeams): void {
   _seams = seams;
+}
+
+/** Absent policy preserves external references and disables legacy repair. */
+export function getResidentResourcePolicy(): ResidentResourcePolicy | undefined {
+  return _seams.residentResourcePolicy;
 }
 
 /** The injected system-prompt composer, or undefined when no shell injected one

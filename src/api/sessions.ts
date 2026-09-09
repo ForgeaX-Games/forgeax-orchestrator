@@ -68,6 +68,7 @@ import type { AgentTemplateDraft } from '../agents/template-types';
 import { ResidentDefinitionStore } from '../agents/resident-definition-store';
 import { AgentMaterializationError } from '../core/session';
 import { resolveTemplateTrust } from '../agents/agent-template-catalog';
+import { agentToolPermissions } from '../kernel/agent-permissions';
 import { isBuiltinToolEnabled } from '../kernel/builtin-tool-policy';
 import { withAgentHostToolDefinitions } from '../tools/agent-host-tool-surface';
 
@@ -905,6 +906,7 @@ export function createSessionsRouter() {
     // sid 供 ui_invoke 的 per-action catalog projection 查询(见 trust-gate)。
     // rules = settings.permissions 分层载出(046 楔子1-补:settings deny/ask/allow 叠加 tier 基线)。
     const decision = checkKernelTool(trustTier, toolName, {
+      ...agentToolPermissions(session, runtimeInstance, projectRoot),
       args,
       projectRoot,
       activeGame: scopeGame,
@@ -1207,6 +1209,7 @@ export function createSessionsRouter() {
       }
 
       decision = checkKernelTool(trustTier, toolName, {
+        ...(session ? agentToolPermissions(session, runtimeInstance, projectRoot) : {}),
         args: input,
         projectRoot,
         ...(activeGame ? { activeGame } : {}),

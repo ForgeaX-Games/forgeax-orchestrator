@@ -9,12 +9,19 @@ import { _resetSnapshotForTests, reloadExtensions } from '../src/extensions/regi
 import { composeSystemPrompt, listAgents, resolveExternalAgentTemplate } from '../src/agents/loader';
 import { resolveBrandMainAgent } from '../src/api/lib/session-create';
 import { brandAssistantAgentId, livePersonaTools } from '../src/tools/host-tool-allow';
+import { ensureAgentScaffold } from '../src/core/agent-scaffold';
+import { initPathManager, resetPathManager } from '../src/fs/path-manager';
+import { AgentTemplateCatalog } from '../src/agents/agent-template-catalog';
+import { ResidentDefinitionStore } from '../src/agents/resident-definition-store';
+import { registerResidentDefinition } from '../src/agents/resident-template-adapter';
+import { initOrchestrationSeams, resetOrchestrationSeams } from '../src/orchestration-seams';
 
 const ROOT = `/tmp/forgeax-brand-assistant-${process.pid}`;
 const previousBrandDir = process.env.FORGEAX_BRAND_DIR;
 const previousBrand = process.env.FORGEAX_BRAND;
 
 beforeEach(async () => {
+  resetOrchestrationSeams();
   rmSync(ROOT, { recursive: true, force: true });
   mkdirSync(join(ROOT, 'defaults.test', 'persona'), { recursive: true });
   writeFileSync(join(ROOT, 'defaults.test', 'persona', 'zh.md'), '# Brand Assistant\n');
@@ -48,6 +55,8 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  resetOrchestrationSeams();
+  resetPathManager();
   if (previousBrandDir === undefined) delete process.env.FORGEAX_BRAND_DIR;
   else process.env.FORGEAX_BRAND_DIR = previousBrandDir;
   if (previousBrand === undefined) delete process.env.FORGEAX_BRAND;
@@ -83,11 +92,39 @@ test('Brand source migration installs explicit coordinator grants and preserves 
   expect(loadFileSystemAgentTemplate(templateRoot, 'guide').configuration?.toolGrants).toEqual(COORDINATOR_TOOL_GRANTS);
   const explicit = { host: ['query_world'] };
   writeFileSync(file, JSON.stringify({ personaFile, skillSources: [], toolGrants: explicit }));
-  const before = readFileSync(file, 'utf8');
   await synchronizeResidentExternalSkillSources(definition);
-  expect(readFileSync(file, 'utf8')).toBe(before);
+  expect(JSON.parse(readFileSync(file, 'utf8')).toolGrants).toEqual(explicit);
+  const after = readFileSync(file, 'utf8');
+  await synchronizeResidentExternalSkillSources(definition);
+  expect(readFileSync(file, 'utf8')).toBe(after);
   writeFileSync(join(templateRoot, 'custom.md'), '# Custom persona');
   writeFileSync(file, JSON.stringify({ personaFile: join(templateRoot, 'custom.md'), skillSources: [] }));
   await synchronizeResidentExternalSkillSources(definition);
   expect(loadFileSystemAgentTemplate(templateRoot, 'guide').configuration?.toolGrants).toBeUndefined();
+});
+
+test('new Brand resident keeps own trust and coordinator grants after source removal and registry reset', async () => {
+  initOrchestrationSeams({ residentResourcePolicy: {
+    persistence: 'snapshot',
+    acceptsSource: source => source.kind === 'brand',
+    matchesLegacyPath: () => false,
+  } });
+  const pm = initPathManager({ userRoot: join(ROOT, 'state'), projectRoot: ROOT });
+  const external = await resolveExternalAgentTemplate('guide');
+  expect(external?.source).toBe('brand');
+  await ensureAgentScaffold('portable-brand', 'guide', { overrides: {
+    personaFile: external!.personaPath, skillSources: [],
+  } });
+  const config = JSON.parse(readFileSync(pm.session('portable-brand').agent('guide').agentJson(), 'utf8'));
+  expect(config.trustTier).toBe('own');
+  expect(config.toolGrants).toEqual(COORDINATOR_TOOL_GRANTS);
+  rmSync(join(ROOT, 'defaults.test'), { recursive: true, force: true });
+  resetBrand();
+  _resetSnapshotForTests();
+  const definition = ResidentDefinitionStore.scan('portable-brand', pm.session('portable-brand').agentsDir()).list()[0]!;
+  const catalog = new AgentTemplateCatalog();
+  const resident = await registerResidentDefinition(catalog, 'portable-brand', definition);
+  expect(catalog.get(resident.templateRef)?.trust).toBe('own');
+  const template = await catalog.resolve(resident.templateRef);
+  expect(template.execution.persona).toMatchObject({ kind: 'inline', text: '# Brand Assistant\n' });
 });

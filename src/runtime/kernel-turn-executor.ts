@@ -16,8 +16,11 @@ import type { AgentInstance } from "./types";
 import type { RuntimeToolContext } from "./runtime-context";
 import { RuntimeAgentHost } from "./runtime-agent-host";
 import { Hook } from "../hooks/types";
+import { withAgentPermissionParent } from "../kernel/agent-permissions";
 
 export interface KernelTurnExecutorServices {
+  /** Host-validated delegation relation for otherwise independent residents. */
+  readonly permissionParentForTurn?: (event: Event) => AgentInstance | undefined;
   readonly eventBus: EventBus;
   readonly blackboard: Blackboard;
   readonly tree: RuntimeAgentTreeAdapter;
@@ -92,7 +95,11 @@ export class KernelTurnExecutor implements AgentTurnExecutor {
       throw error;
     }
     try {
-      const result = await agent.executeTurn(event, signal);
+      const result = await withAgentPermissionParent(
+        instance,
+        this.services.permissionParentForTurn?.(event),
+        () => agent.executeTurn(event, signal),
+      );
       if (result.status === "cancelled") {
         throw new DOMException("runtime kernel turn cancelled", "AbortError");
       }

@@ -94,6 +94,8 @@ export interface ModelsConfig {
 // 在 src/kits/，内容填充见 runtime-rewrite-gaps.md §B1）。
 
 export interface AgentJson {
+  /** Execution posture; absent children inherit their parent, including ancestors. */
+  permissionMode?: import('@forgeax/agent-runtime').PermissionMode;
   /** Explicit ambient capability grants, independent of kit visibility and kernel toolPolicy. */
   toolGrants?: import("../agents/tool-grants").AgentToolGrants;
   /** Host-owned trust snapshot for a Session resident.

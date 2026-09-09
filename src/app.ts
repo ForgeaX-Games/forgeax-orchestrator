@@ -62,6 +62,7 @@ import {
   initOrchestrationSeams,
   type SystemPromptComposer,
   type SessionSkillRootProvider,
+  type ResidentResourcePolicy,
   type HostToolSpec,
   type HostUiActionHandler,
   type AssetPathPolicy,
@@ -81,7 +82,7 @@ import './llm/register-all';
 
 // Part of the public seam contract (like ProductContext): the product shell
 // annotates the upload defaults it injects.
-export type { UploadDefaults } from './orchestration-seams';
+export type { UploadDefaults, ResidentResourcePolicy } from './orchestration-seams';
 
 /** Product-specific context injected by the shell into the orchestration layer. */
 export interface ProductContext {
@@ -131,6 +132,8 @@ export interface ProductContext {
   systemPromptComposer?: SystemPromptComposer;
   /** Host-owned session skill directory; no directory semantics in orchestration. */
   sessionSkillRootProvider?: SessionSkillRootProvider;
+  /** Optional resource snapshots; the host owns eligibility and legacy paths. */
+  residentResourcePolicy?: ResidentResourcePolicy;
   /** Host-only tool specs (list_games / query_world / capture_frame …) exposed
    *  to agents and gated by the host-tool bridge. (Stage A §3, §2.4) */
   hostTools?: HostToolSpec[];
@@ -238,6 +241,7 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   // Install shell-injected orchestration seams once at boot (same idiom as the
   // path/session managers above). Read-only on the hot path thereafter.
   initOrchestrationSeams({
+    residentResourcePolicy: ctx.residentResourcePolicy,
     sessionSkillRootProvider: ctx.sessionSkillRootProvider,
     systemPromptComposer: ctx.systemPromptComposer,
     hostTools: ctx.hostTools,

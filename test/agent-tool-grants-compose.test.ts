@@ -11,6 +11,8 @@ import { buildKindRegistry } from '../src/extensions/kinds';
 import { NATIVE_KERNEL_PROFILE, RENTED_KERNEL_PROFILE } from '../src/kernel/kernel-profile';
 import { COORDINATOR_TOOL_GRANTS, type AgentToolGrants } from '../src/agents/tool-grants';
 import { buildActionCatalog } from '../src/kernel/action-catalog';
+import { MemoryTemplateSource } from '../src/agents/memory-template-source';
+import { RuntimeConfigBinding } from '../src/runtime/runtime-config';
 
 let root: string;
 let previousRoot: string | undefined;
@@ -31,8 +33,8 @@ beforeEach(async () => {
   buildActionCatalog();
   const kinds = buildKindRegistry([]);
   kinds.skills = [
-    { definition: { id: 'scene-guide', description: 'Resident prompt' } },
-    { definition: { id: 'audio-guide', description: 'Unrelated global prompt' } },
+    { definition: { id: 'scene-guide', description: 'Resident prompt', entry: { kind: 'prompt' } } },
+    { definition: { id: 'audio-guide', description: 'Unrelated global prompt', entry: { kind: 'prompt' } } },
   ] as any;
   _setSnapshotForTests({ generation: 1, loadedAt: Date.now(), manifests: [], kinds, scanErrors: [], mergeIssues: [] });
 });
@@ -56,7 +58,17 @@ async function compose(grants: AgentToolGrants | undefined, profile: typeof NATI
     execution: { revision: '1', skills: [{ id: 'scene-guide', executor: 'prompt', source: { kind: 'inline', text: 'Scene guide' } }], kits: [] },
     resources: { skills: [], kits: [], memorySeeds: [] }, runtimeConfigDefaults: {},
   };
-  session.tree.resolve = (() => ({ template, templateRef: template.templateRef })) as any;
+  template.templateRef = session.templateCatalog.register({
+    entryId: template.definition.id,
+    source: new MemoryTemplateSource({ sourceId: 'grant-fixture', templates: { [template.definition.id]: template } }),
+    scope: { kind: 'session', sid: session.sid }, registrationLifetime: 'session',
+    trust: 'imported', provenance: { adapter: 'test' }, revisionPolicy: { kind: 'immutable' },
+  });
+  session.tree.resolve = (() => ({
+    template, templateRef: template.templateRef, sid: session.sid,
+    instanceId: 'grant-fixture', parentInstanceId: null,
+    runtimeConfig: new RuntimeConfigBinding({ revision: '1', value: {} }),
+  })) as any;
   const request = await composeTurnRequest({
     sessionId: session.sid, agentId: 'arbitrary-persona', message: 'Create a scene', prewarm: true,
     kernel: { id: 'fixture', orchestrationProfile: profile } as any,

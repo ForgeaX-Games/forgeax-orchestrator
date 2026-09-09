@@ -172,4 +172,29 @@ describe('本会话 remember', () => {
     applyRememberOnReply('nonexistent-req', false, true);
     expect(isApprovalRemembered(sid, 'exec')).toBe(false);
   });
+
+  test('records the remembered capability and shares only that capability in this live session', async () => {
+    const sid = 'remember-audit';
+    const bus = new EventBus();
+    let resolved: unknown;
+    bus.observe(event => {
+      const p = event.payload as { reqId: string };
+      if (event.type === 'permission:request') {
+        applyRememberOnReply(p.reqId, true, true);
+        resolvePermission(p.reqId, true);
+      }
+      if (event.type === 'permission:resolved') resolved = event.payload;
+    });
+    expect(await requestToolApproval({ eventBus: bus, sid, agent: 'suzu', toolName: 'write_file', capability: 'write' })).toBe(true);
+    expect(resolved).toMatchObject({ allow: true, capability: 'write', remembered: true });
+    let asked = false;
+    const other = new EventBus();
+    other.observe(event => { if (event.type === 'permission:request') asked = true; });
+    expect(await requestToolApproval({ eventBus: other, sid, agent: 'iro', toolName: 'write_file', capability: 'write' })).toBe(true);
+    expect(asked).toBe(false);
+    expect(isApprovalRemembered(sid, 'exec')).toBe(false);
+    expect(isApprovalRemembered('another-session', 'write')).toBe(false);
+    clearRememberedForSession(sid);
+    expect(isApprovalRemembered(sid, 'write')).toBe(false);
+  });
 });
