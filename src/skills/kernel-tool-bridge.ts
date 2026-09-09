@@ -12,7 +12,7 @@ export async function runSkillKernelTool(
   args: unknown,
   caller: SkillRunRequest['caller'],
 ): Promise<{ ok: true; result: unknown } | { ok: false; error: string; code: string }> {
-  const skill = listSkills().find((candidate) => safeSkillToolId(candidate.id) === toolName);
+  const skill = listSkills(caller.sessionId).find((candidate) => safeSkillToolId(candidate.id) === toolName);
   if (!skill) return { ok: false, error: `skill tool not found: ${toolName}`, code: 'not_found' };
   const input = args && typeof args === 'object' && 'input' in args
     ? (args as { input?: unknown }).input
@@ -22,7 +22,7 @@ export async function runSkillKernelTool(
     : undefined;
   const result = await runSkill({
     skillId: skill.id,
-    ...(extensionId ? { extensionId } : {}),
+    extensionId: extensionId ?? skill.extensionId,
     input,
     caller,
   });

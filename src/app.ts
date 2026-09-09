@@ -61,6 +61,7 @@ import type { SessionLayout } from './fs/session-layout';
 import {
   initOrchestrationSeams,
   type SystemPromptComposer,
+  type SessionSkillRootProvider,
   type HostToolSpec,
   type HostUiActionHandler,
   type AssetPathPolicy,
@@ -128,6 +129,8 @@ export interface ProductContext {
    *  typed stable/dynamic split for prompt-cache). Omitted ⇒ cli uses its
    *  generic built-in prompt. (Stage A §3.2) */
   systemPromptComposer?: SystemPromptComposer;
+  /** Host-owned session skill directory; no directory semantics in orchestration. */
+  sessionSkillRootProvider?: SessionSkillRootProvider;
   /** Host-only tool specs (list_games / query_world / capture_frame …) exposed
    *  to agents and gated by the host-tool bridge. (Stage A §3, §2.4) */
   hostTools?: HostToolSpec[];
@@ -235,6 +238,7 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   // Install shell-injected orchestration seams once at boot (same idiom as the
   // path/session managers above). Read-only on the hot path thereafter.
   initOrchestrationSeams({
+    sessionSkillRootProvider: ctx.sessionSkillRootProvider,
     systemPromptComposer: ctx.systemPromptComposer,
     hostTools: ctx.hostTools,
     delivery,

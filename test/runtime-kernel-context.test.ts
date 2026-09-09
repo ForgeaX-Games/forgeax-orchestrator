@@ -55,6 +55,17 @@ function recordingKernel(id: string, requests: TurnRequest[]): AgentKernel {
     capabilities,
     async *runTurn(req) {
       requests.push(structuredClone(req));
+      if (req.input.text === "compact lifecycle") {
+        for (const phase of ["started", "completed"] as const) {
+          yield { kind: "stored-event", payload: {
+            type: "compaction.status", ts: Date.now(),
+            payload: { id: "compact-1", phase, count: 1, summary: "PRIVATE", durationMs: 12 },
+          } };
+        }
+        yield { kind: "stored-event", payload: {
+          type: "compaction.post", ts: Date.now(), payload: { summary: "PRIVATE" },
+        } };
+      }
       yield {
         kind: "message.delta",
         role: "assistant",
@@ -117,6 +128,84 @@ afterEach(async () => {
 });
 
 describe("runtime kernel context", () => {
+  test("public compaction lifecycle reaches the session ledger without private content", async () => {
+    const pm = getPathManager();
+    const session = await initSessionManager(pm).create({
+      displayName: "public-compaction",
+      prepareResidentDefinitions: (sid) => {
+        const root = pm.session(sid).agent("root");
+        mkdirSync(root.root(), { recursive: true });
+        writeFileSync(root.agentJson(), JSON.stringify({ id: "root", kernelId: DEFAULT_KERNEL }));
+      },
+    });
+    await session.enqueueAgent("root", {
+      source: "user", type: "user_input", payload: { content: "compact lifecycle" },
+      to: "root", handoff: "turn", ts: Date.now(),
+    });
+    const events = await session.getOrCreateLedger("root").readAllEvents();
+    const statuses = events.filter((event) => event.type === "compaction.status");
+    expect(statuses.map((event) => event.payload.phase)).toEqual(["started", "completed"]);
+    expect(statuses[1]?.payload).toMatchObject({ id: "compact-1", phase: "completed", count: 1, durationMs: 12 });
+    expect(JSON.stringify(statuses)).not.toContain("PRIVATE");
+  });
+
+  test("configured model windows reach requests without unrelated model configuration", async () => {
+    const pm = getPathManager();
+    mkdirSync(join(pm.user().modelsFile(), ".."), { recursive: true });
+    writeFileSync(pm.user().modelsFile(), JSON.stringify({
+      "model-primary": { contextWindow: 512000, maxOutput: 12000, customField: "DO-NOT-FORWARD" },
+      "model-child": { contextWindow: 64000 },
+      "model-invalid": { contextWindow: -1 },
+      "model-fraction": { contextWindow: 123.5 },
+      "model-string": { contextWindow: "999999" },
+      "model-empty": {},
+    }));
+    const session = await initSessionManager(pm).create({
+      displayName: "model-windows",
+      prepareResidentDefinitions: (sid) => {
+        const root = pm.session(sid).agent("root");
+        mkdirSync(root.root(), { recursive: true });
+        writeFileSync(root.agentJson(), JSON.stringify({ id: "root", kernelId: DEFAULT_KERNEL }));
+      },
+    });
+    await session.enqueueAgent("root", {
+      source: "user", type: "user_input", payload: { content: "hello", model: "model-primary" },
+      to: "root", handoff: "turn", ts: Date.now(),
+    });
+    const request = defaultRequests[0]!;
+    const windows = 'modelContextWindows' in request ? request.modelContextWindows : undefined;
+    expect(windows).toEqual({ "model-primary": 512000, "model-child": 64000 });
+    expect(JSON.stringify(windows)).not.toContain("DO-NOT-FORWARD");
+  });
+
+  test("resident iteration ceiling reaches each kernel request and follows turn-boundary updates", async () => {
+    const pm = getPathManager();
+    const session = await initSessionManager(pm).create({
+      displayName: "resident-budget",
+      prepareResidentDefinitions: (sid) => {
+        const root = pm.session(sid).agent("root");
+        mkdirSync(root.root(), { recursive: true });
+        writeFileSync(root.agentJson(), JSON.stringify({
+          id: "root", kernelId: DEFAULT_KERNEL, maxIterations: 200,
+        }));
+      },
+    });
+    const send = () => session.enqueueAgent("root", {
+      source: "user", type: "user_input", payload: { content: "hello" },
+      to: "root", handoff: "turn", ts: Date.now(),
+    });
+    await send();
+    expect(defaultRequests[0]?.budget.maxTurns).toBe(200);
+    expect(defaultRequests[0]).not.toHaveProperty('modelContextWindows');
+    const instance = session.tree.resolve("root")!;
+    instance.runtimeConfig.stage({
+      revision: "budget-update",
+      value: { ...instance.runtimeConfig.current().value, maxIterations: 7 },
+    });
+    await send();
+    expect(defaultRequests[1]?.budget.maxTurns).toBe(7);
+  });
+
   test("persona、skill、Kit plugin/tool/slot 与 command 在默认和覆盖 Kernel 间共享", async () => {
     const pm = getPathManager();
     const sm = initSessionManager(pm);

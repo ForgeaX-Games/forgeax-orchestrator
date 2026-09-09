@@ -9,10 +9,20 @@ export function parseSkillFrontmatter(raw: string): {
   const body = raw.slice(match[0].length);
   let name: string | undefined;
   let description: string | undefined;
-  for (const line of match[1].split(/\r?\n/)) {
+  const lines = match[1].split(/\r?\n/);
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
     const keyValue = line.match(/^(name|description)\s*:\s*(.*)$/);
     if (!keyValue) continue;
     let value = keyValue[2].trim();
+    if (/^[>|][-+]?$/.test(value)) {
+      const separator = value.startsWith('>') ? ' ' : '\n';
+      const continuation: string[] = [];
+      while (index + 1 < lines.length && (/^\s/.test(lines[index + 1]) || !lines[index + 1])) {
+        continuation.push(lines[++index].trim());
+      }
+      value = continuation.join(separator).trim();
+    }
     if (
       (value.startsWith('"') && value.endsWith('"')) ||
       (value.startsWith("'") && value.endsWith("'"))

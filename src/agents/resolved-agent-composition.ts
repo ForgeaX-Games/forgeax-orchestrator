@@ -19,12 +19,15 @@ import type {
   SkillRefLite,
 } from "../soul/types";
 import type { SystemBlock } from "../llm/types";
+import type { RuntimeConfig } from "../runtime/runtime-config";
 
 export interface ResolveAgentCompositionInput {
   readonly agentId: string;
   readonly projectRoot: string;
   readonly game?: string;
   readonly template?: FrozenAgentTemplate;
+  /** Current turn snapshot, including runtime overrides of template defaults. */
+  readonly runtimeConfig?: Readonly<RuntimeConfig>;
   /** RuntimeAgentHost 已按当前 execution revision 解析的 Kit slots。 */
   readonly kitSystemBlocks?: readonly SystemBlock[];
 }
@@ -61,8 +64,21 @@ export async function resolveAgentComposition(
     return compositionFromLegacyRecord(record);
   }
 
+  const maxIterations = (input.runtimeConfig ?? input.template.runtimeConfigDefaults).maxIterations;
+  // Invalid limits must not reach kernels where zero/negative values skip the
+  // loop entirely. Absent limits retain the kernel's existing default.
+  const maxTurns = typeof maxIterations === "number"
+      && Number.isSafeInteger(maxIterations) && maxIterations > 0
+    ? maxIterations
+    : undefined;
   const definitionId = input.template.definition.id;
   const overlay = await loadNativeSoulOverlay(definitionId, loadOptions);
+  // A native soul overlay replaces only fields it declares. A dollar-only
+  // budget must not erase the resident's iteration ceiling.
+  const budget = {
+    ...(maxTurns !== undefined ? { maxTurns } : {}),
+    ...overlay?.budget,
+  };
   const memory =
     overlay?.memory ?? layeredMemoryForAgent(definitionId, loadOptions);
   const templatePrompt = await materializeTemplatePrompt(input.template);
@@ -85,7 +101,7 @@ export async function resolveAgentComposition(
     ...(dynamicKitPrompt ? { dynamicPrompt: dynamicKitPrompt } : {}),
     ...(overlay?.promptMode ? { promptMode: overlay.promptMode } : {}),
     ...(overlay?.toolPolicy ? { toolPolicy: overlay.toolPolicy } : {}),
-    ...(overlay?.budget ? { budget: overlay.budget } : {}),
+    ...(Object.keys(budget).length ? { budget } : {}),
   };
 }
 

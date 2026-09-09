@@ -1,3 +1,4 @@
+import { sessionProjectSkills, PROJECT_SKILL_SOURCE } from './project-skills';
 /**
  * Phase D4 — SkillRunner.
  *
@@ -221,6 +222,13 @@ export async function runSkill(req: SkillRunRequest): Promise<SkillRunResult> {
     bus.emit('skill.failed', { skillId: req.skillId, error: r.error, caller: req.caller }, { threadId });
     return r;
   }
+  if (req.extensionId === PROJECT_SKILL_SOURCE) {
+    const skill = sessionProjectSkills(req.caller.sessionId).find((item) => item.id === req.skillId);
+    if (!skill) return { ok: false, error: `project skill not found: ${req.skillId}`, code: 'not_found' };
+    bus.emit('skill.starting', { skillId: skill.id, extensionId: PROJECT_SKILL_SOURCE, kind: 'prompt', caller: req.caller }, { threadId });
+    bus.emit('skill.completed', { skillId: skill.id, durationMs: 0, caller: req.caller }, { threadId });
+    return { ok: true, kind: 'prompt', text: skill.text, durationMs: 0 };
+  }
   const entry = resolveSkill(req);
   if (!entry) {
     const r: SkillRunResult = { ok: false, error: `skill not found: ${req.skillId}`, code: 'not_found' };
@@ -403,8 +411,9 @@ export interface SkillDescriptor {
   description: SkillDefinition['description'];
 }
 
-export function listSkills(): SkillDescriptor[] {
-  return getExtensionSnapshot().kinds.skills.map((s) => ({
+export function listSkills(sessionId?: string): SkillDescriptor[] {
+  const project = sessionProjectSkills(sessionId).map(({ text, ...descriptor }) => descriptor);
+  return [...project, ...getExtensionSnapshot().kinds.skills.map((s) => ({
     id: s.definition.id,
     extensionId: s.extensionId,
     kind: s.definition.entry.kind,
@@ -412,5 +421,5 @@ export function listSkills(): SkillDescriptor[] {
     requiresTools: s.definition.requiresTools ?? [],
     displayName: s.definition.displayName,
     description: s.definition.description,
-  }));
+  }))];
 }

@@ -41,6 +41,8 @@ import {
 import { drainPerceptionNotes } from '../api/lib/perception-registry';
 import { firstClassUiToolSpecs } from '../api/lib/ui-manifest-registry';
 import type { FrozenAgentTemplate } from '../agents/template-types';
+import type { AgentInstance } from '../runtime/types';
+import { getConfiguredModelContextWindows } from '../llm/provider';
 import { resolveTemplateTrust } from '../agents/agent-template-catalog';
 import { resolveAgentComposition } from '../agents/resolved-agent-composition';
 import type { SystemBlock } from '../llm/types';
@@ -145,7 +147,8 @@ function replyLanguageDirective(lang: 'en' | 'zh'): string {
 export async function composeTurnRequest(input: ComposeInput): Promise<TurnRequest> {
   const projectRoot = defaultProjectRoot();
   const profile = orchestrationProfileOf(input.kernel);
-  const runtimeTemplate = resolveRuntimeTemplate(input.sessionId, input.agentId);
+  const runtimeInstance = resolveRuntimeInstance(input.sessionId, input.agentId);
+  const runtimeTemplate = runtimeInstance?.template;
   // charter / environment / note 由注入的产品壳 composer 提供(阶段A §3.2)——编排层不再
   // 硬编码游戏宪章。无注入(standalone game-agnostic cli)⇒ composer 缺省 ⇒ 三段皆空。
   const scopeSlug = sessionScopeSlug(input.sessionId ?? input.threadId) ?? getPathManager().resolveScope();
@@ -159,6 +162,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     projectRoot,
     ...(scopeSlug ? { game: scopeSlug } : {}),
     ...(runtimeTemplate ? { template: runtimeTemplate } : {}),
+    ...(runtimeInstance ? { runtimeConfig: runtimeInstance.runtimeConfig.current().value } : {}),
     ...(input.kitSystemBlocks ? { kitSystemBlocks: input.kitSystemBlocks } : {}),
   });
   const runtimeTrust = resolveRuntimeTrust(input.sessionId, runtimeTemplate);
@@ -192,6 +196,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
   const resolvedModels = input.model ? { model: input.model } : await resolveAgentModels(input.sessionId, input.agentId);
   const model = input.model ?? (input.kernel.id === 'forgeax-core' ? resolvedModels.model : undefined);
   const fallbackModels = input.model ? undefined : (input.kernel.id === 'forgeax-core' ? resolvedModels.fallbackModels : undefined);
+  const modelContextWindows = getConfiguredModelContextWindows();
 
   // 合并工具(去重,名字冲突时先到先得)→ 经 MCP 桥下发内核。
   // 优先级:FORGEAX_TOOLS(内置真值)> seam hostTools(产品壳注入,如 list_games/
@@ -262,7 +267,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
           .map((skill) => skill.id),
       )
     : undefined;
-  pushDeduped(skillToolSpecs(residentPromptSkillIds));
+  pushDeduped(skillToolSpecs(residentPromptSkillIds, input.sessionId));
 
   // P3(B 路径):给每个工具标 `delivery`——own 的「安全类且 core 有 builtin 实现」的工具
   //   标 'local'(forgeax-core 内核本进程直跑,经 NodeSandboxFs,满速+crash 隔离);危险类
@@ -406,7 +411,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     tools: deliveredTools,
     ...(capabilitySnapshot ? { capabilityGeneration: capabilitySnapshot.generation } : {}),
     ...(composition.toolPolicy ? { toolPolicy: composition.toolPolicy } : {}),
-    // pack 经 manifest.json 可声明预算硬闸(maxTurns/maxBudgetUsd → --max-turns/--max-budget-usd)。
+    // Resident iteration limits and native soul budget overrides share one composition.
     budget: composition.budget ?? {},
     // 编排层(数字生命引擎)拥有记忆成长 → 内核**不得自主**跑 auto-memory(防双写/双成本/两套SSOT)。
     // 内核的 fork-extract 机制仍可被编排层驱动;forgeax-core 本无自主记忆=no-op,rented(cc)据此关闭其自带提取。
@@ -416,6 +421,7 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     ...(input.traceparent ? { traceparent: input.traceparent } : {}),
     ...(model ? { model } : {}),
     ...(fallbackModels && fallbackModels.length ? { fallbackModels } : {}),
+    ...(modelContextWindows ? { modelContextWindows } : {}),
     ...(context ? { context } : {}),
     ...(history && history.length ? { history } : {}),
     ...(preparedHistory ? { historyPlan: preparedHistory } : {}),
@@ -520,12 +526,12 @@ function normalizeModelChain(
     : {};
 }
 
-function resolveRuntimeTemplate(
+function resolveRuntimeInstance(
   sessionId: string | undefined,
   agentId: string,
-): FrozenAgentTemplate | undefined {
+): AgentInstance | undefined {
   if (!sessionId) return undefined;
-  return getSessionManager().peek(sessionId)?.tree.resolve(agentId)?.template;
+  return getSessionManager().peek(sessionId)?.tree.resolve(agentId);
 }
 
 function resolveRuntimeTrust(

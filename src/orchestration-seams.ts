@@ -159,7 +159,12 @@ export interface UploadDefaults {
   branch?: string;
 }
 
+/** A product may provide one skill directory for the exact caller session.
+ * Omission keeps standalone orchestration independent of host project layout. */
+export type SessionSkillRootProvider = (sessionId: string) => string | undefined;
+
 interface OrchestrationSeams {
+  sessionSkillRootProvider?: SessionSkillRootProvider;
   systemPromptComposer?: SystemPromptComposer;
   hostTools?: HostToolSpec[];
   hostUiActions?: HostUiActionHandler[];
@@ -189,6 +194,11 @@ export function initOrchestrationSeams(seams: OrchestrationSeams): void {
  *  (standalone cli → caller falls back to its built-in generic prompt). */
 export function getSystemPromptComposer(): SystemPromptComposer | undefined {
   return _seams.systemPromptComposer;
+}
+
+/** No process-wide active directory fallback: callers must identify a session. */
+export function getSessionSkillRoot(sessionId?: string): string | undefined {
+  return sessionId ? _seams.sessionSkillRootProvider?.(sessionId) : undefined;
 }
 
 /** Host-only tool specs the shell injected (empty array when none). */

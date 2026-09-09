@@ -72,6 +72,54 @@ describe("ResolvedAgentComposition", () => {
     );
   });
 
+  test.each([
+    [200, 200], [7, 7], [undefined, undefined], [0, undefined],
+    [-1, undefined], [1.5, undefined], [NaN, undefined],
+    [Infinity, undefined], [Number.MAX_SAFE_INTEGER + 1, undefined],
+  ])("maps resident maxIterations %s to kernel maxTurns %s", async (maxIterations, expected) => {
+    const projectRoot = mkdtempSync(join(tmpdir(), "forgeax-budget-"));
+    roots.push(projectRoot);
+    const template = {
+      ...frozenTemplate("budget-agent", { skills: [], kits: [], memorySeeds: [] }),
+      runtimeConfigDefaults: { maxIterations },
+    };
+    const composition = await resolveAgentComposition({ agentId: "budget-agent", projectRoot, template });
+    expect(composition.budget?.maxTurns).toBe(expected);
+    if (expected === undefined) expect(composition.budget).toBeUndefined();
+  });
+
+  test("current runtime config overrides the template ceiling", async () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), "forgeax-budget-runtime-"));
+    roots.push(projectRoot);
+    const template = {
+      ...frozenTemplate("budget-agent", { skills: [], kits: [], memorySeeds: [] }),
+      runtimeConfigDefaults: { maxIterations: 200 },
+    };
+    const composition = await resolveAgentComposition({
+      agentId: "budget-agent", projectRoot, template,
+      runtimeConfig: { maxIterations: 7 },
+    });
+    expect(composition.budget).toEqual({ maxTurns: 7 });
+  });
+
+  test.each([
+    [{ maxBudgetUsd: 1.5 }, { maxTurns: 200, maxBudgetUsd: 1.5 }],
+    [{ maxTurns: 3, maxBudgetUsd: 1.5 }, { maxTurns: 3, maxBudgetUsd: 1.5 }],
+    [{ maxTurns: 0, maxBudgetUsd: 1.5 }, { maxTurns: 200, maxBudgetUsd: 1.5 }],
+  ])("native budget overlays only valid declared fields: %j", async (budget, expected) => {
+    const projectRoot = mkdtempSync(join(tmpdir(), "forgeax-budget-soul-"));
+    roots.push(projectRoot);
+    const pack = join(projectRoot, ".forgeax", "souls-imported", "budget-agent");
+    mkdirSync(pack, { recursive: true });
+    writeFileSync(join(pack, "manifest.json"), JSON.stringify({ budget }));
+    const template = {
+      ...frozenTemplate("budget-agent", { skills: [], kits: [], memorySeeds: [] }),
+      runtimeConfigDefaults: { maxIterations: 200 },
+    };
+    const composition = await resolveAgentComposition({ agentId: "budget-agent", projectRoot, template });
+    expect(composition.budget).toEqual(expected);
+  });
+
   test("native soul-pack 仅在真实命中时作为 overlay，保留既有 policy/budget/tools", async () => {
     const projectRoot = mkdtempSync(join(tmpdir(), "forgeax-composition-soul-"));
     roots.push(projectRoot);

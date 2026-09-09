@@ -16,6 +16,7 @@
  * `threadId = uuidv5(sid::instanceId)` 续接。因而私有 CLI 会话是可选的执行优化,
  * 不是宿主上下文连续性的唯一来源。
  */
+import { publicCompactionStatus } from './compaction-status';
 import { createHash } from 'node:crypto';
 import type { KernelEvent, TurnContextSnapshot } from '@forgeax/agent-runtime';
 import { Hook } from '../hooks/types';
@@ -396,6 +397,11 @@ export async function runKernelTurn(
           });
           break;
         case 'stored-event': {
+          const status = publicCompactionStatus(ev.payload);
+          if (status) {
+            eventBus.publish({ ...status, source: `kernel:${providerId}` }, agentId);
+            break;
+          }
           const envelope = ev.payload;
           const canonicalType = typeof envelope.type === 'string' ? envelope.type : undefined;
           const canonicalPayload = isRecord(envelope.payload) ? envelope.payload : {};

@@ -85,6 +85,20 @@ function loadModelCatalog(): Record<string, ModelSpec> {
   }
 }
 
+/** Explicit catalog capacities only; defaults are owned by the consuming kernel.
+ * A map also covers control-plane model changes and registry-selected children. */
+export function getConfiguredModelContextWindows(): Readonly<Record<string, number>> | undefined {
+  const catalog = loadModelCatalog();
+  if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)) return undefined;
+  const windows = Object.fromEntries(Object.entries(catalog).flatMap(([model, spec]) => {
+    const capacity = spec?.contextWindow;
+    return model && typeof capacity === "number" && Number.isSafeInteger(capacity) && capacity > 0
+      ? [[model, capacity]]
+      : [];
+  }));
+  return Object.keys(windows).length ? windows : undefined;
+}
+
 export function getModelSpec(model: string): ModelSpec {
   const catalog = loadModelCatalog();
   return catalog[model] ?? DEFAULT_SPEC;

@@ -37,7 +37,7 @@ function parseRunBody(body: any): SkillRunRequest | null {
 export function createSkillsRouter() {
   const r = new Hono();
 
-  r.get('/', (c) => c.json({ skills: listSkills() }));
+  r.get('/', (c) => c.json({ skills: listSkills(c.req.query('sessionId')) }));
 
   r.post('/run', async (c) => {
     const body = await c.req.json().catch(() => null);
