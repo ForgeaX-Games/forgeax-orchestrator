@@ -6,12 +6,16 @@ export default {
   description:
     "List teammate agents available for delegation. Returns each agent's " +
     "id, displayName, role, description, and whether they are already " +
-    "active in this session. Call before delegating if you're unsure who " +
+    "registered in this session. This is a delegation roster, not task " +
+    "execution status. Call before delegating if you're unsure who " +
     "exists or which name to pass.",
   guidance:
     "**list_subagents**: Use *before* delegate_to_subagent when the user " +
     "asks to involve another agent and you're not sure of the exact id. " +
-    "Don't grep the filesystem — call this instead.",
+    "Don't grep the filesystem — call this instead. Do not poll this " +
+    "roster for task completion: registered teammates remain listed after " +
+    "their work ends. Completion reports arrive as inbound messages; " +
+    "finish your current turn when waiting on those reports.",
   input_schema: {
     type: "object",
     properties: {},
@@ -23,7 +27,7 @@ export default {
     }
     const lines: string[] = [];
     for (const r of rows) {
-      const flag = r.active ? "active" : "spawn-on-demand";
+      const flag = r.active ? "registered-in-session" : "spawn-on-demand";
       const desc = r.description ? ` — ${r.description}` : "";
       lines.push(`- ${r.id} (${r.displayName}, ${r.role}, ${flag})${desc}`);
     }

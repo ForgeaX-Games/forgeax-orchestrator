@@ -63,7 +63,7 @@ describe('host authoring', () => {
       avatar: 'A',
       color: '#123456',
       scope: 'project',
-      tools: ['asset:*', 'world:read'],
+      tools: ['asset:*', 'world:read', 'mcp__fxt__mcp__playwright__browser_snapshot', 'mcp__playwright__browser_snapshot'],
     });
 
     expect(result).toMatchObject({
@@ -91,7 +91,7 @@ describe('host authoring', () => {
             color: '#123456',
           },
           personaFile: './persona/zh.md',
-          tools: ['asset:*', 'world:read'],
+          tools: ['asset:*', 'world:read', 'mcp__playwright__browser_snapshot'],
         },
       },
     });

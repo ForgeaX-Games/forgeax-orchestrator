@@ -127,6 +127,8 @@ const DEFAULT_MAX_SESSIONS = 32;
 
 export class SessionManager {
   private map = new Map<string, Session>();
+  private readonly opening = new Map<string, Promise<Session>>();
+  private shuttingDown = false;
   private lru: LRUList;
   /** list() 的 closed-session 活动时间缓存。key = session root **绝对路径**(不用
    *  sid:SM 是进程单例、PathManager 原地切根,同一 sid 在不同 workspace 解析到
@@ -208,6 +210,7 @@ export class SessionManager {
   // ─── create / open / close / delete ─────────────────────────────────
 
   async create(opts: CreateSessionOpts): Promise<Session> {
+    if (this.shuttingDown) throw new Error("SessionManager is shutting down");
     const sid = randomUUID();
     // Establish the session's home + game binding (studio = current active game).
     // allocate is the single writer + creates the dir; path is the SSOT of the
@@ -245,11 +248,26 @@ export class SessionManager {
   }
 
   async open(sid: string): Promise<Session> {
+    if (this.shuttingDown) throw new Error("SessionManager is shutting down");
     const cached = this.map.get(sid);
     if (cached) {
       this.lru.touch(sid);
       return cached;
     }
+    const existing = this.opening.get(sid);
+    if (existing) return existing;
+    // Publish the in-flight restoration before another request can create a
+    // competing RuntimeTree, logger, watcher owner or runtime epoch.
+    const pending = this.restore(sid);
+    this.opening.set(sid, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.opening.get(sid) === pending) this.opening.delete(sid);
+    }
+  }
+
+  private async restore(sid: string): Promise<Session> {
     const layer = this.paths.session(sid);
     if (!existsSync(layer.configFile())) {
       throw new Error(`SessionManager.open: session not found '${sid}'`);
@@ -269,6 +287,11 @@ export class SessionManager {
   }
 
   async close(sid: string): Promise<void> {
+    // A cold open is not in map yet. Drain it before closing so it cannot
+    // publish a new live session after close/delete has returned.
+    if (!this.map.has(sid)) {
+      try { await this.opening.get(sid); } catch { return; }
+    }
     const session = this.map.get(sid);
     if (!session) return;
     // **先**把 sid 从 map / lru 摘掉再 await dispose ——
@@ -491,6 +514,8 @@ export class SessionManager {
    *  那一层（forgeax 没 instance 概念，SM 就是顶层）。`main.ts` SIGINT/SIGTERM
    *  handler 应当调一次。 */
   async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    await Promise.allSettled(this.opening.values());
     const sids = [...this.map.keys()];
     await Promise.all(sids.map((sid) => this.close(sid).catch(() => {})));
     if (this._consoleAttached) {

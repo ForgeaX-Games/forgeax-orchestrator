@@ -504,7 +504,7 @@ export function createSessionsRouter() {
     if (agent && !session.tree.resolve(agent)) {
       return c.json({ error: `runtime agent not found: ${agent}` }, 404);
     }
-    session.interruptRuntime(agent, "aborted by API");
+    session.stopRuntime(agent, "aborted by API");
     return c.json({ ok: true, sid, agent: agent ?? null });
   });
 

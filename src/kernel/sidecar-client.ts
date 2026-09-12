@@ -17,6 +17,8 @@ import { join } from 'node:path';
 export type TrustTier = 'own' | 'imported';
 
 export interface KernelSpawnSpec {
+  /** One-shot adapters close stdin; persistent RPC adapters keep the default pipe. */
+  stdin?: 'closed' | 'pipe';
   kind: string;
   credential: 'sidecar-managed' | 'user-managed';
   cmd: string;

@@ -1,3 +1,4 @@
+import { CodexCompactionTracker } from './codex-compaction';
 /**
  * codex-appserver — `codex app-server`(JSON-RPC)路径专属的 codex-isms 归口。
  *
@@ -44,6 +45,7 @@ export class KernelEventQueue {
 }
 
 export interface CodexNotifState {
+  compaction: CodexCompactionTracker;
   /** itemId → 累积的命令输出(outputDelta 拼,completed 时落 tool.result)。 */
   outputByItem: Map<string, string>;
   lastUsage?: { inputTokens?: number; outputTokens?: number; cacheRead?: number };
@@ -58,8 +60,9 @@ export interface CodexNotifState {
   messagePhasesById: Map<string, 'commentary' | 'final_answer'>;
 }
 
-export function createCodexNotifState(): CodexNotifState {
+export function createCodexNotifState(compaction = new CodexCompactionTracker()): CodexNotifState {
   return {
+    compaction,
     outputByItem: new Map(),
     lastUsage: undefined,
     ended: false,
@@ -121,6 +124,9 @@ export function mapCodexNotification(
   state: CodexNotifState,
   queue: KernelEventQueue,
 ): void {
+  for (const status of state.compaction.observe(method, params)) {
+    queue.push({ kind: 'stored-event', payload: { type: 'compaction.status', ts: Date.now(), payload: status } });
+  }
   switch (method) {
     case 'item/agentMessage/delta':
       if (typeof params?.delta === 'string' && params.delta) {

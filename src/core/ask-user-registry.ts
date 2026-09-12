@@ -9,6 +9,8 @@ import { randomUUID } from "node:crypto";
 import { tt } from "../lib/turn-trace";
 
 export interface AskOwner {
+  /** Host-generated identity for independently pending tool requests. */
+  readonly requestId?: string;
   readonly sid: string;
   readonly agentPath: string;
   readonly instanceId: string;
@@ -106,10 +108,12 @@ export function registerAsk(
   const timeoutMs = typeof agentPathOrTimeout === "number"
     ? agentPathOrTimeout
     : (legacyTimeoutMs ?? 0);
-  // Tool batches are serial for one live instance. Superseding is scoped to
+  // Legacy serial requests supersede their predecessor. Explicitly identified
+  // concurrent requests stay independent. Superseding is scoped to
   // the exact epoch so an old turn cannot cancel a new resident epoch's ask.
   for (const entry of pending.values()) {
     if (
+      !owner.requestId &&
       entry.sid === owner.sid &&
       entry.instanceId === owner.instanceId &&
       entry.runtimeEpochId === owner.runtimeEpochId
@@ -118,7 +122,8 @@ export function registerAsk(
     }
   }
 
-  const requestId = randomUUID();
+  const requestId = owner.requestId ?? randomUUID();
+  if (pending.has(requestId)) throw new Error("Duplicate pending ask request identity");
   let resolvePromise!: (values: AskResult | null) => void;
   const promise = new Promise<AskResult | null>((resolve) => {
     resolvePromise = resolve;
@@ -181,6 +186,7 @@ export function resolveAsk(
   const valid = Boolean(
     entry &&
       entry.sid === sid &&
+      (!identity.requestId || !!identity.instanceId || entry.agentPath === agentPath) &&
       (!identity.instanceId || entry.instanceId === identity.instanceId) &&
       (
         !identity.runtimeEpochId ||

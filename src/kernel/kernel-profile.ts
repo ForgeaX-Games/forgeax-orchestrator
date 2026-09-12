@@ -3,7 +3,7 @@
  * the frozen AgentKernel contract. Kernel implementations own the declaration;
  * compose only consumes this shape and never branches on concrete kernel ids.
  */
-import type { AgentKernel } from '@forgeax/agent-runtime';
+import type { AgentKernel, TurnRequest } from '@forgeax/agent-runtime';
 
 export type NativeAttachmentKind = 'image' | 'document';
 
@@ -49,4 +49,20 @@ export function hasNativeHistoryResume(kernel: AgentKernel, threadId?: string): 
     hasNativeHistoryResume?: (id: string) => boolean;
   };
   return Boolean(threadId && candidate.hasNativeHistoryResume?.(threadId));
+}
+
+/** Optional native-history operation, declared by the owning kernel. */
+type NativeHistoryCompactor = (threadId: string, onStatus: (status: {
+  id: string; phase: 'started' | 'completed' | 'failed'; count: number; durationMs?: number;
+}) => void) => Promise<void>;
+export function nativeHistoryCompactor(kernel: AgentKernel): NativeHistoryCompactor | undefined {
+  const candidate = kernel as AgentKernel & { compactNativeHistory?: NativeHistoryCompactor };
+  return candidate.compactNativeHistory?.bind(kernel);
+}
+
+/** A kernel may confirm durable native recovery before the host chooses a
+ * history delta. Kernels without this optional operation retain snapshots. */
+export async function restoreNativeHistory(kernel: AgentKernel, request: TurnRequest): Promise<void> {
+  const candidate = kernel as AgentKernel & { restoreNativeHistory?: (request: TurnRequest) => Promise<void> };
+  await candidate.restoreNativeHistory?.(request);
 }

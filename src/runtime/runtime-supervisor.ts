@@ -220,6 +220,10 @@ export class RuntimeSupervisor {
     this.requireRecord(instanceId).controller.interruptTurn(reason);
   }
 
+  stopTurn(instanceId: string, reason?: string): void {
+    this.requireRecord(instanceId).controller.stopTurn(reason);
+  }
+
   async shutdown(reason = "session closed"): Promise<void> {
     this.shutdownStarted = true;
     this.pauseSpawns();

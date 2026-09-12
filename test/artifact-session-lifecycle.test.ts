@@ -30,12 +30,12 @@ afterEach(async () => {
   rmSync(userRoot, { recursive: true, force: true });
 });
 
-const waitFor = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => {
+const waitFor = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
-  while (!predicate() && Date.now() < deadline) {
+  while (!(await predicate()) && Date.now() < deadline) {
     await new Promise<void>((resolveWait) => setTimeout(resolveWait, 5));
   }
-  expect(predicate()).toBe(true);
+  expect(await predicate()).toBe(true);
 };
 
 async function createSessionWithRoot(displayName: string): Promise<Session> {
@@ -321,7 +321,11 @@ describe("host-owned artifact lifecycle", () => {
     await resetSessionManager();
 
     const recovered = await createReopenedSession(sid);
-    await waitFor(() => contexts.length === 1);
+    // Entering the async resolver is not proof that its result is persisted.
+    // Wait for the lifecycle outcome this recovery test actually asserts.
+    await waitFor(async () => (await recovered.getOrCreateLedger("root").readAllEvents())
+      .some((event) => event.type === "artifact:resolved"));
+    expect(contexts).toHaveLength(1);
     const recoveredEvents = await recovered.getOrCreateLedger("root").readAllEvents();
     expect(recoveredEvents.filter((event) => event.type === "artifact:resolved")).toHaveLength(1);
     expect(contexts[0]).toMatchObject({ sid, turnId: "turn-recovery", checkpointMsgId: "msg-recovery" });

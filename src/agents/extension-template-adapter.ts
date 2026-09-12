@@ -1,4 +1,4 @@
-import { COORDINATOR_TOOL_GRANTS } from './tool-grants';
+import { COORDINATOR_TOOL_GRANTS, declaredProjectMcpGrants } from './tool-grants';
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
@@ -39,13 +39,19 @@ export async function synchronizeResidentExternalSkillSources(
     return;
   }
 
+  // Project MCP discovery runs before concrete tools can become extraTools.
+  // Carry explicit manifest MCP declarations into the frozen scope so that
+  // discovery is enabled without granting unrelated host or project tools.
+  const manifestGrants = declaredProjectMcpGrants(external.tools);
   const nextSources = external.skillSources.map((source) => ({ ...source }));
   const next: AgentJson = {
     ...portable,
     skillSources: portable.skillSources ?? nextSources,
     ...(samePersona && config.toolGrants === undefined && external.source === "brand"
       ? { toolGrants: structuredClone(COORDINATOR_TOOL_GRANTS) }
-      : {}),
+      : samePersona && config.toolGrants === undefined && manifestGrants !== undefined
+        ? { toolGrants: manifestGrants }
+        : {}),
   };
   if (JSON.stringify(next) === JSON.stringify(config)) return;
   // Publish only after all resources exist. A process exit while writing the

@@ -41,6 +41,10 @@ interface JsonRpcResponse {
 }
 
 const REQUEST_TIMEOUT_MS = 8_000;
+// Discovery should fail quickly; tool execution can legitimately include waits,
+// builds, or browser actions. Keep a separate finite budget without interpreting
+// tool names or domain-specific arguments.
+const TOOL_CALL_TIMEOUT_MS = 60_000;
 export const PROJECT_MCP_NATIVE_HANDOFF_TIMEOUT_MS = REQUEST_TIMEOUT_MS + 1_000;
 const NATIVE_POOL_DRAIN_TIMEOUT_MS = PROJECT_MCP_NATIVE_HANDOFF_TIMEOUT_MS;
 const DEFAULT_IDLE_TTL_MS = 5 * 60_000;
@@ -353,17 +357,18 @@ class StdioMcpClient {
   private request(method: string, params: JsonObject = {}): Promise<JsonRpcResponse> {
     if (!this.isAlive()) return Promise.reject(new Error(`MCP server ${this.server.name} is not running`));
     const id = this.nextId++;
+    const timeoutMs = method === 'tools/call' ? TOOL_CALL_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
     return new Promise((resolveRequest, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        const error = new Error(`MCP ${this.server.name} ${method} timed out after ${REQUEST_TIMEOUT_MS}ms`);
+        const error = new Error(`MCP ${this.server.name} ${method} timed out after ${timeoutMs}ms`);
         // A timed-out JSON-RPC child is no longer trustworthy: retaining it
         // would make every later call pay the same timeout. Kill only this
         // server; sibling project MCP clients remain usable in the pool.
         this.rejectAll(error);
         this.close();
         reject(error);
-      }, REQUEST_TIMEOUT_MS);
+      }, timeoutMs);
       this.pending.set(id, {
         resolve: (value) => { clearTimeout(timer); resolveRequest(value); },
         reject: (error) => { clearTimeout(timer); reject(error); },

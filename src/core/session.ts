@@ -1,3 +1,4 @@
+import type { RecorderHooks } from "../fs/agent-fs-recorder";
 /** Session —— per-sid 容器：bus / blackboard / RuntimeTree / EventStores / Supervisor。
  *
  *  与 agenteam ref 的差异（plan §2.0 / §2.1 / §3.1.1）：
@@ -95,6 +96,8 @@ export interface DelegationInfo {
   ts: number;
   /** Stable identity of the delegated delivery, not merely the target address. */
   delegationId?: string;
+  /** A user stop preserves delivery but disables its automatic continuation. */
+  callbackHandoff?: "silent";
   /** Runtime identity captured before delivery. */
   targetInstanceId?: string;
   targetRuntimeEpochId?: string;
@@ -358,6 +361,21 @@ export class Session {
     } catch {
       // Invalid/missing binding falls back to the instance template root.
     }
+    const fileRecorder: RecorderHooks = {
+      ledger: this.fileActivity,
+      locks: this.fileLocks,
+      emit: (record, kind) => {
+        this.eventBus.publish(
+          {
+            source: `agent:${record.agentPath}`,
+            type: `file-activity:${kind}` as const,
+            payload: record as unknown as Record<string, unknown>,
+            ts: record.ts,
+          },
+          record.agentPath,
+        );
+      },
+    };
     this.registrar = new AgentRegistrar(
       this.sid,
       this.templateCatalog,
@@ -391,21 +409,7 @@ export class Session {
           ...(sessionCwd ? { sessionCwd } : {}),
           sessionDefaultModels: this.config.defaultModels,
           permissionParentForTurn: (event) => delegatedPermissionParent(this, instance, event),
-          fileRecorder: {
-            ledger: this.fileActivity,
-            locks: this.fileLocks,
-            emit: (record, kind) => {
-              this.eventBus.publish(
-                {
-                  source: `agent:${record.agentPath}`,
-                  type: `file-activity:${kind}` as const,
-                  payload: record as unknown as Record<string, unknown>,
-                  ts: record.ts,
-                },
-                record.agentPath,
-              );
-            },
-          },
+          fileRecorder,
           onAgentReady: (agent) =>
             this.kitReloadCoordinator.registerAgent(instance, agent),
           onAgentDisposed: () =>
@@ -460,6 +464,8 @@ export class Session {
           sid: this.sid,
           ledger: this.getOrCreateLedger(agentPath),
           sessionDefaultModels: this.config.defaultModels,
+          ...(sessionCwd ? { sessionCwd } : {}),
+          fileRecorder,
           ...(runtimeInstance
             ? {
                 runtime: this.runtimeToolContextFor(runtimeInstance),
@@ -616,11 +622,27 @@ export class Session {
               handoff: "turn" as const,
               ts: Date.now(),
             };
+        // A role's template defaults must not silently replace the caller's
+        // selected execution route. Reuse the validated delegation identity;
+        // ordinary peer messages and callbacks do not inherit sender settings.
+        const parent = delegatedPermissionParent(this, target, event);
+        if (target.parentInstanceId === instance.instanceId || parent?.instanceId === instance.instanceId) {
+          const route = this.getAgentHost(this.tree.addressOf(instance))?.getExecutionRoute();
+          if (route) event.payload = { ...route, ...event.payload };
+        }
         // acceptTurn is the synchronous delivery receipt. Completion remains
         // host-owned so a tool does not wait for the target's full turn.
         const completion = this.supervisor.acceptTurn(target.instanceId, event);
         this.eventBus.publish(event, this.tree.addressOf(instance));
         void completion.catch((error) => {
+          const pending = this.delegations.get(targetAddress);
+          if (pending?.callbackHandoff === "silent" &&
+              pending.sourceEventId === event.eventId) {
+            // A stopped assignment can be rejected before its executor starts,
+            // so no hook:turnEnd exists to release the busy reservation.
+            this.finishDelegation(targetAddress, pending, { aborted: true });
+            return;
+          }
           this.logger.error(
             targetAddress,
             undefined,
@@ -954,6 +976,39 @@ export class Session {
     }
   }
 
+  /** Stop the requested work and its delegated tasks, without deleting results. */
+  stopRuntime(agentAddress?: string, reason = "stopped by user"): void {
+    const targets = new Set<string>();
+    if (agentAddress) {
+      const instance = this.tree.resolve(agentAddress);
+      if (instance) targets.add(instance.instanceId);
+    } else {
+      for (const instance of this.runtimeTree.list()) targets.add(instance.instanceId);
+    }
+    // Resident role relationships are delegation edges, not runtime parentage.
+    // Mark every callback before aborting anything: abort listeners may deliver
+    // completion synchronously, including transitively delegated work.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const [address, info] of this.delegations) {
+        const owner = this.tree.resolve(info.delegator);
+        const target = this.tree.resolve(address);
+        // Stopping the delegate directly must not wake its owner to retry.
+        // Keep the cancellation in history using the same silent handoff as
+        // cancellation cascaded from the delegator.
+        if (target && targets.has(target.instanceId)) info.callbackHandoff = "silent";
+        if (!owner || !targets.has(owner.instanceId)) continue;
+        info.callbackHandoff = "silent";
+        if (target && !targets.has(target.instanceId)) {
+          targets.add(target.instanceId);
+          changed = true;
+        }
+      }
+    }
+    for (const id of targets) this.supervisor.stopTurn(id, reason);
+  }
+
   async stageRuntimeConfig(
     instanceId: string,
     snapshot: RuntimeConfigSnapshot,
@@ -1133,7 +1188,7 @@ export class Session {
             fromAgent: emitterId,
           },
           to: info.delegator,
-          handoff: "turn",
+          handoff: info.callbackHandoff ?? "turn",
           durability: "required",
           ts: Date.now(),
       };
@@ -1178,7 +1233,7 @@ export class Session {
           : {}),
       },
       to: info.delegator,
-      handoff: "turn",
+      handoff: info.callbackHandoff ?? "turn",
       durability: "required",
       ts: Date.now(),
     };

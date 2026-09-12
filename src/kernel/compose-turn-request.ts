@@ -23,7 +23,7 @@ import { defaultProjectRoot } from '@forgeax/platform-io';
 import { getSessionManager } from '../core/session-registry';
 import { getPathManager } from '../fs/path-manager';
 import { materializeFileAttachments } from './materialize-file-attachments';
-import { hasNativeHistoryResume, orchestrationProfileOf } from './kernel-profile';
+import { hasNativeHistoryResume, restoreNativeHistory, orchestrationProfileOf } from './kernel-profile';
 import {
   materializeTurnContext,
   type EventIdentity,
@@ -300,12 +300,94 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     ],
   });
 
+  // Open the durable ledger before materializing context, including after a
+  // host restart when the agent has not yet been loaded in this process.
+  const sharedLedger = input.sessionId && !input.prewarm
+    ? getSessionManager().peek(input.sessionId)?.getOrCreateLedger(input.agentId)
+    : undefined;
+
+  // Context data is host-selected and offered to every kernel. Whether a
+  // stateful CLI resumes, replays or reconciles it is an internal kernel choice.
+  const context = input.prewarm
+    ? undefined
+    : input.context ?? (input.historyLedger
+      ? await materializeTurnContext({
+          agentId: input.agentId,
+          ledger: input.historyLedger,
+          ...(input.historyBlackboard ? { blackboard: input.historyBlackboard } : {}),
+          excludeEvents: input.historyExcludeEvents,
+        })
+      : await materializeSessionContext(
+          input.sessionId,
+          input.agentId,
+          input.historyExcludeEvents,
+        ));
+  const history = context ? [...context.messages] : undefined;
+
+  // Every attachment is materialized. Native kinds remain path-only references; unsupported
+  // kinds become path notes. This keeps base64 off the sidecar wire and durable history.
+  let uploadBase = projectRoot;
+  try {
+    if (input.sessionId) uploadBase = getPathManager().session(input.sessionId).root();
+  } catch { /* layout 未就绪 → 落 projectRoot */ }
+  const uploads = materializeFileAttachments(
+    input.attachments,
+    resolvePath(uploadBase, 'uploads'),
+    profile.nativeAttachmentKinds,
+  );
+  // Native EventBus ingress may already have appended the durable path note.
+  // Re-materialization is idempotent; avoid duplicating model-visible context.
+  const retainedPaths = (uploads.attachments ?? [])
+    .map((att) => att.path)
+    .filter((path): path is string => typeof path === 'string' && path.length > 0);
+  const noteAlreadyPresent = retainedPaths.length > 0
+    && retainedPaths.every((path) => input.message.includes(path));
+  const messageText = uploads.note && !noteAlreadyPresent
+    ? `${input.message}\n\n${uploads.note}`
+    : input.message;
+
+  const request: TurnRequest = {
+    session: { threadId: input.threadId ?? '', agentId: input.agentId },
+    ...(input.turnId ? { turnId: input.turnId } : {}),
+    callId: input.callId,
+    input: {
+      text: messageText,
+      ...(uploads.attachments && uploads.attachments.length ? { attachments: uploads.attachments } : {}),
+    },
+    // pack 经 manifest.json 声明的策略(promptMode/toolPolicy)透传给内核 profile。
+    // own/builtin(forge)无 manifest ⇒ 缺省 append + 无 toolPolicy(零回归)。
+    systemPrompt: {
+      charter,
+      persona: composition.persona,
+      ...(dynamicSuffix ? { dynamicSuffix } : {}),
+      ...(composition.promptMode ? { mode: composition.promptMode } : {}),
+    },
+    tools: deliveredTools,
+    ...(capabilitySnapshot ? { capabilityGeneration: capabilitySnapshot.generation } : {}),
+    ...(composition.toolPolicy ? { toolPolicy: composition.toolPolicy } : {}),
+    // Resident iteration limits and native soul budget overrides share one composition.
+    budget: composition.budget ?? {},
+    // 编排层(数字生命引擎)拥有记忆成长 → 内核**不得自主**跑 auto-memory(防双写/双成本/两套SSOT)。
+    // 内核的 fork-extract 机制仍可被编排层驱动;forgeax-core 本无自主记忆=no-op,rented(cc)据此关闭其自带提取。
+    memoryAutonomy: false,
+    trustTier,
+    ...(permissions ? { permissionMode: permissions.permissionMode } : {}),
+    ...(input.sessionId ? { hostSessionId: input.sessionId } : {}),
+    ...(input.traceparent ? { traceparent: input.traceparent } : {}),
+    ...(model ? { model } : {}),
+    ...(fallbackModels && fallbackModels.length ? { fallbackModels } : {}),
+    ...(modelContextWindows ? { modelContextWindows } : {}),
+    ...(context ? { context } : {}),
+    ...(history && history.length ? { history } : {}),
+  };
+  if (input.sessionId && !input.prewarm && !input.forceSnapshot && profile.historyIntake !== 'structured') {
+    await restoreNativeHistory(input.kernel, request);
+  }
   let preparedHistory: RuntimePreparedHistory | undefined;
   // Shared history is prepared by one coordinator for both native and rented kernels.
   if (input.sessionId && !input.prewarm) {
     try {
-      const session = getSessionManager().peek(input.sessionId);
-      const ledger = session?.getOrCreateLedger(input.agentId);
+      const ledger = sharedLedger;
       if (ledger) {
         const coordinator = new HistoryCoordinator(new LedgerHistorySource(ledger), new LedgerLaneStore(ledger));
         const result = await coordinator.prepare({
@@ -357,79 +439,9 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     }
   }
 
-  // Context data is host-selected and offered to every kernel. Whether a
-  // stateful CLI resumes, replays or reconciles it is an internal kernel choice.
-  const context = input.prewarm
-    ? undefined
-    : input.context ?? (input.historyLedger
-      ? await materializeTurnContext({
-          agentId: input.agentId,
-          ledger: input.historyLedger,
-          ...(input.historyBlackboard ? { blackboard: input.historyBlackboard } : {}),
-          excludeEvents: input.historyExcludeEvents,
-        })
-      : await materializeSessionContext(
-          input.sessionId,
-          input.agentId,
-          input.historyExcludeEvents,
-        ));
-  const history = context ? [...context.messages] : undefined;
-
-  // Every attachment is materialized. Native kinds remain path-only references; unsupported
-  // kinds become path notes. This keeps base64 off the sidecar wire and durable history.
-  let uploadBase = projectRoot;
-  try {
-    if (input.sessionId) uploadBase = getPathManager().session(input.sessionId).root();
-  } catch { /* layout 未就绪 → 落 projectRoot */ }
-  const uploads = materializeFileAttachments(
-    input.attachments,
-    resolvePath(uploadBase, 'uploads'),
-    profile.nativeAttachmentKinds,
-  );
-  // Native EventBus ingress may already have appended the durable path note.
-  // Re-materialization is idempotent; avoid duplicating model-visible context.
-  const retainedPaths = (uploads.attachments ?? [])
-    .map((att) => att.path)
-    .filter((path): path is string => typeof path === 'string' && path.length > 0);
-  const noteAlreadyPresent = retainedPaths.length > 0
-    && retainedPaths.every((path) => input.message.includes(path));
-  const messageText = uploads.note && !noteAlreadyPresent
-    ? `${input.message}\n\n${uploads.note}`
-    : input.message;
-
   return {
-    session: { threadId: input.threadId ?? '', agentId: input.agentId },
-    ...(input.turnId ? { turnId: input.turnId } : {}),
-    callId: input.callId,
-    input: {
-      text: messageText,
-      ...(uploads.attachments && uploads.attachments.length ? { attachments: uploads.attachments } : {}),
-    },
-    // pack 经 manifest.json 声明的策略(promptMode/toolPolicy)透传给内核 profile。
-    // own/builtin(forge)无 manifest ⇒ 缺省 append + 无 toolPolicy(零回归)。
-    systemPrompt: {
-      charter,
-      persona: composition.persona,
-      ...(dynamicSuffix ? { dynamicSuffix } : {}),
-      ...(composition.promptMode ? { mode: composition.promptMode } : {}),
-    },
-    tools: deliveredTools,
-    ...(capabilitySnapshot ? { capabilityGeneration: capabilitySnapshot.generation } : {}),
-    ...(composition.toolPolicy ? { toolPolicy: composition.toolPolicy } : {}),
-    // Resident iteration limits and native soul budget overrides share one composition.
-    budget: composition.budget ?? {},
-    // 编排层(数字生命引擎)拥有记忆成长 → 内核**不得自主**跑 auto-memory(防双写/双成本/两套SSOT)。
-    // 内核的 fork-extract 机制仍可被编排层驱动;forgeax-core 本无自主记忆=no-op,rented(cc)据此关闭其自带提取。
-    memoryAutonomy: false,
-    trustTier,
-    ...(permissions ? { permissionMode: permissions.permissionMode } : {}),
-    ...(input.sessionId ? { hostSessionId: input.sessionId } : {}),
-    ...(input.traceparent ? { traceparent: input.traceparent } : {}),
-    ...(model ? { model } : {}),
-    ...(fallbackModels && fallbackModels.length ? { fallbackModels } : {}),
-    ...(modelContextWindows ? { modelContextWindows } : {}),
-    ...(context ? { context } : {}),
-    ...(history && history.length ? { history } : {}),
+    ...request,
+    systemPrompt: { ...request.systemPrompt, ...(dynamicSuffix ? { dynamicSuffix } : {}) },
     ...(preparedHistory ? { historyPlan: preparedHistory } : {}),
   };
 }

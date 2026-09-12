@@ -284,3 +284,41 @@ test('no policy makes the public snapshot helper a no-op for brand sources', asy
   });
   expect(result).toBe(config);
 });
+
+
+test('freezes manifest MCP grants for discovery and preserves explicit restrictions', async () => {
+  const path = join(current, 'forgeax-extension.json');
+  const manifest = JSON.parse(readFileSync(path, 'utf8'));
+  manifest.provides.agent.tools = ['mcp__fxt__mcp__playwright__browser_snapshot', 'read_file'];
+  write(path, JSON.stringify(manifest));
+  await reloadExtensions({ roots: { builtin: resolve(current, '..'), user: join(root, 'user'), project: join(root, 'project') } });
+  const result = await migrate({ personaFile: join(current, 'persona/zh.md'), skillSources: [] });
+  expect(result.config.toolGrants).toEqual({ projectMcp: ['mcp__playwright__browser_snapshot'] });
+  const restricted = await migrate({ personaFile: join(current, 'persona/zh.md'), toolGrants: {} });
+  expect(restricted.config.toolGrants).toEqual({});
+  const custom = join(root, 'custom-persona.md');
+  write(custom, '# Independent role');
+  const independent = await migrate({ personaFile: custom });
+  expect(independent.config.toolGrants).toBeUndefined();
+});
+
+test('new resident freezes declared MCP grants before snapshotting its persona', async () => {
+  const manifestFile = join(current, 'forgeax-extension.json');
+  const manifest = JSON.parse(readFileSync(manifestFile, 'utf8'));
+  manifest.provides.agent.tools = ['mcp__fxt__mcp__playwright__browser_snapshot', 'read_file'];
+  write(manifestFile, JSON.stringify(manifest));
+  await reloadExtensions({ roots: { builtin: resolve(current, '..'), user: join(root, 'user'), project: join(root, 'project') } });
+  const pm = initPathManager({ userRoot: join(root, 'state'), projectRoot: root });
+  for (const restricted of [false, true]) {
+    const sid = restricted ? 'restricted' : 'declared';
+    await ensureAgentScaffold(sid, 'poly', { overrides: {
+      personaFile: join(current, 'persona/zh.md'),
+      ...(restricted ? { toolGrants: {} } : {}),
+    } });
+    const residentRoot = pm.session(sid).agent('poly').root();
+    const config = JSON.parse(readFileSync(join(residentRoot, 'agent.json'), 'utf8'));
+    expect(isAbsolute(config.personaFile)).toBe(false);
+    expect(config.toolGrants).toEqual(restricted ? {} : { projectMcp: ['mcp__playwright__browser_snapshot'] });
+    expect(() => loadFileSystemAgentTemplate(residentRoot, 'poly')).not.toThrow();
+  }
+});

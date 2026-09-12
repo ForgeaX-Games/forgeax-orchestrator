@@ -1,3 +1,4 @@
+import { canonicalToolName } from '../kernel/canonical-tool-name';
 import { globToRegExp } from '../tools/host-tool-allow';
 
 /** Agent-owned grants for capabilities outside its resolved kit/host-tool
@@ -15,6 +16,12 @@ export interface AgentToolGrants {
 export const COORDINATOR_TOOL_GRANTS: AgentToolGrants = {
   host: ['*'], skills: ['*'], projectMcp: ['*'],
 };
+
+/** Freeze only explicitly declared MCP names before discovery runs. */
+export function declaredProjectMcpGrants(tools: readonly string[] = []): AgentToolGrants | undefined {
+  const projectMcp = [...new Set(tools.map(canonicalToolName).filter(name => name.startsWith('mcp__')))];
+  return projectMcp.length ? { projectMcp } : undefined;
+}
 
 // Product opt-in and agent_manage kit visibility still apply. These are the
 // reusable agent interaction, planning, memory and delegation infrastructure;

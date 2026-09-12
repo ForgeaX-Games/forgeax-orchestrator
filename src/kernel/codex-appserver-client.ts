@@ -78,10 +78,12 @@ export class CodexAppServerClient {
    * configuration (cwd/env/globalArgs) remains immutable and is guarded by the
    * outer pool fingerprint.
    */
-  setTurnHandlers(handlers: Pick<CodexAppServerOptions, 'onServerRequest' | 'onNotification' | 'onExit'>): void {
+  setTurnHandlers(handlers: Pick<CodexAppServerOptions, 'onServerRequest' | 'onNotification' | 'onExit'>): () => void {
+    const previous = { onServerRequest: this.opts.onServerRequest, onNotification: this.opts.onNotification, onExit: this.opts.onExit };
     this.opts.onServerRequest = handlers.onServerRequest;
     this.opts.onNotification = handlers.onNotification;
     this.opts.onExit = handlers.onExit;
+    return () => { Object.assign(this.opts, previous); };
   }
 
   get alive(): boolean {

@@ -1,3 +1,4 @@
+import { CodexCompactionTracker, compactCodexThread, type CompactionStatus } from './codex-compaction';
 /**
  * CodexKernel — 本机已装的 `codex` CLI(headless `codex exec --json`)适配成
  * 中立 `AgentKernel`,与 ClaudeCodeKernel 并列的第二个内核实现。
@@ -23,8 +24,10 @@ import type {
   TurnHandle,
   TurnRequest,
 } from '@forgeax/agent-runtime';
+import { CodexNativeCheckpoint } from './codex-native-checkpoint';
 import { CODEX_KERNEL_PROFILE } from './kernel-profile';
 import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
 import { runCapture } from '../lib/node-spawn';
@@ -73,7 +76,7 @@ import {
   CODEX_MCP_SERVER_KEY,
   CodexMcpError,
 } from './codex-mcp';
-import { codexHomeKey, codexHomeMutex, ensureCodexSessionHome } from './codex-session-home';
+import { codexHomeKey, codexHomeMutex, codexWorkingDirectory, codexSessionHomePath, codexNativeSourceFingerprint, ensureCodexSessionHome } from './codex-session-home';
 import { HISTORY_RESYNC_REQUIRED_MESSAGE } from './history-resync';
 import { registerAsk, type AskHandle } from '../core/ask-user-registry';
 
@@ -155,6 +158,7 @@ export class CodexKernel implements AgentKernel {
   private modelMetadata: CodexModelMetadata[] = [];
   private readonly threadIdMap = new Map<string, string>();
   /** threadId → codex app-server thread id(app-server 路径:thread/start 后记下,用于 thread/resume)。 */
+  private readonly compactionTrackers = new Map<string, CodexCompactionTracker>();
   private readonly appThreadIdMap = new Map<string, string>();
   /** Logical sessions prewarmed by this kernel must resume on the same live
    * app-server. Keeping this owner identity prevents a prewarmed empty native
@@ -195,6 +199,7 @@ export class CodexKernel implements AgentKernel {
     const runtimes = [...this.appThreadRuntimeMap.values()];
     this.appThreadOwnerMap.clear();
     this.appThreadIdMap.clear();
+    this.compactionTrackers.clear();
     this.appThreadRuntimeMap.clear();
     this.appThreadConfigMap.clear();
     await Promise.all(clients.map((client) => client.close()));
@@ -220,11 +225,14 @@ export class CodexKernel implements AgentKernel {
 
   private appServerConfigKey(req: TurnRequest): string {
     const value = {
+      threadId: req.session.threadId?.trim() || '',
+      nativeSources: codexNativeSourceFingerprint(),
       agentId: req.session.agentId?.trim() || 'forge',
       hostSessionId: req.hostSessionId?.trim() || '',
       model: req.model?.trim() || '',
       permissionMode: req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE,
       trustTier: req.trustTier ?? 'own',
+      workingDirectory: codexWorkingDirectory(req),
       charter: req.systemPrompt.charter,
       persona: req.systemPrompt.persona,
       tools: (req.tools ?? []).map((tool) => ({
@@ -239,17 +247,42 @@ export class CodexKernel implements AgentKernel {
       return JSON.stringify(value);
     } catch {
       // Tool schemas are expected to be JSON values. A non-serializable schema
-      // must never widen reuse; names plus identity still force a conservative
-      // replacement instead of sharing the old process.
-      return `unserializable:${value.agentId}:${value.hostSessionId}:${value.tools.map((tool) => tool.name).join(',')}`;
+      // must never widen reuse; a unique key forces a conservative replacement
+      // instead of sharing the old process or restoring a checkpoint.
+      return `unserializable:${randomUUID()}`;
     }
   }
 
   /** The composer may send a delta/none lane only after this kernel has
    * observed a resumable native thread in this process. */
+  private compactionTracker(threadId: string): CodexCompactionTracker {
+    let tracker = this.compactionTrackers.get(threadId);
+    if (!tracker) { tracker = new CodexCompactionTracker(); this.compactionTrackers.set(threadId, tracker); }
+    return tracker;
+  }
+
+  async compactNativeHistory(threadId: string, onStatus: (status: CompactionStatus) => void): Promise<void> {
+    const owner = this.appThreadOwnerMap.get(threadId);
+    const nativeId = this.appThreadIdMap.get(threadId);
+    if (!owner?.alive || !nativeId) throw new Error('Native context is not connected. Continue this conversation before compacting.');
+    await compactCodexThread(owner, nativeId, this.compactionTracker(threadId), onStatus);
+  }
+
   hasNativeHistoryResume(threadId: string): boolean {
     const tid = threadId.trim();
-    return Boolean(tid && (this.threadIdMap.has(tid) || this.appThreadIdMap.has(tid)));
+    return Boolean(tid && (this.threadIdMap.has(tid)
+      || (this.appThreadIdMap.has(tid) && this.appThreadOwnerMap.get(tid)?.alive)));
+  }
+
+  async restoreNativeHistory(req: TurnRequest): Promise<void> {
+    // Restore only an explicitly owned completed thread, never discover an
+    // arbitrary recent rollout or start a new model conversation here.
+    try {
+      await this.prewarm(req, { resumeOnly: true });
+    } catch {
+      // No confirmed native owner: the coordinator retains authoritative
+      // snapshot recovery, including when the control plane cannot start.
+    }
   }
 
   /**
@@ -257,7 +290,7 @@ export class CodexKernel implements AgentKernel {
    * This is deliberately an explicit lifecycle operation: an exec-owned
    * logical session is not migrated until a real snapshot turn is composed.
    */
-  async prewarm(req: TurnRequest): Promise<{ warmed: boolean; reused: boolean }> {
+  async prewarm(req: TurnRequest, options: { resumeOnly?: boolean } = {}): Promise<{ warmed: boolean; reused: boolean }> {
     if (req.trustTier === 'imported') return { warmed: false, reused: false };
     const tid = req.session.threadId?.trim();
     if (!tid) return { warmed: false, reused: false };
@@ -276,11 +309,14 @@ export class CodexKernel implements AgentKernel {
     }
     if (existing || this.appThreadIdMap.has(tid) || this.appThreadRuntimeMap.has(tid)) {
       await this.retireAppOwner(tid);
-      return { warmed: false, reused: false };
+      if (!options.resumeOnly) return { warmed: false, reused: false };
     }
+    const checkpoint = new CodexNativeCheckpoint(codexSessionHomePath(codexHomeKey(req)), configKey);
+    const resumeId = options.resumeOnly ? checkpoint.read() : undefined;
+    if (options.resumeOnly && !resumeId) return { warmed: false, reused: false };
     const binary = await this.binary();
-    const projectRoot = defaultProjectRoot();
-    const hooksActive = ensureCodexHooksConfig(projectRoot);
+    const workingDirectory = codexWorkingDirectory(req);
+    const hooksActive = ensureCodexHooksConfig(workingDirectory);
     const env: Record<string, string> = {};
     if (process.env.OPENAI_API_KEY) env.OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     if (process.env.OPENAI_BASE_URL) env.OPENAI_BASE_URL = process.env.OPENAI_BASE_URL;
@@ -300,10 +336,10 @@ export class CodexKernel implements AgentKernel {
     const releaseHome = await codexHomeMutex.acquire(homeKey);
     let client: CodexAppServerClient | undefined;
     try {
-      env.CODEX_HOME = await ensureCodexSessionHome(homeKey);
+      env.CODEX_HOME = await ensureCodexSessionHome(homeKey, { workingDirectory });
       client = new CodexAppServerClient({
         binary,
-        cwd: projectRoot,
+        cwd: workingDirectory,
         env,
         globalArgs: buildCodexAppServerGlobalArgs(
           hooksActive,
@@ -318,8 +354,9 @@ export class CodexKernel implements AgentKernel {
       const developerInstructions = sp.persona?.trim()
         ? `${sp.charter}\n\n---\n\n## Persona\n\n${sp.persona.trim()}`
         : sp.charter;
-      const started = await client.request('thread/start', {
-        cwd: projectRoot,
+      const started = await client.request(resumeId ? 'thread/resume' : 'thread/start', {
+        ...(resumeId ? { threadId: resumeId } : {}),
+        cwd: workingDirectory,
         ...toCodexAppServerPermission(req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE),
         ...(developerInstructions?.trim() ? { developerInstructions } : {}),
         ...(req.model?.trim() ? { model: req.model.trim() } : {}),
@@ -327,7 +364,7 @@ export class CodexKernel implements AgentKernel {
         ephemeral: false,
       }) as { thread?: { id?: string } };
       const nativeId = started.thread?.id;
-      if (!nativeId) throw new Error('codex prewarm thread/start returned no id');
+      if (!nativeId || (resumeId && nativeId !== resumeId)) throw new Error('codex native thread identity was not confirmed');
       if (hasCodexMcpTools(req)) {
         const readiness = await client.waitForThreadMcpServers(nativeId, [CODEX_MCP_SERVER_KEY]);
         if (!readiness.ready) throw new Error('codex prewarm ForgeaX tools are not ready');
@@ -341,6 +378,10 @@ export class CodexKernel implements AgentKernel {
     } catch (error) {
       client?.shutdown();
       await runtime?.cleanup();
+      if (options.resumeOnly) {
+        checkpoint.clear();
+        return { warmed: false, reused: false };
+      }
       throw error;
     } finally {
       releaseHome();
@@ -411,6 +452,11 @@ export class CodexKernel implements AgentKernel {
    *  - fallback 必须在 yield 任何事件**之前**判定(AppServerUnavailable 在 ensureStarted 抛),
    *    否则会半截重跑。 */
   async *runTurn(req: TurnRequest, signal: AbortSignal): AsyncIterable<KernelEvent> {
+    // Every dispatched host turn can advance its ledger cursor, including
+    // admission failures and exec fallback. Invalidate before either path.
+    new CodexNativeCheckpoint(codexSessionHomePath(codexHomeKey(req), {
+      nativeCapabilities: req.trustTier !== 'imported',
+    }), '').clear();
     // Do not probe the binary, validate provider capability, materialize MCP,
     // acquire a session home, or spawn app-server/exec after cancellation was
     // already requested.  This is the public cold-turn cancellation contract.
@@ -518,11 +564,12 @@ export class CodexKernel implements AgentKernel {
 
     const binary = await this.binary();
     const projectRoot = defaultProjectRoot();
+    const workingDirectory = codexWorkingDirectory(req);
     // settings.permissions 拦截面(046 楔子3):工作区静态 hooks.json(PreToolUse 全量
     // 拦截,补 approval 只覆盖「codex 主动问」的缺口)。app-server 是 per-turn 进程
     // (finally shutdown)→ FORGEAX_* 上下文经 env 注入安全,hook 脚本据此回调
     // /:sid/hook-gate。用户自跑 codex 无 FORGEAX env → hook 零干预。
-    const hooksActive = ensureCodexHooksConfig(projectRoot);
+    const hooksActive = ensureCodexHooksConfig(workingDirectory);
     const env: Record<string, string> = {};
     if (process.env.OPENAI_API_KEY) env.OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     if (process.env.OPENAI_BASE_URL) env.OPENAI_BASE_URL = process.env.OPENAI_BASE_URL;
@@ -562,7 +609,7 @@ export class CodexKernel implements AgentKernel {
     let homeReleased = false;
     const releaseHomeOnce = () => { if (!homeReleased) { homeReleased = true; releaseHome(); } };
     try {
-      env.CODEX_HOME = await ensureCodexSessionHome(homeKey);
+      env.CODEX_HOME = await ensureCodexSessionHome(homeKey, { nativeCapabilities: req.trustTier !== 'imported', workingDirectory });
     } catch (e) {
       releaseHomeOnce();
       await runtime?.cleanup();
@@ -598,7 +645,7 @@ export class CodexKernel implements AgentKernel {
     }
 
     const queue = new KernelEventQueue();
-    const notifState = createCodexNotifState();
+    const notifState = createCodexNotifState(this.compactionTracker(tid ?? req.callId ?? randomUUID()));
     const activeAskHandles = new Set<AskHandle>();
 
     // 审批 server-request:settings.permissions 规则先行(046 楔子3:deny 即拒 /
@@ -612,10 +659,14 @@ export class CodexKernel implements AgentKernel {
             ? p.callId
             : `ask-${String(rpc.id)}`;
           const args = p.arguments && typeof p.arguments === 'object' ? p.arguments : {};
-          queue.push({ kind: 'tool.call', callId, name: 'ask_user', args });
           const sid = req.hostSessionId?.trim() || req.session.threadId?.trim() || '';
           const agent = req.session.agentId?.trim() || 'forge';
-          const handle = registerAsk(sid, agent, 0);
+          const handle = registerAsk({
+            sid, agentPath: agent, instanceId: `codex:${tid ?? sid}:${agent}`,
+            runtimeEpochId: tid ?? sid, requestId: randomUUID(),
+          }, 0);
+          queue.push({ kind: 'tool.call', callId, name: 'ask_user',
+            args: { ...args, _askRequestId: handle.requestId } });
           activeAskHandles.add(handle);
           try {
             const answers = await handle.promise;
@@ -665,8 +716,14 @@ export class CodexKernel implements AgentKernel {
     };
 
     let client: CodexAppServerClient;
+    const closeCompaction = (phase: 'failed' | 'cancelled'): void => {
+      for (const status of notifState.compaction.finish(phase)) {
+        queue.push({ kind: 'stored-event', payload: { type: 'compaction.status', ts: Date.now(), payload: status } });
+      }
+    };
     const onExit = (code: number | null, tail: string): void => {
       if (!notifState.ended) {
+        closeCompaction('failed');
         queue.push({ kind: 'turn.usage' });
         queue.push({ kind: 'error', error: { code: 'protocol', message: `codex app-server exited ${code}${tail ? ': ' + tail : ''}` } });
         queue.push({ kind: 'turn.done', reason: 'error' });
@@ -701,7 +758,7 @@ export class CodexKernel implements AgentKernel {
     } else {
       client = new CodexAppServerClient({
         binary,
-        cwd: projectRoot,
+        cwd: workingDirectory,
         env,
         // globalArgs 注入在 `app-server` 子命令之前：默认关闭 Codex 原生多 Agent；
         // hooksActive → --dangerously-bypass-hook-trust；有工具轮 → 注册本轮 fxt MCP。
@@ -727,6 +784,7 @@ export class CodexKernel implements AgentKernel {
       // its model/MCP work bleed into the next logical turn.
       interruptActiveTurn();
       if (!notifState.ended) {
+        closeCompaction('cancelled');
         queue.push({ kind: 'turn.done', reason: 'cancelled' });
         notifState.ended = true;
       }
@@ -780,7 +838,7 @@ export class CodexKernel implements AgentKernel {
           : sp.charter;
         const model = req.model?.trim() || undefined;
         const res = await client.request('thread/start', {
-          cwd: projectRoot,
+          cwd: workingDirectory,
           ...toCodexAppServerPermission(req.permissionMode ?? CODEX_DEFAULT_PERMISSION_MODE),
           ...(developerInstructions?.trim() ? { developerInstructions } : {}),
           ...(model ? { model } : {}),
@@ -855,6 +913,7 @@ export class CodexKernel implements AgentKernel {
       if (codexThreadId && tid && historyMode === 'snapshot') {
         this.threadIdMap.delete(tid);
       }
+      const checkpoint = new CodexNativeCheckpoint(env.CODEX_HOME!, configKey);
       const turnStart = await client.request('turn/start', {
         ...(reasoningEffort ? { effort: reasoningEffort } : {}),
         threadId: codexThreadId,
@@ -891,6 +950,9 @@ export class CodexKernel implements AgentKernel {
       }
 
       for await (const ev of queue) {
+        if (ev.kind === 'turn.done' && ev.reason === 'stop' && codexThreadId && !ac.signal.aborted) {
+          checkpoint.complete(codexThreadId);
+        }
         yield ev;
         if (ev.kind === 'turn.done') break;
       }
@@ -921,10 +983,10 @@ export class CodexKernel implements AgentKernel {
     let releaseHome: (() => void) | undefined;
     try {
       const binary = await this.binary();
-      const projectRoot = defaultProjectRoot();
+      const workingDirectory = codexWorkingDirectory(req);
       // settings.permissions 拦截面(046 楔子3):同 app-server 路径,工作区静态
       // hooks.json + FORGEAX_* env(exec 是 per-turn 进程,env 注入安全)。
-      const hooksActive = ensureCodexHooksConfig(projectRoot);
+      const hooksActive = ensureCodexHooksConfig(workingDirectory);
 
       // fxt MCP runtime(本轮工具)。materialize 失败 = fail-closed(plan §6.3)。
       const mcpTools = req.tools?.filter((tool) => tool.name !== 'ask_user') ?? [];
@@ -945,7 +1007,7 @@ export class CodexKernel implements AgentKernel {
       // (exec resume 不丢),同 home 串行。
       const homeKey = codexHomeKey(req);
       releaseHome = await codexHomeMutex.acquire(homeKey);
-      const codexHome = await ensureCodexSessionHome(homeKey);
+      const codexHome = await ensureCodexSessionHome(homeKey, { nativeCapabilities: req.trustTier !== 'imported', workingDirectory });
 
       // 凭据地板:imported → scrub。sidecar 路径(FORGEAX_SIDECAR=on)凭据由 sidecar cred-vault
       // 发 scoped token,本进程不跑 in-process cred-proxy 且剔真 key;非 sidecar 用 server 进程内代理。
@@ -982,12 +1044,12 @@ export class CodexKernel implements AgentKernel {
             trustTier: req.trustTier ?? 'own',
             callId: sidecarBaseId,
             ...(req.budget ? { budget: req.budget } : {}),
-            kernel: { kind: 'codex', credential: 'sidecar-managed', cmd: binary, args, cwd: projectRoot, env: stripModelKeys(materializeEnv(envOverride)) },
+            kernel: { kind: 'codex', credential: 'sidecar-managed', cmd: binary, args, cwd: workingDirectory, env: stripModelKeys(materializeEnv(envOverride)) },
           }, ac.signal)
         : spawnJsonl<CodexRawEvent>({
             cmd: binary,
             args,
-            cwd: projectRoot,
+            cwd: workingDirectory,
             signal: ac.signal,
             ...(envOverride ? { envOverride } : {}),
           });

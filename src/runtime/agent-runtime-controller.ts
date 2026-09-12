@@ -142,6 +142,27 @@ export class AgentRuntimeController {
     }
   }
 
+  /** Explicit user stop: retain peer results as context without waking a turn.
+   * Human inputs already queued remain actionable. */
+  stopTurn(reason = "stopped by user"): void {
+    if (this.disposed) return;
+    for (let i = 0; i < this.queue.length; i++) {
+      const turn = this.queue[i]!;
+      if (turn.input && typeof turn.input === "object" &&
+          (turn.input as { source?: unknown }).source === "agent") {
+        if ((turn.input as { type?: unknown }).type === "user_input") {
+          // An unstarted delegated assignment must not execute on continuation.
+          this.queue.splice(i--, 1);
+          turn.reject(new Error(reason));
+        } else {
+          this.queue[i] = { ...turn, input: { ...turn.input, handoff: "silent" } };
+        }
+      }
+    }
+    this.currentAbort?.abort(reason);
+    this.wakeCoalesce?.();
+  }
+
   /** Session mutation barrier: abort active work and reject queued turns. */
   interruptAndClear(reason?: string): void {
     if (this.disposed) return;
@@ -157,8 +178,8 @@ export class AgentRuntimeController {
 
   async dispose(): Promise<void> {
     if (this.disposed) return;
-    this.abortAndRejectQueued("agent disposed");
     this.disposed = true;
+    this.abortAndRejectQueued("agent disposed");
     await this.pumpTask;
     this.setState("disposed");
     await this.executor.dispose?.();

@@ -8,7 +8,7 @@ export function publicCompactionStatus(record: Record<string, unknown>): {
   if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
   const data = p as Record<string, unknown>;
   if (data.visibility === 'private_reasoning') return null;
-  if (data.phase !== 'started' && data.phase !== 'completed' && data.phase !== 'failed') return null;
+  if (data.phase !== 'started' && data.phase !== 'completed' && data.phase !== 'failed' && data.phase !== 'cancelled') return null;
   if (typeof data.id !== 'string' || !data.id || data.id.length > 200) return null;
   if (!Number.isSafeInteger(data.count) || (data.count as number) < 1) return null;
   const duration = data.durationMs;

@@ -31,6 +31,16 @@ function request(): TurnRequest {
 }
 
 describe("private kernel context bootstrap", () => {
+  test.each(['snapshot', 'delta', 'none'])('prepared %s history is supplied only once', (mode) => {
+    const req = request();
+    req.historyPlan = { mode } as TurnRequest['historyPlan'];
+    req.systemPrompt.dynamicSuffix = mode === 'none' ? '' : '# ForgeaX shared session history\nblue-orchid';
+    const task = buildKernelTask(req, true);
+    expect(task.split('blue-orchid').length - 1).toBe(mode === 'none' ? 0 : 1);
+    expect(task).not.toContain('Previous conversation context');
+    expect(task).toContain('现在的口令是什么？');
+  });
+
   test("新私有会话把宿主上下文和当前任务一起交给内核", () => {
     const task = buildKernelTask(request(), true);
     expect(task).toContain("Previous conversation context supplied by ForgeaX");

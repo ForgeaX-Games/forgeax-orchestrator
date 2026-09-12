@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { publicCompactionStatus } from '../src/runtime/compaction-status';
 
 test('only public lifecycle metadata crosses the stored-event bridge', () => {
-  for (const phase of ['started', 'completed', 'failed']) {
+  for (const phase of ['started', 'completed', 'failed', 'cancelled']) {
     const value = publicCompactionStatus({ type: 'compaction.status', ts: 42, payload: {
       id: 'turn-1', phase, count: 2, durationMs: 1500,
       summary: 'PRIVATE', error: 'PRIVATE', replacement: 'PRIVATE', visual_display: 'PRIVATE',

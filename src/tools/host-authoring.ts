@@ -27,6 +27,7 @@ import {
 import { reloadExtensions } from '../extensions/registry';
 import { listAgents } from '../agents/loader';
 import { isValidAgentName } from '../core/agent-scaffold';
+import { canonicalToolName } from '../kernel/canonical-tool-name';
 
 /** 产品工具喂进来的角色规格(与 team-forge 的 create-role.args.json 对齐)。 */
 export interface AgentPackSpec {
@@ -129,7 +130,7 @@ function buildAgentManifest(id: string, spec: AgentPackSpec): {
         personaFile: './persona/zh.md',
         ...(spec.memorySeed && spec.memorySeed.trim() ? { memoryDir: './memory/' } : {}),
         defaultLang: 'zh',
-        ...(spec.tools && spec.tools.length > 0 ? { tools: spec.tools } : {}),
+        ...(spec.tools && spec.tools.length > 0 ? { tools: [...new Set(spec.tools.map(canonicalToolName))] } : {}),
       },
     },
     experimental: true,

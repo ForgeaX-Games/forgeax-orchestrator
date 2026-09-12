@@ -4,6 +4,9 @@ import type { StoredEvent } from '../ledger/types';
 import type { HistoryEntry, KernelLane } from './types';
 import type { HistorySource, LaneStore } from './coordinator';
 
+export const REPLAY_TOOL_PREVIEW_CHARS = 8_000;
+
+
 function textFrom(value: unknown): string {
   if (typeof value === 'string') return value;
   if (value && typeof value === 'object') {
@@ -43,9 +46,26 @@ export class LedgerHistorySource implements HistorySource {
   async read(): Promise<HistoryEntry[]> {
     const rows = await this.ledger.readAllWithCursors();
     const entries: HistoryEntry[] = [];
+    const projectedInputs = new Set(rows.filter((row) => row.event.type === 'inbound_message')
+      .map((row) => row.event.payload?.sourceEventId).filter((id): id is string => typeof id === 'string'));
     for (const row of rows) {
+      if (row.event.type === 'user_input' && typeof row.event.eventId === 'string' && projectedInputs.has(row.event.eventId)) continue;
       const message = messageOf(row.event);
       if (!message) continue;
+      if (message.role === 'tool' && message.result !== undefined) {
+        const serialized = typeof message.result === 'string' ? message.result : JSON.stringify(message.result);
+        if (serialized.length > REPLAY_TOOL_PREVIEW_CHARS) {
+          // A replay is a navigation aid. Keep the faithful output in the WAL,
+          // identify exactly where it lives, and never mislabel truncation as failure.
+          message.result = {
+            preview: serialized.slice(0, REPLAY_TOOL_PREVIEW_CHARS * 3 / 4)
+              + '\n[Middle omitted from replay; full output retained in session event history.]\n'
+              + serialized.slice(-REPLAY_TOOL_PREVIEW_CHARS / 4),
+            originalCharacters: serialized.length,
+            historyReference: { ...row.cursor, field: 'payload.result' },
+          };
+        }
+      }
       const payload = row.event.payload ?? {};
       const history = row.event.history as { origin?: { kernelId?: string }; turnId?: string } | undefined;
       const kernelId = history?.origin?.kernelId

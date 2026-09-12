@@ -58,3 +58,27 @@ describe('shared history compose E2E', () => {
     expect(afterRestart.systemPrompt.dynamicSuffix).toContain('acknowledged');
   });
 });
+
+
+test('composer awaits confirmed native restoration before choosing a history delta', async () => {
+  const session = await getSessionManager().create({ displayName: 'restore-order' });
+  const base = { agentId: 'forge', sessionId: session.sid, threadId: 'thread-history-e2e' };
+  const original = kernel('codex');
+  const first = await composeTurnRequest({ message: 'remember original requirement', kernel: original, ...base });
+  transcribeKernelTurn(session, 'forge', { message: 'remember original requirement', asstText: 'delivered artifact', thinkingText: '', stopReason: 'end_turn', providerId: original.id, historyPlan: first.historyPlan, toolEvents: [] });
+  const restored = kernel('codex');
+  let checked = false;
+  Object.assign(restored, { async restoreNativeHistory(request: import('@forgeax/agent-runtime').TurnRequest) {
+    expect(request.model).toBe('gpt-5.6-luna');
+    expect(request.hostSessionId).toBe(session.sid);
+    expect(request.input.text).toBe('continue with revised requirement');
+    expect(request.historyPlan).toBeUndefined();
+    await Promise.resolve();
+    restored.resume = true;
+    checked = true;
+  } });
+  const next = await composeTurnRequest({ message: 'continue with revised requirement', model: 'gpt-5.6-luna', kernel: restored, ...base });
+  expect(checked).toBe(true);
+  expect(next.historyPlan?.mode).toBe('none');
+  expect(next.systemPrompt.dynamicSuffix).toBeUndefined();
+});

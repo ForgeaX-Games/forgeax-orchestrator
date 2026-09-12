@@ -28,6 +28,13 @@ describe("processed user route recovery", () => {
       event("inbound_message", "user", { kernelId: "other", originalType: "agent_command" }),
     ])).toEqual({ kernelId: "codex", model: "selected" });
   });
+  test("restores the route of a processed delegation for nested completion callbacks", () => {
+    expect(recoverUserTurnRoute([
+      event("user_input", "agent", { kernelId: "codex", model: "selected", delegationId: "delivery-1" }, "delivery-input"),
+      event("inbound_message", "agent", { kernelId: "codex", originalType: "user_input", sourceEventId: "delivery-input" }),
+      event("inbound_message", "agent", { kernelId: "other", originalType: "message" }),
+    ])).toEqual({ kernelId: "codex", model: "selected" });
+  });
   test("another agent with no user history has no inherited override", () => {
     expect(recoverUserTurnRoute([event("inbound_message", "agent", { kernelId: "other" })])).toBeUndefined();
   });

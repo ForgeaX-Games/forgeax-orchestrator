@@ -23,6 +23,7 @@ import {
 } from "@forgeax/agent-runtime";
 import { createSessionsRouter } from "../src/api/sessions";
 import { createCliRouter } from "../src/api/cli/chat";
+import delegateTool from "../builtin/kits/agent_manage/tools/delegate_to_subagent";
 import {
   initSessionManager,
   resetSessionManager,
@@ -402,6 +403,46 @@ describe("runtime kernel context", () => {
     expect(request.systemPrompt.dynamicSuffix).not.toContain(
       "UNIQUE-RUNTIME-STABLE-SLOT",
     );
+  });
+
+  test.each(["resident", "ephemeral"] as const)("delegated %s uses the active caller kernel and model, then returns on the same route", async (kind) => {
+    const pm = getPathManager();
+    const session = await initSessionManager(pm).create({
+      displayName: "delegation-route",
+      prepareResidentDefinitions: (sid) => {
+        for (const id of ["root", "helper"]) {
+          const paths = pm.session(sid).agent(id);
+          mkdirSync(paths.root(), { recursive: true });
+          writeFileSync(paths.agentJson(), JSON.stringify({
+            id, kernelId: DEFAULT_KERNEL, models: { model: ["template-model"] },
+          }));
+        }
+      },
+    });
+    const base = recordingKernel(OVERRIDE_KERNEL, overrideRequests);
+    registerKernel({ ...base, async *runTurn(req, signal) {
+      if (req.input.text === "delegate on selected route") {
+        const host = session.getAgentHost("root")!;
+        await delegateTool.execute({
+          ...(kind === "resident" ? { agent: "helper" }
+            : { templateRef: session.runtimeTree.findResident("helper")!.templateRef }),
+          message: "prepare role deliverable",
+        }, host.agentContext);
+      }
+      yield* base.runTurn(req, signal);
+    } });
+    const app = new Hono().route("/api/sessions", createSessionsRouter());
+    const response = await app.request(`/api/sessions/${session.sid}/messages`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to: "root", content: "delegate on selected route",
+        providerOverride: OVERRIDE_KERNEL, payload: { model: "selected-model" } }),
+    });
+    expect(response.status).toBe(200);
+    await waitUntil(() => [...defaultRequests, ...overrideRequests].length >= 3);
+    expect(defaultRequests).toHaveLength(0);
+    const child = overrideRequests.find((req) => req.input.text === "prepare role deliverable");
+    expect(child?.model).toBe("selected-model");
+    expect(overrideRequests).toHaveLength(3);
   });
 
   test("teammate completion continues the recipient kernel and model until the next user selection", async () => {

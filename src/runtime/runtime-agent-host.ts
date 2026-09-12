@@ -40,7 +40,9 @@ import { executeTool } from "../kits/tool/tool-executor";
 import { getTerminalManager } from "../terminal/manager";
 import { deepMerge } from "../utils/deep-merge";
 import { eventToSessionMessage } from "../message/message-ingress";
-import { runKernelTurn } from "./kernel-turn-runner";
+import { resolveKernel } from "../kernel/resolve-kernel";
+import { nativeHistoryCompactor, orchestrationProfileOf } from "../kernel/kernel-profile";
+import { kernelThreadId, runKernelTurn } from "./kernel-turn-runner";
 import { recoverUserTurnRoute, type UserTurnRoute } from "./user-turn-route";
 import { materializeTurnContext } from "./turn-context";
 import type { RuntimeToolContext } from "./runtime-context";
@@ -94,6 +96,7 @@ export class RuntimeAgentHost {
   private activeDelegationId: string | undefined;
   private activeSourceEventId: string | undefined;
   private activeKernelId: string | undefined;
+  private activeModel: string | undefined;
   private userTurnRoute: UserTurnRoute | undefined;
   private userTurnRouteLoaded = false;
   private disposed = false;
@@ -224,6 +227,32 @@ export class RuntimeAgentHost {
     this.pluginRegistry.setContext(this.agentContext);
   }
 
+  /** Execution identity for host-validated delegated deliveries only. */
+  private compacting = false;
+  async compactNativeContext(): Promise<boolean> {
+    if (this.activeTurnId || this.compacting) throw new Error('Wait for the current operation before compacting.');
+    if (!this.userTurnRouteLoaded) {
+      this.userTurnRoute = recoverUserTurnRoute(await this.config.ledger.readAllEvents());
+      this.userTurnRouteLoaded = true;
+    }
+    const kernel = resolveKernel(this.agentPath, this.userTurnRoute?.kernelId ?? this.config.kernelId);
+    if (orchestrationProfileOf(kernel).hostOwnedHistory) return false;
+    const compact = nativeHistoryCompactor(kernel);
+    if (!compact) throw new Error('The selected kernel does not support manual context compaction.');
+    this.compacting = true;
+    try {
+      await compact(kernelThreadId(this.config.sid, this.config.instanceId), status => {
+        this.boundEventBus.publish({ type: 'compaction.status', ts: Date.now(), source: 'kernel', payload: status }, this.agentPath);
+      });
+      return true;
+    } finally { this.compacting = false; }
+  }
+
+  getExecutionRoute(): UserTurnRoute | undefined {
+    if (!this.activeTurnId) return undefined;
+    return { kernelId: this.activeKernelId, model: this.activeModel };
+  }
+
   setAgentJson(next: AgentJson): void {
     this.agentJson = next;
   }
@@ -299,6 +328,7 @@ export class RuntimeAgentHost {
         "AbortError",
       );
     }
+    if (this.compacting) throw new Error('Context compaction is still running.');
     this.currentSignal = signal;
     const turn = ++this.currentTurn;
     return runWithSession(this.config.sid, () =>
@@ -307,7 +337,8 @@ export class RuntimeAgentHost {
         // Teammate deliveries continue the recipient's user-selected route.
         // They must not silently return to the template/global kernel after a
         // per-turn UI override. User turns still select their own route.
-        if (input.source === "user" && input.type !== "agent_command") {
+        if (input.type !== "agent_command" && (input.source === "user"
+          || (input.source === "agent" && typeof payload.delegationId === "string"))) {
           this.userTurnRoute = {
             kernelId: resolveTurnKernelId(payload, this.config.kernelId),
             model: typeof payload.model === "string" ? payload.model.trim() || undefined : undefined,
@@ -398,6 +429,7 @@ export class RuntimeAgentHost {
           const model = requestedModel ?? route?.model ?? (Array.isArray(models.model)
             ? models.model[0]
             : models.model ?? undefined);
+          this.activeModel = model;
           const tools = visibleTools(
             withAgentHostToolDefinitions(this.toolRegistry.list(), this.agentContext),
             this.agentContext,
@@ -482,6 +514,7 @@ export class RuntimeAgentHost {
           this.activeDelegationId = undefined;
           this.activeSourceEventId = undefined;
           this.activeKernelId = undefined;
+          this.activeModel = undefined;
         }
       })
     );

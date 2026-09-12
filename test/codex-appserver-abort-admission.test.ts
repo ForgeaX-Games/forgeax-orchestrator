@@ -1,14 +1,58 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { initPathManager } from '../src/fs/path-manager';
 import type { KernelEvent, TurnRequest } from '@forgeax/agent-runtime';
 import { CodexKernel } from '../src/kernel/codex-kernel';
 import { HISTORY_RESYNC_REQUIRED_MESSAGE } from '../src/kernel/history-resync';
 import { deriveThreadId } from '../src/lib/thread-id';
 
 const dirs: string[] = [];
+
+test('Codex uses the host session workspace for app-server and imported exec', async () => {
+  const fx = fixture();
+  const first = join(dirname(fx.log), 'workspace a');
+  const second = join(dirname(fx.log), 'workspace b');
+  mkdirSync(first);
+  mkdirSync(second);
+  const roots = new Map([['bound-a', first], ['bound-b', second]]);
+  initPathManager({ layout: {
+    allocate: (sid) => ({ sessionRoot: roots.get(sid)!, workDir: roots.get(sid)! }),
+    sessionRoot: (sid) => roots.get(sid)!,
+    sessionWorkDir: (sid) => {
+      const root = roots.get(sid);
+      if (!root) throw new Error('unbound session');
+      return root;
+    },
+    listSessionIds: () => [...roots.keys()],
+  } });
+  writeFileSync(join(process.env.CODEX_HOME!, 'config.toml'),
+    'model = "fixture"\n[mcp_servers.private]\ncommand = "must-not-start"\n');
+  const kernel = new CodexKernel();
+  try {
+    const imported = { ...req('bound-b'), trustTier: 'imported' as const, tools: [] };
+    const events: KernelEvent[] = [];
+    for await (const event of kernel.runTurn(imported, new AbortController().signal)) events.push(event);
+    expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'stop' });
+    const contexts = () => readFileSync(fx.log, 'utf8').split('\n')
+      .filter(line => line.startsWith('process-context:'))
+      .map(line => JSON.parse(line.slice('process-context:'.length)));
+    const child = contexts().at(-1);
+    expect(child.cwd).toBe(realpathSync(second));
+    expect(child.home).toEndWith('imported-hermetic');
+    expect(child.config).not.toContain('mcp_servers.private');
+    expect(child.config).toContain(JSON.stringify(second));
+
+    writeFileSync(join(process.env.CODEX_HOME!, 'config.toml'), 'model = "fixture"\n');
+    expect(await kernel.prewarm({ ...req('bound-a'), tools: [] })).toEqual({ warmed: true, reused: false });
+    expect(contexts().at(-1).cwd).toBe(realpathSync(first));
+    expect(contexts().at(-1).config).toContain(JSON.stringify(first));
+  } finally {
+    await CodexKernel.closeAppServerPool();
+  }
+});
 const prior = {
   home: process.env.CODEX_HOME,
   binary: process.env.CODEX_CLI_PATH,
@@ -22,6 +66,7 @@ afterEach(() => {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
   };
+  initPathManager();
   restore('CODEX_HOME', prior.home);
   restore('CODEX_CLI_PATH', prior.binary);
   restore('FAKE_CODEX_CONTROL', prior.control);
@@ -44,6 +89,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 if (process.argv.includes('--version')) { console.log('codex-cli 0.143.0'); process.exit(0); }
 const log = process.env.FAKE_CODEX_LOG;
 const control = process.env.FAKE_CODEX_CONTROL;
+appendFileSync(log, 'process-context:' + JSON.stringify({ cwd: process.cwd(), home: process.env.CODEX_HOME, config: readFileSync(process.env.CODEX_HOME + '/config.toml', 'utf8') }) + '\\n');
 const emit = (value) => console.log(JSON.stringify(value));
 const mode = () => { try { return readFileSync(control, 'utf8').trim(); } catch { return ''; } };
 let activeTurn = false;
@@ -74,12 +120,18 @@ for await (const line of console) {
     if (mode() === 'readiness') await Bun.sleep(250);
     emit({ method: 'mcpServer/startupStatus/updated', params: { threadId: 'fixture-thread', name: 'fxt', status: mode() === 'fxt-failed' ? 'failed' : 'ready' } });
   } else if (req.method === 'thread/resume') {
+    if (mode() === 'resume-fail') {
+      emit({ jsonrpc: '2.0', id: req.id, error: { code: -32000, message: 'missing native thread' } });
+      continue;
+    }
     if (mode() === 'thread/resume') await Bun.sleep(250);
     emit({ jsonrpc: '2.0', id: req.id, result: { thread: { id: 'fixture-thread' } } });
+    emit({ method: 'mcpServer/startupStatus/updated', params: { threadId: 'fixture-thread', name: 'fxt', status: 'ready' } });
   } else if (req.method === 'turn/start') {
     appendFileSync(log, 'turn-params:' + JSON.stringify(req.params) + '\\n');
     emit({ jsonrpc: '2.0', id: req.id, result: { turn: { id: 'fixture-turn' } } });
-    if (mode() === 'turn') {
+    if (mode() === 'turn' || mode() === 'compacting') {
+      if (mode() === 'compacting') emit({ method: 'item/started', params: { threadId: 'fixture-thread', item: { type: 'contextCompaction', id: 'active-compact' } } });
       activeTurn = true;
       appendFileSync(log, 'turn-active\\n');
       setTimeout(() => {
@@ -372,7 +424,7 @@ describe('Codex app-server cancellation admission', () => {
     request.tools = [];
     const kernel = new CodexKernel();
     expect((await kernel.prewarm(request)).warmed).toBe(true);
-    writeFileSync(fx.control, 'turn');
+    writeFileSync(fx.control, 'compacting');
 
     const controller = new AbortController();
     const events: KernelEvent[] = [];
@@ -380,9 +432,12 @@ describe('Codex app-server cancellation admission', () => {
       for await (const event of kernel.runTurn(request, controller.signal)) events.push(event);
     })();
     await waitFor(fx.log, 'turn-active');
+    for (let i = 0; i < 100 && !events.some(e => e.kind === 'stored-event'); i++) await Bun.sleep(10);
     controller.abort();
     await consuming;
     await waitFor(fx.log, 'turn/interrupt');
+    const statuses = events.filter(e => e.kind === 'stored-event').map(e => (e as any).payload.payload.phase);
+    expect(statuses).toEqual(['started', 'cancelled']);
 
     expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'cancelled' });
     await CodexKernel.closeAppServerPool();
@@ -483,4 +538,76 @@ test('unadvertised selected model fails before a turn with a valid kernel error'
   expect(events[1]).toMatchObject({ kind: 'error', error: { code: 'protocol' } });
   expect(readFileSync(fx.log, 'utf8')).not.toContain('turn/start');
   expect(readFileSync(fx.log, 'utf8')).not.toContain('exec\n');
+});
+
+
+describe('Codex durable native recovery', () => {
+  async function complete(kernel: CodexKernel, request: TurnRequest) {
+    const events: KernelEvent[] = [];
+    for await (const event of kernel.runTurn(request, new AbortController().signal)) events.push(event);
+    expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'stop' });
+  }
+
+  test('a new kernel confirms the completed native thread without a model turn', async () => {
+    const fx = fixture();
+    const request = req(randomUUID());
+    await complete(new CodexKernel(), request);
+    await CodexKernel.closeAppServerPool();
+    writeFileSync(fx.log, '');
+    const restarted = new CodexKernel();
+    try {
+      expect(restarted.hasNativeHistoryResume(request.session.threadId)).toBe(false);
+      await restarted.restoreNativeHistory(request);
+      expect(restarted.hasNativeHistoryResume(request.session.threadId)).toBe(true);
+      const methods = readFileSync(fx.log, 'utf8').split('\n');
+      expect(methods).toContain('thread/resume');
+      expect(methods).not.toContain('thread/start');
+      expect(methods).not.toContain('turn/start');
+    } finally { await CodexKernel.closeAppServerPool(); }
+  });
+
+  test('changed configuration refuses the checkpoint before spawning', async () => {
+    const fx = fixture();
+    const request = { ...req(randomUUID()), tools: [] };
+    await complete(new CodexKernel(), request);
+    await CodexKernel.closeAppServerPool();
+    writeFileSync(fx.log, '');
+    const restarted = new CodexKernel();
+    await restarted.restoreNativeHistory({ ...request, model: 'different-model' });
+    expect(restarted.hasNativeHistoryResume(request.session.threadId)).toBe(false);
+    expect(readFileSync(fx.log, 'utf8')).toBe('');
+  });
+
+  test('native resume rejection leaves snapshot recovery and no model request', async () => {
+    const fx = fixture();
+    const request = { ...req(randomUUID()), tools: [] };
+    await complete(new CodexKernel(), request);
+    await CodexKernel.closeAppServerPool();
+    writeFileSync(fx.log, '');
+    writeFileSync(fx.control, 'resume-fail');
+    const restarted = new CodexKernel();
+    await restarted.restoreNativeHistory(request);
+    expect(restarted.hasNativeHistoryResume(request.session.threadId)).toBe(false);
+    expect(readFileSync(fx.log, 'utf8').split('\n')).not.toContain('turn/start');
+    writeFileSync(fx.log, '');
+    await restarted.restoreNativeHistory(request);
+    expect(readFileSync(fx.log, 'utf8')).toBe('');
+  });
+
+  test('cancelled work invalidates the prior completed checkpoint', async () => {
+    const fx = fixture();
+    const request = { ...req(randomUUID()), tools: [] };
+    const kernel = new CodexKernel();
+    await complete(kernel, request);
+    writeFileSync(fx.log, '');
+    writeFileSync(fx.control, 'compacting');
+    const events = await abortAt(kernel, request, fx.log, 'turn-active');
+    expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'cancelled' });
+    await CodexKernel.closeAppServerPool();
+    writeFileSync(fx.log, '');
+    const restarted = new CodexKernel();
+    await restarted.restoreNativeHistory(request);
+    expect(restarted.hasNativeHistoryResume(request.session.threadId)).toBe(false);
+    expect(readFileSync(fx.log, 'utf8')).toBe('');
+  });
 });

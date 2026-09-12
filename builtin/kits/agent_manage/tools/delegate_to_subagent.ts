@@ -127,8 +127,8 @@ export default {
     "completion note as your next inbound message.",
   guidance:
     "**delegate_to_subagent**: This is the ONLY way to involve another " +
-    "agent from inside an LLM turn. Use `list_subagents` to inspect live " +
-    "children and registered template refs. Never create or edit agents/ folders. " +
+    "agent from inside an LLM turn. Use `list_subagents` to discover available " +
+    "teammate IDs. Its registration labels are not task execution status. Never create or edit agents/ folders. " +
     "Returns a short ack — do NOT wait for or quote their reply here; a " +
     "completion callback arrives automatically when they finish.",
   input_schema: {
@@ -149,9 +149,11 @@ export default {
       message: {
         type: "string",
         description:
-          "The task / question for the teammate. Write it as if you were " +
-          "the user typing in their chat tab — they'll reply in their own " +
-          "voice, not yours.",
+          "A self-contained task for the teammate: include the relevant user " +
+          "requirements, exact constraints, owned outputs and acceptance criteria. " +
+          "Do not assume the teammate has the caller's conversation. Preserve " +
+          "explicit choices and exclusions when summarizing; include only the " +
+          "context needed for this assignment.",
       },
     },
     required: ["message"],

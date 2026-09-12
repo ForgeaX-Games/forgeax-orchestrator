@@ -29,6 +29,23 @@ async function startHostAndConnect(): Promise<SidecarClient> {
 }
 
 describe('sidecarSpawnJsonl', () => {
+  test('one-shot child waiting for stdin EOF can start through the real host', async () => {
+    const c = await startHostAndConnect();
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 2500);
+    try {
+      const { lines, exit } = sidecarSpawnJsonl<{ ready: boolean }>(c, {
+        sessionId: 'eof', agentId: 'helper', trustTier: 'own',
+        kernel: { kind: 'test', credential: 'user-managed', cmd: process.execPath,
+          args: ['-e', `process.stdin.resume(); process.stdin.on('end', () => console.log(JSON.stringify({ ready: true })));`] },
+      }, ac.signal);
+      const got = [];
+      for await (const line of lines) got.push(line);
+      expect((await exit).code).toBe(0);
+      expect(got).toEqual([{ ready: true }]);
+    } finally { clearTimeout(timer); c.close(); }
+  }, 10000);
+
   test('假内核吐 ndjson → lines 解出 + exit{code:0}', async () => {
     const c = await startHostAndConnect();
     const { lines, exit } = sidecarSpawnJsonl<{ a?: number; b?: number }>(c, {

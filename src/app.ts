@@ -266,13 +266,15 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   }
   await ensureUserDirDefaults(pm);
   const sm = initSessionManager(pm);
-  await sm.bootAutoStart();
 
   // 组合根接线:把 skill 事件触发的 rewire 接到 plugins reload 后置钩子。
   // (registry 不直接 import event-bridge —— 断开 plugins→event-bridge→runner→plugins 环)
   onExtensionsReloaded(syncEventTriggerBindings);
   await reloadExtensions();
   await bootCliProviders();
+  // Resident templates freeze extension resources and tool grants during
+  // restore. Load both registries before any restored resident can run.
+  await sm.bootAutoStart();
 
   const app = new Hono();
   if (ctx.extensionHost) mountExtensionHost(app, ctx.extensionHost);

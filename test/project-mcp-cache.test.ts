@@ -34,6 +34,41 @@ async function waitForExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
 }
 
 describe.serial('project MCP discovery cache', () => {
+
+  test('allows a tool to exceed the discovery deadline and reuses its live client', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'forgeax-project-mcp-slow-tool-'));
+    const script = join(root, 'fixture.mjs');
+    try {
+      resetProjectMcpPoolForTests();
+      mkdirSync(join(root, '.forgeax'));
+      writeFileSync(script, `
+import { createInterface } from 'node:readline';
+let calls = 0;
+createInterface({ input: process.stdin }).on('line', (line) => {
+  const req = JSON.parse(line);
+  const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result }) + '\\n');
+  if (req.method === 'initialize') reply({ capabilities: {} });
+  if (req.method === 'tools/list') reply({ tools: [{ name: 'work', inputSchema: { type: 'object' } }] });
+  if (req.method === 'tools/call') {
+    const ordinal = ++calls;
+    setTimeout(() => reply({ content: [{ type: 'text', text: String(ordinal) }] }), ordinal === 1 ? 9_000 : 0);
+  }
+});
+`);
+      writeFileSync(join(root, '.forgeax', 'mcp.json'), JSON.stringify({
+        mcpServers: { slow: { command: process.execPath, args: [script] } },
+      }));
+      const bridge = createProjectMcpBridge(root);
+      expect(await bridge.callIfKnown('mcp__slow__work', {})).toBe('1');
+      expect(await bridge.callIfKnown('mcp__slow__work', {})).toBe('2');
+      bridge.close();
+    } finally {
+      await shutdownProjectMcpPool();
+      resetProjectMcpPoolForTests();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, { timeout: 15_000 });
+
   test('backs off an all-failed discovery, then retries the same config', async () => {
     const root = mkdtempSync(join(tmpdir(), 'forgeax-project-mcp-cache-'));
     const script = join(root, 'mcp-fixture.mjs');
@@ -854,7 +889,7 @@ process.stdin.on('data', (chunk) => {
 
       const startedAt = Date.now();
       await expect(bridge.callIfKnown('mcp__hung__hung', {})).rejects.toThrow(/timed out/);
-      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(7_500);
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(59_500);
       expect(await waitForExit(hungPid!)).toBe(true);
 
       // The timed-out child is removed from the pool; its healthy sibling is
@@ -871,7 +906,7 @@ process.stdin.on('data', (chunk) => {
       else process.env.FORGEAX_PROJECT_MCP_RETRY_MS = previousRetry;
       rmSync(root, { recursive: true, force: true });
     }
-  }, { timeout: 15_000 });
+  }, { timeout: 75_000 });
 
   test('shutdown reaps both the current pool and a retiring in-flight pool', async () => {
     const root = mkdtempSync(join(tmpdir(), 'forgeax-project-mcp-shutdown-'));

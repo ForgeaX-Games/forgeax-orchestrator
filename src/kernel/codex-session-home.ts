@@ -39,6 +39,14 @@ import { homedir } from 'node:os';
 import { basename, join, resolve as resolvePath } from 'node:path';
 import { defaultProjectRoot } from '@forgeax/platform-io';
 import { resolveUserDir } from '../fs/user-dir';
+import { getPathManager } from '../fs/path-manager';
+
+/** The host layout owns session-to-workspace binding. Never interpret its path
+ * or substitute another session's active scope in a native kernel. */
+export function codexWorkingDirectory(req: TurnRequest): string {
+  const sid = req.hostSessionId?.trim();
+  return sid ? getPathManager().sessionWorkDir(sid) : defaultProjectRoot();
+}
 
 /** Sanitize one path segment into a safe directory-name fragment.
  *  Collapses runs of dots so a hostile id can't smuggle a `..` traversal even
@@ -200,14 +208,18 @@ export function hasProjectTrust(cfg: string, projectRoot: string): boolean {
  *   - current `config.toml`, including native MCP/hooks/plugins, plus project trust;
  *   - links to user-managed native capability directories, avoiding per-session copies.
  */
+export function codexSessionHomePath(key: string, options: { nativeCapabilities?: boolean } = {}): string {
+  const parts = key.split('/').map((p) => seg(p, 'x'));
+  if (options.nativeCapabilities === false) parts.push('imported-hermetic');
+  return join(resolveUserDir(), 'codex', ...parts);
+}
+
 export async function ensureCodexSessionHome(
   key: string,
-  options: { nativeCapabilities?: boolean } = {},
+  options: { nativeCapabilities?: boolean; workingDirectory?: string } = {},
 ): Promise<string> {
   const nativeCapabilities = options.nativeCapabilities !== false;
-  const parts = key.split('/').map((p) => seg(p, 'x'));
-  if (!nativeCapabilities) parts.push('imported-hermetic');
-  const dir = join(resolveUserDir(), 'codex', ...parts);
+  const dir = codexSessionHomePath(key, options);
   mkdirSync(dir, { recursive: true });
   mkdirSync(join(dir, 'sessions'), { recursive: true });
 
@@ -230,7 +242,7 @@ export async function ensureCodexSessionHome(
   }
 
   // Current native config + trust for the current cwd (overwritten each call).
-  const projectRoot = defaultProjectRoot();
+  const projectRoot = options.workingDirectory ?? defaultProjectRoot();
   let cfg = '';
   try {
     const cfgSrc = join(src, 'config.toml');

@@ -16,7 +16,10 @@ export function buildKernelTask(
   const task = suffix
     ? `${req.input.text}\n\n${suffix}`
     : req.input.text;
-  if (!bootstrapContext) return task;
+  // A prepared text-bridge plan is already serialized in dynamicSuffix.
+  // Replaying context.messages again doubles history on fresh/private restart.
+  const mode = (req.historyPlan as { mode?: string } | undefined)?.mode;
+  if (!bootstrapContext || mode === 'snapshot' || mode === 'delta' || mode === 'none') return task;
 
   const messages = req.context?.messages ?? req.history ?? [];
   if (messages.length === 0) return task;

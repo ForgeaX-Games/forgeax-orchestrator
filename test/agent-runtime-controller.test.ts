@@ -52,6 +52,75 @@ function instance(lifetime: "resident" | "ephemeral" = "resident"): AgentInstanc
 }
 
 describe("AgentRuntimeController handoff", () => {
+  test("user stop preserves peer results without automatically starting another turn", async () => {
+    const calls: unknown[] = [];
+    const controller = new AgentRuntimeController(instance(), {
+      execute: async (_instance, input, _bindings, signal) => {
+        calls.push(input);
+        if (calls.length === 1) {
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          throw new Error("stopped");
+        }
+        return { final: false };
+      },
+    });
+    controller.start();
+    const active = controller.enqueue({ source: "user" }).catch(() => undefined);
+    const callback = controller.enqueue({ source: "agent", handoff: "turn", payload: { content: "artifact" } });
+    controller.stopTurn();
+    await active;
+    await controller.waitForQuiescence();
+    expect(calls).toHaveLength(1);
+    const continuation = controller.enqueue({ source: "user", payload: { content: "continue" } });
+    await Promise.all([callback, continuation]);
+    expect(calls).toHaveLength(2);
+    expect((calls[1] as RuntimeTurnBatch).inputs).toEqual([
+      { source: "agent", handoff: "silent", payload: { content: "artifact" } },
+      { source: "user", payload: { content: "continue" } },
+    ]);
+    await controller.dispose();
+  });
+
+  test("stop cancels an unstarted assignment but retains queued human input", async () => {
+    const calls: unknown[] = [];
+    const controller = new AgentRuntimeController(instance(), {
+      execute: async (_instance, input, _bindings, signal) => {
+        calls.push(input);
+        if (calls.length === 1) await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        return { final: false };
+      },
+    });
+    controller.start();
+    const active = controller.enqueue({ source: "user" });
+    const assignment = controller.enqueue({ source: "agent", type: "user_input" }).catch((error) => error.message);
+    const human = controller.enqueue({ source: "user", type: "user_input", payload: { content: "next" } });
+    controller.stopTurn("user stopped");
+    await Promise.all([active, human]);
+    expect(await assignment).toBe("user stopped");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({ source: "user", payload: { content: "next" } });
+    await controller.dispose();
+  });
+
+  test("dispose rejects synchronous admission from an abort listener", async () => {
+    let rejected = false;
+    const controller = new AgentRuntimeController(instance(), {
+      execute: async (_instance, _input, _bindings, signal) => {
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => {
+          try { controller.acceptTurn({ source: "agent" }); } catch { rejected = true; }
+          resolve();
+        }, { once: true }));
+        return { final: false };
+      },
+    });
+    controller.start();
+    const active = controller.enqueue({ source: "user" });
+    await controller.dispose();
+    await active;
+    expect(rejected).toBe(true);
+    expect(controller.pendingTurns).toBe(0);
+  });
+
   test("silent 只积累，由下一条 turn 触发同一批执行", async () => {
     const calls: unknown[] = [];
     const controller = new AgentRuntimeController(instance(), {

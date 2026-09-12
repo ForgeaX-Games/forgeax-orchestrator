@@ -43,6 +43,8 @@ const compact: CommandModule = {
     const agent = await session.initializeAgentHost(agentPath);
     if (!agent) throw new Error(`compact: agent '${agentPath}' not running`);
 
+    if (await agent.compactNativeContext()) return { compacted: true, owner: 'native-kernel' };
+
     const resolveModels = agent.agentContext.resolveModels;
     if (!resolveModels) throw new Error("compact: resolveModels unavailable on agent");
 

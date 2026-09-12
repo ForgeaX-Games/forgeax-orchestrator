@@ -106,10 +106,11 @@ describe('composeTurnRequest selected-kernel policy', () => {
         questions: { type: 'array', minItems: 1, maxItems: 3 },
       },
     });
-    expect(ask?.inputSchema?.anyOf).toEqual([
-      { required: ['question', 'options'] },
-      { required: ['questions'] },
-    ]);
+    // Provider wire schemas must keep root combinators out; argument shape
+    // validation belongs to the host handler for both supported question forms.
+    for (const keyword of ['anyOf', 'oneOf', 'allOf', 'not', 'enum', 'const']) {
+      expect(ask?.inputSchema?.[keyword]).toBeUndefined();
+    }
   });
 
   test('declares todo_write with the CLI schema and local delivery', async () => {

@@ -15,7 +15,7 @@ import { deepMerge } from "../utils/deep-merge";
 import { AGENT_DEFAULTS } from "../defaults/agent-json";
 import { resolveExternalAgentTemplate } from "../agents/loader";
 import { sameResidentResource, snapshotResidentResources } from "../agents/resident-resources";
-import { COORDINATOR_TOOL_GRANTS } from "../agents/tool-grants";
+import { COORDINATOR_TOOL_GRANTS, declaredProjectMcpGrants } from "../agents/tool-grants";
 import type { AgentJson } from "./types";
 
 // ─── 类型 ────────────────────────────────────────────────────────────────────
@@ -118,8 +118,11 @@ export async function ensureAgentScaffold(
     // persona is local, bootstrap must not infer authority from its leaf name.
     if (external && merged.personaFile && sameResidentResource(layer.root(), merged.personaFile, external.personaPath)) {
       if (merged.trustTier === undefined) merged.trustTier = external.trustTier;
-      if (external.source === "brand" && merged.toolGrants === undefined) {
-        merged.toolGrants = structuredClone(COORDINATOR_TOOL_GRANTS);
+      if (merged.toolGrants === undefined) {
+        const grants = external.source === "brand"
+          ? structuredClone(COORDINATOR_TOOL_GRANTS)
+          : declaredProjectMcpGrants(external.tools);
+        if (grants) merged.toolGrants = grants;
       }
     }
     const portable = external

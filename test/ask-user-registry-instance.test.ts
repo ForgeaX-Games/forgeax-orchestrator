@@ -56,3 +56,16 @@ describe("ask_user instance identity", () => {
     expect(await right.promise).toEqual(["right"]);
   });
 });
+
+test('concurrent requests keep independent identities and reject ambiguous replies', async () => {
+  const owner = { sid: 'concurrent-asks', agentPath: 'forge', instanceId: 'forge', runtimeEpochId: 'current' };
+  const a = registerAsk({ ...owner, requestId: 'request-a' }, 0);
+  const b = registerAsk({ ...owner, requestId: 'request-b' }, 0);
+  expect(resolveAsk(owner.sid, owner.agentPath, ['ambiguous'])).toBe(false);
+  expect(resolveAsk(owner.sid, 'other-agent', ['wrong'], { requestId: a.requestId })).toBe(false);
+  expect(resolveAsk('other-session', owner.agentPath, ['wrong'], { requestId: a.requestId })).toBe(false);
+  expect(resolveAsk(owner.sid, owner.agentPath, ['B'], { requestId: b.requestId })).toBe(true);
+  expect(await b.promise).toEqual(['B']);
+  expect(resolveAsk(owner.sid, owner.agentPath, ['A'], { requestId: a.requestId })).toBe(true);
+  expect(await a.promise).toEqual(['A']);
+});

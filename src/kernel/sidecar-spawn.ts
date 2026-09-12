@@ -81,7 +81,7 @@ export function sidecarSpawnJsonl<T = unknown>(
   });
 
   // 先注册监听再 startSession(避免漏事件)。
-  const started = client.startSession(spec).catch((e) => {
+  const started = client.startSession({ ...spec, kernel: { ...spec.kernel, stdin: 'closed' } }).catch((e) => {
     stderrAcc += `startSession failed: ${(e as Error).message}`;
     finish(-1);
   });

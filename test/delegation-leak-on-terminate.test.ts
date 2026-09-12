@@ -407,6 +407,35 @@ describe("delegation registry leak on target termination — 真实 delegate_to_
 });
 
 describe("delegate_to_subagent runtime contract", () => {
+  test.each(["root", "mochi"])("explicit stop of %s cancels delegated work without waking its owner", async (stoppedAddress) => {
+    const kernelId = "delegation-user-stop-kernel";
+    let runs = 0;
+    registerKernel(testKernel(kernelId, async function* (_request, signal) {
+      runs++;
+      await abortableGate(signal, new Promise<void>(() => {}));
+      yield { kind: "turn.done", reason: "stop" };
+    }));
+    const sm = initSessionManager(getPathManager());
+    try {
+      const session = await createRuntimeSession(sm, kernelId, ["root", "mochi"]);
+      const ctx = await getRootCtx(session);
+      const { messages, dispose } = captureMessages(session);
+      await delegateTool.execute({ agent: "mochi", message: "work until stopped" }, ctx);
+      await waitUntil(() => runs === 1);
+      session.stopRuntime(stoppedAddress, "user stopped");
+      await waitUntil(() => !session.delegations.has("mochi"));
+      const target = session.tree.resolve("mochi")!;
+      await session.supervisor.getController(target.instanceId)!.waitForQuiescence();
+      const root = session.tree.resolve("root")!;
+      await session.supervisor.getController(root.instanceId)!.waitForQuiescence();
+      expect(runs).toBe(1);
+      expect(messages.find((event) => event.to === "root")).toMatchObject({ handoff: "silent", durability: "required" });
+      expect(session.delegations.size).toBe(0);
+      dispose();
+      await sm.close(session.sid);
+    } finally { unregisterKernel(kernelId); }
+  });
+
   test("real resident init failure emits the full identity callback, clears busy, and leaves the resident usable", async () => {
     const kernelId = "delegation-contract-resident-init-failure-kernel";
     const kernel = testKernel(kernelId, async function* () {
@@ -435,6 +464,7 @@ describe("delegate_to_subagent runtime contract", () => {
 
       const target = session.runtimeTree.findResident("broken-resident");
       expect(target).toBeDefined();
+      await session.supervisor.getController(target!.instanceId)!.waitForQuiescence();
       expect(target?.state).toBe("idle");
       expect(turnEnds).toHaveLength(1);
       const failure = turnEnds[0]!.payload as Record<string, unknown>;

@@ -115,7 +115,7 @@ function renderRoster(rows: RosterRow[]): string {
   );
   lines.push("");
   if (active.length > 0) {
-    lines.push("## Active in this session");
+    lines.push("## Registered in this session");
     for (const r of active) {
       const desc = r.description ? ` — ${r.description}` : "";
       lines.push(`- **${r.id}** (${r.displayName}, ${r.role})${desc}`);
@@ -132,7 +132,9 @@ function renderRoster(rows: RosterRow[]): string {
   }
   lines.push(
     "Call `list_subagents` for a fresh snapshot if you suspect the roster " +
-      "changed mid-session.",
+      "changed mid-session. Registration does not indicate running work. " +
+      "Do not poll the roster for completion; teammate reports arrive as " +
+      "inbound messages. Finish your current turn when waiting for them.",
   );
   return lines.join("\n");
 }
@@ -141,7 +143,7 @@ export default function subagentRosterSlot(ctx: AgentContext): ContextSlot {
   return {
     name: "subagent_roster",
     description:
-      "Names of teammate agents (active + available to spawn) plus the " +
+      "Names of teammate agents (registered + available to spawn) plus the " +
       "delegate_to_subagent contract. Without this the LLM has no idea " +
       "mochi / rin / etc. are anything other than filenames to grep for.",
     priority: SlotPriority.DYNAMIC_SUBAGENTS,
