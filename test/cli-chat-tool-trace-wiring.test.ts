@@ -83,7 +83,7 @@ async function runTurn(): Promise<Array<{ event: string; data: Record<string, un
   const res = await app.request('/api/cli/chat', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ message: 'hi', agentId: 'forge', providerOverride: KERNEL_ID }),
+    body: JSON.stringify({ message: 'hi', agentId: 'forge', providerOverride: KERNEL_ID, callId: 'trace-call' }),
   });
   const text = await res.text();
   const out: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -128,6 +128,27 @@ describe('CLI 桥:工具事件 → tracer,信封不出墙', () => {
     // 内核铸的 callId 与 shim 自铸的执行 id 并存,两个键都在、且互不冒充。
     expect(attrs.callId).toBe('call_real');
     expect(attrs.toolExecutionId).toBe('fxt-wired-1');
+  });
+
+  test('真实兼容路由产出阶段 span并保留 request/turn/session 关联', async () => {
+    await runTurn();
+    const phases = telemetry.filter((record) => {
+      const span = record as unknown as Record<string, unknown>;
+      const attrs = span.attrs as Record<string, unknown> | undefined;
+      return span.kind === 'span' && typeof attrs?.phase === 'string';
+    }) as unknown as Array<Record<string, unknown>>;
+    expect(phases.map((span) => span.name)).toEqual(expect.arrayContaining([
+      'request.prepare',
+      'model.first_token',
+      'model.generation',
+      'tool',
+    ]));
+    for (const span of phases) {
+      const attrs = span.attrs as Record<string, unknown>;
+      expect(attrs.requestId).toBe('trace-call');
+      expect(attrs.turnId).toBe('trace-call');
+      expect(attrs.sessionId).toBe('unknown');
+    }
   });
 
   test('发给前端的 tool-result 是字符串正文,不是信封', async () => {

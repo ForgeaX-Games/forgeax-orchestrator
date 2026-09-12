@@ -31,6 +31,22 @@ function newTraceId(): string {
   return `${randomUUID()}${randomUUID()}`.replace(/-/g, '').slice(0, 32);
 }
 
+/** Keep correlation values bounded and opaque; never put request content in telemetry. */
+function safeOpaqueId(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, 128) : fallback;
+}
+
+export type ChildTaskStatus = 'ok' | 'error' | 'unknown';
+
+/** Classify only documented terminal reasons; all other provider reasons stay unknown. */
+export function classifyChildTaskStatus(reason: unknown): ChildTaskStatus {
+  if (reason === 'completed' || reason === 'done' || reason === 'stop') return 'ok';
+  if (reason === 'error' || reason === 'failed' || reason === 'cancelled' || reason === 'timeout') return 'error';
+  return 'unknown';
+}
+
 /** 解析 W3C traceparent(`00-<32hex>-<16hex>-<2hex>`)→ {traceId, spanId};非法/全零 → undefined。 */
 function parseTraceparent(tp: string | undefined): { traceId: string; spanId: string } | undefined {
   if (!tp) return undefined;
@@ -116,13 +132,110 @@ interface ToolSpanState {
   collided: boolean;
 }
 
+type PhaseName =
+  | 'request.prepare'
+  | 'model.first_token'
+  | 'model.generation'
+  | 'authorization.wait'
+  | 'child.wait';
+
+interface PhaseSpanState {
+  spanId: string;
+  parentSpanId: string;
+  name: PhaseName;
+  startTs: number;
+  attrs: Record<string, unknown>;
+  closed: boolean;
+  /** A child lifecycle can outlive the tool call that announced it. */
+  childId?: string;
+}
+
+function phaseStartRecord(
+  context: Record<string, unknown>,
+  state: PhaseSpanState,
+): TelemetryRecord {
+  return {
+    kind: 'span',
+    ...context,
+    spanId: state.spanId,
+    parentSpanId: state.parentSpanId,
+    name: state.name,
+    startTs: state.startTs,
+    provisional: true,
+    attrs: {
+      ...state.attrs,
+      phase: state.name,
+      availability: 'pending',
+    },
+  } as unknown as TelemetryRecord;
+}
+
+function phaseFinalRecord(
+  context: Record<string, unknown>,
+  state: PhaseSpanState,
+  endTs: number,
+  availability: 'measured' | 'unknown',
+  extraAttrs: Record<string, unknown> = {},
+  status?: { code: 'ok' | 'error'; message?: string },
+): TelemetryRecord {
+  const attrs = {
+    ...state.attrs,
+    ...extraAttrs,
+    phase: state.name,
+    availability,
+    ...(availability === 'measured'
+      ? { durationMs: Math.max(0, endTs - state.startTs) }
+      : {}),
+  };
+  return {
+    kind: 'span',
+    ...context,
+    spanId: state.spanId,
+    parentSpanId: state.parentSpanId,
+    name: state.name,
+    startTs: state.startTs,
+    endTs,
+    ...(status ? { status } : {}),
+    attrs,
+  } as unknown as TelemetryRecord;
+}
+
+function phaseState(
+  name: PhaseName,
+  parentSpanId: string,
+  startTs: number,
+  attrs: Record<string, unknown>,
+  childId?: string,
+): PhaseSpanState {
+  return {
+    spanId: newSpanId(),
+    parentSpanId,
+    name,
+    startTs,
+    attrs,
+    closed: false,
+    ...(childId ? { childId } : {}),
+  };
+}
+
 export interface CliKernelTurnTrace {
+  /** Composition/history/tool materialization finished and the request is ready to send. */
+  onRequestReady(request?: {
+    model?: unknown;
+    reasoningEffort?: unknown;
+    reasoningSupport?: unknown;
+  }): void;
+  /** First provider text/reasoning token. Tool calls do not count as a token. */
+  onFirstToken(kind: 'text' | 'thinking'): void;
   /** 内核报了一次工具调用 → 开一条 `tool` span(挂 agent.run 下),provisional 立即落盘。
    *  `callId` 是**内核自己铸**的调用 id(codex 上形如 `call_…` 或 `exec-…`,视执行面而定;
    *  不要对前缀做任何假设)。同一 callId 重复上报只开一次。 */
   onToolCall(callId: string, name: string): void;
   /** 该调用的结果 → 收口对应 `tool` span,并把结果里带回的 toolExecutionId 记进 attrs。 */
   onToolResult(callId: string, ok: boolean, result?: unknown, error?: string): void;
+  /** Runtime child lifecycle. These events are optional; no child duration is guessed when absent. */
+  onChildTaskStart(childId: string): void;
+  onChildTaskEnd(childId: string, status: ChildTaskStatus, reason?: string): void;
   /** 收尾:先收未收口的 tool span,再收 agent.run,最后收 kernel.turn。 */
   end(o: {
     ok: boolean;
@@ -139,6 +252,10 @@ export function startCliKernelTurn(o: {
   agentId: string;
   sid?: string;
   traceparent?: string;
+  /** Stable opaque request identity; generated when the caller has none. */
+  requestId?: string;
+  /** Stable opaque turn identity; generated from requestId when omitted. */
+  turnId?: string;
 }): CliKernelTurnTrace {
   const parent = parseTraceparent(o.traceparent);
   const traceId = parent?.traceId ?? newTraceId();
@@ -146,6 +263,9 @@ export function startCliKernelTurn(o: {
   const agentSpanId = newSpanId();
   const startTs = Date.now();
   const context = { traceId, ...(o.sid ? { sid: o.sid } : {}), agentId: o.agentId };
+  const requestId = safeOpaqueId(o.requestId, `req-${randomUUID()}`);
+  const turnId = safeOpaqueId(o.turnId, requestId);
+  const correlation = { requestId, turnId, sessionId: o.sid ?? 'unknown' };
   const kernelBase = {
     ...context,
     spanId: kernelSpanId,
@@ -154,16 +274,108 @@ export function startCliKernelTurn(o: {
   };
   const agentBase = { ...context, spanId: agentSpanId, parentSpanId: kernelSpanId, name: 'agent.run' };
   const tools = new Map<string, ToolSpanState>();
+  const childWaits = new Map<string, PhaseSpanState>();
+  const requestPreparation = phaseState('request.prepare', kernelSpanId, startTs, correlation);
+  let requestReadyAt: number | undefined;
+  let firstToken: PhaseSpanState | undefined;
+  let firstTokenObserved = false;
+  let generation: PhaseSpanState | undefined;
+  let generationObserved = false;
+  let lastOutputAt: number | undefined;
+  let requestModel = 'unknown';
+  let requestReasoningEffort = 'unknown';
+  let requestReasoningSupport = 'unknown';
   let ended = false;
 
+  const emitPhaseStart = (state: PhaseSpanState): void => {
+    emitSafely(o.sid, [phaseStartRecord(context, state)]);
+  };
+
+  const closePhase = (
+    state: PhaseSpanState | undefined,
+    endTs: number,
+    availability: 'measured' | 'unknown',
+    extraAttrs: Record<string, unknown> = {},
+    status?: { code: 'ok' | 'error'; message?: string },
+  ): void => {
+    if (!state || state.closed) return;
+    state.closed = true;
+    emitSafely(o.sid, [phaseFinalRecord(context, state, endTs, availability, extraAttrs, status)]);
+  };
+
+  const unknownPhase = (
+    name: PhaseName,
+    parentSpanId: string,
+    start: number,
+    unknownReason: string,
+  ): void => {
+    const state = phaseState(name, parentSpanId, start, correlation);
+    emitPhaseStart(state);
+    closePhase(state, Date.now(), 'unknown', { unknownReason });
+  };
+
+  const ensureRequestReady = (): void => {
+    if (requestReadyAt !== undefined) return;
+    const now = Date.now();
+    closePhase(requestPreparation, now, 'unknown', {
+      unknownReason: 'request_ready_not_observed',
+      readiness: 'inferred_from_provider_event',
+      requestModel,
+      reasoningEffort: requestReasoningEffort,
+      reasoningSupport: requestReasoningSupport,
+    });
+    requestReadyAt = now;
+    firstToken = phaseState('model.first_token', agentSpanId, now, {
+      ...correlation,
+      requestModel,
+      reasoningEffort: requestReasoningEffort,
+      reasoningSupport: requestReasoningSupport,
+    });
+    emitPhaseStart(firstToken);
+  };
+
+  const noteModelEvent = (kind: 'text' | 'thinking' | 'tool_call'): void => {
+    if (ended) return;
+    ensureRequestReady();
+    const now = Date.now();
+    if (kind !== 'tool_call') lastOutputAt = now;
+    if ((kind === 'text' || kind === 'thinking') && !firstTokenObserved) {
+      firstTokenObserved = true;
+      closePhase(firstToken, now, requestPreparation.attrs.explicitReady === true ? 'measured' : 'unknown', { firstTokenKind: kind });
+    }
+    if (!generation && kind !== 'tool_call') {
+      generationObserved = true;
+      generation = phaseState('model.generation', agentSpanId, now, {
+        ...correlation,
+        outputKind: kind,
+      });
+      emitPhaseStart(generation);
+    }
+    // A tool call is the end of this model-output burst. The next model burst
+    // starts only after the tool result, so tool execution is never hidden
+    // inside a long generation bar.
+    if (kind === 'tool_call') {
+      closePhase(generation, lastOutputAt ?? now, 'measured', { observation: 'first_to_last_output_event' });
+      generation = undefined;
+    }
+  };
+
+  emitSafely(o.sid, [phaseStartRecord(context, requestPreparation)]);
+
   emitSafely(o.sid, [
-    { kind: 'span', ...kernelBase, startTs, provisional: true, attrs: { kernel: o.kernelId } } as TelemetryRecord,
+    {
+      kind: 'span',
+      ...kernelBase,
+      startTs,
+      provisional: true,
+      attrs: { kernel: o.kernelId, ...correlation },
+    } as TelemetryRecord,
     {
       kind: 'log',
       ts: startTs,
       level: 'info',
       msg: 'kernel.turn start',
-      fields: { kernel: o.kernelId },
+      fields: { kernel: o.kernelId, ...correlation },
       ...context,
       spanId: kernelSpanId,
     } as TelemetryRecord,
@@ -172,15 +384,64 @@ export function startCliKernelTurn(o: {
       ...agentBase,
       startTs,
       provisional: true,
-      attrs: { agentType: o.agentId, kernel: o.kernelId },
+      attrs: { agentType: o.agentId, kernel: o.kernelId, ...correlation },
     } as TelemetryRecord,
   ]);
 
   return {
+    onRequestReady(request): void {
+      try {
+        if (ended || requestReadyAt !== undefined) return;
+        if (typeof request?.model === 'string' && request.model.trim()) {
+          requestModel = request.model.trim().slice(0, 256);
+        }
+        if (request && Object.prototype.hasOwnProperty.call(request, 'reasoningEffort')) {
+          requestReasoningEffort = typeof request.reasoningEffort === 'string'
+            ? request.reasoningEffort.trim().slice(0, 32) || 'unknown'
+            : request.reasoningEffort == null ? 'disabled' : 'unknown';
+        }
+        if (request && Object.prototype.hasOwnProperty.call(request, 'reasoningSupport')) {
+          requestReasoningSupport = typeof request.reasoningSupport === 'string'
+            ? request.reasoningSupport.trim().slice(0, 32) || 'unknown'
+            : typeof request.reasoningSupport === 'boolean'
+              ? request.reasoningSupport ? 'supported' : 'unsupported'
+              : 'unknown';
+        }
+        const now = Date.now();
+        requestPreparation.attrs.explicitReady = true;
+        closePhase(requestPreparation, now, 'measured', {
+          readiness: 'request_ready',
+          requestModel,
+          reasoningEffort: requestReasoningEffort,
+          reasoningSupport: requestReasoningSupport,
+        });
+        requestReadyAt = now;
+        firstToken = phaseState('model.first_token', agentSpanId, now, {
+          ...correlation,
+          requestModel,
+          reasoningEffort: requestReasoningEffort,
+          reasoningSupport: requestReasoningSupport,
+        });
+        emitPhaseStart(firstToken);
+      } catch {
+        /* 可观测性永不反噬主流程 */
+      }
+    },
+
+    onFirstToken(kind): void {
+      try {
+        if (ended) return;
+        noteModelEvent(kind);
+      } catch {
+        /* 可观测性永不反噬主流程 */
+      }
+    },
+
     onToolCall(callId, name): void {
       try {
         // 收口之后来的调用不再开新 span —— 那条 span 永远等不到 end() 去收它。
         if (ended) return;
+        noteModelEvent('tool_call');
         const existing = tools.get(callId);
         if (existing) {
           // 同 callId 重复上报。**正常情况**是内核对同一 item 发了多次 started(codex 的两个
@@ -193,9 +454,17 @@ export function startCliKernelTurn(o: {
           if (!existing.closed) existing.collided = true;
           return;
         }
-        const state: ToolSpanState = { spanId: newSpanId(), startTs: Date.now(), name, closed: false, collided: false };
+        const state: ToolSpanState = {
+          spanId: newSpanId(),
+          startTs: Date.now(),
+          name,
+          closed: false,
+          collided: false,
+        };
+        // Tool names do not prove authorization waits. The permission
+        // side-channel is not observed by this tracer yet.
         tools.set(callId, state);
-        emitSafely(o.sid, [
+        const records: TelemetryRecord[] = [
           {
             kind: 'span',
             ...context,
@@ -204,9 +473,16 @@ export function startCliKernelTurn(o: {
             name: 'tool',
             startTs: state.startTs,
             provisional: true,
-            attrs: { tool: name, callId },
+            attrs: {
+              ...correlation,
+              tool: name,
+              callId,
+              phase: 'tool.execution',
+              availability: 'pending',
+            },
           } as TelemetryRecord,
-        ]);
+        ];
+        emitSafely(o.sid, records);
       } catch {
         /* 可观测性永不反噬主流程 */
       }
@@ -220,6 +496,7 @@ export function startCliKernelTurn(o: {
         // 结果」这件事藏起来;留成可观察的缺席,才查得出来。
         if (!state || state.closed) return;
         state.closed = true;
+        const endTs = Date.now();
         const toolExecutionId = readToolExecutionId(result);
         emitSafely(o.sid, [
           {
@@ -229,11 +506,16 @@ export function startCliKernelTurn(o: {
             parentSpanId: agentSpanId,
             name: 'tool',
             startTs: state.startTs,
-            endTs: Date.now(),
+            endTs,
             status: ok ? { code: 'ok' } : { code: 'error', ...(error ? { message: error } : {}) },
             attrs: {
+              ...correlation,
               tool: state.name,
               callId,
+              phase: 'tool.execution',
+              availability: 'measured',
+              durationMs: Math.max(0, endTs - state.startTs),
+              observation: 'tool_call_to_result_including_unobserved_waits',
               ...(toolExecutionId ? { toolExecutionId } : {}),
               // 撞过 callId → 这一行的归属不可判定,别把它当可信证据用。
               ...(state.collided ? { callIdCollision: true } : {}),
@@ -245,11 +527,86 @@ export function startCliKernelTurn(o: {
       }
     },
 
+    onChildTaskStart(childId): void {
+      try {
+        if (ended) return;
+        const id = safeOpaqueId(childId, `child-${childWaits.size + 1}`);
+        if (childWaits.has(id)) return;
+        const state = phaseState('child.wait', agentSpanId, Date.now(), {
+          ...correlation,
+          childId: id,
+        }, id);
+        childWaits.set(id, state);
+        emitPhaseStart(state);
+      } catch {
+        /* 可观测性永不反噬主流程 */
+      }
+    },
+
+    onChildTaskEnd(childId, status, reason): void {
+      try {
+        if (ended) return;
+        const id = safeOpaqueId(childId, '');
+        const state = childWaits.get(id);
+        if (!state) return;
+        closePhase(
+          state,
+          Date.now(),
+          'unknown',
+          { unknownReason: 'child_lifecycle_does_not_prove_parent_wait', outcome: status },
+          status === 'ok' ? { code: 'ok' } : status === 'error' ? { code: 'error' } : undefined,
+        );
+      } catch {
+        /* 可观测性永不反噬主流程 */
+      }
+    },
+
     end(e): void {
       try {
         if (ended) return;
         ended = true;
         const endTs = Date.now();
+
+        unknownPhase('authorization.wait', agentSpanId, startTs, 'authorization_lifecycle_not_observed');
+        if (childWaits.size === 0) {
+          unknownPhase('child.wait', agentSpanId, startTs, 'parent_wait_not_observed');
+        }
+        if (!requestPreparation.closed) {
+          closePhase(requestPreparation, endTs, 'unknown', {
+            unknownReason: 'request_not_ready',
+            requestModel,
+            reasoningEffort: requestReasoningEffort,
+            reasoningSupport: requestReasoningSupport,
+          });
+        }
+        if (!firstToken) {
+          unknownPhase(
+            'model.first_token',
+            agentSpanId,
+            requestReadyAt ?? startTs,
+            requestReadyAt === undefined ? 'request_not_ready' : 'first_token_not_observed',
+          );
+        } else if (!firstTokenObserved) {
+          closePhase(firstToken, endTs, 'unknown', { unknownReason: 'first_token_not_observed' });
+        }
+        if (generation) {
+          closePhase(generation, lastOutputAt ?? endTs, 'measured', { observation: 'first_to_last_output_event' });
+        } else if (!generationObserved) {
+          unknownPhase(
+            'model.generation',
+            agentSpanId,
+            requestReadyAt ?? startTs,
+            requestReadyAt === undefined ? 'request_not_ready' : 'model_output_not_observed',
+          );
+        }
+        for (const state of childWaits.values()) {
+          closePhase(
+            state,
+            endTs,
+            'unknown',
+            { unknownReason: 'child_completion_not_observed', outcome: 'unknown' },
+          );
+        }
 
         // 未收口的 tool span 先收掉:turn 都结束了还挂着的 span 会被当成「卡死」信号,
         // 那就是纯误报源 —— 上一轮 MAJOR-1 的教训正是「开了链不收口比不开更坏」。
@@ -266,7 +623,15 @@ export function startCliKernelTurn(o: {
               startTs: state.startTs,
               endTs,
               status: { code: 'error', message: '工具调用未收到结果(内核提前结束或被取消)' },
-              attrs: { tool: state.name, callId, unclosed: true, ...(state.collided ? { callIdCollision: true } : {}) },
+              attrs: {
+                ...correlation,
+                tool: state.name,
+                callId,
+                phase: 'tool.execution',
+                availability: 'unknown',
+                unclosed: true,
+                ...(state.collided ? { callIdCollision: true } : {}),
+              },
             } as TelemetryRecord,
           ]);
         }
@@ -278,11 +643,17 @@ export function startCliKernelTurn(o: {
             startTs,
             endTs,
             status: e.ok ? { code: 'ok' } : { code: 'error', ...(e.error ? { message: e.error } : {}) },
-            attrs: { agentType: o.agentId, kernel: o.kernelId, tools: tools.size },
+            attrs: { agentType: o.agentId, kernel: o.kernelId, tools: tools.size, ...correlation },
           } as TelemetryRecord,
         ]);
 
-        const attrs: Record<string, unknown> = { kernel: o.kernelId };
+        const attrs: Record<string, unknown> = {
+          kernel: o.kernelId,
+          ...correlation,
+          'request.model': requestModel,
+          'request.reasoningEffort': requestReasoningEffort,
+          'request.reasoningSupport': requestReasoningSupport,
+        };
         if (e.model) attrs.model = e.model;
         if (e.reason) attrs.reason = e.reason;
         if (e.usage) {
@@ -305,6 +676,7 @@ export function startCliKernelTurn(o: {
             msg: 'kernel.turn done',
             fields: {
               kernel: o.kernelId,
+              ...correlation,
               status: e.ok ? 'ok' : 'error',
               ...(e.reason ? { reason: e.reason } : {}),
               ...(e.model ? { model: e.model } : {}),

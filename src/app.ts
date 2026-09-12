@@ -69,13 +69,14 @@ import {
   type DeliveryEnricher,
   type ArtifactResolver,
   type UploadDefaults,
+  type ProgressPolicyProvider,
 } from './orchestration-seams';
 import { ensureUserDirDefaults } from './defaults/scaffold';
 import { initSessionManager } from './core/session-manager';
 import { createRoundDeliveryEnricher } from './checkpoint/round-delivery';
 import {
   buildActionCatalog,
-  HEADLESS_ACTION_GRANDFATHER_IDS,
+  type ActionCatalogEntry,
 } from './kernel/action-catalog';
 import { listBuiltinHeadlessUiActionIds } from './kernel/ui-headless-actions';
 import './llm/register-all';
@@ -151,6 +152,12 @@ export interface ProductContext {
   /** UI 语义操作层的 headless 等价 handler(surface:'both'|'server' 的 action,UI
    *  不在线时 ui_invoke 回落到这里执行;server 是行为 SSOT,方案 §5)。 */
   hostUiActions?: HostUiActionHandler[];
+  /** Complete trusted host catalog. Omitted: generic role/session lifecycle only.
+   * Client manifests can bind executors but cannot add declarations. */
+  actionCatalog?: readonly ActionCatalogEntry[];
+  /** Explicit host migration debt for declared headless actions lacking handlers.
+   * Omitted: no exceptions. Never infer IDs from product names or prior hosts. */
+  headlessActionCompatibilityIds?: readonly string[];
   /** Asset path policy replacing the `.forgeax/games` whitelist. Default CLOSED;
    *  the shell opens roots explicitly. Conditionally required + fail-fast when
    *  asset routers are injected (§3.4). */
@@ -160,6 +167,9 @@ export interface ProductContext {
    *  used to be a compiled constant in the base's upload/config.ts). Omitted ⇒
    *  upload is unconfigured unless the operator sets `FORGEAX_UPLOAD_*`. */
   uploadDefaults?: UploadDefaults;
+  /** Optional product-owned phase/budget/no-progress policy. No injection means
+   *  the generic session keeps its existing unconstrained behavior. */
+  progressPolicyProvider?: ProgressPolicyProvider;
   /** Optional game-host version-prepare hook (product shell injects platform-specific
    *  behavior, e.g. video-game syncing its component set into the game dir before
    *  a version is committed). game-host stays generic; app only passes it through. */
@@ -214,12 +224,10 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
   const delivery = ctx.delivery ?? createRoundDeliveryEnricher();
   const artifactResolver = ctx.artifactResolver ?? (delivery as unknown as ArtifactResolver);
 
-  buildActionCatalog(undefined, {
-    headlessHandlerActionIds: [
-      ...listBuiltinHeadlessUiActionIds(),
-      ...(ctx.hostUiActions ?? []).map((handler) => handler.actionId),
-    ],
-    grandfatheredHeadlessActionIds: HEADLESS_ACTION_GRANDFATHER_IDS,
+  buildActionCatalog(ctx.actionCatalog, {
+    builtinHeadlessHandlerActionIds: listBuiltinHeadlessUiActionIds(),
+    headlessHandlerActionIds: (ctx.hostUiActions ?? []).map((handler) => handler.actionId),
+    grandfatheredHeadlessActionIds: ctx.headlessActionCompatibilityIds ?? [],
   });
 
   try {
@@ -251,6 +259,7 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
     assetPathPolicy: ctx.assetPathPolicy,
     enabledBuiltinTools: ctx.enabledBuiltinTools,
     uploadDefaults: ctx.uploadDefaults,
+    progressPolicyProvider: ctx.progressPolicyProvider,
   });
   if (ctx.extensionHost) {
     await configureExtensionAgentTools(ctx.extensionHost);

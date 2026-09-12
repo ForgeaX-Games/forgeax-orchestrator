@@ -19,6 +19,9 @@ import { Hook } from "../hooks/types";
 import { withAgentPermissionParent } from "../kernel/agent-permissions";
 
 export interface KernelTurnExecutorServices {
+  /** Session policy admission, checked before kits or commands can run. */
+  readonly beforeTurn?: () => void | Promise<void>;
+  readonly afterTurn?: () => void;
   /** Host-validated delegation relation for otherwise independent residents. */
   readonly permissionParentForTurn?: (event: Event) => AgentInstance | undefined;
   readonly eventBus: EventBus;
@@ -74,6 +77,7 @@ export class KernelTurnExecutor implements AgentTurnExecutor {
     );
     let agent: RuntimeAgentHost;
     try {
+      await this.services.beforeTurn?.();
       agent = await this.getOrCreateAgent();
       if (this.loadedExecutionRevision !== bindings.execution.revision) {
         await agent.initKits();
@@ -81,6 +85,7 @@ export class KernelTurnExecutor implements AgentTurnExecutor {
       }
       agent.setAgentJson(toAgentJson(instance, bindings));
     } catch (error) {
+      this.services.afterTurn?.();
       // RuntimeAgentHost normally emits turn-end from its own finally block.
       // Initial host/kit setup happens before that block exists, however. A
       // delegated delivery must still settle through the same five-part
@@ -112,6 +117,7 @@ export class KernelTurnExecutor implements AgentTurnExecutor {
         ...(result.usage ? { usage: result.usage } : {}),
       };
     } finally {
+      this.services.afterTurn?.();
       try {
         await this.eventStore.flush();
       } finally {

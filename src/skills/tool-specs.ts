@@ -15,17 +15,31 @@ export function skillToolSpecs(excludeSkillIds?: ReadonlySet<string>, sessionId?
   // template composer. A resident agent's prompt skills are therefore
   // excluded by id at the composition seam; unrelated global prompt skills
   // remain available to legacy callers that have no resident template.
-  return listSkills(sessionId)
-    .filter((skill) => !excludeSkillIds?.has(skill.id))
-    .map((skill) => ({
-    name: safeSkillToolId(skill.id),
-    description: textOf(skill.description) || `Invoke skill ${skill.id}.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        input: { type: 'object' },
-        extensionId: { type: 'string' },
+  const groups = new Map<string, ReturnType<typeof listSkills>>();
+  for (const skill of listSkills(sessionId)) {
+    if (excludeSkillIds?.has(skill.id)) continue;
+    const name = safeSkillToolId(skill.id);
+    groups.set(name, [...(groups.get(name) ?? []), skill]);
+  }
+  return [...groups].map(([name, skills]) => {
+    const sources = [...new Set(skills.map((skill) => skill.extensionId))];
+    const ambiguous = skills.length > 1;
+    return {
+      name,
+      description: skills.map((skill) =>
+        `${ambiguous ? `[${skill.extensionId}] ` : ''}${textOf(skill.description) || `Invoke skill ${skill.id}.`}`,
+      ).join('\n'),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          input: { type: 'object' },
+          ...(ambiguous ? {
+            extensionId: { type: 'string', enum: sources, description: 'Choose the installed source listed here, not the skill id.' },
+          } : {}),
+        },
+        ...(ambiguous ? { required: ['extensionId'] } : {}),
+        additionalProperties: false,
       },
-    },
-    }));
+    };
+  });
 }

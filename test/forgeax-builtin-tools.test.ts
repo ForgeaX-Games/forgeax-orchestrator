@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { initOrchestrationSeams, resetOrchestrationSeams } from '../src/orchestration-seams';
 import { isForgeaxBuiltinTool, runForgeaxBuiltinTool } from '../src/kernel/forgeax-builtin-tools';
-import { buildActionCatalog } from '../src/kernel/action-catalog';
+import { buildActionCatalog } from './fixtures/host-action-catalog';
 import { soulMemoryRoot } from '../src/soul';
 
 let TMP = '';

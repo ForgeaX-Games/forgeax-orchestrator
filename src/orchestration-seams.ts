@@ -1,5 +1,9 @@
 import type { DeliverSummary, DeliverSummaryClaim } from '@forgeax/types/deliver-summary';
 import type { ArtifactResolvedPayload } from '@forgeax/types/artifact-summary';
+import type {
+  ProgressPolicy,
+  ProgressPolicyContext,
+} from './runtime/progress-control';
 
 /** Orchestration seams — the injection registry the product shell uses to feed
  *  business-specific behavior into the (business-agnostic) orchestration layer.
@@ -163,6 +167,15 @@ export interface UploadDefaults {
  * Omission keeps standalone orchestration independent of host project layout. */
 export type SessionSkillRootProvider = (sessionId: string) => string | undefined;
 
+/**
+ * Product-owned progress policy. The orchestration layer supplies the generic
+ * controller and persistence lifecycle; the host supplies concrete phases,
+ * thresholds, and event classification. Returning undefined keeps the host
+ * opt-in and preserves the pre-progress-control behavior.
+ */
+export type ProgressPolicyProvider =
+  (context: ProgressPolicyContext) => ProgressPolicy | undefined;
+
 /** Optional host choice to freeze resident resources independently of their
  * installation. Hosts own source eligibility and historical path identity;
  * persistence never grants trust or capabilities. */
@@ -191,6 +204,7 @@ interface OrchestrationSeams {
    *  root) — the roster derived from FORGEAX_TOOLS itself. */
   enabledBuiltinTools?: readonly string[];
   uploadDefaults?: UploadDefaults;
+  progressPolicyProvider?: ProgressPolicyProvider;
 }
 
 let _seams: OrchestrationSeams = {};
@@ -255,6 +269,11 @@ export function getArtifactResolver(): ArtifactResolver | undefined {
  *  unconfigured unless the operator sets `FORGEAX_UPLOAD_*`). */
 export function getUploadDefaults(): UploadDefaults | undefined {
   return _seams.uploadDefaults;
+}
+
+/** The product-owned progress policy, or undefined for generic/standalone hosts. */
+export function getProgressPolicyProvider(): ProgressPolicyProvider | undefined {
+  return _seams.progressPolicyProvider;
 }
 
 /** Test-only — reset the registry between cases. */

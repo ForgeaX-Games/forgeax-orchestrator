@@ -1,118 +1,11 @@
-/**
- * Trusted server-side action declarations.
- *
- * M1 keeps these contract types local to forgeax-cli. Promote them to
- * `@forgeax/types` in M2 once the server and UI projections share the contract.
- */
-export type ActionCapability =
-  | 'read'
-  | 'write'
-  | 'delete'
-  | 'exec'
-  | 'network'
-  | 'credential'
-  | 'delegate'
-  | 'other';
-
-export type ActionSurface = 'ui' | 'server' | 'both';
-
-export type JsonValue =
-  | null
-  | boolean
-  | number
-  | string
-  | readonly JsonValue[]
-  | { readonly [key: string]: JsonValue };
-
-export type JsonSchemaObject = { readonly [key: string]: JsonValue };
-
-export interface ActionCatalogEntry {
-  readonly id: string;
-  readonly title: string;
-  readonly description?: string;
-  readonly schema?: JsonSchemaObject;
-  readonly capability: ActionCapability;
-  readonly surface?: ActionSurface;
-  readonly timeoutMs?: number;
-  /** 是否每轮作为独立 ToolSpec 常驻模型上下文。缺省/false 仍可经通用目录发现。
-   *  新增 true 只用于领域入口/发现能力,或已有可复核跨场景高频证据的能力;
-   *  PR 必须说明命中哪条及上下文成本。现有 14 项是存量兼容基线,不据此扩张。 */
-  readonly firstClass?: boolean;
-  /** 状态性前置条件 —— 事实,不是行为指南。只写"世界需要什么样",禁写顺序规则。
-   *  反例(现有 description 里这类句式不许进本字段):
-   *  "Discover existing roles first via role.list" / "list existing slugs"。
-   *  缺省 = 无已知前置;空数组非法(缺席=无,不用空数组冒充)。 */
-  readonly preconditions?: readonly string[];
-  /** 门位**事实**(不是行为指南):这个能力的人类入口在哪。
-   *  - menuCommandId:菜单叶子用了别的 command id(同一能力两个名字)时的别名,
-   *    如 game.switch 的菜单门走 game.pick。门对账凭它把两个 id 认成同一能力。
-   *  缺省 = 无声明;对账仍会拿 actionId 自己去菜单树里配。
-   *  2026-08-06 撤除 railTab/railMode:host.sidebar 无发布者(上游 Page 重构后
-   *  rail 从未接入 surface 总线),声明这两类门会让对账以最高置信度把 agent 指向
-   *  必死的 open('rail:...')。rail 重新发布后按需恢复 —— 恢复时 compileEntry 的
-   *  unknown-key 校验会大声报错,提醒同步这里与 action-door。 */
-  readonly door?: { readonly menuCommandId?: string };
-}
-
-export const HEADLESS_ACTION_GRANDFATHER_IDS = Object.freeze([
-  'game.create',
-  'game.switch',
-  'session.rename',
-  'sessions.refresh',
-] as const);
-
-export interface ActionCatalogBuildOptions {
-  readonly headlessHandlerActionIds: readonly string[];
-  readonly grandfatheredHeadlessActionIds: readonly string[];
-}
+import type { ActionCapability, ActionSurface, JsonValue, JsonSchemaObject, ActionCatalogEntry, ActionCatalogBuildOptions } from './action-catalog-contract';
+export type { ActionCapability, ActionSurface, JsonValue, JsonSchemaObject, ActionCatalogEntry, ActionCatalogBuildOptions } from './action-catalog-contract';
 
 /**
- * M1 migration bundle, transcribed from interface's 23 builtin actions and
- * two trajectory actions. Client-only run/available/choices functions stay out.
+ * Orchestration-owned role and session lifecycle declarations. Product shells
+ * supply their complete trusted catalog at boot; browser manifests cannot mint actions.
  */
 const ACTION_CATALOG_DECLARATIONS = [
-  {
-    id: 'panel.toggle_sidebar',
-    title: '折叠/展开侧栏',
-    description: 'Toggle the left sidebar collapsed state.',
-    capability: 'write',
-    surface: 'ui',
-  },
-  {
-    id: 'panel.toggle_chatpanel',
-    title: '折叠/展开聊天面板',
-    description: 'Toggle the chat panel collapsed state.',
-    capability: 'write',
-    surface: 'ui',
-  },
-  {
-    id: 'app.set_fullscreen',
-    title: '沉浸模式',
-    description: 'Enter or exit fullscreen (immersive) mode which hides all chrome around the main area.',
-    schema: { type: 'object', properties: { value: { type: 'boolean' } }, required: ['value'] },
-    capability: 'write',
-    surface: 'ui',
-  },
-  {
-    id: 'extension.list',
-    title: '列出扩展页面',
-    description: 'List installed extensions that contribute pages. Returns { count, plugins:[{id,name,description}] }.',
-    capability: 'read',
-    firstClass: true,
-    surface: 'ui',
-  },
-  {
-    id: 'extension.open',
-    title: '打开扩展页面',
-    description: 'Open the Page contributed by a specific extension id. Discover valid ids via extension.list.',
-    schema: { type: 'object', properties: { extensionId: { type: 'string' } }, required: ['extensionId'] },
-    capability: 'write',
-    firstClass: true,
-    surface: 'ui',
-    preconditions: [
-      'The target extension must contribute an available singleton page.',
-    ],
-  },
   {
     id: 'role.create',
     title: '创建新角色',
@@ -121,7 +14,7 @@ const ACTION_CATALOG_DECLARATIONS = [
     schema: {
       type: 'object',
       properties: {
-        id: { type: 'string', description: '单段 [a-zA-Z0-9_-];如 "level-designer"' },
+        id: { type: 'string', description: '单段 [a-zA-Z0-9_-];如 "code-reviewer"' },
         persona: { type: 'string', description: '角色 markdown:是谁 / 擅长什么 / 何时被派 / 产出什么' },
         displayName: {
           type: 'object',
@@ -152,88 +45,9 @@ const ACTION_CATALOG_DECLARATIONS = [
     surface: 'both',
   },
   {
-    id: 'role.open',
-    title: '打开角色页',
-    description:
-      'Open the roles/team Page. With { id } it also binds that role to the current chat session so its persona detail is shown.',
-    schema: { type: 'object', properties: { id: { type: 'string' } } },
-    capability: 'read',
-    firstClass: true,
-    surface: 'ui',
-    preconditions: [
-      'When id is provided, it must identify a role in the current roster.',
-      'When id is provided, an active chat session must exist for the role binding.',
-    ],
-  },
-  {
-    id: 'overlay.open',
-    title: '打开浮层',
-    description: "Open an overlay by id (e.g. 'settings'). Optional param selects a section inside it.",
-    schema: {
-      type: 'object',
-      properties: { id: { type: 'string' }, param: { type: 'string' } },
-      required: ['id'],
-    },
-    capability: 'write',
-    surface: 'ui',
-    preconditions: [
-      'The requested id must identify an overlay currently registered by the product shell.',
-    ],
-  },
-  {
-    id: 'overlay.close',
-    title: '关闭浮层',
-    description: 'Close the currently open overlay, if any.',
-    capability: 'write',
-    surface: 'ui',
-  },
-  {
-    id: 'console.clear',
-    title: '清空控制台',
-    description:
-      "Clear a collected console buffer. source:'browser' (default) clears the studio-shell browser console buffer PLUS the cross-tier health entries (fatal region banners are preserved). source:'game' clears the in-app game/editor console (store.consoleLog). Neither touches the raw browser DevTools buffer.",
-    schema: { type: 'object', properties: { source: { type: 'string', enum: ['browser', 'game'] } } },
-    capability: 'write',
-    surface: 'ui',
-  },
-  {
-    id: 'console.read',
-    title: '读取控制台',
-    description:
-      "Read the studio's collected console feed. source:'browser' (default) = the full studio-shell browser console (ALL levels: log/info/warn/error/debug, captured into a 500-entry ring buffer) merged with cross-tier iframe/health signals (window.onerror, unhandled rejections, forwarded play/edit/plugin/engine health). source:'game' = the in-app game/editor console stream. Params: source ('browser'|'game'), level (filter), limit (default 50, max 200). Returns { source, total, count, lines } in the result. This is the studio's own captured console (a web page cannot read the raw browser DevTools buffer directly).",
-    schema: {
-      type: 'object',
-      properties: {
-        source: { type: 'string', enum: ['browser', 'game'] },
-        level: { type: 'string' },
-        limit: { type: 'number' },
-      },
-    },
-    capability: 'read',
-    firstClass: true,
-    surface: 'ui',
-  },
-  {
-    id: 'network.clear',
-    title: '清空网络日志',
-    description: 'Clear the in-app network log panel (store.networkLog). NOT the browser DevTools network tab.',
-    capability: 'write',
-    surface: 'ui',
-  },
-  {
-    id: 'session.switch',
-    title: '切换会话',
-    description: 'Switch the active chat session to the given sid (see the session.tabs state slice for candidates).',
-    schema: { type: 'object', properties: { sid: { type: 'string' } }, required: ['sid'] },
-    capability: 'write',
-    firstClass: true,
-    surface: 'ui',
-    timeoutMs: 15_000,
-  },
-  {
     id: 'session.create',
     title: '新建会话',
-    description: 'Create a new chat session (optionally named) and switch to it.',
+    description: 'Create a new chat session (optionally named).',
     schema: { type: 'object', properties: { displayName: { type: 'string' } } },
     capability: 'write',
     firstClass: true,
@@ -251,92 +65,11 @@ const ACTION_CATALOG_DECLARATIONS = [
     timeoutMs: 15_000,
   },
   {
-    id: 'session.rename',
-    title: '重命名会话',
-    description: 'Persistent session rename is not available in this Studio version; this action rejects instead of changing only the temporary tab label.',
-    schema: {
-      type: 'object',
-      properties: { sid: { type: 'string' }, displayName: { type: 'string' } },
-      required: ['sid', 'displayName'],
-    },
-    capability: 'write',
-    surface: 'both',
-  },
-  {
-    id: 'sessions.refresh',
-    title: '刷新会话列表',
-    description: 'Re-fetch the session list from the server.',
-    capability: 'read',
-    surface: 'both',
-  },
-  {
     id: 'sessions.list',
     title: '列出会话',
-    description: 'List chat sessions of the current game scope. Returns sid/displayName rows in stateDigest.',
+    description: 'List chat sessions managed by this host. Returns sid/displayName rows in stateDigest.',
     capability: 'read',
     surface: 'both',
-  },
-  {
-    id: 'game.switch',
-    title: '切换游戏',
-    door: { menuCommandId: 'game.pick' },
-    description: 'Select the active game (project) by slug. Every open Studio page follows the server authority.',
-    schema: { type: 'object', properties: { slug: { type: 'string' } }, required: ['slug'] },
-    capability: 'write',
-    firstClass: true,
-    surface: 'both',
-    timeoutMs: 20_000,
-    preconditions: [
-      'The requested slug must identify an existing game.',
-    ],
-  },
-  {
-    id: 'game.create',
-    title: '新建游戏',
-    description: 'Create a new game (project) from the template and give it its own dedicated chat session. The action does not switch the UI to the new game.',
-    schema: {
-      type: 'object',
-      properties: {
-        slug: {
-          type: 'string',
-          description: '1-41 位小写字母/数字/连字符,首位字母或数字;如 "neon-runner"',
-        },
-        name: { type: 'string', description: '显示名(可选,缺省用 slug)' },
-        brief: { type: 'string', description: '一句话说明要做什么游戏(可选,写进 FORGE.md)' },
-      },
-      required: ['slug'],
-    },
-    capability: 'write',
-    firstClass: true,
-    surface: 'both',
-    timeoutMs: 20_000,
-    preconditions: [
-      'The requested slug must not already identify an existing game.',
-    ],
-  },
-  {
-    id: 'trajectory.read',
-    title: '读取操作轨迹',
-    description:
-      'Read the recent trajectory of UI operations performed on the page by BOTH the human and the AI, ordered oldest→newest. Every operation dispatched through the action registry is recorded (page mode switches, panel toggles, session/game/role/extension ops, etc.). Use this to understand what the user just did before asking you something. Params: limit (default 50, max 200), source ("human"|"ai" to filter by who performed it). Returns { total, count, entries:[{seq,ts,id,title,source,capability,args}] } in the result.',
-    schema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'number' },
-        source: { type: 'string', enum: ['human', 'ai'] },
-      },
-    },
-    capability: 'read',
-    firstClass: true,
-    surface: 'ui',
-  },
-  {
-    id: 'trajectory.clear',
-    title: '清空操作轨迹',
-    description:
-      'Clear the recorded UI operation trajectory buffer. Returns { cleared } — how many entries were removed.',
-    capability: 'write',
-    surface: 'ui',
   },
 ] as const satisfies readonly ActionCatalogEntry[];
 
@@ -552,6 +285,12 @@ function validateHeadlessRegistry(
 ): void {
   const issues: string[] = [];
   const handlerIds = validateRegistryIds(options.headlessHandlerActionIds, 'handler', issues);
+  const builtinIds = validateRegistryIds(options.builtinHeadlessHandlerActionIds ?? [], 'handler', issues);
+  for (const id of builtinIds) {
+    // A complete host catalog may omit generic capabilities. Explicit host
+    // handlers take precedence, exactly as in the execution seam.
+    if (byId.has(id)) handlerIds.add(id);
+  }
   const grandfatherIds = validateRegistryIds(
     options.grandfatheredHeadlessActionIds,
     'grandfather',
@@ -630,6 +369,7 @@ export function buildActionCatalog(
   if (options) {
     activeHeadlessRegistryOptions = Object.freeze({
       headlessHandlerActionIds: Object.freeze([...options.headlessHandlerActionIds]),
+      builtinHeadlessHandlerActionIds: Object.freeze([...options.builtinHeadlessHandlerActionIds ?? []]),
       grandfatheredHeadlessActionIds: Object.freeze([
         ...options.grandfatheredHeadlessActionIds,
       ]),

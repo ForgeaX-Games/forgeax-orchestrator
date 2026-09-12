@@ -2,6 +2,22 @@ import { describe, expect, it } from 'bun:test';
 import askUserTool, { normalizeAskUserArgs, normalizeAskUserQuestions } from '../builtin/kits/workspace/tools/ask_user';
 
 describe('native ask_user input compatibility', () => {
+  it('publishes an object root accepted by OpenAI-compatible tool registration', () => {
+    const parameters = JSON.parse(JSON.stringify(askUserTool.input_schema));
+    expect(parameters.type).toBe('object');
+    for (const keyword of ['oneOf', 'anyOf', 'allOf', 'enum', 'const', 'not']) {
+      expect(parameters).not.toHaveProperty(keyword);
+    }
+    expect(parameters.properties.questions.items.required).toEqual(['question', 'options']);
+  });
+
+  it('validates both envelopes locally without a root union', async () => {
+    expect(await askUserTool.validateInput?.({ question: 'Which?', options: ['A', 'B'] })).toBeUndefined();
+    for (const args of [{}, { question: 'Which?' }, { options: ['A'] }, { questions: [] }]) {
+      expect(await askUserTool.validateInput?.(args)).toBeString();
+    }
+  });
+
   it('accepts the provider-compatible one-question envelope', async () => {
     const raw = {
       questions: [{

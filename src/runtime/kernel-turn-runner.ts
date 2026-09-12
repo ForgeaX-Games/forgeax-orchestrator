@@ -28,7 +28,11 @@ import type { EventIdentity } from './turn-context';
 import { resolveKernel } from '../kernel/resolve-kernel';
 import { tt } from '../lib/turn-trace';
 import { hostTelemetryEnabled } from '../kernel/host-telemetry';
-import { startCliKernelTurn, type CliKernelTurnTrace } from '../kernel/cli-kernel-trace';
+import {
+  classifyChildTaskStatus,
+  startCliKernelTurn,
+  type CliKernelTurnTrace,
+} from '../kernel/cli-kernel-trace';
 import type { SystemBlock } from '../llm/types';
 import type { AgentManagementToolName } from '../kits/agent-management-visibility';
 
@@ -238,14 +242,28 @@ export async function runKernelTurn(
   try {
     const kernel = resolveKernel(agentId, opts.kernelId);
     providerId = kernel.id;
+    const turnId = opts.callId ?? `${opts.runtimeEpochId ?? 'legacy'}:${turn}`;
+
+    // The generic execution layer owns phase telemetry. Start it before request
+    // composition so preparation latency includes history/tool materialization;
+    // product-specific policy remains outside this module.
+    if (kernel.id !== 'forgeax-core' && hostTelemetryEnabled()) {
+      cliTrace = startCliKernelTurn({
+        kernelId: kernel.id,
+        agentId,
+        ...(opts.sessionId ? { sid: opts.sessionId } : {}),
+        ...(opts.traceparent ? { traceparent: opts.traceparent } : {}),
+        requestId: opts.callId ?? turnId,
+        turnId,
+      });
+    }
+
     const composeInput: ComposeInput = {
       message: opts.userText,
       agentId,
       kernel,
       threadId,
-      turnId:
-        opts.callId ??
-        `${opts.runtimeEpochId ?? 'legacy'}:${turn}`,
+      turnId,
       ...(opts.context ? { context: opts.context } : {}),
       ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
       ...(opts.callId ? { callId: opts.callId } : {}),
@@ -263,19 +281,14 @@ export async function runKernelTurn(
       ...(opts.replyLanguage ? { replyLanguage: opts.replyLanguage } : {}),
     };
     let req = await composeTurnRequest(composeInput);
-
-    // 第 2 层全链路 trace:非-forgeax-core 内核(codebuddy/claude-code/codex/cursor)跑在本进程、
-    //   自身不出 span。给它包一个 kernel.turn(挂浏览器 ui.request 下):provisional 立即落盘,
-    //   卡住 → trace 里留「永不收口的 kernel.turn」可定位。forgeax-core 不包(它自 sidecar 出,
-    //   重复)。未接 host-telemetry(纯 cli)→ 静默不产。
-    if (kernel.id !== 'forgeax-core' && hostTelemetryEnabled()) {
-      cliTrace = startCliKernelTurn({
-        kernelId: kernel.id,
-        agentId,
-        ...(opts.sessionId ? { sid: opts.sessionId } : {}),
-        ...(opts.traceparent ? { traceparent: opts.traceparent } : {}),
-      });
-    }
+    // This path does not currently expose reasoning-effort capability in the
+    // neutral TurnRequest contract. Record that as unknown rather than
+    // inferring support or changing the user's selected model/effort.
+    cliTrace?.onRequestReady({
+      ...(req.model ? { model: req.model } : {}),
+      reasoningEffort: 'unknown',
+      reasoningSupport: 'unknown',
+    });
 
     tt('kt.start', { agent: agentId, turn, sid: opts.sessionId, threadId, tools: req.tools?.length });
     let deltas = 0;
@@ -299,6 +312,7 @@ export async function runKernelTurn(
       }
       switch (ev.kind) {
         case 'message.delta':
+          if (ev.text.length > 0) cliTrace?.onFirstToken('text');
           finalText += ev.text;
           eventBus.hook(Hook.StreamLLM, {
             chunk: { type: 'text', text: ev.text },
@@ -307,6 +321,7 @@ export async function runKernelTurn(
           });
           break;
         case 'thinking.delta':
+          if (ev.text.length > 0) cliTrace?.onFirstToken('thinking');
           thinkingText += ev.text;
           eventBus.hook(Hook.StreamLLM, {
             chunk: { type: 'thinking', text: ev.text },
@@ -315,6 +330,7 @@ export async function runKernelTurn(
           });
           break;
         case 'tool.call': {
+          cliTrace?.onToolCall(ev.callId, ev.name);
           toolName.set(ev.callId, ev.name);
           const args = (ev.args ?? {}) as Record<string, unknown>;
           eventBus.hook(Hook.StreamLLM, {
@@ -338,6 +354,7 @@ export async function runKernelTurn(
           });
           break;
         case 'tool.result':
+          cliTrace?.onToolResult(ev.callId, ev.ok, ev.result, ev.error);
           // P0(历史归属):把工具结果**内容**也带进 bus → 落 per-agent 账本,让 forgeax
           // 拥有可回放的完整一轮(此前只记 name+durationMs,丢了 result)。kernel-neutral:
           // claude-code / codex / forgeax-core 的 tool.result 都带 {callId,ok,result}。
@@ -462,6 +479,16 @@ export async function runKernelTurn(
           // ChatEvent 类型,绕开稳定接口区)。UI 侧按需消费(轨迹图/ghost 高亮),
           // 无人订阅时零成本。非 x.* 的未知 kind 维持忽略。
           if (typeof (ev as { kind?: unknown }).kind === 'string' && (ev as { kind: string }).kind.startsWith('x.')) {
+            const extension = ev as Extract<KernelEvent, { kind: `x.${string}` }>;
+            if (extension.kind === 'x.subagent.start') {
+              cliTrace?.onChildTaskStart(extension.agentId);
+            } else if (extension.kind === 'x.subagent.done') {
+              cliTrace?.onChildTaskEnd(
+                extension.agentId,
+                classifyChildTaskStatus(extension.reason),
+                extension.reason,
+              );
+            }
             try {
               eventBus.publish(
                 {
@@ -528,10 +555,13 @@ export async function runKernelTurn(
   }
 
   // 终态:累计文本作为 assistant 消息发出(落 ledger + 渲染提交)。
-  if (finalText.trim() || thinkingText.trim() || error) {
+  // Failures travel in the structured turn result. Do not impersonate model
+  // output with a diagnostic: clients would render it twice and replay it as
+  // assistant prose on the next turn.
+  if (finalText.trim() || thinkingText.trim()) {
     const llmMessage = {
       role: 'assistant' as const,
-      content: normalizeContent(finalText || (error ? `⚠️ ${error}` : '')),
+      content: normalizeContent(finalText),
       ...(thinkingText.trim() ? { thinking: thinkingText } : {}),
       ts: Date.now(),
       ...(signal.aborted ? { truncated: true } : {}),

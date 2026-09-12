@@ -90,7 +90,7 @@ writeFileSync(
 );
 writeFileSync(
   './dist/index.d.ts',
-  'export declare const HEADLESS_ACTION_GRANDFATHER_IDS: readonly string[];\n',
+  await Bun.file('./src/kernel/action-catalog-contract.ts').text(),
 );
 
 console.log('[build] @forgeax/orchestrator → dist/ (%d js + %d mjs assets + 2 d.ts)', res.outputs.length, assets);

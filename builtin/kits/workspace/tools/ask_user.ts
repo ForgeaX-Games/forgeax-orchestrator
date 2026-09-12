@@ -132,6 +132,7 @@ export default {
     "multiSelect:true when not mutually exclusive.",
   input_schema: {
     type: "object",
+    description: "Provide either question and options for one question, or questions for one to three related questions.",
     properties: {
       question: {
         type: "string",
@@ -208,12 +209,8 @@ export default {
         },
       },
     },
-    // Keep the two supported wire shapes explicit for providers that perform
-    // JSON-schema validation before invoking the host tool.
-    anyOf: [
-      { required: ["question", "options"] },
-      { required: ["questions"] },
-    ],
+    // OpenAI-compatible providers reject root-level unions before generation.
+    // Keep both wire shapes; validateInput enforces their required fields.
   },
   validateInput(args) {
     if (Array.isArray(args.questions) && (args.questions.length < 1 || args.questions.length > 3)) {

@@ -542,3 +542,39 @@ describe('kernel compaction diagnostics', () => {
     }
   });
 });
+
+
+describe('provider failure output', () => {
+  for (const text of ['', 'I will inspect the project.']) {
+    test(`preserves structured errors without synthetic assistant prose (${text ? 'partial' : 'empty'})`, async () => {
+      const kernel: AgentKernel = {
+        id: COMPACTION_KERNEL_ID as AgentKernel['id'],
+        capabilities: {} as AgentKernel['capabilities'],
+        async *runTurn(): AsyncIterable<KernelEvent> {
+          if (text) yield { kind: 'message.delta', role: 'assistant', text };
+          yield { kind: 'error', error: { code: 'protocol', message: 'Invalid schema for function ask_user' } };
+          yield { kind: 'turn.done', reason: 'error' };
+        },
+        openHandle: () => ({ cancel: async () => {} }) as ReturnType<AgentKernel['openHandle']>,
+        probe: async () => ({ ok: true }) as Awaited<ReturnType<AgentKernel['probe']>>,
+      };
+      registerKernel(kernel);
+      const events: Event[] = [];
+      const eventBus: EventBusAPI = {
+        publish(event) { events.push(event); }, emit() {}, emitToSelf() {},
+        hook(type, payload) {
+          const event = { type, payload, source: 'agent:forge', ts: Date.now() } as Event;
+          events.push(event); return event;
+        },
+        observe: () => () => {}, observeAgent: () => () => {},
+      };
+      const result = await runKernelTurn({ agentId: 'forge', kernelId: COMPACTION_KERNEL_ID,
+        userText: 'hello', eventBus, signal: new AbortController().signal, turn: 1 });
+      expect(result).toMatchObject({ status: 'failed', error: 'protocol: Invalid schema for function ask_user' });
+      const assistant = events.filter(event => event.type === 'hook:assistantMessage');
+      expect(assistant).toHaveLength(text ? 1 : 0);
+      expect(JSON.stringify(assistant)).not.toContain('Invalid schema');
+      if (text) expect(JSON.stringify(assistant)).toContain(text);
+    });
+  }
+});

@@ -10,7 +10,7 @@ import { _setSnapshotForTests, _resetSnapshotForTests } from '../src/extensions/
 import { buildKindRegistry } from '../src/extensions/kinds';
 import { NATIVE_KERNEL_PROFILE, RENTED_KERNEL_PROFILE } from '../src/kernel/kernel-profile';
 import { COORDINATOR_TOOL_GRANTS, type AgentToolGrants } from '../src/agents/tool-grants';
-import { buildActionCatalog } from '../src/kernel/action-catalog';
+import { buildActionCatalog } from './fixtures/host-action-catalog';
 import { MemoryTemplateSource } from '../src/agents/memory-template-source';
 import { RuntimeConfigBinding } from '../src/runtime/runtime-config';
 

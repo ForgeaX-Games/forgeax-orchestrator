@@ -1,3 +1,5 @@
+import type { AgentContext } from '../src/core/types';
+import { withAgentHostToolDefinitions } from '../src/tools/agent-host-tool-surface';
 /**
  * Phase D1 — ToolRegistry + KindLoader tests. Builds /tmp manifests, scans
  * them through the real Plugin pipeline, and exercises callTool dispatch
@@ -276,7 +278,7 @@ export default Object.assign({}, orchestratorTools, { tools: hostTools });\n`,
       kind: 'tool',
       displayName: { zh: 'b', en: 'b' },
       entry: { backend: './handlers.mjs' },
-      provides: { tools: [{ id: 'b.kapow' }] },
+      provides: { tools: [{ id: 'b.kapow', exposedToAI: true }] },
     });
     writeFileSync(
       join(dir, 'handlers.mjs'),
@@ -286,6 +288,15 @@ export default Object.assign({}, orchestratorTools, { tools: hostTools });\n`,
     await reloadFromTmp();
     const r = await callTool({ toolId: 'b.kapow', args: {}, caller: { kind: 'user' } });
     expect(r).toEqual({ ok: false, error: 'kapow', code: 'invoke_error' });
+    const ctx = {
+      agentPath: 'test-agent', cwd: TMP,
+      getAgentJson: () => ({ kits: { config: { 'host-tools': { allow: ['b.kapow'] } } } }),
+    } as unknown as AgentContext;
+    const tool = withAgentHostToolDefinitions([], ctx).find(tool => tool.name === 'b_kapow');
+    expect(tool).toBeDefined();
+    const output = await tool!.execute({}, ctx);
+    expect(typeof output).toBe('string');
+    expect(JSON.parse(output as string)).toEqual({ error: 'kapow', code: 'invoke_error' });
   });
 
   it('requireConfirm: AI caller waits for tool.confirm-acked (allow)', async () => {

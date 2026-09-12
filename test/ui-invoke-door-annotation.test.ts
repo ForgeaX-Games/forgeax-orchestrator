@@ -9,7 +9,7 @@ import { describe, expect, it, beforeAll } from 'bun:test';
 import { Hono } from 'hono';
 import { createBusRouter } from '../src/api/bus';
 import { annotateUiInvokeResult } from '../src/kernel/forgeax-builtin-tools';
-import { buildActionCatalog } from '../src/kernel/action-catalog';
+import { buildActionCatalog } from './fixtures/host-action-catalog';
 
 describe('annotateUiInvokeResult — 能力层门注解', () => {
   let app: Hono;

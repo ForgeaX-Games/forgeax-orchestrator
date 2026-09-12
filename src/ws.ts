@@ -30,6 +30,8 @@ interface SessionSub {
   conns: Set<ServerWebSocket<WsClientData>>;
   ring: Array<{ seq: number; json: string }>;
   ringBytes: number;
+  pending: Array<{ seq?: number; json: string }>;
+  flushScheduled: boolean;
   unsub: () => void;
 }
 
@@ -85,26 +87,46 @@ export class WsHub {
     this.clearOrphanAbort(sid);
     let sub = this.subs.get(sid);
     if (!sub) {
-      const created: SessionSub = { conns: new Set(), ring: [], ringBytes: 0, unsub: () => {} };
+      const created: SessionSub = { conns: new Set(), ring: [], ringBytes: 0, pending: [], flushScheduled: false, unsub: () => {} };
       created.unsub = session.eventBus.observe((event: Event, emitterId?: string) => {
-        const json = JSON.stringify({ type: 'session-event', sid, emitterId, event });
-        if (typeof event.seq === 'number') {
-          created.ring.push({ seq: event.seq, json });
-          created.ringBytes += json.length;
-          while (created.ring.length > RING_MAX_FRAMES || created.ringBytes > RING_MAX_BYTES) {
-            const dropped = created.ring.shift();
-            if (!dropped) break;
-            created.ringBytes -= dropped.json.length;
-          }
-        }
-        for (const c of created.conns) {
-          try { c.send(json); } catch { /* client gone; close handler removes */ }
+        // Earlier observers can publish synchronously from this event (for
+        // example a completion callback). Serialize now, then order the whole
+        // synchronous publication batch before advancing any viewer's cursor.
+        created.pending.push({ seq: event.seq, json: JSON.stringify({ type: 'session-event', sid, emitterId, event }) });
+        if (!created.flushScheduled) {
+          created.flushScheduled = true;
+          queueMicrotask(() => {
+            created.flushScheduled = false;
+            if (this.subs.get(sid) === created) this.flushSessionEvents(created);
+          });
         }
       });
       this.subs.set(sid, created);
       sub = created;
     }
+    // Bring the ring up to date before a new viewer joins. It receives the
+    // pending events through resume/snapshot, not both live and replay.
+    this.flushSessionEvents(sub);
     sub.conns.add(ws);
+  }
+
+  private flushSessionEvents(sub: SessionSub): void {
+    const frames = sub.pending.splice(0);
+    frames.sort((a, b) => (a.seq ?? Infinity) - (b.seq ?? Infinity));
+    for (const frame of frames) {
+      if (typeof frame.seq === 'number') {
+        sub.ring.push({ seq: frame.seq, json: frame.json });
+        sub.ringBytes += frame.json.length;
+        while (sub.ring.length > RING_MAX_FRAMES || sub.ringBytes > RING_MAX_BYTES) {
+          const dropped = sub.ring.shift();
+          if (!dropped) break;
+          sub.ringBytes -= dropped.json.length;
+        }
+      }
+      for (const c of sub.conns) {
+        try { c.send(frame.json); } catch { /* client gone; close handler removes */ }
+      }
+    }
   }
 
   detachSession(ws: ServerWebSocket<WsClientData>): void {

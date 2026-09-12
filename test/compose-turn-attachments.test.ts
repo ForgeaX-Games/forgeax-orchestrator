@@ -24,7 +24,7 @@ import { initOrchestrationSeams } from '../src/orchestration-seams';
 import {
   hostToolSurfaceForAgent,
 } from '../src/api/lib/host-tools-for-agent';
-import { buildActionCatalog } from '../src/kernel/action-catalog';
+import { buildActionCatalog } from './fixtures/host-action-catalog';
 import { normalizeManifest } from '@forgeax/types';
 import { drainPerceptionNotes, pushPerceptionNote } from '../src/api/lib/perception-registry';
 

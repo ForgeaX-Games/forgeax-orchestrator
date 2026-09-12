@@ -51,12 +51,13 @@ import {
 import { resolveKernel, listAvailableKernels } from "../../kernel/resolve-kernel";
 import { toKernelErrorPayload } from "../../kernel/kernel-unavailable";
 import { toWireEvents, newWireFoldState } from "../../kernel/to-wire-events";
-import type { AgentKernel } from "@forgeax/agent-runtime";
+import type { AgentKernel, TurnRequest } from "@forgeax/agent-runtime";
 import { kernelEnabled } from "../../kernel/kernel-mode";
 import { isValidSummonAgentId } from "../../kernel/summon-agent";
 import { transcribeKernelTurn } from "../../kernel/transcribe-turn";
 import { hostTelemetryEnabled } from "../../kernel/host-telemetry";
 import {
+  classifyChildTaskStatus,
   startCliKernelTurn,
   unwrapMcpResultEnvelope,
   type CliKernelTurnTrace,
@@ -686,7 +687,42 @@ export function createCliRouter() {
         ...(body.replyLanguage === "en" || body.replyLanguage === "zh" ? { replyLanguage: body.replyLanguage } : {}),
         ...(isValidSummonAgentId(body.summonAgentId) ? { summonAgentId: body.summonAgentId } : {}),
       };
-      let turnReq = await composeTurnRequest(composeInput);
+      const traceRequestId = callId ?? randomUUID();
+      const traceTurnId = callId ?? traceRequestId;
+      let cliTrace: CliKernelTurnTrace | null = null;
+      try {
+        if (selectedKernel.id !== "forgeax-core" && hostTelemetryEnabled()) {
+          cliTrace = startCliKernelTurn({
+            kernelId: selectedKernel.id,
+            agentId,
+            ...(body.sessionId?.trim() ? { sid: body.sessionId.trim() } : {}),
+            ...(body.traceparent?.trim() ? { traceparent: body.traceparent.trim() } : {}),
+            requestId: traceRequestId,
+            turnId: traceTurnId,
+          });
+        }
+      } catch {
+        // Telemetry must never make the compatibility route fail.
+      }
+      let turnReq: TurnRequest;
+      try {
+        turnReq = await composeTurnRequest(composeInput);
+        // The neutral TurnRequest does not expose reasoning-effort capability
+        // for this compatibility path. Preserve that as unknown; do not infer
+        // support or silently alter the selected model/effort.
+        cliTrace?.onRequestReady({
+          ...(turnReq.model ? { model: turnReq.model } : {}),
+          reasoningEffort: "unknown",
+          reasoningSupport: "unknown",
+        });
+      } catch (err) {
+        cliTrace?.end({
+          ok: false,
+          reason: "error",
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
 
       // 历史持久化(host-owned,核心目标):内核每轮的 KernelEvent 流由编排层**转录**进
       // per-agent 账本 —— 与具体内核(claude-code / codex / forgeax-core)无关,账本是
@@ -740,21 +776,8 @@ export function createCliRouter() {
         // 在 try 外声明,让 catch 能拿到内核去 probe(区分「内核不可用」与「运行时报错」)。
         // resolveKernel 抛错(unknown-id / not-registered)时它保持 null,由 err 自身分类。
         let kernel: AgentKernel | null = selectedKernel;
-        let cliTrace: CliKernelTurnTrace | null = null;
         let kernelRunFailed = false;
         let kernelRunError: unknown;
-        try {
-          if (selectedKernel.id !== "forgeax-core" && hostTelemetryEnabled()) {
-            cliTrace = startCliKernelTurn({
-              kernelId: selectedKernel.id,
-              agentId,
-              ...(body.sessionId?.trim() ? { sid: body.sessionId.trim() } : {}),
-              ...(body.traceparent?.trim() ? { traceparent: body.traceparent.trim() } : {}),
-            });
-          }
-        } catch {
-          // Telemetry must never make the compatibility route fail.
-        }
         try {
           providerId = selectedKernel.id;
           for await (const kev of runWithHistoryResync({
@@ -765,6 +788,15 @@ export function createCliRouter() {
             },
             run: (request) => kernel.runTurn(request, ac.signal),
           })) {
+            if (kev.kind === "x.subagent.start") {
+              cliTrace?.onChildTaskStart(kev.agentId);
+            } else if (kev.kind === "x.subagent.done") {
+              cliTrace?.onChildTaskEnd(
+                kev.agentId,
+                classifyChildTaskStatus(kev.reason),
+                kev.reason,
+              );
+            }
             for (const wire of toWireEvents(kev, fold)) {
               let out: ChatEvent = { ...wire, providerId };
               // The MCP adapter's envelope is an internal transport shape:
@@ -774,6 +806,9 @@ export function createCliRouter() {
                 cliTrace?.onToolResult(out.callId, out.ok, out.result, out.error);
                 out = { ...out, result: unwrapMcpResultEnvelope(out.result) };
               }
+              if (out.type === "token" && out.text.length > 0) cliTrace?.onFirstToken("text");
+              if (out.type === "thinking" && out.text.length > 0) cliTrace?.onFirstToken("thinking");
+              if (out.type === "tool-call") cliTrace?.onToolCall(out.callId, out.name);
               // 内核 yield 出的终态 error(如第三方 CLI 未装 → spawn ENOENT 被 kernel 包成
               // code:'protocol' 的裸串)在这里统一翻成友好文案:probe 内核确认是否真不可用,
               // 是 → kernel_unavailable + 成因指引;否 → 保留原 code(真·运行时报错)。
@@ -789,7 +824,6 @@ export function createCliRouter() {
                 case "token": asstText += out.text ?? ""; break;
                 case "thinking": thinkingText += out.text ?? ""; break;
                 case "tool-call":
-                  cliTrace?.onToolCall(out.callId, out.name);
                   toolEvents.push({ kind: "call", callId: out.callId, name: out.name, args: out.args });
                   break;
                 case "tool-result": toolEvents.push({ kind: "result", callId: out.callId, ok: out.ok, result: out.result, error: out.error }); break;

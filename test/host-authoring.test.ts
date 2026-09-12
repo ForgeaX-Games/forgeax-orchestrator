@@ -7,7 +7,7 @@ import {
   isUiActionRuntimeAvailable,
 } from '../src/api/lib/ui-manifest-registry';
 import { _resetSnapshotForTests } from '../src/extensions/registry';
-import { buildActionCatalog } from '../src/kernel/action-catalog';
+import { buildActionCatalog } from './fixtures/host-action-catalog';
 import { runForgeaxBuiltinTool } from '../src/kernel/forgeax-builtin-tools';
 import { getBuiltinHeadlessUiAction } from '../src/kernel/ui-headless-actions';
 import { resetOrchestrationSeams } from '../src/orchestration-seams';

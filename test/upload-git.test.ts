@@ -168,6 +168,33 @@ describe("pushSubset", () => {
 });
 
 describe("pushFilesToPath", () => {
+  test("uploads with the caller's global Git config isolated on every platform", async () => {
+    const home = join(src, "caller-home");
+    mkdirSync(home);
+    writeFileSync(join(home, ".gitconfig"), "[invalid config\n");
+    const file = writeSrc("diagnostics.txt", "diagnostics");
+    const previousHome = process.env.HOME;
+    const previousConfig = process.env.GIT_CONFIG_GLOBAL;
+    try {
+      process.env.HOME = home;
+      process.env.GIT_CONFIG_GLOBAL = join(home, ".gitconfig");
+      const result = await pushFilesToPath({
+        remoteUrl: bare,
+        branch: TEST_BRANCH,
+        destinationPath: "feedback/windows-config/r1",
+        files: [{ sourcePath: file.abs, name: "diagnostics.txt" }],
+        commitMessage: "test isolated config",
+      });
+      expect(result.filesChanged).toBe(1);
+      expect(result.commit).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = previousConfig;
+    }
+  });
+
   test("commits an explicit file set into one feedback directory", async () => {
     const archivePath = join(src, "archive.tar.gz");
     const screenshotPath = join(src, "screenshot.png");

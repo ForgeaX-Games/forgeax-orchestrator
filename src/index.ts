@@ -79,7 +79,7 @@ export {
   type ResumeRequest,
   type Vec2,
 } from '@forgeax/types/npc-protocol';
-export { HEADLESS_ACTION_GRANDFATHER_IDS } from './kernel/action-catalog';
+export type { ActionCatalogEntry, ActionCatalogBuildOptions } from './kernel/action-catalog';
 export {
   redactSecretsInText,
   scanBufferForSecrets,
@@ -101,6 +101,27 @@ export {
   type PushFilesToPathResult,
 } from './upload/git-uploader';
 export { FORGEAX_BUILTIN_TOOL_NAMES } from './kernel/compose-turn-request';
+export {
+  ProgressController,
+  type ProgressControllerOptions,
+  type ProgressDecision,
+  type ProgressEvidence,
+  type ProgressEvent,
+  type ProgressEventClassifier,
+  type ProgressEventContext,
+  type ProgressMetric,
+  type ProgressObservation,
+  type ProgressObservationKind,
+  type ProgressPauseReason,
+  type ProgressPolicy,
+  type ProgressPolicyContext,
+  type ProgressPolicyProvider,
+  type ProgressRecheckPlan,
+  type ProgressRestoreResult,
+  type ProgressSnapshot,
+  type ProgressStatus,
+  type ProgressWaitKind,
+} from './runtime/progress-control';
 
 // Boot / lifecycle helpers used by product shells.
 export { initPathManager } from './fs/path-manager';

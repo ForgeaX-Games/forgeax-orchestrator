@@ -34,7 +34,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { devNull, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import {
   ARCHIVE_FILENAME,
@@ -160,7 +160,9 @@ async function git(args: string[], opts: GitRunOpts): Promise<string> {
     HOME: process.env.HOME,
     GIT_TERMINAL_PROMPT: "0",
     GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: devNull,
+    // Git for Windows cannot open Node's \\.\nul device path as a config.
+    // Its MSYS file layer accepts /dev/null on Windows as well as Unix.
+    GIT_CONFIG_GLOBAL: "/dev/null",
   };
   // Proxy vars are legitimate transport config (many networks can't reach GitHub
   // directly) — pass them through; they carry no secrets of ours.

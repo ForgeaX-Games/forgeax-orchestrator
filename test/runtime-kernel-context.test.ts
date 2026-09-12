@@ -144,7 +144,7 @@ describe("runtime kernel context", () => {
     });
     const events = await session.getOrCreateLedger("root").readAllEvents();
     const statuses = events.filter((event) => event.type === "compaction.status");
-    expect(statuses.map((event) => event.payload.phase)).toEqual(["started", "completed"]);
+    expect(statuses.map((event) => event.payload?.phase)).toEqual(["started", "completed"]);
     expect(statuses[1]?.payload).toMatchObject({ id: "compact-1", phase: "completed", count: 1, durationMs: 12 });
     expect(JSON.stringify(statuses)).not.toContain("PRIVATE");
   });
@@ -402,6 +402,80 @@ describe("runtime kernel context", () => {
     expect(request.systemPrompt.dynamicSuffix).not.toContain(
       "UNIQUE-RUNTIME-STABLE-SLOT",
     );
+  });
+
+  test("teammate completion continues the recipient kernel and model until the next user selection", async () => {
+    const pm = getPathManager();
+    const session = await initSessionManager(pm).create({
+      displayName: "continuation-route",
+      prepareResidentDefinitions: (sid) => {
+        const root = pm.session(sid).agent("root");
+        mkdirSync(root.root(), { recursive: true });
+        writeFileSync(root.agentJson(), JSON.stringify({
+          id: "root", kernelId: DEFAULT_KERNEL, models: { model: ["default-model"] },
+        }));
+      },
+    });
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const baseKernel = recordingKernel(OVERRIDE_KERNEL, overrideRequests);
+    registerKernel({ ...baseKernel, async *runTurn(req, signal) {
+      if (req.input.text === "delegate work") { entered(); await blocked; }
+      yield* baseKernel.runTurn(req, signal);
+    } });
+    const app = new Hono().route("/api/sessions", createSessionsRouter());
+    const response = await app.request(`/api/sessions/${session.sid}/messages`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to: "root", content: "delegate work",
+        providerOverride: OVERRIDE_KERNEL, payload: { model: "selected-model" } }),
+    });
+    expect(response.status).toBe(200);
+    const root = session.runtimeTree.findResident("root")!;
+    // Hold the user turn so two teammate callbacks must coalesce, matching
+    // the reported failure rather than testing only an isolated message.
+    await started;
+    const firstCallback = session.supervisor.enqueue(root.instanceId, {
+      source: "agent", type: "message", payload: { content: "teammate finished", fromAgent: "helper" },
+      to: "root", handoff: "turn", durability: "required", ts: Date.now(),
+    });
+    const secondCallback = session.supervisor.enqueue(root.instanceId, {
+      source: "agent", type: "message", payload: { content: "audio finished", fromAgent: "audio" },
+      to: "root", handoff: "turn", durability: "required", ts: Date.now(),
+    });
+    release();
+    await Promise.all([firstCallback, secondCallback]);
+    expect(defaultRequests).toHaveLength(0);
+    expect(overrideRequests).toHaveLength(2);
+    expect(overrideRequests[1]?.input.text).toContain("audio finished");
+    expect(overrideRequests[1]?.model).toBe("selected-model");
+    expect(overrideRequests[1]?.input.text).toContain("teammate finished");
+
+    // Recreate the capability host to exercise persisted WAL recovery rather
+    // than relying only on the in-memory selection from the previous turn.
+    await session.supervisor.getController(root.instanceId)!.turnExecutor.dispose!();
+    await session.supervisor.enqueue(root.instanceId, {
+      source: "agent", type: "user_input", payload: { content: "completion after restore" },
+      to: "root", handoff: "turn", durability: "required", ts: Date.now(),
+    });
+    expect(overrideRequests).toHaveLength(3);
+    expect(overrideRequests[2]?.model).toBe("selected-model");
+    expect(defaultRequests).toHaveLength(0);
+
+    // A subsequent user turn without an override uses the configured default;
+    // the old override must not become an immutable session-wide preference.
+    await session.supervisor.enqueue(root.instanceId, {
+      source: "user", type: "user_input", payload: { content: "use configured route" },
+      to: "root", handoff: "turn", durability: "required", ts: Date.now(),
+    });
+    await session.supervisor.enqueue(root.instanceId, {
+      source: "agent", type: "message", payload: { content: "second completion" },
+      to: "root", handoff: "turn", durability: "required", ts: Date.now(),
+    });
+    expect(overrideRequests).toHaveLength(3);
+    expect(defaultRequests).toHaveLength(2);
+    expect(defaultRequests[1]?.model).toBe("default-model");
   });
 
   test("per-turn Kernel override 仍经过 Runtime，并把 pinned model 与前轮上下文交给 Kernel", async () => {

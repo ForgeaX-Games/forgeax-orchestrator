@@ -27,7 +27,7 @@ afterEach(() => setHostTelemetry(null));
 describe('cli-kernel-trace', () => {
   test('start:provisional kernel.turn 挂 traceparent 下 + start log,立即产出', () => {
     startCliKernelTurn({ kernelId: 'codebuddy', agentId: 'forge', sid: 'sid-1', traceparent: TP });
-    const prov = spans().find((s) => s.provisional)!;
+    const prov = kernelProv();
     expect(prov.name).toBe('kernel.turn');
     expect(prov.traceId).toBe('a'.repeat(32)); // 复用上游 traceId
     expect(prov.parentSpanId).toBe('b'.repeat(16)); // 挂 ui.request 下
@@ -76,6 +76,81 @@ describe('cli-kernel-trace', () => {
   test('非法 traceparent → 当作无 parent(自建 root,不挂坏 parent)', () => {
     startCliKernelTurn({ kernelId: 'codex', agentId: 'forge', traceparent: 'not-a-traceparent' });
     expect(kernelProv().parentSpanId).toBeUndefined();
+  });
+
+  test('phase telemetry carries request/turn correlation and explicit unknowns', () => {
+    const h = startCliKernelTurn({
+      kernelId: 'codex',
+      agentId: 'forge',
+      sid: 'sid-1',
+      requestId: 'request-1',
+      turnId: 'turn-1',
+    });
+    h.onRequestReady({ model: 'deepseek-v4-flash', reasoningEffort: 'unknown', reasoningSupport: 'unknown' });
+    h.onFirstToken('text');
+    h.onToolCall('call-auth', 'permission_request');
+    h.onToolResult('call-auth', true, 'approved');
+    h.onChildTaskStart('child-1');
+    h.onChildTaskEnd('child-1', 'unknown', 'provider-did-not-report-status');
+    h.end({ ok: true, reason: 'stop' });
+
+    const phaseRecords = spans().filter((record) => typeof record.attrs?.phase === 'string');
+    expect(phaseRecords.map((record) => record.name)).toEqual(expect.arrayContaining([
+      'request.prepare',
+      'model.first_token',
+      'model.generation',
+      'authorization.wait',
+      'child.wait',
+    ]));
+    for (const record of phaseRecords) {
+      expect(record.attrs.requestId).toBe('request-1');
+      expect(record.attrs.turnId).toBe('turn-1');
+      expect(record.attrs.sessionId).toBe('sid-1');
+    }
+    const requestReady = phaseRecords.find((record) => record.name === 'request.prepare' && record.endTs !== undefined)!;
+    expect(requestReady.attrs.availability).toBe('measured');
+    const firstToken = phaseRecords.find((record) => record.name === 'model.first_token' && record.endTs !== undefined)!;
+    expect(firstToken.attrs.firstTokenKind).toBe('text');
+    const unknownChild = phaseRecords.find((record) => record.name === 'child.wait' && record.endTs !== undefined)!;
+    expect(unknownChild.attrs.availability).toBe('unknown');
+    expect(unknownChild.attrs.durationMs).toBeUndefined();
+    expect(unknownChild.attrs.outcome).toBe('unknown');
+    expect(unknownChild.status).toBeUndefined();
+  });
+
+  test('missing provider events are recorded as unknown, never inferred as zero', () => {
+    const h = startCliKernelTurn({ kernelId: 'codex', agentId: 'forge', requestId: 'request-2', turnId: 'turn-2' });
+    h.end({ ok: true });
+    const phases = spans().filter((record) => typeof record.attrs?.phase === 'string' && record.endTs !== undefined);
+    expect(phases.find((record) => record.name === 'request.prepare')!.attrs.availability).toBe('unknown');
+    expect(phases.find((record) => record.name === 'model.first_token')!.attrs.availability).toBe('unknown');
+    expect(phases.find((record) => record.name === 'model.generation')!.attrs.availability).toBe('unknown');
+    expect(phases.find((record) => record.name === 'model.first_token')!.attrs.durationMs).toBeUndefined();
+  });
+
+  test('provider events without request-ready cannot measure preparation or first-token latency', () => {
+    const h = startCliKernelTurn({ kernelId: 'codex', agentId: 'agent' });
+    h.onFirstToken('text');
+    h.end({ ok: true });
+    for (const name of ['request.prepare', 'model.first_token']) {
+      const phase = spans().find((s) => s.name === name && s.endTs !== undefined)!;
+      expect(phase.attrs.availability).toBe('unknown');
+      expect(phase.attrs.durationMs).toBeUndefined();
+    }
+  });
+
+  test('tool names alone cannot establish authorization or zero-duration generation', () => {
+    const h = startCliKernelTurn({ kernelId: 'codex', agentId: 'agent' });
+    h.onRequestReady();
+    h.onToolCall('call', 'list_permissions');
+    h.onToolResult('call', true);
+    h.end({ ok: true });
+    for (const name of ['authorization.wait', 'model.generation']) {
+      const phases = spans().filter((s) => s.name === name && s.endTs !== undefined);
+      expect(phases).toHaveLength(1);
+      expect(phases[0].attrs.availability).toBe('unknown');
+      expect(phases[0].attrs.durationMs).toBeUndefined();
+    }
   });
 
   test('未接 host-telemetry → 静默 no-op(不抛、无产出)', () => {

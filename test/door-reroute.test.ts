@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Hono } from 'hono';
 import { createBusRouter } from '../src/api/bus';
-import { buildActionCatalog } from '../src/kernel/action-catalog';
+import { buildActionCatalog } from './fixtures/host-action-catalog';
 import { runForgeaxBuiltinTool } from '../src/kernel/forgeax-builtin-tools';
 import { makeInProcessExecuteTool } from '../src/kernel/host-tool-bridge';
 import { initOrchestrationSeams, resetOrchestrationSeams } from '../src/orchestration-seams';
@@ -122,7 +122,10 @@ describe('咽喉改道收口在能力实现层(两张嘴共用)', () => {
   it('原生内核口(host-tool-bridge):同一改道同样生效,不再整条绕开', async () => {
     browseCalls.length = 0;
     const fakeSession = {
-      scheduler: { getAgent: () => ({ agentContext: { tools: { list: () => [] } } }) },
+      // Execution checks the agent's granted tool surface as well as host opt-in.
+      scheduler: { getAgent: () => ({ agentContext: { tools: {
+        list: () => [{ name: 'ui_invoke', description: 'Invoke a UI action', schema: { type: 'object' } }],
+      } } }) },
       eventBus: { publish: () => {} },
       config: {},
     };

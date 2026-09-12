@@ -4,18 +4,13 @@ import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createForgeaxApp } from '../src/app';
-import { HEADLESS_ACTION_GRANDFATHER_IDS as PACKAGE_GRANDFATHER_IDS } from '../src/index';
 import {
   _resetActionCatalogValidationForTests,
-  HEADLESS_ACTION_GRANDFATHER_IDS,
+
 } from '../src/kernel/action-catalog';
 
 afterEach(() => {
   _resetActionCatalogValidationForTests();
-});
-
-test('package root exports the ActionCatalog grandfather constant by identity', () => {
-  expect(PACKAGE_GRANDFATHER_IDS).toBe(HEADLESS_ACTION_GRANDFATHER_IDS);
 });
 
 test('createForgeaxApp wires packaged orchestrator resources into PathManager', () => {

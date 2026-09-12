@@ -21,10 +21,8 @@ import { checkKernelTool, classifyTool } from '../src/kernel/trust-gate';
 import { registerPerception, resolvePerception } from '../src/api/lib/perception-registry';
 import { runForgeaxBuiltinTool } from '../src/kernel/forgeax-builtin-tools';
 import { makeInProcessExecuteTool } from '../src/kernel/host-tool-bridge';
-import {
-  _resetActionCatalogValidationForTests,
-  buildActionCatalog,
-} from '../src/kernel/action-catalog';
+import { _resetActionCatalogValidationForTests } from '../src/kernel/action-catalog';
+import { buildActionCatalog } from './fixtures/host-action-catalog';
 import { createSessionsRouter } from '../src/api/sessions';
 import { initOrchestrationSeams, resetOrchestrationSeams, getHostTool, getHostTools } from '../src/orchestration-seams';
 import uiBridgeContract from '../src/kernel/ui-bridge-contract.json';
@@ -425,10 +423,10 @@ describe('P1-9 一等工具化 — firstClass 派生与反解', () => {
   test('真冷启动:catalog firstClass 派生 role.* ToolSpec 并可反解,无需 manifest seed', () => {
     const specs = firstClassUiToolSpecs(SID);
     const names = specs.map((s) => s.name);
-    expect(specs).toHaveLength(12);
+    expect(specs).toHaveLength(11);
     expect(names).toContain('ui_act_role_create');
     expect(names).toContain('ui_act_role_list');
-    expect(names).toContain('ui_act_game_switch');
+    expect(names).not.toContain('ui_act_game_switch');
     expect(names).not.toContain('ui_act_console_clear');
     const roleCreate = specs.find((s) => s.name === 'ui_act_role_create')!;
     expect(roleCreate.description).toContain('创建新角色');
@@ -442,7 +440,7 @@ describe('P1-9 一等工具化 — firstClass 派生与反解', () => {
       .not.toContain('Preconditions (state facts, not operation order):');
     expect(resolveFirstClassUiTool(SID, 'ui_act_role_create')).toEqual({ actionId: 'role.create' });
     expect(resolveFirstClassUiTool(SID, 'ui_act_role_list')).toEqual({ actionId: 'role.list' });
-    expect(resolveFirstClassUiTool(SID, 'ui_act_game_switch')).toEqual({ actionId: 'game.switch' });
+    expect(resolveFirstClassUiTool(SID, 'ui_act_game_switch')).toBeUndefined();
     expect(resolveFirstClassUiTool(SID, 'ui_act_console_clear')).toBeUndefined();
     expect(resolveFirstClassUiTool(SID, 'not_a_ui_tool')).toBeUndefined();
     expect(firstClassUiToolSpecs(undefined)).toEqual([]);
@@ -459,9 +457,9 @@ describe('P1-9 一等工具化 — firstClass 派生与反解', () => {
       lease,
     );
     const names = firstClassUiToolSpecs(SID).map((s) => s.name);
-    expect(names).toContain('ui_act_game_switch');
+    expect(names).not.toContain('ui_act_game_switch');
     expect(names).not.toContain('ui_act_console_clear');
-    expect(firstClassUiToolSpecs(SID).find((s) => s.name === 'ui_act_game_switch')?.description).toContain('切换游戏');
+    expect(firstClassUiToolSpecs(SID).find((s) => s.name === 'ui_act_game_switch')).toBeUndefined();
   });
 });
 

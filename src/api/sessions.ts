@@ -508,6 +508,50 @@ export function createSessionsRouter() {
     return c.json({ ok: true, sid, agent: agent ?? null });
   });
 
+  // Progress control is deliberately a separate acknowledgement channel:
+  // ordinary messages never silently resume a paused long-running task.
+  r.get('/:sid/progress', async (c) => {
+    const sid = c.req.param('sid');
+    const session = getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
+    const requested = c.req.query('agent') || undefined;
+    const agent = requested
+      ? session.tree.get(requested)?.path
+        ?? session.tree.getByFullId(requested)?.path
+      : session.tree.list().find((node) => node.depth === 1)?.path;
+    if (!agent) return c.json({ error: 'runtime agent not found' }, 404);
+    const snapshot = session.getProgressSnapshot(agent);
+    if (!snapshot) {
+      return c.json({
+        error: 'progress control is not enabled for this agent',
+        code: 'progress_disabled',
+      }, 409);
+    }
+    return c.json({ sid, agent, snapshot });
+  });
+
+  r.post('/:sid/progress/continue', async (c) => {
+    const sid = c.req.param('sid');
+    const session = getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
+    const body = await c.req.json().catch(() => ({}));
+    const requested = typeof body.agent === 'string' && body.agent
+      ? body.agent
+      : c.req.query('agent') || undefined;
+    const agent = requested
+      ? session.tree.get(requested)?.path
+        ?? session.tree.getByFullId(requested)?.path
+      : session.tree.list().find((node) => node.depth === 1)?.path;
+    if (!agent) return c.json({ error: 'runtime agent not found' }, 404);
+    try {
+      const decision = await session.continueProgress(agent);
+      return c.json({ sid, agent, ...decision });
+    } catch (error) {
+      return c.json({
+        error: error instanceof Error ? error.message : String(error),
+        code: 'progress_disabled',
+      }, 409);
+    }
+  });
+
   r.post('/:sid/messages', async (c) => {
     const sid = c.req.param('sid');
     const body = await c.req.json().catch(() => ({}));

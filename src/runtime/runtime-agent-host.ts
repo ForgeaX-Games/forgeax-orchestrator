@@ -41,6 +41,7 @@ import { getTerminalManager } from "../terminal/manager";
 import { deepMerge } from "../utils/deep-merge";
 import { eventToSessionMessage } from "../message/message-ingress";
 import { runKernelTurn } from "./kernel-turn-runner";
+import { recoverUserTurnRoute, type UserTurnRoute } from "./user-turn-route";
 import { materializeTurnContext } from "./turn-context";
 import type { RuntimeToolContext } from "./runtime-context";
 import type { KitSourceRef } from "../agents/template-types";
@@ -93,6 +94,8 @@ export class RuntimeAgentHost {
   private activeDelegationId: string | undefined;
   private activeSourceEventId: string | undefined;
   private activeKernelId: string | undefined;
+  private userTurnRoute: UserTurnRoute | undefined;
+  private userTurnRouteLoaded = false;
   private disposed = false;
   private readonly contextWindow: ContextWindow;
 
@@ -301,7 +304,23 @@ export class RuntimeAgentHost {
     return runWithSession(this.config.sid, () =>
       runWithAgentTurn(this.agentPath, turn, async () => {
         const payload = input.payload as Record<string, unknown>;
-        const kernelId = resolveTurnKernelId(payload, this.config.kernelId);
+        // Teammate deliveries continue the recipient's user-selected route.
+        // They must not silently return to the template/global kernel after a
+        // per-turn UI override. User turns still select their own route.
+        if (input.source === "user" && input.type !== "agent_command") {
+          this.userTurnRoute = {
+            kernelId: resolveTurnKernelId(payload, this.config.kernelId),
+            model: typeof payload.model === "string" ? payload.model.trim() || undefined : undefined,
+          };
+          this.userTurnRouteLoaded = true;
+        }
+        const continuation = input.source === "agent" && input.type !== "agent_command";
+        if (continuation && !this.userTurnRouteLoaded) {
+          this.userTurnRoute = recoverUserTurnRoute(await this.config.ledger.readAllEvents());
+          this.userTurnRouteLoaded = true;
+        }
+        const route = continuation ? this.userTurnRoute : undefined;
+        const kernelId = resolveTurnKernelId(payload, route?.kernelId ?? this.config.kernelId);
         const turnId =
           typeof payload.delegationId === "string" && payload.delegationId.trim()
             ? `delegation:${payload.delegationId.trim()}`
@@ -330,6 +349,7 @@ export class RuntimeAgentHost {
         });
         let error: string | undefined;
         try {
+          signal?.throwIfAborted();
           if (input.type === "agent_command") {
             return await this.executeCommand(input, turn);
           }
@@ -375,7 +395,7 @@ export class RuntimeAgentHost {
           const requestedModel = typeof payload.model === "string"
             ? payload.model.trim() || undefined
             : undefined;
-          const model = requestedModel ?? (Array.isArray(models.model)
+          const model = requestedModel ?? route?.model ?? (Array.isArray(models.model)
             ? models.model[0]
             : models.model ?? undefined);
           const tools = visibleTools(

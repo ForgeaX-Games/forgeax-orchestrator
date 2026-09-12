@@ -72,8 +72,17 @@ import { ConsciousAgent } from "./conscious-agent";
 import { AGENT_DEFAULTS } from "../defaults/agent-json";
 import type { ArtifactResolver, ArtifactTurnContext } from "../orchestration-seams";
 import type { ArtifactResolvedPayload, ArtifactSummary } from "@forgeax/types/artifact-summary";
-import { getArtifactResolver } from "../orchestration-seams";
+import {
+  getArtifactResolver,
+  getProgressPolicyProvider,
+} from "../orchestration-seams";
 import { createHash } from "node:crypto";
+import {
+  ProgressController,
+  type ProgressDecision,
+  type ProgressPolicyProvider,
+  type ProgressSnapshot,
+} from "../runtime/progress-control";
 
 /** One pending delegate_to_subagent awaiting the sub-agent's turn-end.
  *  Keyed by sub-agent's `agentPath` (e.g. "suzu"). */
@@ -112,6 +121,7 @@ export interface SessionInitConfig {
   paths: PathManagerAPI;
   config: SessionConfig;
   artifactResolver?: ArtifactResolver;
+  progressPolicyProvider?: ProgressPolicyProvider;
 }
 
 function stableArtifactId(sid: string, turnId: string, checkpointMsgId?: string): string {
@@ -269,6 +279,11 @@ export class Session {
   private readonly permissionAskCalls = new Set<string>();
   private readonly activeTurnIds = new Map<string, string>();
   private readonly artifactResolutionInFlight = new Map<string, Promise<void>>();
+  /** Host-opt-in progress controllers. No provider means no controller and no
+   * behavior change for standalone/generic consumers. */
+  private readonly progressControllers = new Map<string, ProgressController>();
+  private readonly progressRestores = new Map<string, Promise<void>>();
+  private readonly progressPolicyProvider?: ProgressPolicyProvider;
 
   private disposed = false;
   private readonly residentTemplateRefs = new Set<TemplateRef>();
@@ -280,6 +295,7 @@ export class Session {
     this.paths = init.paths.session(init.sid);
     this.config = init.config;
     this.artifactResolver = init.artifactResolver ?? getArtifactResolver();
+    this.progressPolicyProvider = init.progressPolicyProvider ?? getProgressPolicyProvider();
 
     this.blackboard = new Blackboard(this.paths.root() + "/blackboard.json");
     this.blackboard.loadFromDisk();
@@ -353,6 +369,23 @@ export class Session {
         eventStore,
         {
           eventBus: this.eventBus,
+          beforeTurn: async () => {
+            const address = this.tree.addressOf(instance);
+            if (!this.progressControllers.has(address)) await this._restoreProgressForAgent(address);
+            const controller = this.progressControllers.get(address);
+            if (!controller) return;
+            if (!controller.canStartTurn()) throw new Error("progress paused: explicit continue required");
+            const inputFingerprint = await controller.resolveInputFingerprint();
+            controller.restore(controller.snapshot(), { inputFingerprint });
+            controller.startTurn();
+          },
+          afterTurn: () => {
+            const address = this.tree.addressOf(instance);
+            const controller = this.progressControllers.get(address);
+            if (!controller || !controller.canStartTurn()) return;
+            const decision = controller.observe({ kind: "wait", waitKind: "user" });
+            this.persistProgressSnapshot(address, decision.snapshot, decision.reason ?? "idle");
+          },
           blackboard: this.blackboard,
           tree: this.tree,
           ...(sessionCwd ? { sessionCwd } : {}),
@@ -471,6 +504,7 @@ export class Session {
     //      partial_boundary、compact_boundary 等）落到 `<sid>/global-events.jsonl`。
     // 顺序无关；dispose 时按注册逆序 unsub。
     this._busUnsubs = [
+      this._bindProgressControl(),
       this._bindLedgerPersistence(),
       this._bindArtifactResolution(),
       this._bindAgentCommandRouting(),
@@ -492,6 +526,7 @@ export class Session {
     mkdirSync(this.paths.agentsDir(), { recursive: true });
     await recoverAbandonedEphemeralHistories(this.sid, this.paths.root());
     await this._bootstrapResidentDefinitions();
+    await this._restoreProgressForAgents();
     // RuntimeTree and the address-indexed ledgers are populated by the
     // bootstrap above.  Reconcile here as well as on construction so a
     // reopen cannot miss terminal events that were already on disk before the
@@ -506,7 +541,9 @@ export class Session {
     }
     this.residentTemplateRefs.clear();
     this.ledgers.clear();
+    this.progressControllers.clear();
     await this._bootstrapResidentDefinitions();
+    await this._restoreProgressForAgents();
   }
 
   private async _bootstrapResidentDefinitions(): Promise<void> {
@@ -736,6 +773,7 @@ export class Session {
       const address = this.tree.addressOf(instance);
       const store = this.supervisor.getEventStore(instance.instanceId);
       if (store) this.ledgers.set(address, store.ledger);
+      await this._restoreProgressForAgent(address);
       return address;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -823,6 +861,8 @@ export class Session {
       const address = this.tree.addressOf(item);
       this.blackboard.removeAll(address);
       this.ledgers.delete(address);
+      this.progressControllers.delete(address);
+      this.progressRestores.delete(address);
       this.templateCatalog.unregister(item.templateRef);
       this.residentTemplateRefs.delete(item.templateRef);
     }
@@ -850,6 +890,29 @@ export class Session {
     const instance = this.tree.resolve(agentPath);
     if (!instance) return Promise.reject(new Error(`runtime agent not found: ${agentPath}`));
     return this.supervisor.enqueue(instance.instanceId, input);
+  }
+
+  /** Read the host-injected progress state without manufacturing a policy. */
+  getProgressSnapshot(agentPath: string): ProgressSnapshot | undefined {
+    return this.progressControllers.get(agentPath)?.snapshot();
+  }
+
+  /**
+   * Explicit continuation entry point. A paused turn is never silently resumed
+   * by the next ordinary message; the caller must acknowledge the checkpoint.
+   */
+  async continueProgress(agentPath: string): Promise<ProgressDecision> {
+    const controller = this.progressControllers.get(agentPath)
+      ?? this.createProgressController(agentPath);
+    if (!controller) {
+      throw new Error(`progress control is not enabled for agent: ${agentPath}`);
+    }
+    if (controller.canStartTurn()) return controller.continue();
+    const inputFingerprint = await controller.resolveInputFingerprint();
+    controller.restore(controller.snapshot(), { inputFingerprint });
+    const decision = controller.continue({ inputFingerprint });
+    this.persistProgressSnapshot(agentPath, decision.snapshot, "resumed");
+    return decision;
   }
 
   /** Lazily materialize the Kit/AgentContext host; this creates no lifecycle. */
@@ -1488,6 +1551,158 @@ export class Session {
     return work;
   }
 
+  // ─── Host-injected progress control ──────────────────────────────────────
+
+  private createProgressController(agentPath: string): ProgressController | undefined {
+    if (!this.progressPolicyProvider) return undefined;
+    if (this.progressControllers.has(agentPath)) {
+      return this.progressControllers.get(agentPath);
+    }
+    let policy;
+    try {
+      policy = this.progressPolicyProvider({
+        sessionId: this.sid,
+        agentId: agentPath,
+        ...(this.config.defaultDir ? { scope: this.config.defaultDir } : {}),
+      });
+    } catch (error) {
+      this.logger.error(
+        agentPath,
+        undefined,
+        `progress policy failed closed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw error;
+    }
+    if (!policy) return undefined;
+    const controller = new ProgressController(policy);
+    controller.observe({ kind: "wait", waitKind: "user" });
+    this.progressControllers.set(agentPath, controller);
+    return controller;
+  }
+
+  private async _restoreProgressForAgent(agentPath: string): Promise<void> {
+    const existing = this.progressRestores.get(agentPath);
+    if (existing) return existing;
+    const work = (async () => {
+      const controller = this.progressControllers.get(agentPath)
+        ?? this.createProgressController(agentPath);
+      if (!controller) return;
+      try {
+        const events = await this.getOrCreateLedger(agentPath).readAllEvents();
+        for (let index = events.length - 1; index >= 0; index -= 1) {
+          const event = events[index];
+          if (event.type !== "progress:state") continue;
+          const persisted = (event.payload as Record<string, unknown> | undefined)?.snapshot;
+          if (persisted === undefined) continue;
+          const inputFingerprint = await controller.resolveInputFingerprint();
+          const restored = controller.restore(persisted, { inputFingerprint });
+          if (!restored.restored && restored.reason === "invalid_snapshot") {
+            throw new Error("invalid persisted progress snapshot");
+          }
+          break;
+        }
+      } catch (error) {
+        this.logger.error(
+          agentPath,
+          undefined,
+          `progress state restore failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        this.progressControllers.delete(agentPath);
+        throw error;
+      }
+    })().finally(() => {
+      if (this.progressRestores.get(agentPath) === work) {
+        this.progressRestores.delete(agentPath);
+      }
+    });
+    this.progressRestores.set(agentPath, work);
+    return work;
+  }
+
+  private async _restoreProgressForAgents(): Promise<void> {
+    if (!this.progressPolicyProvider) return;
+    const agents = new Set<string>(this.ledgers.keys());
+    for (const instance of this.runtimeTree.list()) {
+      agents.add(this.tree.addressOf(instance));
+    }
+    await Promise.all([...agents].map((agentPath) => this._restoreProgressForAgent(agentPath)));
+  }
+
+  private persistProgressSnapshot(
+    agentPath: string,
+    snapshot: ProgressSnapshot,
+    reason?: string,
+  ): void {
+    this.eventBus.publish(
+      {
+        source: "runtime-progress",
+        type: "progress:state",
+        durability: "required",
+        payload: {
+          version: 1,
+          snapshot,
+          ...(reason ? { reason } : {}),
+        },
+        ts: Date.now(),
+      },
+      agentPath,
+    );
+  }
+
+  /**
+   * Translate host-classified lifecycle facts into the generic controller.
+   * The observer is deliberately additive: without an injected policy it is
+   * never installed, and ordinary turns retain their existing lifecycle.
+   */
+  private _bindProgressControl(): () => void {
+    if (!this.progressPolicyProvider) return () => {};
+    return this.eventBus.observe((event, emitterId) => {
+      if (!emitterId || event.type.startsWith("progress:")) return;
+      const controller = this.progressControllers.get(emitterId);
+      if (!controller) return;
+
+      if (event.type === "hook:turnStart" && !controller.canStartTurn()) {
+        const instance = this.tree.resolve(emitterId);
+        if (instance) {
+          this.supervisor.interruptTurn(
+            instance.instanceId,
+            `progress paused: explicit continue required (${controller.snapshot().pauseReason ?? "checkpoint"})`,
+          );
+        }
+        return;
+      }
+
+      let decision;
+      try {
+        const observation = controller.classify({
+          sessionId: this.sid,
+          agentId: emitterId,
+          event,
+          ...(this.config.defaultDir ? { scope: this.config.defaultDir } : {}),
+        });
+        if (!observation) return;
+        decision = controller.observe(observation);
+      } catch (error) {
+        const decision = controller.pause("policy_error");
+        this.persistProgressSnapshot(emitterId, decision.snapshot, "policy_error");
+        const instance = this.tree.resolve(emitterId);
+        if (instance) this.supervisor.interruptTurn(instance.instanceId, "progress classifier failed");
+        throw error;
+      }
+      if (decision.changed) {
+        this.persistProgressSnapshot(
+          emitterId,
+          decision.snapshot,
+          decision.reason ?? (decision.snapshot.status === "waiting" ? "waiting" : undefined),
+        );
+      }
+      if (decision.action === "pause") {
+        const instance = this.tree.resolve(emitterId);
+        if (instance) this.supervisor.interruptTurn(instance.instanceId, `progress paused: ${decision.reason}`);
+      }
+    });
+  }
+
   // ─── EventBus → ledger persistence ───────────────────────────────────────
 
   /** 镜像 agenteam ref `session-manager._bindEventBus`：所有跟某个 agent 关联的
@@ -1636,6 +1851,8 @@ export class Session {
     this.finishDelegationsForTarget(agentPath);
     this.blackboard.removeAll(agentPath);
     this.ledgers.delete(agentPath);
+    this.progressControllers.delete(agentPath);
+    this.progressRestores.delete(agentPath);
   }
 
   // ─── Lifecycle ───────────────────────────────────────────────────────────
@@ -1664,6 +1881,8 @@ export class Session {
     this.templateCatalog.unregisterByLifetime("session");
     this.blackboard.flush();
     this.ledgers.clear();
+    this.progressControllers.clear();
+    this.progressRestores.clear();
     this.fileActivity.dispose();
     this.fileLocks.clear();
     clearRememberedForSession(this.sid); // 清本会话的工具审批 remember(不跨会话残留)

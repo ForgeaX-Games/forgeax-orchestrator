@@ -135,7 +135,7 @@ function definitionForDescriptor(
           ? result.result
           : JSON.stringify(result.result, null, 2);
       }
-      return { error: result.error, code: result.code };
+      return JSON.stringify({ error: result.error, code: result.code });
     },
   }, descriptor.id);
 }

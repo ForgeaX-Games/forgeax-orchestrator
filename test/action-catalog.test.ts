@@ -1,14 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   _resetActionCatalogValidationForTests,
-  buildActionCatalog,
   catalogAll,
   catalogFirstClass,
   catalogGet,
-  HEADLESS_ACTION_GRANDFATHER_IDS,
   type ActionCatalogBuildOptions,
   type ActionCatalogEntry,
 } from '../src/kernel/action-catalog';
+import { buildActionCatalog, HEADLESS_ACTION_GRANDFATHER_IDS } from './fixtures/host-action-catalog';
 
 const CURRENT_HEADLESS_HANDLER_IDS = Object.freeze([
   'sessions.list',
@@ -50,9 +49,7 @@ describe('ActionCatalog', () => {
       'When id is provided, it must identify a role in the current roster.',
       'When id is provided, an active chat session must exist for the role binding.',
     ]);
-    expect(preconditions('game.switch')).toEqual([
-      'The requested slug must identify an existing game.',
-    ]);
+    expect(catalogGet('game.switch')).toBeUndefined();
     expect(preconditions('overlay.open')).toEqual([
       'The requested id must identify an overlay currently registered by the product shell.',
     ]);
@@ -103,18 +100,17 @@ describe('ActionCatalog', () => {
     expect(stored).toEqual(['The world must be ready.']);
   });
 
-  test('door 门位事实经构建原样存活 —— 白名单丢弃会让咽喉改道整条失效', () => {
-    // 2026-08-05 实测:compileEntry 白名单没放行 door,catalogGet 拿不到别名事实,
-    // findVisibleDoor 配不出 game.switch 的门,ui_act_game_switch 又走回无头直调。
-    buildActionCatalog(undefined, registryOptions());
-    expect(catalogGet('game.switch')?.door).toEqual({ menuCommandId: 'game.pick' });
-    expect(catalogGet('role.open')?.door).toBeUndefined();
+  test('door metadata survives compilation for registered actions', () => {
+    const door = { menuCommandId: 'sample.open' };
+    buildActionCatalog([{ id: 'sample.open', title: 'Open', capability: 'read', surface: 'ui', door }]);
+    expect(catalogGet('sample.open')?.door).toEqual(door);
+    expect(catalogGet('game.switch')).toBeUndefined();
   });
-  test('atomically assembles all 23 trusted action declarations', () => {
+  test('atomically assembles all 22 trusted action declarations', () => {
     const catalog = catalogAll();
 
-    expect(catalog).toHaveLength(23);
-    expect(new Set(catalog.map((entry) => entry.id)).size).toBe(23);
+    expect(catalog).toHaveLength(22);
+    expect(new Set(catalog.map((entry) => entry.id)).size).toBe(22);
     expect(catalogGet('role.create')).toMatchObject({
       capability: 'delegate',
       surface: 'both',
@@ -132,22 +128,21 @@ describe('ActionCatalog', () => {
       firstClass: true,
     });
     expect(catalogGet('panel.toggle_sidebar')?.schema).toBeUndefined();
-    expect(catalogFirstClass()).toHaveLength(12);
+    expect(catalogFirstClass()).toHaveLength(11);
     expect(JSON.parse(JSON.stringify(catalog))).toEqual(catalog);
     expect(catalog.every((entry) => !('run' in entry) && !('available' in entry))).toBe(true);
   });
 
-  test('accepts the complete headless registry and the frozen four-item grandfather', () => {
+  test('accepts the complete headless registry and the frozen three-item grandfather', () => {
     expect(HEADLESS_ACTION_GRANDFATHER_IDS).toEqual([
       'game.create',
-      'game.switch',
       'session.rename',
       'sessions.refresh',
     ]);
     expect(Object.isFrozen(HEADLESS_ACTION_GRANDFATHER_IDS)).toBe(true);
 
     const catalog = buildActionCatalog(undefined, registryOptions());
-    expect(catalog.filter((entry) => entry.surface === 'both' || entry.surface === 'server')).toHaveLength(9);
+    expect(catalog.filter((entry) => entry.surface === 'both' || entry.surface === 'server')).toHaveLength(8);
   });
 
   test('revalidates later bare rebuilds with the last successful registry options', () => {
@@ -230,7 +225,7 @@ describe('ActionCatalog', () => {
       'ActionCatalog: duplicate action id "panel.toggle_sidebar"',
     );
     expect(catalogAll()).toBe(before);
-    expect(catalogAll()).toHaveLength(23);
+    expect(catalogAll()).toHaveLength(22);
   });
 
   test('rejects schemas that are not pure JSON objects without replacing the catalog', () => {
@@ -255,7 +250,7 @@ describe('ActionCatalog', () => {
     ])).toThrow(/ActionCatalog: action "invalid\.schema\.sparse" schema contains a non-JSON value/);
 
     expect(catalogAll()).toBe(before);
-    expect(catalogAll()).toHaveLength(23);
+    expect(catalogAll()).toHaveLength(22);
   });
 
   test('preserves JSON __proto__ keys without mutating object prototypes', () => {
@@ -312,7 +307,7 @@ describe('ActionCatalog', () => {
       extensionId.type = 'number';
     }).toThrow();
 
-    expect(catalogAll()).toHaveLength(23);
+    expect(catalogAll()).toHaveLength(22);
     expect(catalogGet('extension.open')?.title).toBe('打开扩展页面');
     expect((catalogGet('extension.open')?.schema?.properties as Record<string, unknown>).extensionId).toEqual({ type: 'string' });
   });

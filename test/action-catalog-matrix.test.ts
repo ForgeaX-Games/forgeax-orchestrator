@@ -8,7 +8,8 @@ import {
   resolveFirstClassUiTool,
   setUiManifest,
 } from '../src/api/lib/ui-manifest-registry';
-import { catalogGet, buildActionCatalog, type ActionCapability } from '../src/kernel/action-catalog';
+import { catalogGet, type ActionCapability } from '../src/kernel/action-catalog';
+import { buildActionCatalog } from './fixtures/host-action-catalog';
 import {
   preflightUiToolDispatch,
   runForgeaxBuiltinTool,
