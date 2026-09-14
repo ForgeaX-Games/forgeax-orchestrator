@@ -38,6 +38,18 @@ export function createKernelPermissionsRouter(
     });
   });
 
+  r.patch('/', async (c) => {
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body.kernelId !== 'string' || !body.kernelId.trim()) return c.json({ error: 'kernelId required' }, 400);
+    const patch = coercePerKernelModes({ [body.kernelId]: body.mode });
+    if (body.mode !== null && !Object.hasOwn(patch, body.kernelId)) return c.json({ error: 'invalid permission mode' }, 400);
+    const config = readKernelPermissions();
+    if (body.mode === null) delete config.perKernel[body.kernelId];
+    else config.perKernel[body.kernelId] = patch[body.kernelId]!;
+    writeKernelPermissions(config);
+    return c.json({ ok: true, config });
+  });
+
   r.put('/', async (c) => {
     let body: Partial<KernelPermissionConfig>;
     try {

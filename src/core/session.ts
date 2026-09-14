@@ -1184,7 +1184,7 @@ export class Session {
           source: "agent",
           type: "message",
           payload: {
-            content: `✓ ${emitterId} ${status}了你交办的任务${detail}：${info.brief}${resultBlock}`,
+            content: `${payload.aborted || payload.error ? "" : "✓ "}${emitterId} ${status}了你交办的任务${detail}：${info.brief}${resultBlock}`,
             fromAgent: emitterId,
           },
           to: info.delegator,
@@ -1223,7 +1223,7 @@ export class Session {
       source: "agent",
       type: "message",
       payload: {
-        content: `✓ ${key} ${status}了你交办的任务${detail}：${info.brief}`,
+        content: `${outcome.aborted || outcome.error ? "" : "✓ "}${key} ${status}了你交办的任务${detail}：${info.brief}`,
         fromAgent: key,
         ...(info.delegationId ? { delegationId: info.delegationId } : {}),
         ...(info.sourceEventId ? { sourceEventId: info.sourceEventId } : {}),

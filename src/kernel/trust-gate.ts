@@ -106,7 +106,8 @@ const SCOPED_CAPS: ReadonlySet<Capability> = new Set<Capability>(['write', 'dele
  *  防止将来调能力策略时误伤。 */
 /** Pure orchestration/reporting tools do not touch the workspace. Settings
  * deny rules still run before this set, so an explicit user deny wins. */
-const ALWAYS_ALLOW = new Set(['delegate_to_subagent', 'list_subagents', 'list_agents', 'deliver_summary']);
+// todo_write updates the session-owned plan; it never resolves or writes a caller file path.
+const ALWAYS_ALLOW = new Set(['delegate_to_subagent', 'list_subagents', 'list_agents', 'deliver_summary', 'todo_write']);
 
 export interface TrustDecision {
   /** 向后兼容:`true` 当且仅当 `outcome==='allow'`。旧调用方只看此字段时 ask/deny 均 fail-closed。 */

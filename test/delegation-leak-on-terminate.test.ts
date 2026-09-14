@@ -257,6 +257,7 @@ describe("delegation registry leak on target termination", () => {
     expect(messages[0]?.to).toBe("someone-else");
     const content = (messages[0]?.payload as { content?: string }).content ?? "";
     expect(content).toContain("取消");
+    expect(content).not.toContain("✓");
     expect(content).toContain("帮我看看这个 bug");
 
     dispose();
@@ -358,7 +359,7 @@ describe("delegation registry leak on target termination", () => {
 
       expect(messages.some((message) => {
         const content = (message.payload as { content?: string }).content ?? "";
-        return message.to === "root" && content.includes("完成") && message.durability === "required";
+        return message.to === "root" && content.includes("完成") && content.startsWith("✓") && message.durability === "required";
       })).toBe(true);
       dispose();
       await sm.close(session.sid);
@@ -397,6 +398,7 @@ describe("delegation registry leak on target termination — 真实 delegate_to_
     expect(cancelMsg).toBeTruthy();
     const content = (cancelMsg?.payload as { content?: string }).content ?? "";
     expect(content).toContain("取消");
+    expect(content).not.toContain("✓");
     // 4) delegationGuard 不再因为「target busy」永久拦截对 mochi 的新委托。
     const guard = delegationGuard({ delegations: session.delegations, delegator: "root", target: "mochi" });
     expect(guard.block).toBe(false);
@@ -713,7 +715,7 @@ describe("delegate_to_subagent runtime contract", () => {
       await waitUntil(() => session.delegations.size === 0 && session.runtimeTree.size === 1);
       expect(messages.some((message) => {
         const content = (message.payload as { content?: string }).content ?? "";
-        return message.to === "root" && content.includes("失败") && content.includes("worker failed");
+        return message.to === "root" && content.includes("失败") && content.includes("worker failed") && !content.startsWith("✓");
       })).toBe(true);
       dispose();
       await sm.close(session.sid);

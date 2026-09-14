@@ -130,7 +130,10 @@ for await (const line of console) {
   } else if (req.method === 'turn/start') {
     appendFileSync(log, 'turn-params:' + JSON.stringify(req.params) + '\\n');
     emit({ jsonrpc: '2.0', id: req.id, result: { turn: { id: 'fixture-turn' } } });
-    if (mode() === 'turn' || mode() === 'compacting') {
+    if (mode() === 'pending-ask') {
+      emit({ jsonrpc: '2.0', id: 'ask-rpc', method: 'item/tool/call', params: { callId: 'pending-ask', tool: 'ask_user', arguments: { question: 'Continue?' } } });
+      setTimeout(() => emit({ method: 'turn/completed', params: { threadId: 'fixture-thread', turn: { id: 'fixture-turn', status: 'completed' } } }), 30);
+    } else if (mode() === 'turn' || mode() === 'compacting') {
       if (mode() === 'compacting') emit({ method: 'item/started', params: { threadId: 'fixture-thread', item: { type: 'contextCompaction', id: 'active-compact' } } });
       activeTurn = true;
       appendFileSync(log, 'turn-active\\n');
@@ -610,4 +613,35 @@ describe('Codex durable native recovery', () => {
     expect(restarted.hasNativeHistoryResume(request.session.threadId)).toBe(false);
     expect(readFileSync(fx.log, 'utf8')).toBe('');
   });
+});
+
+ test('terminal Codex turn settles an outstanding ask before announcing completion', async () => {
+  const fx = fixture();
+  writeFileSync(fx.control, 'pending-ask');
+  const request = req(randomUUID());
+  request.tools = [{ name: 'ask_user', description: 'Ask user', inputSchema: { type: 'object' } }];
+  const events: KernelEvent[] = [];
+  try {
+    for await (const event of new CodexKernel().runTurn(request, new AbortController().signal)) events.push(event);
+    expect(events.some(event => event.kind === 'tool.call' && event.callId === 'pending-ask')).toBe(true);
+    expect(events.at(-2)).toMatchObject({ kind: 'tool.result', callId: 'pending-ask', name: 'ask_user', ok: false });
+    expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'stop' });
+  } finally { await CodexKernel.closeAppServerPool(); }
+});
+
+test('user Stop settles an outstanding ask before cancelled turn completion', async () => {
+  const fx = fixture();
+  writeFileSync(fx.control, 'pending-ask');
+  const request = req(randomUUID());
+  request.tools = [{ name: 'ask_user', description: 'Ask user', inputSchema: { type: 'object' } }];
+  const controller = new AbortController();
+  const events: KernelEvent[] = [];
+  try {
+    for await (const event of new CodexKernel().runTurn(request, controller.signal)) {
+      events.push(event);
+      if (event.kind === 'tool.call') controller.abort();
+    }
+    expect(events.at(-2)).toMatchObject({ kind: 'tool.result', callId: 'pending-ask', name: 'ask_user', ok: false });
+    expect(events.at(-1)).toEqual({ kind: 'turn.done', reason: 'cancelled' });
+  } finally { await CodexKernel.closeAppServerPool(); }
 });

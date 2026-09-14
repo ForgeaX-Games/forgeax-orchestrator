@@ -5,6 +5,9 @@ import type { HistoryEntry, KernelLane } from './types';
 import type { HistorySource, LaneStore } from './coordinator';
 
 export const REPLAY_TOOL_PREVIEW_CHARS = 8_000;
+// Text-bridge history has no provider-side compaction before admission. Reserve
+// a bounded excerpt budget across results, not 8 KB multiplied by every tool.
+export const TEXT_BRIDGE_TOOL_PREVIEW_BUDGET_CHARS = 128_000;
 
 
 function textFrom(value: unknown): string {
@@ -41,7 +44,7 @@ function messageOf(event: StoredEvent): TurnMessage | null {
 }
 
 export class LedgerHistorySource implements HistorySource {
-  constructor(private readonly ledger: EventLedger) {}
+  constructor(private readonly ledger: EventLedger, private readonly toolPreviewBudgetChars = Infinity) {}
 
   async read(): Promise<HistoryEntry[]> {
     const rows = await this.ledger.readAllWithCursors();
@@ -52,20 +55,6 @@ export class LedgerHistorySource implements HistorySource {
       if (row.event.type === 'user_input' && typeof row.event.eventId === 'string' && projectedInputs.has(row.event.eventId)) continue;
       const message = messageOf(row.event);
       if (!message) continue;
-      if (message.role === 'tool' && message.result !== undefined) {
-        const serialized = typeof message.result === 'string' ? message.result : JSON.stringify(message.result);
-        if (serialized.length > REPLAY_TOOL_PREVIEW_CHARS) {
-          // A replay is a navigation aid. Keep the faithful output in the WAL,
-          // identify exactly where it lives, and never mislabel truncation as failure.
-          message.result = {
-            preview: serialized.slice(0, REPLAY_TOOL_PREVIEW_CHARS * 3 / 4)
-              + '\n[Middle omitted from replay; full output retained in session event history.]\n'
-              + serialized.slice(-REPLAY_TOOL_PREVIEW_CHARS / 4),
-            originalCharacters: serialized.length,
-            historyReference: { ...row.cursor, field: 'payload.result' },
-          };
-        }
-      }
       const payload = row.event.payload ?? {};
       const history = row.event.history as { origin?: { kernelId?: string }; turnId?: string } | undefined;
       const kernelId = history?.origin?.kernelId
@@ -78,6 +67,34 @@ export class LedgerHistorySource implements HistorySource {
           ? 'rewind'
           : undefined;
       entries.push({ cursor: row.cursor, ts: row.event.ts, turnId, message, ...(kernelId ? { kernelId } : {}), ...(boundary ? { semanticBoundary: boundary } : {}) });
+    }
+    // Prefer recent evidence. Older outputs retain their status and a durable
+    // cursor; this is an excerpt projection, never a semantic compaction.
+    let remaining = this.toolPreviewBudgetChars;
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const entry = entries[index]!;
+      const message = entry.message;
+      if (message.role !== 'tool') continue;
+      const value = message.result ?? message.error ?? '';
+      const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+      const available = Math.max(0, Math.min(REPLAY_TOOL_PREVIEW_CHARS, remaining));
+      remaining -= Math.min(serialized.length, available);
+      if (serialized.length <= available) continue;
+      const head = Math.ceil(available * 3 / 4);
+      const tail = available - head;
+      entry.message = {
+        ...message,
+        ...(message.error ? { error: 'Error details retained in the referenced session event.' } : {}),
+        result: {
+          preview: available > 0
+            ? serialized.slice(0, head)
+              + '\n[Middle omitted from replay; full output retained in session event history.]\n'
+              + (tail > 0 ? serialized.slice(-tail) : '')
+            : '[Output omitted from replay; full output retained in session event history.]',
+          originalCharacters: serialized.length,
+          historyReference: { ...entry.cursor, field: message.result !== undefined ? 'payload.result' : 'payload.error' },
+        },
+      };
     }
     return entries;
   }
@@ -100,10 +117,10 @@ export class LedgerLaneStore implements LaneStore {
           laneId: String(p.laneId), kernelId, epoch: Number(p.epoch ?? 1),
           ...(typeof p.nativeSessionRef === 'string' ? { nativeSessionRef: p.nativeSessionRef } : {}),
         };
-      } else if (lane && row.event.type === 'kernel_history_applied') {
+      } else if (lane && p.laneId === lane.laneId && p.epoch === lane.epoch && row.event.type === 'kernel_history_applied') {
         const cursor = p.knownThrough as KernelLane['knownThrough'];
         lane = { ...lane, ...(cursor ? { knownThrough: cursor } : {}) };
-      } else if (lane && row.event.type === 'kernel_lane_invalidated') {
+      } else if (lane && p.laneId === lane.laneId && p.epoch === lane.epoch && row.event.type === 'kernel_lane_invalidated') {
         lane = { ...lane, invalidated: true };
       }
     }

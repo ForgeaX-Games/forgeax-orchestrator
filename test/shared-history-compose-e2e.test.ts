@@ -82,3 +82,27 @@ test('composer awaits confirmed native restoration before choosing a history del
   expect(next.historyPlan?.mode).toBe('none');
   expect(next.systemPrompt.dynamicSuffix).toBeUndefined();
 });
+
+test('reopened Codex session admits a large tool history without losing the current request', async () => {
+  const { buildCodexAppServerTurnInput } = await import('../src/kernel/codex-profile');
+  const session = await getSessionManager().create({ displayName: 'large-recovery' });
+  const ledger = session.getOrCreateLedger('forge');
+  ledger.append({ type: 'inbound_message', ts: Date.now(), source: 'test', payload: { content: 'Original requirement: retain restart and three waves.' } } as never);
+  for (let i = 0; i < 305; i++) {
+    ledger.append({ type: 'hook:toolResult', ts: Date.now(), source: 'test', payload: {
+      callId: `tool-${i}`, ok: true, result: { output: '\\[tool evidence]'.repeat(1_000) },
+    } } as never);
+  }
+  await getSessionManager().close(session.sid);
+  await getSessionManager().open(session.sid);
+  const request = await composeTurnRequest({ message: 'Continue with a visible HUD.', kernel: kernel('codex'),
+    model: 'gpt-5.6-luna', sessionId: session.sid, agentId: 'forge', threadId: 'thread-history-e2e' });
+  const input = buildCodexAppServerTurnInput(request);
+  const text = String(input[0]!.text);
+  expect(request.historyPlan?.mode).toBe('snapshot');
+  expect(text.length).toBeLessThan(400_000);
+  expect(text).toContain('Original requirement: retain restart and three waves.');
+  expect(text).toContain('Continue with a visible HUD.');
+  expect(text).toContain('historyReference');
+  expect(request.input.text).toBe('Continue with a visible HUD.');
+});

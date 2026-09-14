@@ -29,6 +29,10 @@ describe('checkKernelTool + settings 规则叠加', () => {
     expect(checkKernelTool('own', 'delegate_to_subagent', {}).outcome).toBe('allow');
   });
 
+  test('explicit deny still applies to session plan updates', () => {
+    expect(checkKernelTool('imported', 'todo_write', { rules: rules({ deny: ['todo_write'] }) }).outcome).toBe('deny');
+  });
+
   test('tier 硬 deny(imported credential)不被 settings allow 洗白', () => {
     const d = checkKernelTool('imported', 'get_secret', { rules: rules({ allow: ['get_secret'] }) });
     expect(d.outcome).toBe('deny');

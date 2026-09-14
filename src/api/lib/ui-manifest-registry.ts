@@ -76,6 +76,21 @@ export function acquireUiLease(sid: string, clientId: string): { leaseId: string
   return { leaseId, ttlMs: UI_LEASE_TTL_MS };
 }
 
+/** A passive query may recover an unowned surface, never displace a live owner. */
+export function claimAvailableUiLease(sid: string, clientId: string): { leaseId: string; ttlMs: number } | null {
+  const lease = states.get(sid)?.lease;
+  if (lease && lease.expiresAt > Date.now() && lease.clientId !== clientId) return null;
+  return acquireUiLease(sid, clientId);
+}
+
+/** Renew only the current owner; background heartbeats must never acquire ownership. */
+export function renewUiLease(sid: string, clientId: string, leaseId: unknown): { leaseId: string; ttlMs: number } | null {
+  const lease = states.get(sid)?.lease;
+  if (!lease || lease.clientId !== clientId || lease.leaseId !== leaseId || lease.expiresAt <= Date.now()) return null;
+  lease.expiresAt = Date.now() + UI_LEASE_TTL_MS;
+  return { leaseId: lease.leaseId, ttlMs: UI_LEASE_TTL_MS };
+}
+
 /** 校验 leaseId 当前有效(存在、匹配、未过期)。manifest 写入与 ui_* 感知回灌都以此把关。 */
 export function validateUiLease(sid: string, leaseId: unknown): boolean {
   if (typeof leaseId !== 'string' || !leaseId) return false;

@@ -50,7 +50,7 @@ import type { SystemBlock } from '../llm/types';
 import type { LedgerReader } from '../context-window/context-window';
 import type { BlackboardAPI } from '../core/types';
 import { HistoryCoordinator } from '../history/coordinator';
-import { LedgerHistorySource, LedgerLaneStore } from '../history/ledger-history';
+import { LedgerHistorySource, LedgerLaneStore, TEXT_BRIDGE_TOOL_PREVIEW_BUDGET_CHARS } from '../history/ledger-history';
 import { renderHistoryPatch } from '../history/text-bridge';
 import { getExtensionSnapshot } from '../extensions/registry';
 import { projectToolSpecs } from '../capabilities/projection';
@@ -142,7 +142,7 @@ export interface ComposeInput {
 /** 一行回复语言指令(英文中立,注入 dynamicSuffix)。 */
 function replyLanguageDirective(lang: 'en' | 'zh'): string {
   const name = lang === 'zh' ? 'Simplified Chinese' : 'English';
-  return `# Reply language\nWrite your reply to the user in ${name}. Keep code, identifiers, file paths and technical terms unchanged.`;
+  return `# Reply language\nUse ${name} as the default reply language unless the user explicitly requests another language. Keep code, identifiers, file paths and technical terms unchanged.`;
 }
 
 export async function composeTurnRequest(input: ComposeInput): Promise<TurnRequest> {
@@ -389,7 +389,8 @@ export async function composeTurnRequest(input: ComposeInput): Promise<TurnReque
     try {
       const ledger = sharedLedger;
       if (ledger) {
-        const coordinator = new HistoryCoordinator(new LedgerHistorySource(ledger), new LedgerLaneStore(ledger));
+        const coordinator = new HistoryCoordinator(new LedgerHistorySource(ledger,
+          profile.historyIntake === 'text-bridge' ? TEXT_BRIDGE_TOOL_PREVIEW_BUDGET_CHARS : undefined), new LedgerLaneStore(ledger));
         const result = await coordinator.prepare({
           kernelId: input.kernel.id,
           intake: profile.historyIntake,

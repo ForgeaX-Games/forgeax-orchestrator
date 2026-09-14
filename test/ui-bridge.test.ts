@@ -8,6 +8,8 @@
 import { describe, expect, test, beforeEach, afterEach, spyOn } from 'bun:test';
 import {
   acquireUiLease,
+  claimAvailableUiLease,
+  renewUiLease,
   validateUiLease,
   setUiManifest,
   getUiAction,
@@ -632,4 +634,50 @@ describe('P1-8 headless 回落 — surface both/server 的 ui_invoke', () => {
     expect(handlerCalls).toBe(0);
     expect(publishes).toBe(0);
   });
+});
+
+ test('stale background renewal cannot displace the newly focused UI', () => {
+  const sid = 'renewal-regression';
+  const a = acquireUiLease(sid, 'background-app');
+  const b = acquireUiLease(sid, 'focused-browser');
+  expect(renewUiLease(sid, 'background-app', a.leaseId)).toBeNull();
+  expect(validateUiLease(sid, b.leaseId)).toBe(true);
+  expect(renewUiLease(sid, 'focused-browser', b.leaseId)?.leaseId).toBe(b.leaseId);
+  expect(renewUiLease(sid, 'other-client', b.leaseId)).toBeNull();
+ });
+
+test('expired UI renewal cannot resurrect a lease', () => {
+  const sid = 'expired-renewal-regression';
+  const lease = acquireUiLease(sid, 'client');
+  const now = Date.now();
+  const clock = spyOn(Date, 'now').mockReturnValue(now + lease.ttlMs + 1);
+  try { expect(renewUiLease(sid, 'client', lease.leaseId)).toBeNull(); }
+  finally { clock.mockRestore(); clearUiStateForSession(sid); }
+});
+
+
+test('passive query claims cannot steal the foreground surface after a rejected renewal', () => {
+  const a = acquireUiLease(SID, 'background-window');
+  const b = acquireUiLease(SID, 'foreground-window');
+  expect(renewUiLease(SID, 'background-window', a.leaseId)).toBeNull();
+  expect(claimAvailableUiLease(SID, 'background-window')).toBeNull();
+  expect(validateUiLease(SID, b.leaseId)).toBe(true);
+  expect(claimAvailableUiLease(SID, 'foreground-window')?.leaseId).toBe(b.leaseId);
+  // A later actual focus transition still transfers ownership.
+  const refocused = acquireUiLease(SID, 'background-window');
+  expect(validateUiLease(SID, b.leaseId)).toBe(false);
+  expect(validateUiLease(SID, refocused.leaseId)).toBe(true);
+});
+
+test('passive query claims recover empty or expired ownership without crossing sessions', () => {
+  const first = claimAvailableUiLease(SID, 'first')!;
+  const now = Date.now();
+  const clock = spyOn(Date, 'now').mockReturnValue(now + first.ttlMs + 1);
+  try {
+    const second = claimAvailableUiLease(SID, 'second')!;
+    expect(validateUiLease(SID, first.leaseId)).toBe(false);
+    expect(validateUiLease(SID, second.leaseId)).toBe(true);
+    expect(claimAvailableUiLease('another-session', 'first')).not.toBeNull();
+    expect(validateUiLease(SID, second.leaseId)).toBe(true);
+  } finally { clock.mockRestore(); clearUiStateForSession('another-session'); }
 });

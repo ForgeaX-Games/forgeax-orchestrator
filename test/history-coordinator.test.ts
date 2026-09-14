@@ -41,3 +41,12 @@ describe('HistoryCoordinator', () => {
     expect(snapshot).toMatchObject({ mode: 'snapshot', messages: [{ content: 'A' }, { content: 'B' }] });
   });
 });
+
+
+test('an unacknowledged or invalidated lane cannot claim a delta', async () => {
+  for (const state of [{}, { invalidated: true, knownThrough: entry(1, 'a').cursor }]) {
+    const h = harness([entry(1, 'a'), entry(2, 'b')], { laneId: 'old', kernelId: 'cc', epoch: 1, ...state });
+    const result = await new HistoryCoordinator(h.source, h.lanes).prepare({ kernelId: 'cc', intake: 'text-bridge', nativeResumeAvailable: true });
+    expect(result).toMatchObject({ mode: 'snapshot', messages: [{ content: 'a' }, { content: 'b' }] });
+  }
+});

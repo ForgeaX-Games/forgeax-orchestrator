@@ -19,6 +19,20 @@ export function createMemorySettingsRouter(): Hono {
     return c.json({ config: readMemorySwitch(), kernels: listKernelCacheCaps() });
   });
 
+  r.patch('/', async (c) => {
+    const body = await c.req.json().catch(() => null);
+    if (!body || !(typeof body.master === 'boolean' || (typeof body.kernelId === 'string' && body.kernelId.trim() && typeof body.enabled === 'boolean'))) return c.json({ error: 'master or kernelId and enabled required' }, 400);
+    const config = readMemorySwitch();
+    if (typeof body.master === 'boolean') config.master = body.master;
+    else {
+      const patch = coercePerKernel({ [body.kernelId]: body.enabled });
+      if (!Object.hasOwn(patch, body.kernelId)) return c.json({ error: 'invalid kernelId' }, 400);
+      config.perKernel = { ...config.perKernel, ...patch };
+    }
+    writeMemorySwitch(config);
+    return c.json({ ok: true, config });
+  });
+
   r.put('/', async (c) => {
     let body: Partial<MemorySwitchConfig>;
     try {

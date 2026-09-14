@@ -16,6 +16,7 @@
  * `threadId = uuidv5(sid::instanceId)` 续接。因而私有 CLI 会话是可选的执行优化,
  * 不是宿主上下文连续性的唯一来源。
  */
+import { publicContextUsage } from './context-usage';
 import { publicCompactionStatus } from './compaction-status';
 import { createHash } from 'node:crypto';
 import type { KernelEvent, TurnContextSnapshot } from '@forgeax/agent-runtime';
@@ -291,6 +292,18 @@ export async function runKernelTurn(
     });
 
     tt('kt.start', { agent: agentId, turn, sid: opts.sessionId, threadId, tools: req.tools?.length });
+    let acknowledgedPatch: string | undefined;
+    // A native session has consumed the submitted patch once it produces model
+    // activity. A later cancellation must not cause that patch to be replayed.
+    const acknowledgeHistory = () => {
+      const plan = req.historyPlan;
+      if (!plan?.laneId || !plan.through || plan.mode === 'authoritative' || plan.patchId === acknowledgedPatch) return;
+      eventBus.publish({ type: 'kernel_history_applied', ts: Date.now(), source: 'history-coordinator',
+        payload: { laneId: plan.laneId, kernelId: kernel.id, epoch: plan.epoch,
+          knownThrough: plan.through, patchId: plan.patchId, mode: plan.mode },
+      }, agentId);
+      acknowledgedPatch = plan.patchId;
+    };
     let deltas = 0;
     let lastKind = '';
     for await (const ev of runWithHistoryResync({
@@ -302,6 +315,10 @@ export async function runKernelTurn(
       run: (request) => kernel.runTurn(request, signal),
     })) {
       lastKind = ev.kind;
+      if (((ev.kind === 'message.delta' || ev.kind === 'thinking.delta') && ev.text.length > 0) ||
+          ev.kind === 'tool.call' ||
+          (ev.kind === 'turn.usage' && typeof ev.inputTokens === 'number' && ev.inputTokens > 0) ||
+          (ev.kind === 'turn.done' && ev.reason === 'stop')) acknowledgeHistory();
       if (ev.kind === 'message.delta' || ev.kind === 'thinking.delta') {
         deltas++;
         if (deltas === 1) tt('kt.first-delta', { agent: agentId, turn, kind: ev.kind });
@@ -414,7 +431,7 @@ export async function runKernelTurn(
           });
           break;
         case 'stored-event': {
-          const status = publicCompactionStatus(ev.payload);
+          const status = publicCompactionStatus(ev.payload) ?? publicContextUsage(ev.payload);
           if (status) {
             eventBus.publish({ ...status, source: `kernel:${providerId}` }, agentId);
             break;

@@ -291,7 +291,7 @@ export function transcribeKernelTurn(
       type: 'kernel_history_applied', ts: Date.now(), source: 'history-coordinator',
       payload: {
         laneId: rec.historyPlan.laneId, kernelId: rec.providerId, epoch: rec.historyPlan.epoch,
-        knownThrough: endCursor, patchId: rec.historyPlan.patchId,
+        knownThrough: endCursor, patchId: rec.historyPlan.patchId, mode: rec.historyPlan.mode,
       },
     }));
   }

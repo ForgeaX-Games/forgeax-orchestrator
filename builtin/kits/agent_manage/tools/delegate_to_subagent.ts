@@ -130,7 +130,7 @@ export default {
     "agent from inside an LLM turn. Use `list_subagents` to discover available " +
     "teammate IDs. Its registration labels are not task execution status. Never create or edit agents/ folders. " +
     "Returns a short ack — do NOT wait for or quote their reply here; a " +
-    "completion callback arrives automatically when they finish.",
+    "completion callback arrives automatically after your current turn ends. Continue independent work; once blocked on the handoff, end this turn so the report can be consumed before integration.",
   input_schema: {
     type: "object",
     properties: {
@@ -265,7 +265,7 @@ export default {
         `${templateRef}. The child's reply streams into its own tab; when it ` +
         `finishes the turn, you'll automatically receive a short completion ` +
         `note as your next inbound message — do NOT wait for or quote their ` +
-        `reply here, just acknowledge the handoff.`
+        `reply here. Continue independent work, then end your turn when you need their report; do not replace or declare missing work whose report is still queued.`
       );
     }
 
@@ -353,7 +353,7 @@ export default {
       `chat tab — the user can switch tabs to read it. When ${agentId} ` +
       `finishes the turn, you'll automatically receive a short completion ` +
       `note as your next inbound message; do NOT wait for or quote their ` +
-      `reply here, just acknowledge the handoff.`
+      `reply here. Continue independent work, then end your turn when you need their report; do not replace or declare missing work whose report is still queued.`
     );
   },
   compactResult(args) {

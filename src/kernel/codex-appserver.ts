@@ -260,6 +260,18 @@ export function mapCodexNotification(
       // 内，只作为 cacheRead 明细透传，不能再次相加。
       const t = params?.tokenUsage?.last;
       if (t) state.lastUsage = { inputTokens: t.inputTokens, outputTokens: t.outputTokens, cacheRead: t.cachedInputTokens };
+      const window = params?.tokenUsage?.modelContextWindow;
+      if (t && Number.isFinite(t.inputTokens) && t.inputTokens >= 0 &&
+          Number.isFinite(t.outputTokens) && t.outputTokens >= 0 &&
+          Number.isFinite(window) && window > 0) {
+        // Persist while running, including turns subsequently cancelled. This is
+        // context occupancy, not cumulative billing usage or a model-name guess.
+        queue.push({ kind: 'stored-event', payload: {
+          type: 'context.usage', ts: Date.now(), payload: {
+            inputTokens: t.inputTokens, outputTokens: t.outputTokens, contextWindow: window,
+          },
+        } });
+      }
       return;
     }
     case 'turn/completed':

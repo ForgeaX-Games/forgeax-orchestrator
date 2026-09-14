@@ -154,6 +154,23 @@ describe('codex-appserver mapNotification', () => {
     expect(st.ended).toBe(true);
   });
 
+  test('persists native occupancy immediately without waiting for a successful turn', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('thread/tokenUsage/updated', {
+      tokenUsage: { modelContextWindow: 258400,
+        total: { inputTokens: 4_600_000, outputTokens: 10000 },
+        last: { inputTokens: 156884, outputTokens: 292, cachedInputTokens: 100000 },
+      },
+    }, st, q);
+    q.end(); // Cancel before turn/completed: the occupancy event must survive.
+    const events = await collect(q);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ kind: 'stored-event', payload: {
+      type: 'context.usage', payload: { inputTokens: 156884, outputTokens: 292, contextWindow: 258400 },
+    } });
+  });
+
   test('cumulative-only token update is not misreported as current turn usage', async () => {
     const st = createCodexNotifState();
     const q = new KernelEventQueue();

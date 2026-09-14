@@ -26,7 +26,7 @@ import { randomUUID } from 'node:crypto';
 import { isValidSummonAgentId } from '../kernel/summon-agent';
 import { registerPermission, resolvePermission } from '../core/permission-registry';
 import { registerPerception, resolvePerception, pushPerceptionNote } from './lib/perception-registry';
-import { acquireUiLease, setUiManifest, uiInvokeTimeoutMs } from './lib/ui-manifest-registry';
+import { acquireUiLease, claimAvailableUiLease, renewUiLease, setUiManifest, uiInvokeTimeoutMs } from './lib/ui-manifest-registry';
 import { createSessionWithBootstrap, ensureSessionWithBootstrap } from './lib/session-create';
 import { getHostTool } from '../orchestration-seams';
 import type { PerceptionKind } from '../kernel/forgeax-builtin-tools';
@@ -1415,7 +1415,10 @@ export function createSessionsRouter() {
     const clientId = typeof body.clientId === 'string' && body.clientId ? body.clientId : '';
     if (!clientId) return c.json({ ok: false, reason: 'clientId (string) required' }, 400);
     if (!getSessionManager().peek(sid)) return c.json({ ok: false, reason: 'no-session' }, 200);
-    const lease = acquireUiLease(sid, clientId);
+    const lease = Object.prototype.hasOwnProperty.call(body, 'leaseId')
+      ? renewUiLease(sid, clientId, body.leaseId)
+      : body.claimOnly === true ? claimAvailableUiLease(sid, clientId) : acquireUiLease(sid, clientId);
+    if (!lease) return c.json({ ok: false, reason: 'lease-lost' }, 200);
     return c.json({ ok: true, ...lease });
   });
 

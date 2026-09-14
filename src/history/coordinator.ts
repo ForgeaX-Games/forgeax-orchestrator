@@ -48,10 +48,11 @@ export class HistoryCoordinator {
       return this.result('authoritative', messages, lane, entries.at(-1)?.cursor);
     }
 
-    const messages = current && options.nativeResumeAvailable && !options.forceSnapshot
-      ? this.projectAfter(entries, current.knownThrough, options.maxMessages)
+    const canResume = current && !current.invalidated && current.knownThrough && options.nativeResumeAvailable && !options.forceSnapshot;
+    const messages = canResume
+      ? this.projectAfter(entries, current.knownThrough, options.maxMessages, options.kernelId)
       : this.project(entries, options.maxMessages);
-    const mode = current && options.nativeResumeAvailable && !options.forceSnapshot
+    const mode = canResume
       ? (messages.length ? 'delta' : 'none')
       : 'snapshot';
     if (!options.nativeResumeAvailable && current && !messages.length) {
@@ -78,15 +79,17 @@ export class HistoryCoordinator {
     return maxMessages ? messages.slice(-maxMessages) : messages;
   }
 
-  private projectAfter(entries: HistoryEntry[], cursor?: HistoryCursor, maxMessages?: number): TurnMessage[] {
+  private projectAfter(entries: HistoryEntry[], cursor?: HistoryCursor, maxMessages?: number, nativeKernelId?: string): TurnMessage[] {
     if (!cursor) return this.project(entries, maxMessages);
     const index = entries.findIndex((entry) => cursorKey(entry.cursor) === cursorKey(cursor));
     if (index < 0) {
       const newer = entries.filter((entry) => entry.cursor.shard > cursor.shard || (entry.cursor.shard === cursor.shard && entry.cursor.line > cursor.line));
       if (newer.some((entry) => entry.semanticBoundary)) return this.project(entries, maxMessages);
-      return this.project(newer, maxMessages);
+      return this.project(newer.filter((entry) => entry.message.role === 'user' || entry.kernelId !== nativeKernelId), maxMessages);
     }
     if (entries.slice(index + 1).some((entry) => entry.semanticBoundary)) return this.project(entries, maxMessages);
-    return this.project(entries.slice(index + 1), maxMessages);
+    // The warm native owner already holds its own model/tool output. Incoming
+    // user/teammate messages and other kernels' output must still be delivered.
+    return this.project(entries.slice(index + 1).filter((entry) => entry.message.role === 'user' || entry.kernelId !== nativeKernelId), maxMessages);
   }
 }

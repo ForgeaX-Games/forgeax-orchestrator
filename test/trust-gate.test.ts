@@ -204,3 +204,9 @@ describe('委派/编排原语始终放行(含 imported)', () => {
     expect(checkKernelTool(undefined, 'deliver_summary').outcome).toBe('allow');
   });
 });
+
+// Session planning is not a filesystem write, including imported role packs.
+test('session plan updates do not require a fabricated target path', () => {
+  expect(checkKernelTool('imported', 'todo_write', { args: { todos: [] } }).outcome).toBe('allow');
+  expect(checkKernelTool('imported', 'write_file', { args: { content: 'x' } }).outcome).toBe('deny');
+});

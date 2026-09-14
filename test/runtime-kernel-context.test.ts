@@ -1,3 +1,4 @@
+import { RENTED_KERNEL_PROFILE } from '../src/kernel/kernel-profile';
 import {
   afterEach,
   beforeEach,
@@ -57,6 +58,9 @@ function recordingKernel(id: string, requests: TurnRequest[]): AgentKernel {
     async *runTurn(req) {
       requests.push(structuredClone(req));
       if (req.input.text === "compact lifecycle") {
+        yield { kind: 'stored-event', payload: { type: 'context.usage', ts: Date.now(),
+          payload: { inputTokens: 156884, outputTokens: 292, contextWindow: 258400, llmMessage: 'PRIVATE' },
+        } };
         for (const phase of ["started", "completed"] as const) {
           yield { kind: "stored-event", payload: {
             type: "compaction.status", ts: Date.now(),
@@ -129,6 +133,96 @@ afterEach(async () => {
 });
 
 describe("runtime kernel context", () => {
+  test('runtime acknowledges consumed history, preserves incoming gaps, and snapshots after owner loss', async () => {
+    let resume = false;
+    const requests: TurnRequest[] = [];
+    const native = Object.assign(recordingKernel(DEFAULT_KERNEL, requests), {
+      orchestrationProfile: RENTED_KERNEL_PROFILE,
+      hasNativeHistoryResume: () => resume,
+    });
+    unregisterKernel(DEFAULT_KERNEL);
+    registerKernel(native);
+    const pm = getPathManager();
+    const session = await initSessionManager(pm).create({
+      displayName: 'native-history-ack',
+      prepareResidentDefinitions: (sid) => {
+        const root = pm.session(sid).agent('root');
+        mkdirSync(root.root(), { recursive: true });
+        writeFileSync(root.agentJson(), JSON.stringify({ id: 'root', kernelId: DEFAULT_KERNEL }));
+      },
+    });
+    const ledger = session.getOrCreateLedger('root');
+    const seed = 'ORIGINAL_REQUIREMENT ' + 'prior context '.repeat(2000);
+    ledger.append({ type: 'user_input', ts: 1, source: 'user', payload: { content: seed } });
+    const send = (content: string) => session.enqueueAgent('root', {
+      source: 'user', type: 'user_input', payload: { content }, to: 'root', handoff: 'turn', ts: Date.now(),
+    });
+    await send('first');
+    expect(requests[0]?.historyPlan?.mode).toBe('snapshot');
+    expect(requests[0]?.systemPrompt.dynamicSuffix).toContain('ORIGINAL_REQUIREMENT');
+    expect((await ledger.readAllEvents()).some(e => e.type === 'kernel_history_applied')).toBe(true);
+    resume = true;
+    ledger.append({ type: 'inbound_message', ts: Date.now(), source: 'teammate', payload: { content: 'UNSEEN_TEAMMATE_RESULT' } });
+    await send('second');
+    expect(requests[1]?.historyPlan?.mode).toBe('delta');
+    expect(requests[1]?.systemPrompt.dynamicSuffix).not.toContain('ORIGINAL_REQUIREMENT');
+    expect(requests[1]?.systemPrompt.dynamicSuffix).not.toContain('answer-1');
+    expect(requests[1]?.systemPrompt.dynamicSuffix).toContain('UNSEEN_TEAMMATE_RESULT');
+    resume = false;
+    await send('restart');
+    expect(requests[2]?.historyPlan?.mode).toBe('snapshot');
+    expect(requests[2]?.systemPrompt.dynamicSuffix).toContain('ORIGINAL_REQUIREMENT');
+    expect(requests[2]?.systemPrompt.dynamicSuffix).toContain('answer-1');
+  });
+
+  for (const consumed of [false, true]) {
+    test(`native history acknowledgement follows consumption before interruption: ${consumed}`, async () => {
+      const requests: TurnRequest[] = [];
+      let markStarted!: () => void;
+      const started = new Promise<void>(resolve => { markStarted = resolve; });
+      const native = Object.assign(recordingKernel(DEFAULT_KERNEL, requests), {
+        orchestrationProfile: RENTED_KERNEL_PROFILE,
+        hasNativeHistoryResume: () => requests.length > 0,
+        async *runTurn(req: TurnRequest, signal: AbortSignal) {
+          requests.push(req);
+          if (requests.length === 1) {
+            if (consumed) yield { kind: 'message.delta' as const, role: 'assistant' as const, text: 'started' };
+            await new Promise<void>(resolve => { signal.addEventListener('abort', () => resolve(), { once: true }); markStarted(); });
+            throw new DOMException('interrupted', 'AbortError');
+          }
+          yield { kind: 'message.delta' as const, role: 'assistant' as const, text: 'recovered' };
+          yield { kind: 'turn.done' as const, reason: 'stop' as const };
+        },
+      });
+      unregisterKernel(DEFAULT_KERNEL);
+      registerKernel(native);
+      const pm = getPathManager();
+      const session = await initSessionManager(pm).create({
+        displayName: 'history-interruption',
+        prepareResidentDefinitions: (sid) => {
+          const root = pm.session(sid).agent('root');
+          mkdirSync(root.root(), { recursive: true });
+          writeFileSync(root.agentJson(), JSON.stringify({ id: 'root', kernelId: DEFAULT_KERNEL }));
+        },
+      });
+      const ledger = session.getOrCreateLedger('root');
+      ledger.append({ type: 'user_input', ts: 1, source: 'user', payload: { content: 'RETAIN_REQUIREMENT' } });
+      const send = (content: string) => session.enqueueAgent('root', {
+        source: 'user', type: 'user_input', payload: { content }, to: 'root', handoff: 'turn', ts: Date.now(),
+      });
+      const pending = send('first').catch(() => undefined);
+      await started;
+      session.stopRuntime('root', 'user stopped');
+      await pending;
+      const applied = (await ledger.readAllEvents()).filter(e => e.type === 'kernel_history_applied');
+      expect(applied).toHaveLength(consumed ? 1 : 0);
+      await send('continue');
+      expect(requests[1]?.historyPlan?.mode).toBe(consumed ? 'delta' : 'snapshot');
+      if (consumed) expect(requests[1]?.systemPrompt.dynamicSuffix).not.toContain('RETAIN_REQUIREMENT');
+      else expect(requests[1]?.systemPrompt.dynamicSuffix).toContain('RETAIN_REQUIREMENT');
+    });
+  }
+
   test("public compaction lifecycle reaches the session ledger without private content", async () => {
     const pm = getPathManager();
     const session = await initSessionManager(pm).create({
@@ -148,6 +242,10 @@ describe("runtime kernel context", () => {
     expect(statuses.map((event) => event.payload?.phase)).toEqual(["started", "completed"]);
     expect(statuses[1]?.payload).toMatchObject({ id: "compact-1", phase: "completed", count: 1, durationMs: 12 });
     expect(JSON.stringify(statuses)).not.toContain("PRIVATE");
+    const occupancy = events.filter((event) => event.type === 'context.usage');
+    expect(occupancy).toHaveLength(1);
+    expect(occupancy[0]?.payload).toMatchObject({ inputTokens: 156884, outputTokens: 292, contextWindow: 258400 });
+    expect(JSON.stringify(occupancy)).not.toContain('PRIVATE');
   });
 
   test("configured model windows reach requests without unrelated model configuration", async () => {

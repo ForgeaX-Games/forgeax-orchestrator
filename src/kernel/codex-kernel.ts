@@ -646,7 +646,7 @@ export class CodexKernel implements AgentKernel {
 
     const queue = new KernelEventQueue();
     const notifState = createCodexNotifState(this.compactionTracker(tid ?? req.callId ?? randomUUID()));
-    const activeAskHandles = new Set<AskHandle>();
+    const activeAskHandles = new Map<AskHandle, string>();
 
     // 审批 server-request:settings.permissions 规则先行(046 楔子3:deny 即拒 /
     // allow 即批 / ask 强制走卡),未命中 → 中立 requestPermission(= Studio 审批卡),
@@ -667,7 +667,7 @@ export class CodexKernel implements AgentKernel {
           }, 0);
           queue.push({ kind: 'tool.call', callId, name: 'ask_user',
             args: { ...args, _askRequestId: handle.requestId } });
-          activeAskHandles.add(handle);
+          activeAskHandles.set(handle, callId);
           try {
             const answers = await handle.promise;
             if (answers === null) {
@@ -777,8 +777,7 @@ export class CodexKernel implements AgentKernel {
       }, 5_000).catch(() => undefined);
     };
     const onAbort = () => {
-      for (const handle of activeAskHandles) handle.dispose();
-      activeAskHandles.clear();
+      // Keep ask identities until the terminal drain publishes their results.
       // app-server owners are intentionally reused across turns. Ending only
       // this turn's local queue would leave the native turn running and let
       // its model/MCP work bleed into the next logical turn.
@@ -950,6 +949,19 @@ export class CodexKernel implements AgentKernel {
       }
 
       for await (const ev of queue) {
+        // A native turn can end while a dynamic ask is still pending. Closing
+        // its handle only in finally drops the result into an ended queue and
+        // leaves the UI waiting for a request the host can no longer answer.
+        // Publish the terminal tool facts before the terminal turn fact.
+        if (ev.kind === 'turn.done') {
+          const pendingAsks = [...activeAskHandles];
+          activeAskHandles.clear();
+          for (const [handle] of pendingAsks) handle.dispose();
+          for (const [, callId] of pendingAsks) {
+            yield { kind: 'tool.result', callId, name: 'ask_user', ok: false,
+              error: 'The turn ended before this question was answered.' } as KernelEvent;
+          }
+        }
         if (ev.kind === 'turn.done' && ev.reason === 'stop' && codexThreadId && !ac.signal.aborted) {
           checkpoint.complete(codexThreadId);
         }
@@ -957,7 +969,7 @@ export class CodexKernel implements AgentKernel {
         if (ev.kind === 'turn.done') break;
       }
     } finally {
-      for (const handle of activeAskHandles) handle.dispose();
+      for (const handle of activeAskHandles.keys()) handle.dispose();
       activeAskHandles.clear();
       ac.signal.removeEventListener('abort', onAbort);
       if (ownsClient) client.shutdown();
