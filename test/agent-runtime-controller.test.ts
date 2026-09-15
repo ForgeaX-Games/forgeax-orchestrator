@@ -51,6 +51,33 @@ function instance(lifetime: "resident" | "ephemeral" = "resident"): AgentInstanc
   };
 }
 
+test.each(['before', 'after'])('host feedback arriving %s Stop cannot restart a paid turn', async (timing) => {
+  const calls: unknown[] = [];
+  let release!: () => void;
+  const finishing = new Promise<void>(resolve => { release = resolve; });
+  const controller = new AgentRuntimeController(instance(), {
+    execute: async (_instance, input) => {
+      calls.push(input);
+      if (calls.length === 1) await finishing;
+      return { final: false };
+    },
+  });
+  controller.start();
+  const active = controller.enqueue({ source: 'user' });
+  if (timing === 'after') controller.stopTurn();
+  const feedback = controller.enqueueFeedback({ source: 'studio-runtime', handoff: 'steer', payload: { content: 'failure' } });
+  if (timing === 'before') controller.stopTurn();
+  release();
+  await active;
+  await controller.waitForQuiescence();
+  expect(calls).toHaveLength(1);
+  await controller.enqueue({ source: 'user', payload: { content: 'continue' } });
+  await feedback;
+  expect(calls).toHaveLength(2);
+  expect((calls[1] as RuntimeTurnBatch).inputs[0]).toMatchObject({ source: 'studio-runtime', handoff: 'silent' });
+  await controller.dispose();
+});
+
 describe("AgentRuntimeController handoff", () => {
   test("user stop preserves peer results without automatically starting another turn", async () => {
     const calls: unknown[] = [];
@@ -433,4 +460,28 @@ describe("AgentRuntimeController handoff", () => {
     expect(revisions).toEqual(["cfg_1", "cfg_2"]);
     await controller.dispose();
   });
+});
+
+test('feedback steers active work and idle feedback waits for explicit continuation', async () => {
+  const calls: unknown[] = [];
+  const controller = new AgentRuntimeController(instance(), {
+    execute: async (_instance, input, _bindings, signal) => {
+      calls.push(input);
+      if (calls.length === 1) await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+      return { final: false };
+    },
+  });
+  controller.start();
+  const first = controller.enqueue({ source: 'user' });
+  await controller.enqueueFeedback({ source: 'host', handoff: 'steer' });
+  await first;
+  await controller.waitForQuiescence();
+  expect(calls).toHaveLength(2);
+  const idle = controller.enqueueFeedback({ source: 'host', handoff: 'steer' });
+  await controller.waitForQuiescence();
+  expect(calls).toHaveLength(2);
+  await controller.enqueue({ source: 'user' });
+  await idle;
+  expect(calls).toHaveLength(3);
+  await controller.dispose();
 });

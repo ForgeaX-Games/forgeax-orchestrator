@@ -27,6 +27,7 @@ export interface AgentTurnExecutor {
 }
 
 interface QueuedTurn {
+  readonly feedback?: boolean;
   readonly input: unknown;
   readonly resolve: (result: AgentTurnResult) => void;
   readonly reject: (error: unknown) => void;
@@ -75,7 +76,7 @@ export class AgentRuntimeController {
    * return as "queued": all rejection conditions are checked before this
    * method returns. `enqueue()` preserves the older promise-only API by
    * converting those synchronous errors back into rejected promises. */
-  acceptTurn(input: unknown): Promise<AgentTurnResult> {
+  acceptTurn(input: unknown, options: { feedback?: boolean } = {}): Promise<AgentTurnResult> {
     if (this.disposed) {
       throw new Error(`controller disposed: ${this.instance.instanceId}`);
     }
@@ -88,12 +89,17 @@ export class AgentRuntimeController {
         `controller does not accept turns in state ${this.instance.state}: ${this.instance.instanceId}`,
       );
     }
+    // Host feedback may continue active work, but never revive stopped/idle work.
+    // Decide against the controller signal, not an executor's lagging turn ID.
+    if (options.feedback && (!this.currentAbort || this.currentAbort.signal.aborted)) {
+      input = { ...(input as Record<string, unknown>), handoff: "silent" };
+    }
     const handoff = eventHandoff(input);
     if (handoff === "passive" && !this.processing) {
       return Promise.resolve({ final: false });
     }
     const promise = new Promise<AgentTurnResult>((resolve, reject) => {
-      this.queue.push({ input, resolve, reject });
+      this.queue.push({ input, resolve, reject, feedback: options.feedback });
       if (this.queue.length > MAX_QUEUED_TURNS) {
         this.queue.shift()!.reject(
           new Error(
@@ -113,6 +119,15 @@ export class AgentRuntimeController {
   enqueue(input: unknown): Promise<AgentTurnResult> {
     try {
       return this.acceptTurn(input);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  /** Trusted host feedback, retained silently when active work has stopped. */
+  enqueueFeedback(input: Record<string, unknown>): Promise<AgentTurnResult> {
+    try {
+      return this.acceptTurn(input, { feedback: true });
     } catch (error) {
       return Promise.reject(error);
     }
@@ -148,6 +163,10 @@ export class AgentRuntimeController {
     if (this.disposed) return;
     for (let i = 0; i < this.queue.length; i++) {
       const turn = this.queue[i]!;
+      if (turn.feedback) {
+        this.queue[i] = { ...turn, input: { ...(turn.input as Record<string, unknown>), handoff: "silent" } };
+        continue;
+      }
       if (turn.input && typeof turn.input === "object" &&
           (turn.input as { source?: unknown }).source === "agent") {
         if ((turn.input as { type?: unknown }).type === "user_input") {
