@@ -15,6 +15,8 @@ export {
   createNpcWebSocketHandler,
   NpcRuntime,
   type NpcRuntimeConfig,
+  type NpcRuntimeQuiesceOptions,
+  type NpcRuntimeQuiesceResult,
   type NpcSession,
   type NpcSessionGrant,
   type ResolvedNpcSoulBinding as NpcSoulBinding,
@@ -26,6 +28,50 @@ export {
   type StandaloneNpcBrainConfig,
   type StandaloneNpcBrainServer,
 } from './npc-brain/standalone';
+export * from './npc-brain/a2a-contract';
+export {
+  createFileMemoryRuntimeHost,
+  type FileMemoryProviderAuditEvent,
+  type FileMemoryRuntimeHost,
+  type FileMemoryRuntimeHostOptions,
+  type FileMemoryRuntimeHostState,
+  type FileMemoryRuntimeProductAdapter,
+} from './npc-brain/memory/file-memory-runtime-host';
+export {
+  createReferenceMemoryRuntimeHost,
+  type ReferenceMemoryRuntimeHost,
+  type ReferenceMemoryRuntimeHostOptions,
+  type ReferenceMemoryRuntimeHostState,
+  type ReferenceMemoryRuntimeMode,
+} from './npc-brain/memory/reference-memory-runtime-host';
+export {
+  createExternalReadOnlyMemoryRuntimeHost,
+  type ExternalReadOnlyMemoryProviderV1,
+  type ExternalReadOnlyMemoryRuntimeHost,
+  type ExternalReadOnlyMemoryRuntimeHostOptions,
+  type ExternalReadOnlyMemoryRuntimeHostState,
+  type ExternalReadOnlyMemoryRuntimeMode,
+} from './npc-brain/memory/external-readonly-memory-runtime-host';
+export {
+  createNpcMemoryAuditSink,
+  type NpcMemoryAuditSink,
+  type NpcMemoryAuditSinkOptions,
+  type NpcMemoryAuditRecordInput,
+  type NpcMemoryAuditSource,
+} from './npc-brain/memory/npc-memory-audit-sink';
+export type {
+  NpcMemoryProviderMode,
+  NpcMemoryWritePolicy,
+  NpcMemoryRuntimeBinding,
+} from './npc-brain/memory-host-seam';
+export {
+  REFERENCE_FIXTURE,
+  REFERENCE_FIXTURE_CLOCK_DOMAIN,
+  REFERENCE_FIXTURE_ID,
+  REFERENCE_FIXTURE_OWNER,
+  REFERENCE_FIXTURE_STORE,
+} from './npc-brain/memory/reference-snapshot-fixture';
+export type { ReferenceFixtureEntryV1 } from './npc-brain/memory/reference-snapshot-fixture';
 export {
   NPC_LIMITS,
   NPC_PROTOCOL_VERSION,
@@ -79,7 +125,7 @@ export {
   type ResumeRequest,
   type Vec2,
 } from '@forgeax/types/npc-protocol';
-export type { ActionCatalogEntry, ActionCatalogBuildOptions } from './kernel/action-catalog';
+export type { ActionCatalogEntry, ActionCatalogBuildOptions, ActionPrecondition, ActionEffect } from './kernel/action-catalog';
 export {
   redactSecretsInText,
   scanBufferForSecrets,
@@ -195,3 +241,5 @@ export { repointEngineForgeaXSymlink } from './api/lib/engine-symlink';
 export { callTool } from './tools/registry';
 export { getTerminalManager } from './terminal/manager';
 export type { FileActivityRecord } from './ledger/file-activity-ledger';
+
+export { HEADLESS_ACTION_GRANDFATHER_IDS } from "./kernel/action-catalog";

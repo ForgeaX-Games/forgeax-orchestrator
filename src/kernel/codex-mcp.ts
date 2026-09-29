@@ -165,6 +165,9 @@ export function buildCodexMcpOverrides(runtime: ForgeaxToolsRuntime): string[] {
   // without it and therefore masked the bug in the original parity test.
   for (const [name, value] of Object.entries(runtime.env)) {
     if (!name.startsWith('FORGEAX_')) continue;
+    // A source capability is a bearer secret. Codex receives only the 0600
+    // token-file path; never serialize a direct token into process argv.
+    if (name === 'FORGEAX_KERNEL_TOOL_TOKEN') continue;
     argv.push('-c', `${k}.env.${name}=${tomlString(value)}`);
   }
   return argv;

@@ -6,6 +6,14 @@ import { NpcBrainService } from '../src/npc-brain/service';
 import { NpcRuntime } from '../src/npc-brain/runtime';
 import { npcDecisionWireSchema, perceptionSnapshotSchema } from '../src/npc-brain/protocol';
 import { onLifeEvent } from '../src/soul';
+import type { NpcMemoryRecallResultV1 } from '@forgeax/types/npc-memory';
+import type { NpcMemoryRuntimeBinding } from '../src/npc-brain/memory-host-seam';
+import { createFileSoulMemoryReader } from '../src/npc-brain/memory/file-soul-memory-provider';
+import {
+  fileMemoryFactIdempotencyKey,
+  fileMemorySettlementIdempotencyKey,
+} from '../src/npc-brain/memory/file-memory-idempotency';
+import { writeMemoryEntry } from '../src/soul/layered-memory';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -29,6 +37,48 @@ function snapshot(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+const fileSubjectFor: NpcMemoryRuntimeBinding['subjectFor'] = ({ game, npcId, soulId }) => ({
+  ownerNpcId: npcId,
+  soulId,
+  scope: {
+    authority: 'forgeax-file',
+    game,
+    memoryGame: game,
+    soulId,
+    storagePartition: { kind: 'soul-shared' },
+  },
+});
+
+const referenceSubjectFor: NpcMemoryRuntimeBinding['subjectFor'] = ({ npcId, soulId }) => ({
+  ownerNpcId: npcId,
+  soulId,
+  scope: {
+    authority: 'reference-fixture',
+    fixtureId: 'fixture-1',
+    clockDomainId: 'clock-1',
+  },
+});
+
+const fileRecallRequestFor: NpcMemoryRuntimeBinding['recallRequestFor'] = ({ subject, snapshot: current }) => ({
+  subject,
+  trigger: 'active_decision',
+  at: { day: 0, hour: 0, minute: 0 },
+  context: {
+    mapId: current.scene ?? current.game,
+    sceneAreaId: current.visibilityGroup ?? null,
+    visibleRefIds: current.nearby.map((item) => item.id),
+    focusEntityIds: [],
+    // File legacy reincarnation search is keyed by the current snapshot text.
+    conversationTurns: current.text ? [{
+      speakerEntityId: current.playerId ?? 'local',
+      listenerEntityId: current.npcId,
+      text: current.text,
+      at: current.t,
+    }] : [],
+  },
+  budget: { mode: 'legacy-exact' },
+});
 
 function auditPath(projectRoot: string, game = 'demo') {
   return join(projectRoot, '.forgeax/npc-brain', game, 'decisions-19700101.jsonl');
@@ -54,6 +104,571 @@ describe('NPC protocol', () => {
 });
 
 describe('NpcBrainService', () => {
+  test('rejects invalid provider recall budgets at construction', () => {
+    expect(() => new NpcBrainService({ projectRoot: root(), memoryRecallBudgetMs: -1 })).toThrow(/finite non-negative/);
+    expect(() => new NpcBrainService({ projectRoot: root(), memoryRecallBudgetMs: Number.NaN })).toThrow(/finite non-negative/);
+    expect(() => new NpcBrainService({ projectRoot: root(), memoryRecallBudgetMs: Number.POSITIVE_INFINITY })).toThrow(/finite non-negative/);
+  });
+
+  test('active memory provider owns recall prompt and durable handoff, while decision survives handoff failure', async () => {
+    const projectRoot = root();
+    let handoff: unknown;
+    let prompt = '';
+    const memoryAudit: unknown[] = [];
+    const memoryResult: NpcMemoryRecallResultV1 = {
+      source: { kind: 'live-file' }, rawRecallVersion: 1,
+      rawBlocks: [{ name: 'authority-memory', text: 'Provider-owned fact.' }],
+      diagnostics: { stale: false, volatileStateUsed: false, projectionMode: 'full', identityResolved: true },
+    };
+    const brain = new NpcBrainService({
+      projectRoot,
+      loadAgentRecord: async (agentId) => ({
+        agentId, source: 'builtin', trustTier: 'own', persona: 'Persona', skills: [], tools: [],
+        memory: { root: join(projectRoot, 'unused') }, warnings: [],
+      }),
+      memory: {
+        mode: 'active',
+        writePolicy: 'configured-writer',
+        reader: { recall: async () => memoryResult },
+        subjectFor: fileSubjectFor,
+        recallRequestFor: fileRecallRequestFor,
+        enqueueHandoff: async (value) => {
+          handoff = value;
+          throw new Error('journal unavailable');
+        },
+        audit: (event) => memoryAudit.push(event),
+      },
+      complete: async (request) => {
+        prompt = request.messages.at(-1)?.content ?? '';
+        return { text: JSON.stringify({ utterance: { lines: ['ok'] }, memoryOps: [{ kind: 'episode', text: 'remember', sourceEventId: 'evt-1' }] }), model: request.model, transport: 'mock', latencyMs: 1 };
+      },
+    });
+    const decision = await brain.decide(snapshot());
+    expect(decision?.utterance?.lines).toEqual(['ok']);
+    expect(prompt).toContain('Provider-owned fact.');
+    expect(handoff).toBeDefined();
+    expect(memoryAudit).toContainEqual(expect.objectContaining({ operation: 'recall', eventId: 'evt-1' }));
+    expect(memoryAudit).toContainEqual(expect.objectContaining({ operation: 'handoff', eventId: 'evt-1' }));
+  });
+
+  test('active deny policy keeps a durable zero-command receipt and emits no provider write', async () => {
+    const projectRoot = root();
+    const handoffs: any[] = [];
+    const brain = new NpcBrainService({
+      projectRoot,
+      memory: {
+        mode: 'active',
+        writePolicy: 'deny',
+        reader: { recall: async () => ({
+          source: { kind: 'live-file' }, rawRecallVersion: 1, rawBlocks: [],
+          diagnostics: { stale: false, volatileStateUsed: false, projectionMode: 'full', identityResolved: true },
+        }) },
+        subjectFor: fileSubjectFor,
+        recallRequestFor: fileRecallRequestFor,
+        enqueueHandoff: async (value) => { handoffs.push(value); },
+      },
+      complete: async (request) => ({
+        text: JSON.stringify({
+          utterance: { lines: ['ok'] },
+          memoryOps: [{ kind: 'episode', text: 'must not write', sourceEventId: 'evt-1' }],
+        }),
+        model: request.model, transport: 'mock', latencyMs: 1,
+      }),
+    });
+    await brain.decide(snapshot());
+    expect(handoffs).toHaveLength(1);
+    expect(handoffs[0].commands).toEqual([]);
+  });
+
+  test('off performs zero provider/preload/audit calls and keeps the legacy File writer', async () => {
+    const projectRoot = root();
+    let providerCalls = 0;
+    const brain = new NpcBrainService({
+      projectRoot,
+      memory: {
+        mode: 'off',
+        reader: {
+          recall: async () => { providerCalls += 1; throw new Error('off reader called'); },
+          preload: async () => { providerCalls += 1; return []; },
+        },
+        subjectFor: (input) => { providerCalls += 1; return fileSubjectFor(input); },
+        recallRequestFor: (input) => { providerCalls += 1; return fileRecallRequestFor(input); },
+        audit: () => { providerCalls += 1; },
+      },
+      complete: async (request) => ({
+        text: JSON.stringify({
+          utterance: { lines: ['ok'] },
+          memoryOps: [{ kind: 'episode', text: 'legacy write', sourceEventId: 'evt-1' }],
+        }),
+        model: request.model,
+        transport: 'mock',
+        latencyMs: 1,
+      }),
+    });
+    await brain.preload('demo', [{ npcId: 'guide', soulId: 'demo.guide' }]);
+    await brain.decide(snapshot());
+    expect(providerCalls).toBe(0);
+    expect(existsSync(join(projectRoot, '.forgeax/souls/demo.guide/memory/episodes/demo/legacy-write.md'))).toBe(true);
+  });
+
+  test('shadow recalls and audits a diff but preserves the legacy prompt and writer', async () => {
+    const projectRoot = root();
+    const memoryRoot = join(projectRoot, '.forgeax/souls/demo.guide/memory');
+    writeMemoryEntry({ root: memoryRoot, game: 'demo' }, { tier: 'episodes', text: 'Legacy prompt fact.' });
+    let prompt = '';
+    let recallCalls = 0;
+    const audits: unknown[] = [];
+    const brain = new NpcBrainService({
+      projectRoot,
+      loadAgentRecord: async (agentId) => ({
+        agentId, source: 'builtin', trustTier: 'own', persona: 'Persona', skills: [], tools: [],
+        memory: { root: memoryRoot, game: 'demo' }, warnings: [],
+      }),
+      memory: {
+        mode: 'shadow',
+        reader: { recall: async () => {
+          recallCalls += 1;
+          return {
+            source: { kind: 'live-file' }, rawRecallVersion: 1,
+            rawBlocks: [{ name: 'shadow-only', text: 'Shadow-only fact.' }],
+            diagnostics: { stale: false, volatileStateUsed: false, projectionMode: 'full', identityResolved: true },
+          };
+        } },
+        subjectFor: fileSubjectFor,
+        recallRequestFor: fileRecallRequestFor,
+        audit: (event) => audits.push(event),
+      },
+      complete: async (request) => {
+        prompt = request.messages.map((message) => message.content).join('\n');
+        return {
+          text: JSON.stringify({
+            utterance: { lines: ['ok'] },
+            memoryOps: [{ kind: 'episode', text: 'shadow legacy write', sourceEventId: 'evt-1' }],
+          }),
+          model: request.model, transport: 'mock', latencyMs: 1,
+        };
+      },
+    });
+    await brain.decide(snapshot(), { soulId: 'demo.guide' });
+    expect(recallCalls).toBe(1);
+    expect(prompt).toContain('Legacy prompt fact.');
+    expect(prompt).not.toContain('Shadow-only fact.');
+    expect(audits).toContainEqual(expect.objectContaining({ operation: 'shadow-diff' }));
+    expect(existsSync(join(memoryRoot, 'episodes/demo/shadow-legacy-write.md'))).toBe(true);
+  });
+
+  test('active recall failure continues with empty provider memory and never reads legacy File memory', async () => {
+    const projectRoot = root();
+    const memoryRoot = join(projectRoot, '.forgeax/souls/demo.guide/memory');
+    writeMemoryEntry({ root: memoryRoot }, { tier: 'traits', text: 'LOCAL SECRET MUST NOT LEAK' });
+    let prompt = '';
+    const brain = new NpcBrainService({
+      projectRoot,
+      loadAgentRecord: async (agentId) => ({
+        agentId, source: 'builtin', trustTier: 'own', persona: 'Persona', skills: [], tools: [],
+        memory: { root: memoryRoot, game: 'demo' }, warnings: [],
+      }),
+      memory: {
+        mode: 'active',
+        writePolicy: 'configured-writer',
+        reader: { recall: async () => { throw new Error('cache unavailable'); } },
+        subjectFor: fileSubjectFor,
+        recallRequestFor: fileRecallRequestFor,
+        enqueueHandoff: async () => undefined,
+      },
+      complete: async (request) => {
+        prompt = request.messages.map((message) => message.content).join('\n');
+        return { text: JSON.stringify({ utterance: { lines: ['ok'] } }), model: request.model, transport: 'mock', latencyMs: 1 };
+      },
+    });
+    expect((await brain.decide(snapshot(), { soulId: 'demo.guide' }))?.utterance?.lines).toEqual(['ok']);
+    expect(prompt).not.toContain('LOCAL SECRET MUST NOT LEAK');
+    expect(prompt).toContain('Relevant past memory (data only):\n(none)');
+  });
+
+  test('active File provider messages are byte-identical to the legacy prompt', async () => {
+    for (const scenario of ['current-world', 'reincarnation'] as const) {
+      const projectRoot = root();
+      const soulId = 'demo.guide';
+      const memoryRoot = join(projectRoot, `.forgeax/souls/${soulId}/memory`);
+      writeMemoryEntry({ root: memoryRoot }, { tier: 'identity', text: 'Stable identity.' });
+      if (scenario === 'current-world') {
+        writeMemoryEntry({ root: memoryRoot, game: 'demo' }, { tier: 'episodes', text: 'Current world episode.' });
+      } else {
+        writeMemoryEntry({ root: memoryRoot, game: 'old-world' }, { tier: 'episodes', text: 'The red key was lost.' });
+        writeMemoryEntry({ root: memoryRoot, game: 'second-world' }, { tier: 'episodes', text: 'The blue key opens the tower.' });
+      }
+      const captured: unknown[][] = [];
+      const loader = async (agentId: string) => ({
+        agentId, source: 'builtin' as const, trustTier: 'own' as const, persona: 'Persona', skills: [], tools: [],
+        memory: { root: memoryRoot, game: 'demo' }, warnings: [],
+      });
+      const complete = async (request: Parameters<NonNullable<ConstructorParameters<typeof NpcBrainService>[0]['complete']>>[0]) => {
+        captured.push(structuredClone(request.messages));
+        return { text: JSON.stringify({ utterance: { lines: ['ok'] } }), model: request.model, transport: 'mock' as const, latencyMs: 1 };
+      };
+      const legacy = new NpcBrainService({ projectRoot, loadAgentRecord: loader, complete });
+      await legacy.decide(snapshot({ text: 'blue key' }), { soulId });
+
+      const reader = createFileSoulMemoryReader({
+        now: () => 0,
+        monotonicNow: () => 0,
+        resolveIdentity: () => null,
+        identityResolverVersion: () => null,
+        audit: () => undefined,
+      }, { projectRoot, stateDir: join(projectRoot, '.provider-state') });
+      await reader.start();
+      const active = new NpcBrainService({
+        projectRoot,
+        loadAgentRecord: loader,
+        complete,
+        memory: {
+          mode: 'active', writePolicy: 'configured-writer', reader, subjectFor: fileSubjectFor, recallRequestFor: fileRecallRequestFor,
+          enqueueHandoff: async () => undefined,
+        },
+      });
+      await active.decide(snapshot({ text: 'blue key' }), { soulId });
+      expect(captured[1]).toEqual(captured[0]);
+      await reader.stop({ mode: 'drain' });
+    }
+  });
+
+  test('reuses a durable decision receipt after restart without another model call', async () => {
+    const projectRoot = root();
+    const handoffs = new Map<string, any>();
+    let modelCalls = 0;
+    const binding: NpcMemoryRuntimeBinding = {
+      mode: 'active',
+      writePolicy: 'configured-writer',
+      reader: { recall: async () => ({
+        source: { kind: 'live-file' }, rawRecallVersion: 1, rawBlocks: [],
+        diagnostics: { stale: false, volatileStateUsed: false, projectionMode: 'full', identityResolved: true },
+      }) },
+      subjectFor: fileSubjectFor,
+      recallRequestFor: fileRecallRequestFor,
+      enqueueHandoff: async (value) => { handoffs.set(value.handoffId, structuredClone(value)); },
+      readHandoff: (id) => handoffs.get(id),
+    };
+    const config = {
+      projectRoot,
+      memory: binding,
+      complete: async (request: any) => {
+        modelCalls += 1;
+        return {
+          text: JSON.stringify({
+            utterance: { lines: ['remembered'] },
+            memoryOps: [
+              { kind: 'episode', text: ' remember   me ', sourceEventId: 'evt-1' },
+              { kind: 'episode', text: 'remember me', sourceEventId: 'evt-1' },
+            ],
+          }),
+          model: request.model, transport: 'mock' as const, latencyMs: 1,
+        };
+      },
+    };
+    const first = await new NpcBrainService(config).decide(snapshot());
+    const restarted = new NpcBrainService({
+      ...config,
+      budget: { maxCallsPerMinute: 1, maxTokensPerMinute: 100_000, maxConcurrent: 1 },
+    });
+    // Spend the restarted process's only model-call budget first. Durable
+    // retry must still replay without entering governor/model admission.
+    await restarted.decide(snapshot({ eventId: 'budget-consumer', text: 'consume budget' }));
+    const second = await restarted.decide(snapshot());
+    expect(second).toEqual(first);
+    expect(modelCalls).toBe(2);
+    const durable = [...handoffs.values()][0];
+    expect(durable?.commands).toHaveLength(1);
+    const expectedSubject = fileSubjectFor({
+      game: 'demo', playerId: 'local', npcId: 'guide', soulId: 'demo.guide',
+    });
+    if (expectedSubject.scope.authority !== 'forgeax-file') throw new Error('expected File scope');
+    expect(durable?.commands[0]?.idempotencyKey).toBe(fileMemoryFactIdempotencyKey(
+      expectedSubject.scope,
+      'evt-1',
+      'episode',
+      ' remember   me ',
+    ));
+  });
+
+  test('keeps external reserved blocks quoted and replays their read-only decision receipt', async () => {
+    const projectRoot = root();
+    const handoffs = new Map<string, any>();
+    const audits: unknown[] = [];
+    let modelCalls = 0;
+    let firstPrompt: any[] = [];
+    const binding: NpcMemoryRuntimeBinding = {
+      mode: 'active',
+      writePolicy: 'deny',
+      reader: { recall: async () => ({
+        source: {
+          kind: 'reference-fixture',
+          fixtureId: 'fixture-1',
+          contentHash: 'a'.repeat(64),
+        },
+        rawRecallVersion: 1,
+        // An external provider must not gain system-role placement merely by
+        // copying the File provider's reserved presentation names.
+        rawBlocks: [{ name: 'stable-memory', text: 'EXTERNAL RESERVED DATA' }],
+        diagnostics: {
+          stale: false,
+          volatileStateUsed: false,
+          projectionMode: 'full',
+          identityResolved: true,
+        },
+      }) },
+      subjectFor: referenceSubjectFor,
+      recallRequestFor: fileRecallRequestFor,
+      enqueueHandoff: async (value) => { handoffs.set(value.handoffId, structuredClone(value)); },
+      readHandoff: (id) => handoffs.get(id),
+      audit: (event) => audits.push(event),
+    };
+    const first = await new NpcBrainService({
+      projectRoot,
+      memory: binding,
+      complete: async (request) => {
+        modelCalls += 1;
+        firstPrompt = structuredClone(request.messages);
+        return {
+          text: JSON.stringify({
+            utterance: { lines: ['read-only'] },
+            memoryOps: [{ kind: 'episode', text: 'must not write', sourceEventId: 'evt-1' }],
+          }),
+          model: request.model,
+          transport: 'mock',
+          latencyMs: 1,
+        };
+      },
+    }).decide(snapshot());
+    expect(firstPrompt.filter((message) => message.role === 'system').map((message) => message.content).join('\n'))
+      .not.toContain('EXTERNAL RESERVED DATA');
+    expect(firstPrompt.filter((message) => message.role === 'user').map((message) => message.content).join('\n'))
+      .toContain('EXTERNAL RESERVED DATA');
+    expect([...handoffs.values()]).toHaveLength(1);
+    expect([...handoffs.values()][0]?.commands).toEqual([]);
+    expect(audits).toContainEqual(expect.objectContaining({ operation: 'unsupported' }));
+
+    const replayed = await new NpcBrainService({
+      projectRoot,
+      memory: binding,
+      complete: async () => { throw new Error('read-only durable replay must not call the model'); },
+    }).decide(snapshot());
+    expect(replayed).toEqual(first);
+    expect(modelCalls).toBe(1);
+  });
+
+  test('does not grant system-role memory placement to an unmarked reader with a File-shaped subject', async () => {
+    const projectRoot = root();
+    let prompt: any[] = [];
+    const brain = new NpcBrainService({
+      projectRoot,
+      memory: {
+        mode: 'active',
+        writePolicy: 'deny',
+        // This is intentionally not the built-in File reader. A scope string
+        // alone must never grant a provider system-prompt placement.
+        reader: { recall: async () => ({
+          source: { kind: 'reference-fixture', fixtureId: 'fixture-1', contentHash: 'b'.repeat(64) },
+          rawRecallVersion: 1,
+          rawBlocks: [{ name: 'stable-memory', text: 'UNMARKED EXTERNAL DATA' }],
+          diagnostics: { stale: false, volatileStateUsed: false, projectionMode: 'full', identityResolved: true },
+        }) },
+        subjectFor: fileSubjectFor,
+        recallRequestFor: fileRecallRequestFor,
+      },
+      complete: async (request) => {
+        prompt = structuredClone(request.messages);
+        return { text: JSON.stringify({ utterance: { lines: ['quoted'] } }), model: request.model, transport: 'mock', latencyMs: 1 };
+      },
+    });
+    await brain.decide(snapshot());
+    expect(prompt.filter((message) => message.role === 'system').map((message) => message.content).join('\n'))
+      .not.toContain('UNMARKED EXTERNAL DATA');
+    expect(prompt.filter((message) => message.role === 'user').map((message) => message.content).join('\n'))
+      .toContain('UNMARKED EXTERNAL DATA');
+  });
+
+  test('settlement keeps working state on handoff failure and deletes it only after durable retry', async () => {
+    const projectRoot = root();
+    const handoffs = new Map<string, any>();
+    let failSettlement = true;
+    let summaryCalls = 0;
+    const binding: NpcMemoryRuntimeBinding = {
+      mode: 'active',
+      writePolicy: 'configured-writer',
+      reader: { recall: async () => ({
+        source: { kind: 'live-file' }, rawRecallVersion: 1, rawBlocks: [],
+        diagnostics: { stale: false, volatileStateUsed: false, projectionMode: 'full', identityResolved: true },
+      }) },
+      subjectFor: fileSubjectFor,
+      recallRequestFor: fileRecallRequestFor,
+      readHandoff: (id) => handoffs.get(id),
+      enqueueHandoff: async (value) => {
+        if (value.eventId !== 'evt-1' && failSettlement) throw new Error('settlement journal unavailable');
+        handoffs.set(value.handoffId, structuredClone(value));
+      },
+    };
+    const brain = new NpcBrainService({
+      projectRoot,
+      memory: binding,
+      complete: async (request) => {
+        if (request.messages[0]?.content.startsWith('Extract one concise')) {
+          summaryCalls += 1;
+          return { text: 'Durable episode.', model: request.model, transport: 'mock', latencyMs: 1 };
+        }
+        return { text: JSON.stringify({ utterance: { lines: ['ok'] } }), model: request.model, transport: 'mock', latencyMs: 1 };
+      },
+    });
+    await brain.decide(snapshot());
+    await expect(brain.settle('demo', 'local', ['guide'])).rejects.toThrow('settlement journal unavailable');
+    expect(brain.activeBrainCount).toBe(1);
+    failSettlement = false;
+    await expect(brain.settle('demo', 'local', ['guide'])).resolves.toBe(1);
+    expect(brain.activeBrainCount).toBe(0);
+    expect(summaryCalls).toBe(2);
+    const settlement = [...handoffs.values()].find((value) => value.eventId !== 'evt-1');
+    expect(settlement?.commands).toHaveLength(1);
+    expect(settlement?.commands[0]?.idempotencyKey).toBe(fileMemorySettlementIdempotencyKey(
+      settlement.commands[0].payload.subject.scope,
+      settlement.commands[0].payload.settlementId,
+    ));
+    expect(settlement?.commands[0]?.payload.retryPolicy).toBe('durable-until-terminal');
+  });
+
+  test('settlement resolves the per-soul model instead of using its legacy fallback', async () => {
+    const projectRoot = root();
+    const requestedModels: string[] = [];
+    const brain = new NpcBrainService({
+      projectRoot,
+      loadAgentRecord: async (agentId) => ({
+        agentId, source: 'builtin', trustTier: 'own', persona: 'Persona', skills: [], tools: [],
+        models: { model: 'soul-settlement-model' },
+        memory: { root: join(projectRoot, 'memory') }, warnings: [],
+      }),
+      complete: async (request) => {
+        requestedModels.push(request.model);
+        return {
+          text: request.responseFormat
+            ? JSON.stringify({ utterance: { lines: ['ok'] } })
+            : 'Durable episode.',
+          model: request.model, transport: 'mock', latencyMs: 1,
+        };
+      },
+    });
+
+    await brain.decide(snapshot(), { soulId: 'demo.guide' });
+    await expect(brain.settle('demo', 'local', ['guide'])).resolves.toBe(1);
+    expect(requestedModels).toEqual(['soul-settlement-model', 'soul-settlement-model']);
+  });
+
+  test('settlement resolves global model and preserves explicit service override precedence', async () => {
+    const projectRoot = root();
+    mkdirSync(join(projectRoot, '.forgeax'), { recursive: true });
+    writeFileSync(join(projectRoot, '.forgeax', 'npc-brain.json'), JSON.stringify({ model: 'global-settlement-model' }));
+    const requestedModels: string[] = [];
+    const record = (agentId: string) => ({
+      agentId, source: 'builtin' as const, trustTier: 'own' as const, persona: 'Persona', skills: [], tools: [],
+      memory: { root: join(projectRoot, 'memory') }, warnings: [],
+    });
+    const complete = async (request: Parameters<NonNullable<ConstructorParameters<typeof NpcBrainService>[0]['complete']>>[0]) => {
+      requestedModels.push(request.model);
+      return {
+        text: request.responseFormat
+          ? JSON.stringify({ utterance: { lines: ['ok'] } })
+          : 'Durable episode.',
+        model: request.model, transport: 'mock' as const, latencyMs: 1,
+      };
+    };
+    const globalBrain = new NpcBrainService({
+      projectRoot,
+      loadAgentRecord: async (agentId) => record(agentId),
+      complete,
+    });
+    await globalBrain.decide(snapshot(), { soulId: 'demo.guide' });
+    await expect(globalBrain.settle('demo', 'local', ['guide'])).resolves.toBe(1);
+    expect(requestedModels).toEqual(['global-settlement-model', 'global-settlement-model']);
+
+    requestedModels.length = 0;
+    const overrideBrain = new NpcBrainService({
+      projectRoot,
+      model: 'service-settlement-model',
+      loadAgentRecord: async (agentId) => ({ ...record(agentId), models: { model: 'soul-model' } }),
+      complete,
+    });
+    await overrideBrain.decide(snapshot({ eventId: 'override-event' }), { soulId: 'demo.guide' });
+    await expect(overrideBrain.settle('demo', 'local', ['guide'])).resolves.toBe(1);
+    expect(requestedModels).toEqual(['service-settlement-model', 'service-settlement-model']);
+  });
+
+  test('keeps File working state when settlement produces no durable episode', async () => {
+    const projectRoot = root();
+    let emptySummary = true;
+    const handoffs = new Map<string, any>();
+    const binding: NpcMemoryRuntimeBinding = {
+      mode: 'active',
+      writePolicy: 'configured-writer',
+      reader: { recall: async () => ({
+        source: { kind: 'live-file' }, rawRecallVersion: 1, rawBlocks: [],
+        diagnostics: { stale: false, volatileStateUsed: false, projectionMode: 'full', identityResolved: true },
+      }) },
+      subjectFor: fileSubjectFor,
+      recallRequestFor: fileRecallRequestFor,
+      readHandoff: (id) => handoffs.get(id),
+      enqueueHandoff: async (value) => { handoffs.set(value.handoffId, structuredClone(value)); },
+    };
+    const brain = new NpcBrainService({
+      projectRoot,
+      memory: binding,
+      complete: async (request) => ({
+        text: request.messages[0]?.content.startsWith('Extract one concise')
+          ? emptySummary ? '   ' : 'Recovered durable episode.'
+          : JSON.stringify({ utterance: { lines: ['ok'] } }),
+        model: request.model,
+        transport: 'mock',
+        latencyMs: 1,
+      }),
+    });
+    await brain.decide(snapshot());
+    await expect(brain.settle('demo', 'local', ['guide'])).rejects.toThrow(/no durable episode/);
+    expect(brain.activeBrainCount).toBe(1);
+    emptySummary = false;
+    await expect(brain.settle('demo', 'local', ['guide'])).resolves.toBe(1);
+    expect(brain.activeBrainCount).toBe(0);
+  });
+
+  test('applies the settlement deadline before durable handoff and keeps working state on expiry', async () => {
+    const projectRoot = root();
+    let now = 1_700_000_000_000;
+    const handoffs: unknown[] = [];
+    const brain = new NpcBrainService({
+      projectRoot,
+      now: () => now,
+      memory: {
+        mode: 'active',
+        writePolicy: 'configured-writer',
+        reader: { recall: async () => ({
+          source: { kind: 'live-file' }, rawRecallVersion: 1, rawBlocks: [],
+          diagnostics: { stale: false, volatileStateUsed: false, projectionMode: 'full', identityResolved: true },
+        }) },
+        subjectFor: fileSubjectFor,
+        recallRequestFor: fileRecallRequestFor,
+        enqueueHandoff: async (value) => { handoffs.push(structuredClone(value)); },
+      },
+      complete: async (request) => {
+        if (request.messages[0]?.content.startsWith('Extract one concise')) {
+          now += 30_001;
+          return { text: 'Too-late episode.', model: request.model, transport: 'mock', latencyMs: 30_001 };
+        }
+        return { text: JSON.stringify({ utterance: { lines: ['ok'] } }), model: request.model, transport: 'mock', latencyMs: 1 };
+      },
+    });
+    await brain.decide(snapshot());
+    expect(handoffs).toHaveLength(1);
+    await expect(brain.settle('demo', 'local', ['guide'])).rejects.toThrow(/handoff deadline/);
+    expect(handoffs).toHaveLength(1);
+    expect(brain.activeBrainCount).toBe(1);
+  });
+
   test('reads per-soul model overrides at the Brain boundary without changing the Soul record', async () => {
     const projectRoot = root();
     const pack = join(projectRoot, '.forgeax/souls-builtin/demo.guide');
@@ -244,6 +859,7 @@ describe('NpcBrainService', () => {
     expect(messages[0]?.content).toContain('Canonical reply shapes');
     expect(messages.at(-1)?.content).toContain('Untrusted player text');
     expect(messages.at(-1)?.content).toContain(JSON.stringify(injected));
+    expect(messages.at(-1)?.content).toContain('"eventId":"evt-1"');
     expect(messages.at(-1)?.content).not.toContain('"playerText"');
   });
 
@@ -401,6 +1017,71 @@ describe('NpcBrainService', () => {
 });
 
 describe('NpcRuntime soul mapping', () => {
+  test('keeps a session retryable until settlement handoff succeeds', async () => {
+    const projectRoot = root();
+    const handoffs = new Map<string, any>();
+    let failSettlement = true;
+    const memory: NpcMemoryRuntimeBinding = {
+      mode: 'active',
+      writePolicy: 'configured-writer',
+      reader: { recall: async () => ({
+        source: { kind: 'live-file' }, rawRecallVersion: 1, rawBlocks: [],
+        diagnostics: { stale: false, volatileStateUsed: false, projectionMode: 'full', identityResolved: true },
+      }) },
+      subjectFor: fileSubjectFor,
+      recallRequestFor: fileRecallRequestFor,
+      readHandoff: (id) => handoffs.get(id),
+      enqueueHandoff: async (value) => {
+        if (value.eventId !== 'evt-1' && failSettlement) throw new Error('retry settlement');
+        handoffs.set(value.handoffId, structuredClone(value));
+      },
+    };
+    const brain = new NpcBrainService({
+      projectRoot,
+      now: () => 0,
+      memory,
+      complete: async (request) => request.messages[0]?.content.startsWith('Extract one concise')
+        ? { text: 'Episode.', model: request.model, transport: 'mock', latencyMs: 1 }
+        : { text: JSON.stringify({ utterance: { lines: ['ok'] } }), model: request.model, transport: 'mock', latencyMs: 1 },
+    });
+    const runtime = new NpcRuntime({ projectRoot, now: () => 0, brain });
+    const grant = runtime.createSession({ game: 'demo', playerId: 'local', npcs: [{ npcId: 'guide' }] });
+    const session = runtime.authorize(grant.sessionId, grant.token)!;
+    expect(await runtime.decide(session, snapshot())).toBeDefined();
+    expect(brain.activeBrainCount).toBe(1);
+    await expect(runtime.end(session)).rejects.toThrow('retry settlement');
+    expect(runtime.authorize(grant.sessionId, grant.token)).toBeDefined();
+    failSettlement = false;
+    await expect(runtime.end(session)).resolves.toBe(1);
+    expect(runtime.authorize(grant.sessionId, grant.token)).toBeUndefined();
+  });
+
+  test('quiesce settles shared game/player/NPC working state only once across transport sessions', async () => {
+    const projectRoot = root();
+    let summaries = 0;
+    const brain = new NpcBrainService({
+      projectRoot,
+      complete: async (request) => {
+        if (request.messages[0]?.content.startsWith('Extract one concise')) {
+          summaries += 1;
+          return { text: 'Episode.', model: request.model, transport: 'mock', latencyMs: 1 };
+        }
+        return {
+          text: JSON.stringify({ utterance: { lines: ['ok'] } }),
+          model: request.model, transport: 'mock', latencyMs: 1,
+        };
+      },
+    });
+    const runtime = new NpcRuntime({ projectRoot, brain });
+    const first = runtime.createSession({ game: 'demo', playerId: 'same-player', npcIds: ['guide'] });
+    runtime.createSession({ game: 'demo', playerId: 'same-player', npcIds: ['guide'] });
+    const session = runtime.authorize(first.sessionId, first.token)!;
+    await runtime.decide(session, snapshot());
+
+    await expect(runtime.quiesce()).resolves.toEqual({ sessions: 2, settled: 1 });
+    expect(summaries).toBe(1);
+  });
+
   test('loads and writes memory by soulId while keeping npcId on the wire', async () => {
     const projectRoot = root();
     const runtime = new NpcRuntime({

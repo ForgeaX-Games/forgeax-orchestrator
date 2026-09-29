@@ -1,37 +1,59 @@
-import { afterEach, expect, test } from 'bun:test';
-import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { createForgeaxApp } from '../src/app';
+import { afterEach, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createForgeaxApp } from "../src/app";
 import {
-  _resetActionCatalogValidationForTests,
-
-} from '../src/kernel/action-catalog';
+	HEADLESS_ACTION_GRANDFATHER_IDS as PACKAGE_GRANDFATHER_IDS,
+	createFileMemoryRuntimeHost as packageCreateFileMemoryRuntimeHost,
+	createReferenceMemoryRuntimeHost as packageCreateReferenceMemoryRuntimeHost,
+} from "../src/index";
+import { createFileMemoryRuntimeHost } from "../src/npc-brain/memory/file-memory-runtime-host";
+import { createReferenceMemoryRuntimeHost } from "../src/npc-brain/memory/reference-memory-runtime-host";
+import {
+	_resetActionCatalogValidationForTests,
+	HEADLESS_ACTION_GRANDFATHER_IDS,
+} from "../src/kernel/action-catalog";
 
 afterEach(() => {
-  _resetActionCatalogValidationForTests();
+	_resetActionCatalogValidationForTests();
 });
 
-test('createForgeaxApp wires packaged orchestrator resources into PathManager', () => {
-  const source = readFileSync(join(import.meta.dir, '../src/app.ts'), 'utf8');
-  expect(source).toContain("builtinRoot: ctx.resourceRoot ? join(ctx.resourceRoot, 'builtin') : undefined");
+test("package root exports the ActionCatalog grandfather constant by identity", () => {
+	expect(PACKAGE_GRANDFATHER_IDS).toBe(HEADLESS_ACTION_GRANDFATHER_IDS);
+	expect(packageCreateFileMemoryRuntimeHost).toBe(createFileMemoryRuntimeHost);
+	expect(packageCreateReferenceMemoryRuntimeHost).toBe(
+		createReferenceMemoryRuntimeHost,
+	);
 });
 
-test('createForgeaxApp fails before filesystem boot when the headless registry is invalid', async () => {
-  const projectRoot = join(tmpdir(), `forgeax-invalid-action-catalog-${randomUUID()}`);
+test("createForgeaxApp wires packaged orchestrator resources into PathManager", () => {
+	const source = readFileSync(join(import.meta.dir, "../src/app.ts"), "utf8");
+	expect(source).toContain(
+		"builtinRoot: ctx.resourceRoot ? join(ctx.resourceRoot, 'builtin') : undefined",
+	);
+});
 
-  await expect(
-    createForgeaxApp({
-      instanceRoot: projectRoot,
-      hostUiActions: [
-        {
-          actionId: 'outside.catalog',
-          run: () => ({ status: 'completed' }),
-        },
-      ],
-    }),
-  ).rejects.toThrow('orphan headless handler "outside.catalog" is not declared');
+test("createForgeaxApp fails before filesystem boot when the headless registry is invalid", async () => {
+	const projectRoot = join(
+		tmpdir(),
+		`forgeax-invalid-action-catalog-${randomUUID()}`,
+	);
 
-  expect(existsSync(projectRoot)).toBe(false);
+	await expect(
+		createForgeaxApp({
+			instanceRoot: projectRoot,
+			hostUiActions: [
+				{
+					actionId: "outside.catalog",
+					run: () => ({ status: "completed" }),
+				},
+			],
+		}),
+	).rejects.toThrow(
+		'orphan headless handler "outside.catalog" is not declared',
+	);
+
+	expect(existsSync(projectRoot)).toBe(false);
 });

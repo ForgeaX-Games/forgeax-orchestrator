@@ -10,6 +10,9 @@ import {
   type NpcWsClientData,
 } from './runtime';
 import { loadStandaloneSoulRecord } from './standalone-soul-loader';
+import type { NpcMemoryRuntimeBinding } from './memory-host-seam';
+
+const BUN_SERVER_STOP_WAIT_MS = 1_000;
 
 export interface StandaloneNpcBrainConfig {
   dataDir: string;
@@ -24,6 +27,7 @@ export interface StandaloneNpcBrainConfig {
   maxConcurrent?: number;
   /** Injectable deterministic transport for tests and offline acceptance. */
   complete?: NpcBrainConfig['complete'];
+  memory?: NpcMemoryRuntimeBinding;
 }
 
 export interface StandaloneNpcBrainServer {
@@ -89,6 +93,7 @@ export function startStandaloneNpcBrain(
     loadAgentRecord: loadStandaloneSoulRecord,
     memoryScope: (game, playerId) => `${game}:${playerId}`,
     complete: config.complete,
+    memory: config.memory,
   });
   const runtime = new NpcRuntime({ projectRoot: config.dataDir, brain });
   const app = new Hono();
@@ -143,7 +148,21 @@ export function startStandaloneNpcBrain(
     server,
     url: `http://${host}:${server.port}`,
     stop: async () => {
-      await server.stop(true);
+      // Bun 1.3.14 releases the listener but leaves the returned Promise
+      // pending forever after any server-initiated WebSocket close
+      // (oven-sh/bun#36223). Bound only that bookkeeping wait; stop(true)
+      // has already been invoked and the port is available for reuse.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          server.stop(true),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, BUN_SERVER_STOP_WAIT_MS);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     },
   };
 }

@@ -84,8 +84,8 @@ function mcpToolName(it: any): string {
   return 'mcp';
 }
 
-/** 从 MCP completed item 抽取 result,保留 content / structuredContent(plan §9.1)。
- *  纯文本 content → 返回 join 后的文本;含 structuredContent → 返回 {text, structuredContent};
+/** 从 MCP completed item 抽取 result,保留 content / structuredContent / _meta(plan §9.1)。
+ *  纯文本 content → 返回 join 后的文本;含业务 structuredContent 或传输 _meta 时一并保留;
  *  非标准形状 → 原样透传 item.result。 */
 function extractMcpResult(it: any): unknown {
   const r = it?.result;
@@ -96,9 +96,15 @@ function extractMcpResult(it: any): unknown {
         .filter((c: any) => c?.type === 'text' && typeof c.text === 'string')
         .map((c: any) => c.text)
         .join('\n');
-      if (r.structuredContent !== undefined) return { text, structuredContent: r.structuredContent };
       // 含非文本 content(如 image block)→ 保留整个 content 数组。
       const hasNonText = content.some((c: any) => c?.type && c.type !== 'text');
+      const metadata = {
+        ...(r.structuredContent !== undefined ? { structuredContent: r.structuredContent } : {}),
+        ...(r._meta !== undefined ? { _meta: r._meta } : {}),
+      };
+      if (Object.keys(metadata).length > 0) {
+        return hasNonText ? { content, ...metadata } : { text, ...metadata };
+      }
       return hasNonText ? { content } : text;
     }
     return r;

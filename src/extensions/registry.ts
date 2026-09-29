@@ -134,6 +134,7 @@ export async function reloadExtensions(opts: ExtensionRegistryOpts = {}): Promis
   // fresh snapshot, via the reload hook(组合根接的 syncEventTriggerBindings)。
   // Idempotent; the bridge tears down the previous bindings before re-adding.
   _onReloaded?.(next, getEventBus());
+  getEventBus().emit('plugin.reloaded', { generation });
   return next;
 }
 

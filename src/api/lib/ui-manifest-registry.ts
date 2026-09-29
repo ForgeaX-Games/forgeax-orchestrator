@@ -24,8 +24,13 @@ import type { Capability } from '../../kernel/trust-gate';
 export interface UiActionDecl {
   id: string;
   title: string;
-  description?: string;
-  inputSchema?: unknown;
+  description: string;
+  inputSchema: unknown;
+  resultSchema: unknown;
+  preconditions: ActionCatalogEntry['preconditions'];
+  effect: ActionCatalogEntry['effect'];
+  exposedToAI: boolean;
+  requireConfirm: boolean;
   capability: Capability;
   surface?: 'ui' | 'server' | 'both';
   /** 预期执行时长(ms);ui_invoke 往返超时据此放宽(clamp 后),缺省走通道默认。 */
@@ -50,6 +55,47 @@ interface SidUiState {
 }
 
 const states = new Map<string, SidUiState>();
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+const EXTRA_UI_ORIGINS = new Set(
+  (process.env.FORGEAX_UI_BRIDGE_ORIGINS ?? '').split(',').map((value) => value.trim()).filter(Boolean),
+);
+
+interface HeaderReader {
+  req: { header: (name: string) => string | undefined };
+}
+
+function requestHost(value: string): string {
+  if (!value) return '';
+  try {
+    return new URL(`http://${value}`).host;
+  } catch {
+    return '';
+  }
+}
+
+/** Runtime UI 写入口的 Origin 校验。旧 lease/manifest 端点允许无 Origin 的本机非浏览器
+ * 客户端；需要证明是当前浏览器页面时传 requireOrigin:true。 */
+export function uiWriteOriginAllowed(
+  context: HeaderReader,
+  options: { requireOrigin?: boolean } = {},
+): boolean {
+  const origin = context.req.header('origin');
+  if (!origin) return options.requireOrigin !== true;
+  if (EXTRA_UI_ORIGINS.has(origin)) return true;
+  try {
+    const originUrl = new URL(origin);
+    const host = context.req.header('host') ?? '';
+    const requestHostValue = requestHost(host);
+    if (options.requireOrigin === true) {
+      return !!requestHostValue && originUrl.host === requestHostValue;
+    }
+    return LOOPBACK_HOSTS.has(originUrl.hostname)
+      || (!!requestHostValue && originUrl.host === requestHostValue);
+  } catch {
+    return false;
+  }
+}
 
 function stateFor(sid: string): SidUiState {
   let s = states.get(sid);
@@ -104,8 +150,13 @@ function catalogProjection(entry: ActionCatalogEntry): UiActionDecl {
   return Object.freeze({
     id: entry.id,
     title: entry.title,
-    ...(entry.description !== undefined ? { description: entry.description } : {}),
-    ...(entry.schema !== undefined ? { inputSchema: entry.schema } : {}),
+    description: entry.description,
+    inputSchema: entry.argsSchema,
+    resultSchema: entry.resultSchema,
+    preconditions: entry.preconditions,
+    effect: entry.effect,
+    exposedToAI: entry.exposedToAI,
+    requireConfirm: entry.requireConfirm,
     capability: entry.capability as Capability,
     ...(entry.surface !== undefined ? { surface: entry.surface } : {}),
     ...(entry.timeoutMs !== undefined ? { timeoutMs: entry.timeoutMs } : {}),
@@ -212,10 +263,12 @@ function firstClassToolName(actionId: string): string {
 }
 
 function modelDescription(entry: ActionCatalogEntry): string {
-  const preconditions = entry.preconditions?.length
-    ? `Preconditions (state facts, not operation order):\n${entry.preconditions.map((fact) => `- ${fact}`).join('\n')}`
+  const preconditions = entry.preconditions.length
+    ? `Preconditions (state facts, not operation order):\n${entry.preconditions
+        .map((fact) => `- [${fact.errorCode}] ${fact.description}`)
+        .join('\n')}`
     : '';
-  return [entry.description ?? '', preconditions].filter(Boolean).join('\n\n');
+  return [entry.description, preconditions].filter(Boolean).join('\n\n');
 }
 
 export function isFirstClassUiToolName(toolName: string): boolean {
@@ -226,6 +279,7 @@ function exposedFirstClassEntries(): ActionCatalogEntry[] {
   const out: ActionCatalogEntry[] = [];
   const taken = new Set<string>();
   for (const entry of catalogFirstClass()) {
+    if (!entry.exposedToAI) continue;
     if (out.length >= MAX_FIRST_CLASS_TOOLS) break;
     const name = firstClassToolName(entry.id);
     if (taken.has(name)) continue;
@@ -247,10 +301,10 @@ export function firstClassUiToolSpecs(
       name: firstClassToolName(entry.id),
       description:
         `[UI action] ${entry.title}. ${modelDescription(entry)} ` +
-        `Executes on the connected UI surface; result semantics match ui_invoke ` +
-        `({ status: completed|accepted|rejected, reason?, stateDigest? } — on 'accepted' do NOT wait or retry, ` +
-        `confirm later via ui_snapshot).`,
-      inputSchema: entry.schema ?? { type: 'object', properties: {} },
+        `Executes through the product action door; the terminal receipt status is ` +
+        `completed, rejected, or failed. A missing terminal receipt is incomplete ledger state, ` +
+        `not a fourth execution result; verify writes from receipt.readback or a later ui_snapshot.`,
+      inputSchema: entry.argsSchema,
     });
   }
   return out;

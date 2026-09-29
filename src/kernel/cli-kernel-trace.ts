@@ -67,19 +67,18 @@ function emitSafely(sid: string | undefined, records: TelemetryRecord[]): void {
 /**
  * 从一条工具结果里读出 shim 自铸的 `toolExecutionId`。
  *
- * 只认一个位置:`result.structuredContent.toolExecutionId`。MCP 的
- * `structuredContent` 是内核逐字回传的(实证:本机 codex rollout 里 2811 次真实回传,
- * 其中 1873 次来自一个**根本没声明 outputSchema** 的 server → 不需要 outputSchema)。
+ * 只认一个位置:`result._meta.forgeax.toolExecutionId`。MCP 的 `_meta` 是协议保留的
+ * 传输元数据位置,不会挤占模型可见的业务 `content` / `structuredContent`。
  * 取不到就**返回 undefined、上游不带这个键** —— 消费方据「有没有这个键」判断能不能 join,
  * 写空串会让它以为能 join 然后连到错的地方。
  */
 export function readToolExecutionId(result: unknown): string | undefined {
   try {
     if (typeof result !== 'object' || result === null) return undefined;
-    const structured = (result as Record<string, unknown>).structuredContent;
-    if (typeof structured !== 'object' || structured === null) return undefined;
+    const metadata = (result as Record<string, unknown>)._meta;
+    if (typeof metadata !== 'object' || metadata === null) return undefined;
     // 自铸内容住在我们独占的 `forgeax` 命名空间里 —— 认协议,不猜形状。
-    const forgeax = (structured as Record<string, unknown>).forgeax;
+    const forgeax = (metadata as Record<string, unknown>).forgeax;
     if (typeof forgeax !== 'object' || forgeax === null) return undefined;
     const value = (forgeax as Record<string, unknown>).toolExecutionId;
     if (typeof value !== 'string') return undefined;
@@ -95,9 +94,8 @@ export function readToolExecutionId(result: unknown): string | undefined {
 /**
  * 剥掉 MCP 结果信封,还原成工具真正说的那句话。
  *
- * `extractMcpResult` 在内核适配层把带 structuredContent 的 MCP 结果规范化成
- * `{text, structuredContent}`。structuredContent 装的是**传输层元数据**(连接键),
- * 不该继续往下走:下游有四处消费工具结果 —— SSE 工具卡、账本、跨内核历史桥、事件
+ * 内核适配层把 MCP 业务结果与 `_meta` 一起交给这里。`_meta` 装的是传输层元数据
+ * (连接键),不该继续往下走:下游有四处消费工具结果 —— SSE 工具卡、账本、跨内核历史桥、事件
  * 格式化器,其中 `store.ts` 明确只认字符串(`typeof result === 'string' ? … : undefined`),
  * 信封一进去,工具卡的正文就整段消失。
  *
@@ -108,19 +106,12 @@ export function readToolExecutionId(result: unknown): string | undefined {
 export function unwrapMcpResultEnvelope(result: unknown): unknown {
   if (typeof result !== 'object' || result === null) return result;
   const r = result as Record<string, unknown>;
-  if (typeof r.text !== 'string') return result;
-  const structured = r.structuredContent;
-  if (typeof structured !== 'object' || structured === null) return result;
-  // `{text, structuredContent}` 这个形状**不是我们独有的** —— 适配层对任何回了
-  // structuredContent 的 MCP server 都产出它,包括经 fxt 代理的第三方 project-MCP
-  // (它们的 structuredContent 装的是**真业务数据**)。上一版按形状剥,把第三方的业务
-  // 结果剥成了纯文本(2026-08-06 外审 MAJOR-1,已复现)。
-  // 判据落在我们独占的命名空间上:整份 structuredContent **只有 `forgeax` 一个键**
-  // (还有别的键 = 第三方的结果,一个字段都不许动),且里面确有可连接的 id。
-  const keys = Object.keys(structured as Record<string, unknown>);
-  if (keys.length !== 1 || keys[0] !== 'forgeax') return result;
   if (!readToolExecutionId(result)) return result;
-  return r.text;
+  const { _meta: _transportMeta, ...business } = r;
+  const keys = Object.keys(business);
+  return keys.length === 1 && typeof business.text === 'string'
+    ? business.text
+    : business;
 }
 
 interface ToolSpanState {

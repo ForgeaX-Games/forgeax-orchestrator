@@ -93,12 +93,11 @@ describe('scanner + merger', () => {
     const dir = join(TMP, 'npm', 'embedded-extension');
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'forgeax-extension.json'), JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: '@forgeax-extension/embedded',
       version: '1.0.0',
-      kind: 'workbench',
       displayName: { en: 'Embedded' },
-      provides: { workbench: { id: 'embedded' } },
+      contributes: {},
     }), 'utf-8');
 
     const result = await scanAllExtensionOrigins(ROOTS(), [join(TMP, 'npm')]);

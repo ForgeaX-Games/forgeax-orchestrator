@@ -17,10 +17,134 @@
  */
 
 import { Hono } from 'hono';
+import { defaultProjectRoot } from '@forgeax/platform-io';
 import { getEventBus } from '../events/bus';
+import { getSessionManager } from '../core/session-manager';
+import {
+  uiWriteOriginAllowed,
+  validateUiLease,
+} from './lib/ui-manifest-registry';
+import { catalogGet } from '../kernel/action-catalog';
+import {
+  productActionLedgerRegistry,
+  readProductActionLedger,
+} from '../kernel/product-ai-native-ledger';
 
 export function createBusRouter(): Hono {
   const router = new Hono();
+
+  router.post('/product-ai-native/human-attempt', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    const actionId = typeof body.actionId === 'string' ? body.actionId.trim() : '';
+    if (!actionId) return c.json({ ok: false, code: 'bad-request', reason: 'actionId (string) required' }, 400);
+
+    const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim()
+      ? body.sessionId.trim()
+      : undefined;
+    if (sessionId) {
+      let sessionExists = false;
+      try {
+        sessionExists = !!getSessionManager().peek(sessionId);
+      } catch {
+        sessionExists = false;
+      }
+      if (!sessionExists) {
+        return c.json({ ok: false, code: 'no-session', reason: `session '${sessionId}' is not live` }, 404);
+      }
+      if (!validateUiLease(sessionId, body.leaseId)) {
+        return c.json({ ok: false, code: 'invalid-lease', reason: 'A current UI lease is required' }, 403);
+      }
+    } else if (!uiWriteOriginAllowed(c, { requireOrigin: true })) {
+      return c.json({ ok: false, code: 'origin-not-allowed', reason: 'A same-origin Studio browser is required' }, 403);
+    }
+
+    const actionArgs = body.args && typeof body.args === 'object' && !Array.isArray(body.args)
+      ? body.args as Record<string, unknown>
+      : {};
+    const clientCallId = typeof body.clientCallId === 'string' && body.clientCallId.trim()
+      ? body.clientCallId.trim()
+      : undefined;
+    try {
+      const pending = productActionLedgerRegistry.begin({
+        projectRoot: defaultProjectRoot(),
+        ...(sessionId ? { sessionId } : {}),
+        actorKind: 'human',
+        actorId: `human:${sessionId ?? 'studio-local'}`,
+        actionId,
+        actionArgs,
+        effect: catalogGet(actionId)?.effect ?? 'write',
+        ...(clientCallId ? { clientCallId } : {}),
+      });
+      return c.json({ ok: true, ...pending }, 201);
+    } catch (error) {
+      return c.json({
+        ok: false,
+        code: 'attempt-write-failed',
+        reason: error instanceof Error ? error.message : String(error),
+      }, 500);
+    }
+  });
+
+  router.post('/product-ai-native/human-terminal', async (c) => {
+    if (!uiWriteOriginAllowed(c, { requireOrigin: true })) {
+      return c.json({ ok: false, code: 'origin-not-allowed', reason: 'A same-origin Studio browser is required' }, 403);
+    }
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    const executionId = typeof body.executionId === 'string' ? body.executionId.trim() : '';
+    const completionToken = typeof body.completionToken === 'string' ? body.completionToken.trim() : '';
+    if (!executionId || !completionToken || typeof body.started !== 'boolean') {
+      return c.json({
+        ok: false,
+        code: 'bad-request',
+        reason: 'executionId, completionToken, and started (boolean) are required',
+      }, 400);
+    }
+    if (!body.result || typeof body.result !== 'object' || Array.isArray(body.result)) {
+      return c.json({ ok: false, code: 'bad-request', reason: 'result (object) required' }, 400);
+    }
+    try {
+      const settled = productActionLedgerRegistry.settle({
+        executionId,
+        completionToken,
+        result: body.result,
+        started: body.started,
+      });
+      return c.json(settled, settled.ok ? 200 : settled.code === 'completion-token-mismatch' ? 403 : 404);
+    } catch (error) {
+      return c.json({
+        ok: false,
+        code: 'terminal-write-failed',
+        reason: error instanceof Error ? error.message : String(error),
+      }, 500);
+    }
+  });
+
+  router.get('/product-ai-native/ledger', (c) => {
+    // 协议 7:readLedger 是**带作用域的授权投影**,不是"给我全部"。缺 sessionId 时
+    // readProductActionLedger 的语义是跨会话全读 —— 这条 GET 又没有 caller gate,
+    // 两者相加等于一个无凭据的全库读口。作用域由 sessionId 强制,缺了直接 400。
+    // 不加 Origin 要求:协议一致性 runner 从不带 Origin 的 Node 进程读它,
+    // loopback-only 已在 forgeax-server 边界上把关(与两个 POST 邻居的取舍不同)。
+    const limitValue = Number(c.req.query('limit'));
+    const sessionId = c.req.query('sessionId')?.trim();
+    if (!sessionId) {
+      return c.json({
+        ok: false,
+        code: 'bad-request',
+        reason: 'sessionId (query) is required — the ledger read is a session-scoped projection',
+      }, 400);
+    }
+    const items = readProductActionLedger(defaultProjectRoot(), {
+      sessionId,
+      ...(c.req.query('executionId') ? { executionId: c.req.query('executionId') } : {}),
+      ...(c.req.query('clientCallId') ? { clientCallId: c.req.query('clientCallId') } : {}),
+      ...(c.req.query('actionId') ? { actionId: c.req.query('actionId') } : {}),
+      ...(c.req.query('from') ? { from: c.req.query('from') } : {}),
+      ...(c.req.query('to') ? { to: c.req.query('to') } : {}),
+      ...(Number.isInteger(limitValue) && limitValue > 0 ? { limit: Math.min(limitValue, 1_000) } : {}),
+    });
+    return c.json({ items, count: items.length });
+  });
 
 
   // ui/surfaces —— Map-backed live store. dual-modality 入口:
@@ -218,6 +342,12 @@ export function createBusRouter(): Hono {
 
   // 新增 endpoint: AI 通过 HTTP 派发动作到 surface (服务端内部也可用 dispatchToSurface 直调)
   router.post('/ui/surfaces/:id/dispatch', async (c) => {
+    // 这条路由入队的每一条都被 dispatchToSurface 打上 source:'ai',却此前**没有任何
+    // caller gate** —— 任何能连上本机端口的进程都能以 AI 的名义驱动界面。它的现实
+    // 调用方是同源 Studio 浏览器(聊天里的 /tool 斜杠命令),与两个 human-* 写口同款。
+    if (!uiWriteOriginAllowed(c, { requireOrigin: true })) {
+      return c.json({ error: 'origin-not-allowed', message: 'A same-origin Studio browser is required' }, 403);
+    }
     const id = c.req.param('id');
     let body: { action?: string; args?: unknown; awaitAck?: boolean; timeoutMs?: number };
     try { body = await c.req.json(); } catch { return c.json({ error: 'invalid-json' }, 400); }
@@ -230,6 +360,9 @@ export function createBusRouter(): Hono {
       const token = dispatchToSurface(id, body.action, body.args);
       return c.json({ ok: true, token });
     } catch (e) {
+      if (e instanceof HiddenSurfaceActionError) {
+        return c.json({ error: e.code, message: e.message, surfaceId: e.surfaceId, action: e.action }, 403);
+      }
       return c.json({ error: 'dispatch-failed', message: (e as Error).message }, 400);
     }
   });
@@ -440,6 +573,20 @@ export function multiPageHint(pages: number): string {
     + '不要向用户声称界面已经变了;请他只保留一个 ForgeaX 页面并刷新后重试。';
 }
 
+/** 派发一条 surface 自己声明为「不对 AI 暴露」的 action。带结构化 code,路由据此
+ *  回 403 而不是笼统的 dispatch-failed —— 这是协议 1 的拒绝,不是派发故障。 */
+export class HiddenSurfaceActionError extends Error {
+  readonly code = 'hidden-action' as const;
+  readonly surfaceId: string;
+  readonly action: string;
+  constructor(surfaceId: string, action: string) {
+    super(`action ${JSON.stringify(action)} on surface ${JSON.stringify(surfaceId)} is not exposed to AI`);
+    this.name = 'HiddenSurfaceActionError';
+    this.surfaceId = surfaceId;
+    this.action = action;
+  }
+}
+
 /**
  * Enqueue an action for `surfaceId`. Returns the token panel will ack with.
  * Throws if the surface isn't registered yet — caller decides whether to
@@ -449,6 +596,15 @@ export function multiPageHint(pages: number): string {
 export function dispatchToSurface(surfaceId: string, action: string, args: unknown): string {
   const rec = surfaces.get(surfaceId);
   if (!rec) throw new Error(`surface ${surfaceId} not registered`);
+  // 协议 1:只有 exposedToAI === true 的 action 可被 AI 执行,且必须在**入队之前**
+  // 拒绝 —— 队列里的每一条都恒打 source:'ai',入了队就等于以 AI 身份执行了。
+  // 缺键 = false(默认拒绝)。进程内直调者同样过这道闸:内部调用方不是豁免理由。
+  // surface 没登记这条 action 时同样拒绝:协议只承认**显式** exposedToAI === true,
+  // "没有声明"与"声明为隐藏"在 AI 面前是同一回事(懒注册面 actions 恒为空 → 恒拒)。
+  const declared = rec.actions.find((entry) => entry.id === action);
+  if (declared?.exposedToAI !== true) {
+    throw new HiddenSurfaceActionError(surfaceId, action);
+  }
   rec.seqCounter += 1;
   const token = `${surfaceId}-${rec.seqCounter}-${Math.random().toString(36).slice(2, 8)}`;
   rec.pending.push({ seq: rec.seqCounter, token, action, args, ts: Date.now(), source: 'ai' });

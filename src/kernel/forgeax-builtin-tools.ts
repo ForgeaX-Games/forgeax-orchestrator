@@ -34,6 +34,11 @@ import {
   type HostToolRunCtx,
 } from '../orchestration-seams';
 import { catalogGet } from './action-catalog';
+import {
+  projectActionCatalogSnapshot,
+  projectActionCatalogSurface,
+  projectCatalogAction,
+} from './product-ai-native-projection';
 import { findVisibleDoor } from './action-door';
 import { walkDoorInstead } from './door-reroute';
 import { getSurfaceSnapshot } from '../api/bus';
@@ -64,10 +69,11 @@ export function isForgeaxBuiltinTool(name: string): boolean {
   return BUILTIN_NAMES.has(name);
 }
 
-export interface UiActionNotFoundResult {
+export interface UiActionPreflightRejection {
   status: 'rejected';
-  code: 'not_found';
+  code: 'not_found' | 'not_exposed' | 'invalid_args';
   reason: string;
+  details?: readonly string[];
 }
 
 /** Attach the catalog-to-visible-door reconciliation at the capability boundary. */
@@ -89,7 +95,7 @@ export function annotateUiInvokeResult(
   return { ...(value as Record<string, unknown>), door };
 }
 
-function notFoundUiAction(actionId: string): UiActionNotFoundResult {
+function notFoundUiAction(actionId: string): UiActionPreflightRejection {
   return {
     status: 'rejected',
     code: 'not_found',
@@ -97,16 +103,94 @@ function notFoundUiAction(actionId: string): UiActionNotFoundResult {
   };
 }
 
-/** Catalog existence preflight shared by direct builtin execution and both host dispatchers. */
-export function uiActionCatalogRejection(actionId: unknown): UiActionNotFoundResult | undefined {
+function hiddenUiAction(actionId: string): UiActionPreflightRejection {
+  return {
+    status: 'rejected',
+    code: 'not_exposed',
+    reason: `action ${JSON.stringify(actionId)} is not exposed to AI`,
+  };
+}
+
+function invalidUiActionArgs(actionId: string, details: readonly string[]): UiActionPreflightRejection {
+  return {
+    status: 'rejected',
+    code: 'invalid_args',
+    reason: `arguments for action ${JSON.stringify(actionId)} do not match argsSchema`,
+    details,
+  };
+}
+
+function jsonTypeMatches(value: unknown, expected: string): boolean {
+  switch (expected) {
+    case 'object': return value !== null && typeof value === 'object' && !Array.isArray(value);
+    case 'array': return Array.isArray(value);
+    case 'string': return typeof value === 'string';
+    case 'number': return typeof value === 'number' && Number.isFinite(value);
+    case 'integer': return typeof value === 'number' && Number.isInteger(value);
+    case 'boolean': return typeof value === 'boolean';
+    case 'null': return value === null;
+    default: return false;
+  }
+}
+
+/** Validate the JSON-Schema subset used by ActionCatalog before any business handler runs. */
+function validateActionArgs(value: unknown, schema: Record<string, unknown>, path = '$'): string[] {
+  const issues: string[] = [];
+  if (typeof schema.type === 'string' && !jsonTypeMatches(value, schema.type)) {
+    return [`${path} must be ${schema.type}`];
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => Object.is(candidate, value))) {
+    issues.push(`${path} must be one of ${schema.enum.map((candidate) => JSON.stringify(candidate)).join(', ')}`);
+  }
+  if (Array.isArray(value) && schema.items && typeof schema.items === 'object' && !Array.isArray(schema.items)) {
+    for (const [index, item] of value.entries()) {
+      issues.push(...validateActionArgs(item, schema.items as Record<string, unknown>, `${path}[${index}]`));
+    }
+  }
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const objectValue = value as Record<string, unknown>;
+    const properties = schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
+      ? schema.properties as Record<string, unknown>
+      : {};
+    if (Array.isArray(schema.required)) {
+      for (const required of schema.required) {
+        if (typeof required === 'string' && !Object.hasOwn(objectValue, required)) {
+          issues.push(`${path}.${required} is required`);
+        }
+      }
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(objectValue)) {
+        if (!Object.hasOwn(properties, key)) issues.push(`${path}.${key} is not allowed`);
+      }
+    }
+    for (const [key, childSchema] of Object.entries(properties)) {
+      if (!Object.hasOwn(objectValue, key) || !childSchema || typeof childSchema !== 'object' || Array.isArray(childSchema)) {
+        continue;
+      }
+      issues.push(...validateActionArgs(objectValue[key], childSchema as Record<string, unknown>, `${path}.${key}`));
+    }
+  }
+  return issues;
+}
+
+/** Catalog exposure and argument preflight shared by direct execution and both host dispatchers. */
+export function uiActionCatalogRejection(
+  actionId: unknown,
+  actionArgs: unknown = {},
+): UiActionPreflightRejection | undefined {
   const id = typeof actionId === 'string' ? actionId : '';
-  return catalogGet(id) ? undefined : notFoundUiAction(id);
+  const entry = catalogGet(id);
+  if (!entry) return notFoundUiAction(id);
+  if (!entry.exposedToAI) return hiddenUiAction(id);
+  const issues = validateActionArgs(actionArgs, entry.argsSchema as Record<string, unknown>);
+  return issues.length > 0 ? invalidUiActionArgs(id, issues) : undefined;
 }
 
 export interface UiToolDispatchPreflight {
   name: string;
   args: unknown;
-  rejection?: UiActionNotFoundResult;
+  rejection?: UiActionPreflightRejection;
 }
 
 /** Normalize ui_act_* to ui_invoke and reject catalog misses before any trust policy runs. */
@@ -127,7 +211,7 @@ export function preflightUiToolDispatch(
     return { name, args: normalizedArgs, rejection: notFoundUiAction(name) };
   }
   if (name === 'ui_invoke') {
-    const rejection = uiActionCatalogRejection(normalizedArgs.actionId);
+    const rejection = uiActionCatalogRejection(normalizedArgs.actionId, normalizedArgs.args ?? {});
     return { name, args: normalizedArgs, ...(rejection ? { rejection } : {}) };
   }
   return { name, args };
@@ -152,6 +236,7 @@ export interface BuiltinToolCtx {
   callId?: string;
   turnCallId?: string;
   toolExecutionId?: string;
+  executionId?: string;
 }
 
 const PERCEPTION_TIMEOUT_MS = 8_000;
@@ -169,18 +254,32 @@ export function annotateUiSnapshotResult(out: unknown): unknown {
   const actions = (out as { actions?: unknown }).actions;
   if (!Array.isArray(actions)) return out;
   try {
-    let changed = false;
-    const annotatedActions = actions.map((row) => {
-      if (!row || typeof row !== 'object' || Array.isArray(row)) return row;
+    const protocolActions: ReturnType<typeof projectCatalogAction>[] = [];
+    const annotatedActions = actions.flatMap((row) => {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) {
+        return [];
+      }
       const id = typeof (row as { id?: unknown }).id === 'string'
         ? (row as { id: string }).id
         : '';
-      const preconditions = id ? catalogGet(id)?.preconditions : undefined;
-      if (!preconditions?.length) return row;
-      changed = true;
-      return { ...(row as Record<string, unknown>), preconditions: [...preconditions] };
+      const entry = id ? catalogGet(id) : undefined;
+      if (!entry?.exposedToAI) {
+        return [];
+      }
+      const action = projectCatalogAction(entry);
+      protocolActions.push(action);
+      return [{ ...(row as Record<string, unknown>), ...action }];
     });
-    return changed ? { ...(out as Record<string, unknown>), actions: annotatedActions } : out;
+    const snapshot = projectActionCatalogSnapshot(out);
+    return {
+      ...(out as Record<string, unknown>),
+      actions: annotatedActions,
+      productAiNative: {
+        surface: projectActionCatalogSurface(),
+        actions: protocolActions,
+        ...(snapshot ? { snapshot } : {}),
+      },
+    };
   } catch {
     return out;
   }
@@ -200,6 +299,7 @@ export function hostToolRunCtx(ctx: BuiltinToolCtx): HostToolRunCtx {
     ...(ctx.callId ? { callId: ctx.callId } : {}),
     ...(ctx.turnCallId ? { turnCallId: ctx.turnCallId } : {}),
     ...(ctx.toolExecutionId ? { toolExecutionId: ctx.toolExecutionId } : {}),
+    ...(ctx.executionId ? { executionId: ctx.executionId } : {}),
     perception: (kind, query) => perceptionQuery(ctx, kind, query),
     ...(delivery
       ? { delivery: { enrich: (claim) => delivery.enrich(claim, deliveryContext) } }
@@ -497,9 +597,9 @@ export async function runForgeaxBuiltinTool(
     }
     case 'ui_invoke': {
       const actionId = typeof args?.actionId === 'string' ? args.actionId : '';
-      const rejection = uiActionCatalogRejection(actionId);
-      if (rejection) return rejection;
       const actionArgs = (args?.args ?? {}) as Record<string, unknown>;
+      const rejection = uiActionCatalogRejection(actionId, actionArgs);
+      if (rejection) return rejection;
       const walked = await walkDoorInstead(
         { actionId, args: actionArgs },
         { runCtx: hostToolRunCtx(ctx) },
@@ -508,7 +608,8 @@ export async function runForgeaxBuiltinTool(
       // catalog 已校验 action 存在；UI 侧按声明的 timeoutMs 执行。
       // A live lease + accepted manifest row is only an executor binding. With no binding,
       // cold-start dispatch must not wait for a UI timeout before trying the server surface.
-      const out = isUiActionRuntimeAvailable(ctx.sid, actionId)
+      const hasUiExecutor = isUiActionRuntimeAvailable(ctx.sid, actionId);
+      const out = hasUiExecutor
         ? await perceptionQuery(
             ctx,
             'ui_invoke',
@@ -516,8 +617,9 @@ export async function runForgeaxBuiltinTool(
             uiInvokeTimeoutMs(ctx.sid, actionId, UI_INVOKE_TIMEOUT_MS),
           )
         : { unavailable: true, reason: `no live UI executor binding for action ${JSON.stringify(actionId)}` };
-      // UI 不可用时，surface 为 server/both 的 action 可降级到 headless handler。
-      if (out && typeof out === 'object' && (out as { unavailable?: unknown }).unavailable === true && actionId) {
+      // 只有从未向 UI 派发时才允许回落。已有 executor 时，`unavailable` 可能表示
+      // UI 已执行但回执丢失；此时再跑 headless 会把同一写操作执行两次。
+      if (!hasUiExecutor && out && typeof out === 'object' && (out as { unavailable?: unknown }).unavailable === true && actionId) {
         const decl = getUiAction(ctx.sid, actionId);
         if (decl && (decl.surface === 'server' || decl.surface === 'both')) {
           const handler = getHostUiAction(actionId) ?? getBuiltinHeadlessUiAction(actionId);
@@ -535,6 +637,18 @@ export async function runForgeaxBuiltinTool(
             }
           }
         }
+      }
+      if (hasUiExecutor && out && typeof out === 'object' && (out as { unavailable?: unknown }).unavailable === true) {
+        const reason = typeof (out as { reason?: unknown }).reason === 'string'
+          ? (out as { reason: string }).reason
+          : 'UI executor returned no terminal receipt';
+        return annotateUiInvokeResult({
+          status: 'failed',
+          started: true,
+          effectState: 'unknown',
+          code: 'ui-terminal-receipt-missing',
+          reason,
+        }, actionId, actionArgs);
       }
       return annotateUiInvokeResult(out, actionId, actionArgs);
     }

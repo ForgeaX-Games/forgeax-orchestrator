@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   acquireUiLease,
   clearUiStateForSession,
@@ -26,6 +29,7 @@ interface CapabilityCase {
   capability: Extract<ActionCapability, 'read' | 'write' | 'delete'>;
   actionId: string;
   toolName: string;
+  actionArgs: Record<string, unknown>;
   outcomes: Record<TrustTier, GateOutcome>;
 }
 
@@ -34,18 +38,21 @@ const CAPABILITY_CASES: readonly CapabilityCase[] = [
     capability: 'read',
     actionId: 'role.list',
     toolName: 'ui_act_role_list',
+    actionArgs: {},
     outcomes: { own: 'allow', imported: 'allow' },
   },
   {
     capability: 'write',
     actionId: 'session.create',
     toolName: 'ui_act_session_create',
+    actionArgs: {},
     outcomes: { own: 'allow', imported: 'ask' },
   },
   {
     capability: 'delete',
     actionId: 'session.close',
     toolName: 'ui_act_session_close',
+    actionArgs: { sid: 'target-session' },
     outcomes: { own: 'ask', imported: 'ask' },
   },
 ];
@@ -126,7 +133,7 @@ describe('ActionCatalog trust matrix', () => {
   for (const [index, row] of MATRIX_ROWS.entries()) {
     const { tier, capabilityCase, lifecycle } = row;
     const caseNumber = String(index + 1).padStart(2, '0');
-    const { actionId, capability, toolName } = capabilityCase;
+    const { actionId, actionArgs, capability, toolName } = capabilityCase;
     const expectedOutcome = capabilityCase.outcomes[tier];
 
     test(
@@ -142,10 +149,10 @@ describe('ActionCatalog trust matrix', () => {
         expect(firstClassUiToolSpecs(sid).some((spec) => spec.name === toolName)).toBe(true);
         expect(resolveFirstClassUiTool(sid, toolName)).toEqual({ actionId });
 
-        const preflight = preflightUiToolDispatch(toolName, {}, sid);
+        const preflight = preflightUiToolDispatch(toolName, actionArgs, sid);
         expect(preflight).toEqual({
           name: 'ui_invoke',
-          args: { actionId, args: {} },
+          args: { actionId, args: actionArgs },
         });
         const decision = checkKernelTool(tier, preflight.name, { sid, args: preflight.args });
         expect(decision).toMatchObject({
@@ -173,7 +180,7 @@ describe('ActionCatalog trust matrix', () => {
         expect(typeof resultDoor?.certainty).toBe('string');
         expect(resultRest).toEqual({
           status: 'completed',
-          stateDigest: { actionId, args: {} },
+          stateDigest: { actionId, args: actionArgs },
           executedVia: 'headless',
         });
         expect(handler.calls()).toBe(1);
@@ -315,23 +322,41 @@ describe('ActionCatalog cross-cutting invariants', () => {
 
   test('missing declarations return not_found before the trust gate', async () => {
     const sid = nextSid('not-found');
+    const projectRoot = mkdtempSync(join(tmpdir(), 'forgeax-action-catalog-not-found-'));
+    const fakeAgent = { agentContext: { tools: { list: () => [] } } };
+    const fakeSession = { getAgentHost: () => fakeAgent };
     let gateCalls = 0;
     const bridge = makeInProcessExecuteTool('forge', {
+      getSessionManager: (() => ({
+        peek: () => fakeSession,
+        open: async () => fakeSession,
+      })) as never,
+      projectRoot: () => projectRoot,
       checkKernelTool: (...args) => {
         gateCalls += 1;
         return checkKernelTool(...args);
       },
     });
-    expect(await bridge('ui_invoke', { actionId: 'missing.action', args: {} }, sid)).toEqual({
-      status: 'rejected',
-      code: 'not_found',
-      reason: 'action "missing.action" not in server ActionCatalog',
-    });
-    expect(await bridge('ui_act_missing_action', {}, sid)).toEqual({
-      status: 'rejected',
-      code: 'not_found',
-      reason: 'action "ui_act_missing_action" not in server ActionCatalog',
-    });
-    expect(gateCalls).toBe(0);
+    try {
+      expect(await bridge('ui_invoke', { actionId: 'missing.action', args: {} }, sid)).toMatchObject({
+        status: 'rejected',
+        started: false,
+        error: {
+          code: 'not_found',
+          message: 'action "missing.action" not in server ActionCatalog',
+        },
+      });
+      expect(await bridge('ui_act_missing_action', {}, sid)).toMatchObject({
+        status: 'rejected',
+        started: false,
+        error: {
+          code: 'not_found',
+          message: 'action "ui_act_missing_action" not in server ActionCatalog',
+        },
+      });
+      expect(gateCalls).toBe(0);
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
   });
 });

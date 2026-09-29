@@ -81,10 +81,12 @@ describe('composeTurnRequest selected-kernel policy', () => {
     const roleOpen = req.tools.find((tool) => tool.name === 'ui_act_role_open');
     const consoleRead = req.tools.find((tool) => tool.name === 'ui_act_console_read');
 
+    expect(roleOpen?.description).toContain('Preconditions (state facts, not operation order):');
     expect(roleOpen?.description).toContain(
-      'Preconditions (state facts, not operation order):\n'
-        + '- When id is provided, it must identify a role in the current roster.\n'
-        + '- When id is provided, an active chat session must exist for the role binding.',
+      '- [role-not-found] When id is provided, it identifies a role in the current roster.',
+    );
+    expect(roleOpen?.description).toContain(
+      '- [active-session-not-found] When id is provided, an active chat session exists for the role binding.',
     );
     expect(consoleRead?.description).not.toContain('Preconditions (state facts, not operation order):');
   });

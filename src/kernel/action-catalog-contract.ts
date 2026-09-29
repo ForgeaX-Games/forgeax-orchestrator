@@ -1,8 +1,8 @@
-/**
- * Trusted server-side action declarations.
- *
- * Hosts provide these pure-data contracts through ProductContext.
- */
+/** Trusted server-side action declarations projected from product AI-native v0.1. */
+import type {
+  ProductAction,
+  ProductPrecondition,
+} from '@forgeax/types/product-ai-native';
 export type ActionCapability =
   | 'read'
   | 'write'
@@ -25,11 +25,21 @@ export type JsonValue =
 
 export type JsonSchemaObject = { readonly [key: string]: JsonValue };
 
+export type ActionEffect = ProductAction['effect'];
+export type ActionPrecondition = Readonly<ProductPrecondition>;
+
 export interface ActionCatalogEntry {
   readonly id: string;
   readonly title: string;
-  readonly description?: string;
-  readonly schema?: JsonSchemaObject;
+  readonly description: string;
+  readonly argsSchema: JsonSchemaObject;
+  readonly resultSchema: JsonSchemaObject;
+  /** Compatibility projection for consumers not yet renamed to argsSchema. */
+  readonly schema: JsonSchemaObject;
+  readonly preconditions: readonly ActionPrecondition[];
+  readonly effect: ActionEffect;
+  readonly exposedToAI: boolean;
+  readonly requireConfirm: boolean;
   readonly capability: ActionCapability;
   readonly surface?: ActionSurface;
   readonly timeoutMs?: number;
@@ -37,14 +47,9 @@ export interface ActionCatalogEntry {
    *  新增 true 只用于领域入口/发现能力,或已有可复核跨场景高频证据的能力;
    *  PR 必须说明命中哪条及上下文成本。现有 14 项是存量兼容基线,不据此扩张。 */
   readonly firstClass?: boolean;
-  /** 状态性前置条件 —— 事实,不是行为指南。只写"世界需要什么样",禁写顺序规则。
-   *  反例(现有 description 里这类句式不许进本字段):
-   *  "Discover existing roles first via role.list" / "list existing slugs"。
-   *  缺省 = 无已知前置;空数组非法(缺席=无,不用空数组冒充)。 */
-  readonly preconditions?: readonly string[];
   /** 门位**事实**(不是行为指南):这个能力的人类入口在哪。
    *  - menuCommandId:菜单叶子用了别的 command id(同一能力两个名字)时的别名,
-   *    门对账凭它把两个 id 认成同一能力。
+   *    如 game.switch 的菜单门走 game.pick。门对账凭它把两个 id 认成同一能力。
    *  缺省 = 无声明;对账仍会拿 actionId 自己去菜单树里配。
    *  2026-08-06 撤除 railTab/railMode:host.sidebar 无发布者(上游 Page 重构后
    *  rail 从未接入 surface 总线),声明这两类门会让对账以最高置信度把 agent 指向
@@ -54,10 +59,19 @@ export interface ActionCatalogEntry {
 }
 
 export interface ActionCatalogBuildOptions {
-  /** Explicit host handlers: each must be declared and support headless execution. */
   readonly headlessHandlerActionIds: readonly string[];
-  /** Available generic fallbacks, enabled only for declared IDs without a host handler. */
   readonly builtinHeadlessHandlerActionIds?: readonly string[];
   readonly grandfatheredHeadlessActionIds: readonly string[];
 }
 
+/**
+ * M1 migration bundle, transcribed from interface's 23 builtin actions and
+ * two trajectory actions. Client-only run/available/choices functions stay out.
+ */
+
+export const HEADLESS_ACTION_GRANDFATHER_IDS = Object.freeze([
+  'game.create',
+  'game.switch',
+  'session.rename',
+  'sessions.refresh',
+] as const);

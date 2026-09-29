@@ -16,8 +16,11 @@ import type { AgentKernel, KernelEvent, TurnRequest } from '@forgeax/agent-runti
 import { registerKernel, unregisterKernel } from '@forgeax/agent-runtime';
 import type { TelemetryRecord } from '@forgeax/types';
 import { createCliRouter } from '../src/api/cli/chat';
+import { runKernelTurn } from '../src/runtime/kernel-turn-runner';
+import { Hook } from '../src/hooks/types';
 import { setHostTelemetry } from '../src/kernel/host-telemetry';
-import { initPathManager, resetPathManager } from '../src/fs/path-manager';
+import { getPathManager, initPathManager, resetPathManager } from '../src/fs/path-manager';
+import { initSessionManager, resetSessionManager } from '../src/core/session-manager';
 
 const KERNEL_ID = 'fake-trace-kernel';
 /** 工具真正说的那句话。剥完信封应当逐字等于它。 */
@@ -45,14 +48,16 @@ let telemetry: TelemetryRecord[];
 let savedKernelEnv: string | undefined;
 let savedProjectRoot: string | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'fx-trace-wiring-'));
   savedKernelEnv = process.env.FORGEAX_KERNEL;
   savedProjectRoot = process.env.FORGEAX_PROJECT_ROOT;
   process.env.FORGEAX_KERNEL = 'kernel';
   process.env.FORGEAX_PROJECT_ROOT = root;
   resetPathManager();
+  await resetSessionManager();
   initPathManager({ userRoot: root });
+  initSessionManager(getPathManager());
   telemetry = [];
   setHostTelemetry((_sid, records) => { telemetry.push(...records); });
   registerKernel(fakeKernel([
@@ -61,8 +66,8 @@ beforeEach(() => {
       kind: 'tool.result',
       callId: 'call_real',
       ok: true,
-      // 这就是 codex app-server 适配层规范化后的形状(extractMcpResult)。
-      result: { text: TOOL_TEXT, structuredContent: { forgeax: { toolExecutionId: 'fxt-wired-1' } } },
+      // MCP `_meta` 是传输元数据；业务正文仍由 content/text 承载。
+      result: { text: TOOL_TEXT, _meta: { forgeax: { toolExecutionId: 'fxt-wired-1' } } },
     },
     { kind: 'turn.usage', inputTokens: 1, outputTokens: 1 },
     { kind: 'turn.done', reason: 'stop' },
@@ -70,9 +75,10 @@ beforeEach(() => {
   app = new Hono().route('/api/cli', createCliRouter());
 });
 
-afterEach(() => {
+afterEach(async () => {
   unregisterKernel(KERNEL_ID);
   setHostTelemetry(null);
+  await resetSessionManager();
   resetPathManager();
   if (savedKernelEnv === undefined) delete process.env.FORGEAX_KERNEL; else process.env.FORGEAX_KERNEL = savedKernelEnv;
   if (savedProjectRoot === undefined) delete process.env.FORGEAX_PROJECT_ROOT; else process.env.FORGEAX_PROJECT_ROOT = savedProjectRoot;
@@ -160,6 +166,40 @@ describe('CLI 桥:工具事件 → tracer,信封不出墙', () => {
     expect(toolResult!.data.result).toBe(TOOL_TEXT);
     // 内部连接键不该出现在发往前端的载荷里。
     expect(JSON.stringify(toolResult!.data)).not.toContain('fxt-wired-1');
-    expect(JSON.stringify(toolResult!.data)).not.toContain('structuredContent');
+    expect(JSON.stringify(toolResult!.data)).not.toContain('_meta');
+  });
+
+  test('Runtime 主入口同样接入 tracer，并只把业务正文写入 ToolResult', async () => {
+    const hooks: Array<{ event: string; payload: unknown }> = [];
+    const eventBus = {
+      hook(event: string, payload: unknown) { hooks.push({ event, payload }); },
+      publish() {},
+    } as never;
+
+    const result = await runKernelTurn({
+      agentId: 'forge',
+      kernelId: KERNEL_ID,
+      sessionId: 'runtime-wiring-sid',
+      userText: 'hi',
+      eventBus,
+      signal: new AbortController().signal,
+      turn: 0,
+    });
+
+    expect(result).toMatchObject({ status: 'completed', aborted: false });
+    const toolResult = hooks.find((row) => row.event === Hook.ToolResult)?.payload as
+      | { result?: unknown }
+      | undefined;
+    expect(toolResult?.result).toBe(TOOL_TEXT);
+
+    const finalToolSpans = telemetry.filter((row) => {
+      const span = row as unknown as Record<string, unknown>;
+      return span.kind === 'span' && span.name === 'tool' && span.endTs !== undefined;
+    }) as unknown as Array<Record<string, unknown>>;
+    expect(finalToolSpans).toHaveLength(1);
+    expect(finalToolSpans[0]?.attrs).toMatchObject({
+      callId: 'call_real',
+      toolExecutionId: 'fxt-wired-1',
+    });
   });
 });

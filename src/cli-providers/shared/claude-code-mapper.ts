@@ -46,6 +46,10 @@ interface RawToolResultBlock {
 interface RawUserEvent {
   type: 'user';
   message?: { role?: string; content?: unknown[] };
+  /** the reference agent CLI stream-json folds MCP metadata into this stdout-only
+   *  envelope. The persisted transcript keeps it as `mcpMeta`, but that shape
+   *  is not what the CLI emits to the host process. */
+  tool_use_result?: unknown;
 }
 
 interface RawStreamEvent {
@@ -120,6 +124,29 @@ function flattenToolResultContent(content: unknown): string {
       .join('\n');
   }
   return '';
+}
+
+/** Preserve MCP business structuredContent, plus only ForgeaX's own transport
+ *  metadata. Arbitrary provider `_meta` must not change the public result. */
+function readMcpToolResultExtras(toolUseResult: unknown): Record<string, unknown> | undefined {
+  if (typeof toolUseResult !== 'object' || toolUseResult === null) return undefined;
+  const result = toolUseResult as Record<string, unknown>;
+  const extras: Record<string, unknown> = {};
+  if (result.structuredContent !== undefined) {
+    extras.structuredContent = result.structuredContent;
+  }
+  const metadata = result._meta;
+  if (typeof metadata === 'object' && metadata !== null) {
+    const forgeax = (metadata as Record<string, unknown>).forgeax;
+    if (typeof forgeax === 'object' && forgeax !== null) {
+      const value = (forgeax as Record<string, unknown>).toolExecutionId;
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed.startsWith('fxt-') && trimmed.length > 4) extras._meta = metadata;
+      }
+    }
+  }
+  return Object.keys(extras).length > 0 ? extras : undefined;
 }
 
 export interface MappedUsage {
@@ -247,7 +274,9 @@ export function mapClaudeEvent(raw: ClaudeRawEvent, state: ClaudeMapperState): C
   // Map each tool_result block → a `tool-result` ChatEvent keyed by
   // tool_use_id (== the callId the tool-call chip was created with).
   if (raw.type === 'user') {
-    const content = (raw as RawUserEvent).message?.content;
+    const userEvent = raw as RawUserEvent;
+    const content = userEvent.message?.content;
+    const resultExtras = readMcpToolResultExtras(userEvent.tool_use_result);
     if (Array.isArray(content)) {
       for (const block of content) {
         if (block && typeof block === 'object' && (block as { type?: unknown }).type === 'tool_result') {
@@ -261,7 +290,12 @@ export function mapClaudeEvent(raw: ClaudeRawEvent, state: ClaudeMapperState): C
               ? canonicalToolFields(state.toolNamesById.get(tr.tool_use_id)!)
               : {}),
             ok: !isErr,
-            ...(isErr ? { error: text } : { result: text }),
+            ...(isErr
+              ? {
+                  error: text,
+                  ...(resultExtras ? { result: { text, ...resultExtras } } : {}),
+                }
+              : { result: resultExtras ? { text, ...resultExtras } : text }),
           });
         }
       }

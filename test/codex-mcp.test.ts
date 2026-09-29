@@ -41,6 +41,7 @@ import {
   sanitizeImportedCodexConfig,
   sanitizeCodexConfig,
 } from '../src/kernel/codex-session-home';
+import { authorizeKernelToolCapability } from '../src/kernel/kernel-tool-capability';
 
 const SERVER = resolvePath(import.meta.dir, '../src/kernel/mcp/forgeax-tools-server.mjs');
 const PERMISSION_SERVER = resolvePath(import.meta.dir, '../src/cli-providers/mcp/permission-server.mjs');
@@ -115,10 +116,21 @@ describe('codex-mcp — buildCodexMcpOverrides', () => {
   });
 
   test('no secrets in argv (only config keys)', () => {
-    const argv = buildCodexMcpOverrides({ ...runtime, env: { OPENAI_API_KEY: 'sk-secret', FORGEAX_SID: 'sid-1' } });
+    const argv = buildCodexMcpOverrides({
+      ...runtime,
+      env: {
+        OPENAI_API_KEY: 'sk-secret',
+        FORGEAX_SID: 'sid-1',
+        FORGEAX_KERNEL_TOOL_TOKEN: 'kernel-secret',
+        FORGEAX_KERNEL_TOOL_TOKEN_FILE: '/tmp/x/kernel-tool-capability',
+      },
+    });
     expect(argv.join(' ')).not.toContain('sk-secret');
+    expect(argv.join(' ')).not.toContain('kernel-secret');
+    expect(argv.join(' ')).not.toContain('FORGEAX_KERNEL_TOOL_TOKEN=');
     expect(argv.join(' ')).not.toContain('OPENAI_API_KEY');
     expect(argv.join(' ')).toContain('FORGEAX_SID');
+    expect(argv.join(' ')).toContain('FORGEAX_KERNEL_TOOL_TOKEN_FILE');
   });
 });
 
@@ -233,8 +245,17 @@ describe('forgeax-tools-runtime — materialize', () => {
     expect(mode).toBe(0o600);
     const specs = JSON.parse(readFileSync(rt!.specsFile, 'utf8'));
     expect(specs.map((s: any) => s.name)).toEqual(['echo', 'echo', 'ui_act_role_list']);
+    const tokenFile = rt!.env.FORGEAX_KERNEL_TOOL_TOKEN_FILE;
+    expect(tokenFile).toBeTruthy();
+    expect(statSync(tokenFile!).mode & 0o777).toBe(0o600);
+    const token = readFileSync(tokenFile!, 'utf8').trim();
+    expect(authorizeKernelToolCapability(token, 't-thread', 'ui_act_role_list')).toEqual({
+      sid: 't-thread',
+      agentPath: 'forge',
+    });
     await rt!.cleanup();
     await rt!.cleanup(); // idempotent
+    expect(authorizeKernelToolCapability(token, 't-thread', 'ui_act_role_list')).toBeUndefined();
     expect(() => statSync(rt!.specsFile)).toThrow();
   });
 
@@ -732,8 +753,8 @@ describe('forgeax-tools-server — double allowlist (process-level)', () => {
       // 查无此行"(可观察的缺席),而不是根本无从查起。
       const a = await srv.rpc('tools/call', { name: 'my_host_tool', arguments: {} });
       const b = await srv.rpc('tools/call', { name: 'my_host_tool', arguments: {} });
-      const idA = a.result.structuredContent?.forgeax?.toolExecutionId;
-      const idB = b.result.structuredContent?.forgeax?.toolExecutionId;
+      const idA = a.result._meta?.forgeax?.toolExecutionId;
+      const idB = b.result._meta?.forgeax?.toolExecutionId;
       expect(idA).toMatch(/^fxt-[0-9a-f-]{36}$/);
       // **同名同参连调两次必须拿到两个不同的 id** —— 这正是外审的验收判据:
       // 一对一关联不能靠工具名、顺序或时间戳。
@@ -751,7 +772,7 @@ describe('forgeax-tools-server — double allowlist (process-level)', () => {
     try {
       await srv.rpc('initialize', { protocolVersion: '2024-11-05' });
       const r = await srv.rpc('tools/call', { name: 'ui_snapshot', arguments: {} });
-      const id: string = r.result.structuredContent?.forgeax?.toolExecutionId;
+      const id: string = r.result._meta?.forgeax?.toolExecutionId;
       expect(id.startsWith('fxt-')).toBe(true);
       // codex 的两种调用 id 形态都不以 fxt- 开头,一眼可辨。
       expect(id.startsWith('call_')).toBe(false);

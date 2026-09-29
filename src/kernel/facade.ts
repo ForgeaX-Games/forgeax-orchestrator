@@ -122,7 +122,8 @@ function defaultSeams(): KernelFacadeSeams {
     // agent-host socket. Server shutdown must only release its own connection
     // and child handle; asking the shared host to shut down strands every other
     // running Studio instance. Credential updates continue to use
-    // `restartSidecar()`, which intentionally replaces the global singleton.
+    // `restartSidecar()`, which replaces an owned host or reports that the
+    // external host owner must restart it.
     teardownSidecar: async () => resetSidecarSingleton(),
   };
 }

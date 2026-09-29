@@ -1,8 +1,12 @@
-import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { buildCbcArgs, buildCbcMcpArgs } from '../src/kernel/cbc-profile';
+import {
+  authorizeKernelToolCapability,
+  resetKernelToolCapabilitiesForTests,
+} from '../src/kernel/kernel-tool-capability';
 
 const request: Record<string, unknown> = {
   tools: [{ name: 'npc_wire', description: 'wire', inputSchema: { type: 'object' } }],
@@ -18,6 +22,8 @@ const turnRequest = {
 } as never;
 
 describe('cbc builtin adoption surface', () => {
+  afterEach(() => resetKernelToolCapabilitiesForTests());
+
   test('keeps npc_wire local to the forgeax builtin MCP server', () => {
     const args = buildCbcMcpArgs(request as unknown as Parameters<typeof buildCbcMcpArgs>[0], 'sid');
     const configPath = args[args.indexOf('--mcp-config') + 1];
@@ -60,5 +66,20 @@ describe('cbc builtin adoption surface', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test('writes a private MCP config with a source capability bound to the turn', () => {
+    const args = buildCbcMcpArgs(request as unknown as Parameters<typeof buildCbcMcpArgs>[0], 'sid');
+    const configPath = args[args.indexOf('--mcp-config') + 1]!;
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
+      mcpServers?: { fxt?: { env?: Record<string, string> } };
+    };
+    const token = config.mcpServers?.fxt?.env?.FORGEAX_KERNEL_TOOL_TOKEN;
+    expect(token).toBeTruthy();
+    expect(authorizeKernelToolCapability(token, 'sid', 'npc_wire')).toEqual({
+      sid: 'sid',
+      agentPath: 'forge',
+    });
   });
 });

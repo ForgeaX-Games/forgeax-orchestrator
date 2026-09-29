@@ -39,6 +39,10 @@ import { hostToolSurfaceForAgent, hostToolSpecsForAgent } from '../src/api/lib/h
 import { visibleAgentManagementToolsForAgent } from '../src/kits/agent-management-visibility';
 import { buildSoulForkComposeInput } from '../src/soul/fork-extract';
 import { initOrchestrationSeams, resetOrchestrationSeams } from '../src/orchestration-seams';
+import {
+  issueKernelToolCapability,
+  resetKernelToolCapabilitiesForTests,
+} from '../src/kernel/kernel-tool-capability';
 
 let userRoot: string;
 
@@ -48,6 +52,7 @@ beforeEach(async () => {
   await resetSessionManager();
   initPathManager({ userRoot });
   _resetSnapshotForTests();
+  resetKernelToolCapabilitiesForTests();
 });
 
 afterEach(async () => {
@@ -55,10 +60,20 @@ afterEach(async () => {
   resetPathManager();
   _resetSnapshotForTests();
   resetOrchestrationSeams();
+  resetKernelToolCapabilitiesForTests();
   rmSync(userRoot, { recursive: true, force: true });
 });
 
 const flushMicrotasks = () => new Promise<void>((r) => setImmediate(r));
+
+function kernelHeaders(sid: string, agentPath: string, toolName: string): Record<string, string> {
+  const capability = issueKernelToolCapability({ sid, agentPath, enabledTools: [toolName] });
+  if (!capability) throw new Error('failed to issue kernel-tool capability for test');
+  return {
+    'content-type': 'application/json',
+    'x-forgeax-kernel-token': capability.token,
+  };
+}
 
 async function createSessionWithRootAndTeammate(displayName: string, slug: string, teammate?: string): Promise<Session> {
   const pm = getPathManager();
@@ -201,7 +216,7 @@ describe("agent_manage kit — delegate_to_subagent", () => {
       const app = new Hono().route('/api/sessions', createSessionsRouter());
       const listResponse = await app.request(`/api/sessions/${session.sid}/kernel-tool`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: kernelHeaders(session.sid, 'root', 'list_subagents'),
         body: JSON.stringify({
           agentPath: 'root',
           toolName: 'list_subagents',
@@ -215,7 +230,7 @@ describe("agent_manage kit — delegate_to_subagent", () => {
 
       const response = await app.request(`/api/sessions/${session.sid}/kernel-tool`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: kernelHeaders(session.sid, 'root', 'delegate_to_subagent'),
         body: JSON.stringify({
           agentPath: 'root',
           toolName: 'delegate_to_subagent',
@@ -241,7 +256,7 @@ describe("agent_manage kit — delegate_to_subagent", () => {
     for (const toolName of ['list_subagents', 'delegate_to_subagent']) {
       const response = await app.request(`/api/sessions/${session.sid}/kernel-tool`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: kernelHeaders(session.sid, 'root', toolName),
         body: JSON.stringify({
           agentPath: 'root',
           toolName,
@@ -324,7 +339,7 @@ describe("agent_manage kit — delegate_to_subagent", () => {
       for (const toolName of scenario.hidden) {
         const response = await app.request(`/api/sessions/${session.sid}/kernel-tool`, {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: kernelHeaders(session.sid, 'root', toolName),
           body: JSON.stringify({ agentPath: 'root', toolName, args: {} }),
         });
         expect(response.status).toBe(200);

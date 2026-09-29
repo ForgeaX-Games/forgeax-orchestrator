@@ -1,9 +1,12 @@
-import type { DeliverSummary, DeliverSummaryClaim } from '@forgeax/types/deliver-summary';
-import type { ArtifactResolvedPayload } from '@forgeax/types/artifact-summary';
 import type {
-  ProgressPolicy,
-  ProgressPolicyContext,
-} from './runtime/progress-control';
+	DeliverSummary,
+	DeliverSummaryClaim,
+} from "@forgeax/types/deliver-summary";
+import type { ArtifactResolvedPayload } from "@forgeax/types/artifact-summary";
+import type {
+	ProgressPolicy,
+	ProgressPolicyContext,
+} from "./runtime/progress-control";
 
 /** Orchestration seams — the injection registry the product shell uses to feed
  *  business-specific behavior into the (business-agnostic) orchestration layer.
@@ -37,14 +40,18 @@ import type {
  *  parts. Each consumer keeps the historical order (charter, environment, note),
  *  so the assembled bytes are identical to the pre-seam build. */
 export interface SystemPromptComposer {
-  /** The game-authoring charter. Byte-stable across turns (cache prefix). */
-  charter(): string;
-  /** The active-game scoping note for a slug ('' when no active game). */
-  activeGameNote(slug: string | undefined): string;
-  /** The `# Environment` section (paths / game info / page plugins /
-   *  skills). Mirrors the historical renderEnvironmentText opts so each caller
-   *  passes exactly what it always did (byte-identical). */
-  environment(opts: { cwd: string; projectRoot?: string; slug?: string | null }): string;
+	/** The game-authoring charter. Byte-stable across turns (cache prefix). */
+	charter(): string;
+	/** The active-game scoping note for a slug ('' when no active game). */
+	activeGameNote(slug: string | undefined): string;
+	/** The `# Environment` section (paths / game info / page plugins /
+	 *  skills). Mirrors the historical renderEnvironmentText opts so each caller
+	 *  passes exactly what it always did (byte-identical). */
+	environment(opts: {
+		cwd: string;
+		projectRoot?: string;
+		slug?: string | null;
+	}): string;
 }
 
 /** 宿主侧工具执行上下文(seam run 的显式输入,Pipeline Isolation)。`perception` 是
@@ -52,43 +59,47 @@ export interface SystemPromptComposer {
  *  工具(query_world/capture_frame)用它向浏览器里的真值源取数;UI 未连时 fail-soft
  *  返回 `{ unavailable }`。 */
 export interface DeliveryContext {
-  sid?: string;
-  agentId: string;
-  projectRoot: string;
-  game?: string;
+	sid?: string;
+	agentId: string;
+	projectRoot: string;
+	game?: string;
 }
 
 export interface HostToolRunCtx extends DeliveryContext {
-  perception?: (kind: 'world' | 'frame', query?: unknown) => Promise<unknown>;
-  /** Optional correlation keys carried by the host audit and tool ledgers. */
-  callId?: string;
-  turnCallId?: string;
-  toolExecutionId?: string;
-  /** Narrow read-only seam for host-enriched delivery summaries. */
-  delivery?: DeliveryEnricher;
+	perception?: (kind: "world" | "frame", query?: unknown) => Promise<unknown>;
+	/** Optional correlation keys carried by the host audit and tool ledgers. */
+	callId?: string;
+	turnCallId?: string;
+	toolExecutionId?: string;
+	executionId?: string;
+	/** Narrow read-only seam for host-enriched delivery summaries. */
+	delivery?: DeliveryEnricher;
 }
 
 /** Orchestrator-owned delivery derivation. The implementation may read
  * checkpoint/ledger state; product shells only provide the resulting seam. */
 export interface DeliveryEnricher {
-  enrich(claim: DeliverSummaryClaim, context?: DeliveryContext): Promise<DeliverSummary>;
+	enrich(
+		claim: DeliverSummaryClaim,
+		context?: DeliveryContext,
+	): Promise<DeliverSummary>;
 }
 
 /** Final-settle input for host-owned artifact derivation. */
 export interface ArtifactTurnContext extends DeliveryContext {
-  turnId: string;
-  checkpointMsgId?: string;
-  anchorSeq?: number;
-  startedAt: number;
-  settledAt: number;
-  aborted?: boolean;
-  error?: string;
+	turnId: string;
+	checkpointMsgId?: string;
+	anchorSeq?: number;
+	startedAt: number;
+	settledAt: number;
+	aborted?: boolean;
+	error?: string;
 }
 
 export interface ArtifactResolver {
-  resolveTurn(context: ArtifactTurnContext): Promise<ArtifactResolvedPayload>;
-  /** Optional startup/reopen reconciliation hook. */
-  reconcile?(sid: string): Promise<void>;
+	resolveTurn(context: ArtifactTurnContext): Promise<ArtifactResolvedPayload>;
+	/** Optional startup/reopen reconciliation hook. */
+	reconcile?(sid: string): Promise<void>;
 }
 
 /** A host-only tool spec the shell exposes to agents (list_games / query_world /
@@ -97,13 +108,16 @@ export interface ArtifactResolver {
  *  actual call. Shape matches `TurnRequest['tools'][number]` without importing it
  *  here (keep this module dependency-light). */
 export interface HostToolSpec {
-  name: string;
-  description: string;
-  inputSchema: unknown;
-  /** 宿主侧执行体(forgeax-core 原生路径:两个 host 工具执行口在信任闸放行后调用)。
-   *  缺省 = 仅声明,执行回落 agent kit 注册表(历史行为)。注意:spec 出墙给内核时
-   *  只序列化 name/description/inputSchema,`run` 永不过 wire。 */
-  run?: (args: Record<string, unknown>, ctx: HostToolRunCtx) => Promise<unknown> | unknown;
+	name: string;
+	description: string;
+	inputSchema: unknown;
+	/** 宿主侧执行体(forgeax-core 原生路径:两个 host 工具执行口在信任闸放行后调用)。
+	 *  缺省 = 仅声明,执行回落 agent kit 注册表(历史行为)。注意:spec 出墙给内核时
+	 *  只序列化 name/description/inputSchema,`run` 永不过 wire。 */
+	run?: (
+		args: Record<string, unknown>,
+		ctx: HostToolRunCtx,
+	) => Promise<unknown> | unknown;
 }
 
 /** UI 语义操作层的 headless 等价 handler(方案 §5 surface:'both'|'server'):UI 不在线
@@ -111,18 +125,21 @@ export interface HostToolSpec {
  *  硬约束:handler 必须调与 UI run() 相同的内部实现/HTTP API(server 是行为 SSOT),
  *  不许长出第二份业务逻辑。 */
 export interface HostUiActionHandler {
-  actionId: string;
-  run: (args: Record<string, unknown>, ctx: HostToolRunCtx) => Promise<unknown> | unknown;
+	actionId: string;
+	run: (
+		args: Record<string, unknown>,
+		ctx: HostToolRunCtx,
+	) => Promise<unknown> | unknown;
 }
 
 /** Asset path policy — replaces the `.forgeax/games` whitelist baked into
  *  safe-path / fs-browser. Default is CLOSED; the shell explicitly opens roots.
  *  Conditional-required + fail-fast: see app.ts mount site (§3.4). */
 export interface AssetPathPolicy {
-  /** Absolute roots under which asset reads/writes are permitted. */
-  allowRoots: string[];
-  /** Optional deny globs applied within the allowed roots. */
-  denyGlobs?: string[];
+	/** Absolute roots under which asset reads/writes are permitted. */
+	allowRoots: string[];
+	/** Optional deny globs applied within the allowed roots. */
+	denyGlobs?: string[];
 }
 
 /** marketplace UI asset-cleanup capability — injected by the product shell
@@ -131,18 +148,23 @@ export interface AssetPathPolicy {
  *  (uses the original image). Lives here (cli seam type) because ProductContext
  *  references it while the ce-api-shim business that USES it lives in the shell. */
 export interface UiAssetCanvasReport {
-  opaqueEdgePixels: number;
-  transparentCornerDirtyPixels: number;
-  fragmentationRatio: number;
-  largestComponentRatio: number;
-  opaqueBoundsFillRatio: number;
+	opaqueEdgePixels: number;
+	transparentCornerDirtyPixels: number;
+	fragmentationRatio: number;
+	largestComponentRatio: number;
+	opaqueBoundsFillRatio: number;
 }
 export interface UiAssetCleanup {
-  normalizeStandaloneUiAsset(
-    dataUrl: string,
-    options?: { mode?: 'icon' | 'chrome'; fillRatio?: number; chromeEdgeRefine?: 'dark-ui' | undefined; pixelPerfect?: boolean },
-  ): Promise<string>;
-  inspectUiAssetCanvas(dataUrl: string): Promise<UiAssetCanvasReport>;
+	normalizeStandaloneUiAsset(
+		dataUrl: string,
+		options?: {
+			mode?: "icon" | "chrome";
+			fillRatio?: number;
+			chromeEdgeRefine?: "dark-ui" | undefined;
+			pixelPerfect?: boolean;
+		},
+	): Promise<string>;
+	inspectUiAssetCanvas(dataUrl: string): Promise<UiAssetCanvasReport>;
 }
 
 /** Upload destination defaults — the shared repo + shared write credential are
@@ -155,17 +177,19 @@ export interface UiAssetCleanup {
  *  resolve time; absent seam + absent env ⇒ upload is simply unconfigured on
  *  this build (graceful, §9). The token is never logged / committed / persisted. */
 export interface UploadDefaults {
-  /** `owner/repo` of the shared destination, e.g. `ForgeaX-Games/Forgeax-Data`. */
-  repo?: string;
-  /** The shared write credential. Never persisted / committed / logged. */
-  token?: string;
-  /** Default branch (usually `main`). */
-  branch?: string;
+	/** `owner/repo` of the shared destination, e.g. `ForgeaX-Games/Forgeax-Data`. */
+	repo?: string;
+	/** The shared write credential. Never persisted / committed / logged. */
+	token?: string;
+	/** Default branch (usually `main`). */
+	branch?: string;
 }
 
 /** A product may provide one skill directory for the exact caller session.
  * Omission keeps standalone orchestration independent of host project layout. */
-export type SessionSkillRootProvider = (sessionId: string) => string | undefined;
+export type SessionSkillRootProvider = (
+	sessionId: string,
+) => string | undefined;
 
 /**
  * Product-owned progress policy. The orchestration layer supplies the generic
@@ -173,110 +197,117 @@ export type SessionSkillRootProvider = (sessionId: string) => string | undefined
  * thresholds, and event classification. Returning undefined keeps the host
  * opt-in and preserves the pre-progress-control behavior.
  */
-export type ProgressPolicyProvider =
-  (context: ProgressPolicyContext) => ProgressPolicy | undefined;
+export type ProgressPolicyProvider = (
+	context: ProgressPolicyContext,
+) => ProgressPolicy | undefined;
 
 /** Optional host choice to freeze resident resources independently of their
  * installation. Hosts own source eligibility and historical path identity;
  * persistence never grants trust or capabilities. */
 export interface ResidentResourcePolicy {
-  persistence: 'snapshot';
-  acceptsSource(source: { kind: string; origin?: string }): boolean;
-  matchesLegacyPath(configuredPath: string, currentPath: string): boolean;
+	persistence: "snapshot";
+	acceptsSource(source: { kind: string; origin?: string }): boolean;
+	matchesLegacyPath(configuredPath: string, currentPath: string): boolean;
 }
 
 interface OrchestrationSeams {
-  residentResourcePolicy?: ResidentResourcePolicy;
-  sessionSkillRootProvider?: SessionSkillRootProvider;
-  systemPromptComposer?: SystemPromptComposer;
-  hostTools?: HostToolSpec[];
-  hostUiActions?: HostUiActionHandler[];
-  assetPathPolicy?: AssetPathPolicy;
-  delivery?: DeliveryEnricher;
-  artifactResolver?: ArtifactResolver;
-  /** Opt-in builtin tools — the ONLY advertisement gate for every builtin in
-   *  compose-turn-request's FORGEAX_TOOLS (task flow, digital-life memory, UI
-   *  bridge, sub-agent delegation, ask_user). A builtin not named here is never
-   *  advertised on any kernel path (rented-kernel fxt MCP injection and
-   *  forgeax-core host execution alike), so a standalone / other-product
-   *  consumer of the orchestration layer inherits none of them by default.
-   *  Names must come from `FORGEAX_BUILTIN_TOOL_NAMES` (exported at the package
-   *  root) — the roster derived from FORGEAX_TOOLS itself. */
-  enabledBuiltinTools?: readonly string[];
-  uploadDefaults?: UploadDefaults;
-  progressPolicyProvider?: ProgressPolicyProvider;
+	residentResourcePolicy?: ResidentResourcePolicy;
+	sessionSkillRootProvider?: SessionSkillRootProvider;
+	systemPromptComposer?: SystemPromptComposer;
+	hostTools?: HostToolSpec[];
+	hostUiActions?: HostUiActionHandler[];
+	assetPathPolicy?: AssetPathPolicy;
+	delivery?: DeliveryEnricher;
+	artifactResolver?: ArtifactResolver;
+	/** Opt-in builtin tools — the ONLY advertisement gate for every builtin in
+	 *  compose-turn-request's FORGEAX_TOOLS (task flow, digital-life memory, UI
+	 *  bridge, sub-agent delegation, ask_user). A builtin not named here is never
+	 *  advertised on any kernel path (rented-kernel fxt MCP injection and
+	 *  forgeax-core host execution alike), so a standalone / other-product
+	 *  consumer of the orchestration layer inherits none of them by default.
+	 *  Names must come from `FORGEAX_BUILTIN_TOOL_NAMES` (exported at the package
+	 *  root) — the roster derived from FORGEAX_TOOLS itself. */
+	enabledBuiltinTools?: readonly string[];
+	uploadDefaults?: UploadDefaults;
+	progressPolicyProvider?: ProgressPolicyProvider;
 }
 
 let _seams: OrchestrationSeams = {};
 
 /** Install the injected seams. Called once by createForgeaxApp at boot. */
 export function initOrchestrationSeams(seams: OrchestrationSeams): void {
-  _seams = seams;
+	_seams = seams;
 }
 
 /** Absent policy preserves external references and disables legacy repair. */
-export function getResidentResourcePolicy(): ResidentResourcePolicy | undefined {
-  return _seams.residentResourcePolicy;
+export function getResidentResourcePolicy():
+	| ResidentResourcePolicy
+	| undefined {
+	return _seams.residentResourcePolicy;
 }
 
 /** The injected system-prompt composer, or undefined when no shell injected one
  *  (standalone cli → caller falls back to its built-in generic prompt). */
 export function getSystemPromptComposer(): SystemPromptComposer | undefined {
-  return _seams.systemPromptComposer;
+	return _seams.systemPromptComposer;
 }
 
 /** No process-wide active directory fallback: callers must identify a session. */
 export function getSessionSkillRoot(sessionId?: string): string | undefined {
-  return sessionId ? _seams.sessionSkillRootProvider?.(sessionId) : undefined;
+	return sessionId ? _seams.sessionSkillRootProvider?.(sessionId) : undefined;
 }
 
 /** Host-only tool specs the shell injected (empty array when none). */
 export function getHostTools(): HostToolSpec[] {
-  return _seams.hostTools ?? [];
+	return _seams.hostTools ?? [];
 }
 
 /** Opt-in builtin tools the product enabled (empty set when none / standalone). */
 export function getEnabledBuiltinTools(): ReadonlySet<string> {
-  return new Set(_seams.enabledBuiltinTools ?? []);
+	return new Set(_seams.enabledBuiltinTools ?? []);
 }
 
 /** 按名取 shell 注入的 host 工具(执行口用;undefined = 非 seam 工具)。 */
 export function getHostTool(name: string): HostToolSpec | undefined {
-  return _seams.hostTools?.find((t) => t.name === name);
+	return _seams.hostTools?.find((t) => t.name === name);
 }
 
 /** 按 actionId 取 shell 注入的 headless UI action handler(ui_invoke 回落用)。 */
-export function getHostUiAction(actionId: string): HostUiActionHandler | undefined {
-  return _seams.hostUiActions?.find((h) => h.actionId === actionId);
+export function getHostUiAction(
+	actionId: string,
+): HostUiActionHandler | undefined {
+	return _seams.hostUiActions?.find((h) => h.actionId === actionId);
 }
 
 /** The injected asset path policy, or undefined when none was injected. */
 export function getAssetPathPolicy(): AssetPathPolicy | undefined {
-  return _seams.assetPathPolicy;
+	return _seams.assetPathPolicy;
 }
 
 /** The injected delivery enricher, or undefined until round derivation lands. */
 export function getDeliveryEnricher(): DeliveryEnricher | undefined {
-  return _seams.delivery;
+	return _seams.delivery;
 }
 
 export function getArtifactResolver(): ArtifactResolver | undefined {
-  return _seams.artifactResolver;
+	return _seams.artifactResolver;
 }
 
 /** The product shell's upload destination defaults (shared repo + shared write
  *  token), or undefined when none was injected (standalone build → upload
  *  unconfigured unless the operator sets `FORGEAX_UPLOAD_*`). */
 export function getUploadDefaults(): UploadDefaults | undefined {
-  return _seams.uploadDefaults;
+	return _seams.uploadDefaults;
 }
 
 /** The product-owned progress policy, or undefined for generic/standalone hosts. */
-export function getProgressPolicyProvider(): ProgressPolicyProvider | undefined {
-  return _seams.progressPolicyProvider;
+export function getProgressPolicyProvider():
+	| ProgressPolicyProvider
+	| undefined {
+	return _seams.progressPolicyProvider;
 }
 
 /** Test-only — reset the registry between cases. */
 export function resetOrchestrationSeams(): void {
-  _seams = {};
+	_seams = {};
 }

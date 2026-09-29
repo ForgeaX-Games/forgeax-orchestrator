@@ -6,6 +6,7 @@ import { NpcBatchCollector } from '../src/npc-brain/batch-collector';
 import { NpcGovernor } from '../src/npc-brain/governor';
 import { NpcBrainService } from '../src/npc-brain/service';
 import { NpcWorkingMemory } from '../src/npc-brain/working-memory';
+import type { NpcMemoryRuntimeBinding } from '../src/npc-brain/memory-host-seam';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -202,6 +203,62 @@ describe('M2 true batching', () => {
     expect(brain.budgetState('arena').calls?.used).toBe(1);
   });
 
+  test('chunks more than the model batch cap while charging one call per chunk', async () => {
+    let calls = 0;
+    const brain = new NpcBrainService({
+      projectRoot: projectRoot(),
+      now: () => 0,
+      complete: async (request) => {
+        calls += 1;
+        const sections = request.messages[1]!.content.trim().split('\n').map((line) => JSON.parse(line));
+        return {
+          text: JSON.stringify({
+            decisions: sections.map(({ npcId }: { npcId: string }) => ({
+              npcId,
+              decision: { utterance: { lines: [`hello ${npcId}`] } },
+            })),
+          }),
+          model: request.model,
+          transport: 'mock',
+          latencyMs: 1,
+        };
+      },
+      budget: { maxCallsPerMinute: 2 },
+    });
+    const snapshots = Array.from({ length: 9 }, (_, index) => snapshot(`npc-${index}`));
+    for (const item of snapshots) brain.attach('arena', item.npcId);
+    const decisions = await brain.decideBatch(snapshots);
+    expect(decisions).toHaveLength(9);
+    expect(calls).toBe(2);
+    expect(brain.budgetState('arena').calls).toMatchObject({ limit: 2, used: 2, remaining: 0 });
+  });
+
+  test('fails closed when a provider returns more decisions than one model batch permits', async () => {
+    let calls = 0;
+    const brain = new NpcBrainService({
+      projectRoot: projectRoot(),
+      now: () => 0,
+      complete: async (request) => {
+        calls += 1;
+        return {
+          text: JSON.stringify({
+            decisions: Array.from({ length: 9 }, (_, index) => ({
+              npcId: `npc-${index}`,
+              decision: { utterance: { lines: ['invalid'] } },
+            })),
+          }),
+          model: request.model,
+          transport: 'mock',
+          latencyMs: 1,
+        };
+      },
+    });
+    const snapshots = Array.from({ length: 5 }, (_, index) => snapshot(`npc-${index}`));
+    for (const item of snapshots) brain.attach('arena', item.npcId);
+    await expect(brain.decideBatch(snapshots)).resolves.toEqual([]);
+    expect(calls).toBe(1);
+  });
+
   test('falls back when a player-message batch omits the required utterance', async () => {
     const brain = new NpcBrainService({
       projectRoot: projectRoot(),
@@ -235,6 +292,93 @@ describe('M2 true batching', () => {
     );
     expect(decisions).toEqual([]);
     expect(Date.now() - startedAt).toBeLessThan(500);
+  });
+
+  test('runs member recalls in parallel and prunes only the expired member before one model call', async () => {
+    const modeledNpcIds: string[] = [];
+    let modelCalls = 0;
+    const memory: NpcMemoryRuntimeBinding = {
+      mode: 'active',
+      writePolicy: 'configured-writer',
+      subjectFor: ({ game, npcId, soulId }) => ({
+        ownerNpcId: npcId,
+        soulId,
+        scope: { authority: 'forgeax-file', game, memoryGame: game, soulId, storagePartition: { kind: 'soul-shared' } },
+      }),
+      recallRequestFor: ({ subject, snapshot: current }) => ({
+        subject,
+        trigger: 'active_decision',
+        at: { day: 0, hour: 0, minute: 0 },
+        context: { mapId: current.scene ?? current.game, sceneAreaId: null, visibleRefIds: [], focusEntityIds: [], conversationTurns: [] },
+        budget: { mode: 'legacy-exact' },
+      }),
+      reader: { recall: async (request) => {
+        if (request.subject.ownerNpcId === 'expired') await new Promise((resolve) => setTimeout(resolve, 80));
+        return {
+          source: { kind: 'live-file' }, rawRecallVersion: 1, rawBlocks: [],
+          diagnostics: { stale: false, volatileStateUsed: false, projectionMode: 'full', identityResolved: true },
+        };
+      } },
+      enqueueHandoff: async () => undefined,
+    };
+    const brain = new NpcBrainService({
+      projectRoot: projectRoot(),
+      memory,
+      memoryRecallBudgetMs: 100,
+      complete: async (request) => {
+        modelCalls += 1;
+        const sections = request.messages[1]!.content.trim().split('\n').map((line) => JSON.parse(line));
+        for (const section of sections) modeledNpcIds.push(section.npcId);
+        return {
+          text: JSON.stringify({ decisions: sections.map(({ npcId }: { npcId: string }) => ({
+            npcId,
+            decision: { utterance: { lines: [`hello ${npcId}`] } },
+          })) }),
+          model: request.model, transport: 'mock', latencyMs: 1,
+        };
+      },
+    });
+    for (const npcId of ['fast-a', 'expired', 'fast-b']) brain.attach('arena', npcId);
+    const decisions = await brain.decideBatch(
+      [snapshot('fast-a'), snapshot('expired'), snapshot('fast-b')],
+      (current) => ({ deadlineMs: current.npcId === 'expired' ? 15 : 200 }),
+    );
+    expect(modelCalls).toBe(1);
+    expect(modeledNpcIds.sort()).toEqual(['fast-a', 'fast-b']);
+    expect(decisions.map((decision) => decision.npcId).sort()).toEqual(['fast-a', 'fast-b']);
+  });
+
+  test('does not let a short-lived admitted member abort longer-lived members in the shared model call', async () => {
+    let modelCalls = 0;
+    let modeledNpcIds: string[] = [];
+    const brain = new NpcBrainService({
+      projectRoot: projectRoot(),
+      complete: async (request) => {
+        modelCalls += 1;
+        const sections = request.messages[1]!.content.trim().split('\n').map((line) => JSON.parse(line));
+        modeledNpcIds = sections.map(({ npcId }: { npcId: string }) => npcId);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return {
+          text: JSON.stringify({ decisions: sections.map(({ npcId }: { npcId: string }) => ({
+            npcId,
+            decision: { utterance: { lines: [`hello ${npcId}`] } },
+          })) }),
+          model: request.model,
+          transport: 'mock',
+          latencyMs: 150,
+        };
+      },
+    });
+    for (const npcId of ['short', 'long']) brain.attach('arena', npcId);
+
+    const decisions = await brain.decideBatch(
+      [snapshot('short'), snapshot('long')],
+      (current) => ({ deadlineMs: current.npcId === 'short' ? 100 : 500 }),
+    );
+
+    expect(modelCalls).toBe(1);
+    expect(modeledNpcIds.sort()).toEqual(['long', 'short']);
+    expect(decisions.map((decision) => decision.npcId)).toEqual(['long']);
   });
 
   test('does not feed heartbeat decisions back into working-memory prompts', async () => {

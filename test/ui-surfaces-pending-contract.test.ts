@@ -37,7 +37,10 @@ describe('GET /ui/surfaces/:id/pending — actions 与 items 必须同时存在'
     await app.request('/api/bus/ui/surfaces', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: ID, layer: 'host', actions: [{ id: 'selectTab' }] }),
+      // exposedToAI 必须显式为 true:本组用例全部走 dispatchToSurface(恒 source:'ai'),
+      // 而派发闸对已声明的 action 默认拒绝(缺键 = 隐藏)。这条 fixture 表达的一直是
+      // 「一条可被 AI 派发的动作」,补上声明是把它写实,不是放宽闸门。
+      body: JSON.stringify({ id: ID, layer: 'host', actions: [{ id: 'selectTab', exposedToAI: true }, { id: 'invoke', exposedToAI: true }] }),
     });
   });
 
@@ -108,7 +111,7 @@ describe('GET /ui/surfaces/:id/pending — actions 与 items 必须同时存在'
     await fresh.request('/api/bus/ui/surfaces', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: 'ui.anon.count', layer: 'host', actions: [{ id: 'x' }] }),
+      body: JSON.stringify({ id: 'ui.anon.count', layer: 'host', actions: [{ id: 'x', exposedToAI: true }] }),
     });
     await fresh.request('/api/bus/ui/surfaces/ui.anon.count/pending');
     await fresh.request('/api/bus/ui/surfaces/ui.anon.count/pending?page=pCCC');

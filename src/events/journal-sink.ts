@@ -61,15 +61,29 @@ function isBusCorrelationId(value: unknown): value is string {
 const MAX_REDACTION_DEPTH = 8;
 const MAX_STRING_LENGTH = 4_096;
 
-function truncateSecretish(value: string): string {
-  return value.length <= MAX_STRING_LENGTH ? value : `${value.slice(0, MAX_STRING_LENGTH)}[truncated]`;
+/** 脱敏过程里"有没有真的剪掉过东西"的出参。剪切发生在树的任意深处,而调用方
+ *  (产品账本)要把这件事记成 `truncated:true` —— 返回值本身看不出来,只能靠它带出。 */
+export interface JournalSanitizeStats {
+  truncated: boolean;
+}
+
+function truncateSecretish(value: string, stats?: JournalSanitizeStats): string {
+  if (value.length <= MAX_STRING_LENGTH) return value;
+  if (stats) stats.truncated = true;
+  return `${value.slice(0, MAX_STRING_LENGTH)}[truncated]`;
 }
 
 /** 递归脱敏并**返回新对象**——原 envelope 还要发给别的订阅者,绝不能改它。
  *  深度上限防炸;循环引用在这里换成 '[circular]',而整条 payload 的
- *  `{unserializable:true}` 兜底仍由 serialize 的 try/catch 负责(两层各管各的)。 */
-function sanitize(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
-  if (typeof value === 'string') return truncateSecretish(value);
+ *  `{unserializable:true}` 兜底仍由 serialize 的 try/catch 负责(两层各管各的)。
+ *  `stats` 可选:传入才统计截断,原有三参调用方一字不改。 */
+export function sanitizeJournalValue(
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+  stats?: JournalSanitizeStats,
+): unknown {
+  if (typeof value === 'string') return truncateSecretish(value, stats);
   if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'undefined') return null;
@@ -80,7 +94,7 @@ function sanitize(value: unknown, depth = 0, seen = new WeakSet<object>()): unkn
   seen.add(value);
   if (Array.isArray(value)) {
     return value.map((item) => {
-      try { return sanitize(item, depth + 1, seen); } catch { return '[unreadable]'; }
+      try { return sanitizeJournalValue(item, depth + 1, seen, stats); } catch { return '[unreadable]'; }
     });
   }
   let keys: string[];
@@ -89,10 +103,21 @@ function sanitize(value: unknown, depth = 0, seen = new WeakSet<object>()): unkn
   for (const key of keys) {
     let fieldValue: unknown;
     try { fieldValue = Reflect.get(value, key); } catch { out[key] = '[unreadable]'; continue; }
+    // 顺序即协议(v0.1 §6):**先脱敏,再截断**。命中密钥名的字段整值换掉,绝不
+    // 走 truncateSecretish —— 否则 4096 字符的凭据前缀会以 `[truncated]` 的名义留在盘上。
     if (SECRET_KEY_PATTERN.test(key) && !isBusCorrelationId(fieldValue)) { out[key] = '[redacted]'; continue; }
-    try { out[key] = sanitize(fieldValue, depth + 1, seen); } catch { out[key] = '[unreadable]'; }
+    try { out[key] = sanitizeJournalValue(fieldValue, depth + 1, seen, stats); } catch { out[key] = '[unreadable]'; }
   }
   return out;
+}
+
+/** `sanitizeJournalValue` 的同胞:脱敏结果连同"这一趟有没有剪过东西"一起返回。
+ *  产品账本(product-ai-native-ledger)据此记 `truncated:true` —— 协议 v0.1 §6
+ *  要求任何截断都留痕,而字符串级剪切此前只有 8KB 总量超限才被记录。 */
+export function sanitizeJournalValueWithStats(value: unknown): { value: unknown; truncated: boolean } {
+  const stats: JournalSanitizeStats = { truncated: false };
+  const sanitized = sanitizeJournalValue(value, 0, new WeakSet<object>(), stats);
+  return { value: sanitized, truncated: stats.truncated };
 }
 
 function payloadKeys(payload: unknown): string[] {
@@ -117,7 +142,7 @@ export function installEventJournal(opts: { projectRoot: string }): () => void {
     let serialized: string;
     try {
       // 脱敏产出新对象,不动原 envelope(它还要发给别的订阅者)。
-      serialized = JSON.stringify({ ...envelope, payload: sanitize(envelope.payload) });
+      serialized = JSON.stringify({ ...envelope, payload: sanitizeJournalValue(envelope.payload) });
     } catch {
       serialized = JSON.stringify({
         ...envelope,

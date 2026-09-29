@@ -9,6 +9,7 @@
 // src/main.ts **已走这条 (a) 路径**:build ctx -> createForgeaxApp(ctx) -> Bun.serve,
 // 自己只负责 Bun.serve + 静态 SPA + engine/interface 进程 spawn + vite 代理。
 
+import type { HeadersInit } from 'bun';
 import { Hono } from 'hono';
 import { join } from 'node:path';
 import type { AgentKernel } from '@forgeax/agent-runtime';
@@ -42,6 +43,8 @@ import {
 } from './api/llm-test';
 import { createNpcRouter } from './api/npc';
 import { NpcRuntime } from './npc-brain/runtime';
+import type { NpcMemoryRuntimeBinding } from './npc-brain/memory-host-seam';
+import type { ProductNpcAgentRecordResolver } from './npc-brain/service';
 import { createUsageRouter } from './api/usage';
 import { createToolsRouter } from './api/tools';
 import { createEventsRouter } from './api/events';
@@ -93,6 +96,8 @@ export interface ProductContext {
   resourceRoot?: string;
   /** Private runtime instance root (.forgeax/). User projects are games. */
   instanceRoot: string;
+  /** Server-only partial resolver for product-owned NPC AgentRecords. */
+  npcSoulResolver?: ProductNpcAgentRecordResolver;
   /** Port assignments for the product processes. */
   ports?: {
     server?: number;
@@ -121,6 +126,12 @@ export interface ProductContext {
    *  stays under the user root (`~/.forgeax`), i.e. standalone-CLI behavior.
    *  Keys / kits / settings never follow this root. */
   stateRootFactory?: (instanceRoot: string) => string;
+  /** Already-started NPC memory binding. The product shell owns provider/
+   * outbox lifecycle; HTTP and WS share the single NpcRuntime created here.
+   * Omitted preserves the exact legacy/off path. */
+  npcMemory?: NpcMemoryRuntimeBinding;
+  /** Optional per-decision budget for provider memory recall. */
+  npcMemoryRecallBudgetMs?: number;
   /** Business routers injected by the shell, mounted after the static cli routers
    *  (order/path unchanged for the static set). Replaces the per-feature static
    *  mounts as business migrates out of cli (Stage A §3). Each entry mounts at
@@ -204,6 +215,79 @@ export function mountExtensionHost(
   app: Hono,
   host: Parameters<typeof createHonoExtensionRouter>[0],
 ): void {
+  const byId = new Hono();
+  byId.all('/by-id/:slug/*', async (c) => {
+    const maxBodyBytes = 1_048_576;
+    const declaredBodyBytes = Number(c.req.header('content-length') ?? 0);
+    if (Number.isFinite(declaredBodyBytes) && declaredBodyBytes > maxBodyBytes) {
+      return c.json({ error: 'request body is too large' }, 413);
+    }
+    const gameId = c.req.query('gameId');
+    if (!gameId) return c.json({ error: 'gameId is required' }, 400);
+
+    const slug = c.req.param('slug');
+    const catalog = await host.catalog(gameId);
+    const matches = Array.isArray(catalog)
+      ? catalog.filter((candidate): candidate is {
+          extensionId: string;
+          runtimeId: string;
+        } => {
+          if (!candidate || typeof candidate !== 'object') return false;
+          const entry = candidate as Record<string, unknown>;
+          return typeof entry.extensionId === 'string'
+            && typeof entry.runtimeId === 'string'
+            && entry.extensionId.replace(/^@[^/]+\//, '') === slug;
+        })
+      : [];
+    if (matches.length === 0) {
+      return c.json({ error: `extension not found: ${slug}` }, 404);
+    }
+    if (matches.length !== 1) {
+      return c.json({ error: `extension slug is ambiguous: ${slug}` }, 409);
+    }
+
+    const url = new URL(c.req.url);
+    const pathParts = url.pathname.split('/');
+    const byIdIndex = pathParts.indexOf('by-id');
+    const extensionPath = url.pathname
+      .split('/')
+      .slice(byIdIndex + 2)
+      .filter(Boolean)
+      .map((part) => decodeURIComponent(part))
+      .join('/');
+    const query: Record<string, string[]> = {};
+    for (const [key, value] of url.searchParams) {
+      if (key !== 'gameId') (query[key] ??= []).push(value);
+    }
+    const headers: Record<string, string[]> = {};
+    for (const [key, value] of c.req.raw.headers) headers[key] = [value];
+    const body = c.req.method === 'GET' || c.req.method === 'HEAD'
+      ? new Uint8Array()
+      : new Uint8Array(await c.req.arrayBuffer());
+    if (body.byteLength > maxBodyBytes) {
+      return c.json({ error: 'request body is too large' }, 413);
+    }
+    const response = await host.extension({
+      gameId,
+      runtimeId: matches[0]!.runtimeId,
+      path: extensionPath,
+      query,
+      method: c.req.method,
+      headers,
+      body,
+    });
+    return new Response(
+      c.req.method === 'HEAD' || response.body === undefined
+        ? null
+        : Uint8Array.from(response.body),
+      {
+        status: response.status,
+        headers: response.headers as ResponseInit["headers"],
+      },
+    );
+  });
+  app.route('/api/extension-runtime', byId);
+  app.route('/__extension__/v1', byId);
   app.route(
     '/__extension__/v1',
     createHonoExtensionRouter(host, { prefix: '/__extension__/v1' }),
@@ -278,7 +362,14 @@ export async function createForgeaxApp(ctx: ProductContext): Promise<ForgeaxApp>
 
   const app = new Hono();
   if (ctx.extensionHost) mountExtensionHost(app, ctx.extensionHost);
-  const npcRuntime = new NpcRuntime({ projectRoot: instanceRoot });
+  const npcRuntime = new NpcRuntime({
+    projectRoot: instanceRoot,
+    memory: ctx.npcMemory,
+    memoryRecallBudgetMs: ctx.npcMemoryRecallBudgetMs,
+  });
+  if (ctx.npcSoulResolver) {
+    npcRuntime.brain.setProductAgentRecordResolver(ctx.npcSoulResolver);
+  }
 
   // 给每个 /api/* 请求建立 ALS session 作用域(从 query/path/JSON body 解析 sid),
   // 让 handler(含 streamSSE 流体)里的 console.* 经 logger bridge 落对应 session

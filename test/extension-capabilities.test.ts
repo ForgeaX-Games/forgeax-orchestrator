@@ -41,6 +41,27 @@ describe('ExtensionCapabilityRegistry', () => {
     }]);
   });
 
+  test('keeps a legacy Extension Host caller anonymous instead of inventing identity', async () => {
+    const registry = new ExtensionCapabilityRegistry();
+    const anonymousContext: ExtensionCapabilityInvocationContext = {
+      ...context,
+      caller: { kind: 'extension', identityState: 'unavailable' },
+    };
+    let observed: ExtensionCapabilityInvocationContext | undefined;
+    registry.control.registerProvider({
+      capabilityId: 'media.video.generate',
+      version: 1,
+      async invoke(_input, _options, invocationContext) {
+        observed = invocationContext;
+        return { ok: true };
+      },
+    });
+
+    await registry.scoped(anonymousContext).invoke('media.video.generate', 1, {});
+
+    expect(observed?.caller).toEqual({ kind: 'extension', identityState: 'unavailable' });
+  });
+
   test('reports missing and ambiguous providers with stable capability codes', async () => {
     const missing = new ExtensionCapabilityRegistry();
     await expect(missing.scoped(context).invoke('media.video.generate', 1, {})).rejects.toMatchObject({

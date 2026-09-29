@@ -115,4 +115,117 @@ describe('claude-code-mapper tool names', () => {
       args: { outcome: 'done', files: [] },
     }]);
   });
+
+  test('keeps MCP business text visible while carrying ForgeaX trace metadata out-of-band', () => {
+    const state = createClaudeMapperState();
+    mapClaudeEvent({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tc-meta', name: 'mcp__fxt__ui_snapshot' },
+      },
+    } as ClaudeRawEvent, state);
+    mapClaudeEvent({
+      type: 'stream_event',
+      event: { type: 'content_block_stop', index: 0 },
+    } as ClaudeRawEvent, state);
+
+    const [result] = mapClaudeEvent({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tc-meta', content: 'BUSINESS_OK' }],
+      },
+      tool_use_result: {
+        content: { count: 1 },
+        _meta: { forgeax: { toolExecutionId: 'fxt-claude-1' } },
+      },
+    } as ClaudeRawEvent, state);
+
+    expect(result).toMatchObject({
+      type: 'tool-result',
+      callId: 'tc-meta',
+      ok: true,
+      result: {
+        text: 'BUSINESS_OK',
+        _meta: { forgeax: { toolExecutionId: 'fxt-claude-1' } },
+      },
+    });
+  });
+
+  test('keeps MCP structuredContent beside ForgeaX trace metadata', () => {
+    const state = createClaudeMapperState();
+    const [result] = mapClaudeEvent({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tc-structured', content: 'BUSINESS_OK' }],
+      },
+      tool_use_result: {
+        structuredContent: { rows: 2, cursor: 'next' },
+        _meta: { forgeax: { toolExecutionId: 'fxt-claude-structured-1' } },
+      },
+    } as ClaudeRawEvent, state);
+
+    expect(result).toMatchObject({
+      type: 'tool-result',
+      callId: 'tc-structured',
+      ok: true,
+      result: {
+        text: 'BUSINESS_OK',
+        structuredContent: { rows: 2, cursor: 'next' },
+        _meta: { forgeax: { toolExecutionId: 'fxt-claude-structured-1' } },
+      },
+    });
+  });
+
+  test('keeps non-ForgeaX metadata from changing a plain business result into an object', () => {
+    const state = createClaudeMapperState();
+    const [result] = mapClaudeEvent({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tc-provider-meta', content: 'BUSINESS_OK' }],
+      },
+      tool_use_result: { _meta: { provider: 'other' } },
+    } as ClaudeRawEvent, state);
+
+    expect(result).toMatchObject({
+      type: 'tool-result',
+      callId: 'tc-provider-meta',
+      ok: true,
+      result: 'BUSINESS_OK',
+    });
+  });
+
+  test('keeps ForgeaX trace metadata on failed MCP results', () => {
+    const state = createClaudeMapperState();
+    const [result] = mapClaudeEvent({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tc-error-meta',
+          content: 'HOST_REJECTED',
+          is_error: true,
+        }],
+      },
+      tool_use_result: {
+        _meta: { forgeax: { toolExecutionId: 'fxt-claude-error-1' } },
+      },
+    } as ClaudeRawEvent, state);
+
+    expect(result).toMatchObject({
+      type: 'tool-result',
+      callId: 'tc-error-meta',
+      ok: false,
+      error: 'HOST_REJECTED',
+      result: {
+        text: 'HOST_REJECTED',
+        _meta: { forgeax: { toolExecutionId: 'fxt-claude-error-1' } },
+      },
+    });
+  });
 });

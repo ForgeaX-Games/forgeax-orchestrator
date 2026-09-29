@@ -38,7 +38,7 @@ export interface StartSessionReq {
   /** serve 模式:per-session unix-sock 路径(adapter 提供,Host 回显)。 */
   endpoint?: string;
 }
-export interface SessionGrant { sessionId: string; pid: number; pgid: number; scopedToken?: string; baseUrl?: string; endpoint?: string }
+export interface SessionGrant { sessionId: string; pid: number; pgid: number | null; scopedToken?: string; baseUrl?: string; endpoint?: string }
 export interface ExitInfo { sessionId: string; code: number | null; signal: string | null; reason: string }
 export interface PingResult { pid: number; uptimeMs: number; version: string; sessions: number }
 
@@ -136,7 +136,7 @@ export class SidecarClient {
   /** 请整个 sidecar 进程优雅退出(reap 所有 session + 关 socket + exit)。用于凭据变更后
    *  强制 sidecar 重生以**重读进程 env**(cred-vault 的真 key/upstream 在 spawn 时冻结)。 */
   shutdown(): Promise<void> { return this.request('shutdown') as Promise<void>; }
-  getProcess(sessionId: string): Promise<{ pid: number; pgid: number } | null> { return this.request('getProcess', { sessionId }) as Promise<{ pid: number; pgid: number } | null>; }
+  getProcess(sessionId: string): Promise<{ pid: number; pgid: number | null } | null> { return this.request('getProcess', { sessionId }) as Promise<{ pid: number; pgid: number | null } | null>; }
   listSessions(): Promise<unknown[]> { return this.request('listSessions') as Promise<unknown[]>; }
   onExit(cb: (info: ExitInfo) => void): () => void { this.exitCbs.add(cb); return () => this.exitCbs.delete(cb); }
   onData(cb: (d: { sessionId: string; stream: 'stdout' | 'stderr'; chunk: string }) => void): () => void { this.dataCbs.add(cb); return () => this.dataCbs.delete(cb); }

@@ -23,6 +23,7 @@ import {
 import type { TrustTier } from '../soul';
 import { findSoulPack } from '../soul/soul-pack-loader';
 import { NpcBatchCollector } from './batch-collector';
+import type { NpcMemoryRuntimeBinding } from './memory-host-seam';
 
 export interface NpcSessionGrant {
   sessionId: string;
@@ -52,14 +53,36 @@ export interface NpcSession extends NpcSessionGrant {
 export interface NpcRuntimeConfig {
   projectRoot: string;
   brain?: NpcBrainService;
+  memory?: NpcMemoryRuntimeBinding;
   sessionTtlMs?: number;
   now?: () => number;
   maxSessions?: number;
+  /** Per-decision provider recall budget passed to the Brain. */
+  memoryRecallBudgetMs?: number;
+}
+
+/** Process-lifecycle boundary for NPC work. Await this before stopping a
+ * durable memory host: success means no admitted decision can append after
+ * session settlement starts. */
+export interface NpcRuntimeQuiesceOptions {
+  /** Abort accepted decision work, then still wait for its stable boundary. */
+  signal?: AbortSignal;
+}
+
+export interface NpcRuntimeQuiesceResult {
+  sessions: number;
+  settled: number;
 }
 
 export interface NpcWsClientData {
   id: string;
   npc: { sessionId: string; token: string };
+}
+
+function validateOptionalNonNegativeFinite(value: number | undefined, name: string): void {
+  if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+    throw new TypeError(`${name} must be a finite non-negative number`);
+  }
 }
 
 export class NpcRuntime {
@@ -71,9 +94,17 @@ export class NpcRuntime {
   readonly #maxSessions: number;
   readonly #projectRoot: string;
   readonly #enforceDeclaredPacks: boolean;
+  readonly #activeOperations = new Map<symbol, { controller: AbortController; done: Promise<void> }>();
+  #admissionsClosed = false;
+  #quiescence?: Promise<NpcRuntimeQuiesceResult>;
 
   constructor(config: NpcRuntimeConfig) {
-    this.brain = config.brain ?? new NpcBrainService({ projectRoot: config.projectRoot });
+    validateOptionalNonNegativeFinite(config.memoryRecallBudgetMs, 'memoryRecallBudgetMs');
+    this.brain = config.brain ?? new NpcBrainService({
+      projectRoot: config.projectRoot,
+      memory: config.memory,
+      memoryRecallBudgetMs: config.memoryRecallBudgetMs,
+    });
     this.#projectRoot = config.projectRoot;
     // An injected Brain owns its loader contract (tests and deployment-C use this).
     // The normal Studio runtime must never silently replace an explicitly bound Soul.
@@ -84,6 +115,7 @@ export class NpcRuntime {
   }
 
   createSession(input: unknown): NpcSessionGrant {
+    this.#assertAdmitting();
     const request = npcSessionRequestSchema.parse(input);
     this.prune();
     if (this.#sessions.size >= this.#maxSessions) throw new Error('session capacity reached');
@@ -106,17 +138,19 @@ export class NpcRuntime {
   }
 
   async preloadSession(session: NpcSession): Promise<void> {
-    for (const binding of session.soulBindings.values()) this.#assertDeclaredPack(binding);
-    const loaded = await this.brain.preload(
-      session.game,
-      session.soulBindings.values(),
-      session.playerId,
-    );
-    const trustBySoul = new Map(loaded.map((item) => [item.soulId, item.trustTier]));
-    for (const binding of session.soulBindings.values()) {
-      binding.trustTier = trustBySoul.get(binding.soulId);
-    }
-    for (const npcId of session.npcIds) this.brain.attach(session.game, npcId);
+    await this.#runOperation(undefined, async () => {
+      for (const binding of session.soulBindings.values()) this.#assertDeclaredPack(binding);
+      const loaded = await this.brain.preload(
+        session.game,
+        session.soulBindings.values(),
+        session.playerId,
+      );
+      const trustBySoul = new Map(loaded.map((item) => [item.soulId, item.trustTier]));
+      for (const binding of session.soulBindings.values()) {
+        binding.trustTier = trustBySoul.get(binding.soulId);
+      }
+      for (const npcId of session.npcIds) this.brain.attach(session.game, npcId);
+    });
   }
 
   authorize(sessionId: string | undefined, token: string | undefined): NpcSession | undefined {
@@ -136,32 +170,44 @@ export class NpcRuntime {
     input: unknown,
     options: Omit<NpcBrainDecideOptions, 'soulId'> = {},
   ): Promise<NpcDecisionWire | undefined> {
-    const snapshot = perceptionSnapshotSchema.parse(input);
-    const binding = session.soulBindings.get(snapshot.npcId);
-    if (snapshot.game !== session.game || !binding) {
-      throw new Error('snapshot outside session capability');
-    }
-    const decision = await this.brain.decide(
-      { ...snapshot, playerId: session.playerId },
-      {
-        ...options,
-        deadlineMs: options.deadlineMs ?? binding.decisionTimeoutMs,
-        soulId: binding.soulId,
-      },
-    );
-    if (!decision) return undefined;
-    session.lastSeq.set(decision.npcId, decision.seq);
-    const replay = session.replay.get(decision.npcId) ?? [];
-    replay.push(decision);
-    if (replay.length > 128) replay.splice(0, replay.length - 128);
-    session.replay.set(decision.npcId, replay);
-    return decision;
+    return this.#runOperation(options.signal, async (signal) => {
+      const snapshot = perceptionSnapshotSchema.parse(input);
+      const binding = session.soulBindings.get(snapshot.npcId);
+      if (snapshot.game !== session.game || !binding) {
+        throw new Error('snapshot outside session capability');
+      }
+      const decision = await this.brain.decide(
+        { ...snapshot, playerId: session.playerId },
+        {
+          ...options,
+          signal,
+          deadlineMs: options.deadlineMs ?? binding.decisionTimeoutMs,
+          soulId: binding.soulId,
+        },
+      );
+      if (!decision) return undefined;
+      session.lastSeq.set(decision.npcId, decision.seq);
+      const replay = session.replay.get(decision.npcId) ?? [];
+      replay.push(decision);
+      if (replay.length > 128) replay.splice(0, replay.length - 128);
+      session.replay.set(decision.npcId, replay);
+      return decision;
+    });
   }
 
   async decideBatch(
     session: NpcSession,
     inputs: unknown[],
     options: Omit<NpcBrainDecideOptions, 'soulId'> = {},
+  ): Promise<NpcDecisionWire[]> {
+    return this.#runOperation(options.signal, (signal) => this.#decideBatch(session, inputs, options, signal));
+  }
+
+  async #decideBatch(
+    session: NpcSession,
+    inputs: unknown[],
+    options: Omit<NpcBrainDecideOptions, 'soulId'>,
+    signal: AbortSignal,
   ): Promise<NpcDecisionWire[]> {
     const snapshots = inputs.map((input) => perceptionSnapshotSchema.parse(input));
     for (const snapshot of snapshots) {
@@ -182,6 +228,7 @@ export class NpcRuntime {
         const binding = session.soulBindings.get(snapshot.npcId)!;
         return {
           ...options,
+          signal,
           deadlineMs: options.deadlineMs ?? binding.decisionTimeoutMs,
           soulId: binding.soulId,
         };
@@ -197,22 +244,24 @@ export class NpcRuntime {
   }
 
   async attach(session: NpcSession, binding: NpcSoulBinding): Promise<ResolvedNpcSoulBinding> {
-    if (!session.soulBindings.has(binding.npcId) && session.soulBindings.size >= NPC_LIMITS.maxSessionNpcs) {
-      throw new Error('session NPC capacity reached');
-    }
-    const resolved: ResolvedNpcSoulBinding = {
-      npcId: binding.npcId,
-      soulId: binding.soulId ?? `${session.game}.${binding.npcId}`,
-      decisionTimeoutMs: resolveNpcDecisionDeadlineMs(binding.decisionDeadline),
-      requiresPack: binding.soulId !== undefined,
-    };
-    this.#assertDeclaredPack(resolved);
-    session.npcIds.add(resolved.npcId);
-    session.soulBindings.set(resolved.npcId, resolved);
-    const [loaded] = await this.brain.preload(session.game, [resolved], session.playerId);
-    resolved.trustTier = loaded?.trustTier;
-    this.brain.attach(session.game, resolved.npcId);
-    return resolved;
+    return this.#runOperation(undefined, async () => {
+      if (!session.soulBindings.has(binding.npcId) && session.soulBindings.size >= NPC_LIMITS.maxSessionNpcs) {
+        throw new Error('session NPC capacity reached');
+      }
+      const resolved: ResolvedNpcSoulBinding = {
+        npcId: binding.npcId,
+        soulId: binding.soulId ?? `${session.game}.${binding.npcId}`,
+        decisionTimeoutMs: resolveNpcDecisionDeadlineMs(binding.decisionDeadline),
+        requiresPack: binding.soulId !== undefined,
+      };
+      this.#assertDeclaredPack(resolved);
+      session.npcIds.add(resolved.npcId);
+      session.soulBindings.set(resolved.npcId, resolved);
+      const [loaded] = await this.brain.preload(session.game, [resolved], session.playerId);
+      resolved.trustTier = loaded?.trustTier;
+      this.brain.attach(session.game, resolved.npcId);
+      return resolved;
+    });
   }
 
   detach(session: NpcSession, npcId: string): boolean {
@@ -244,12 +293,41 @@ export class NpcRuntime {
     const existing = this.#settlements.get(session.sessionId);
     if (existing && existing.expiresAt > this.#now()) return existing.promise;
     const settlement = this.brain.settle(session.game, session.playerId, session.npcIds)
-      .finally(() => this.#sessions.delete(session.sessionId));
+      .then((result) => {
+        this.#sessions.delete(session.sessionId);
+        return result;
+      })
+      .catch((error) => {
+        // A failed durable handoff is retryable. Do not memoize the rejection
+        // or discard the session capability needed by the lifecycle supervisor.
+        this.#settlements.delete(session.sessionId);
+        throw error;
+      });
     this.#settlements.set(session.sessionId, {
       promise: settlement,
       expiresAt: this.#now() + this.#sessionTtlMs,
     });
     return settlement;
+  }
+
+  /**
+   * Close new NPC work, wait for all admitted decisions to stop, then settle
+   * the captured sessions one at a time. Rejection leaves failed settlement
+   * state retryable; a caller must not stop the memory host after rejection.
+   */
+  async quiesce(options: NpcRuntimeQuiesceOptions = {}): Promise<NpcRuntimeQuiesceResult> {
+    if (this.#quiescence) return this.#quiescence;
+    this.#admissionsClosed = true;
+    const work = this.#quiesce(options);
+    this.#quiescence = work;
+    try {
+      return await work;
+    } catch (error) {
+      // Keep admission closed while allowing a transient durable failure to be
+      // retried without a new decision racing that retry.
+      if (this.#quiescence === work) this.#quiescence = undefined;
+      throw error;
+    }
   }
 
   prune(): void {
@@ -290,6 +368,53 @@ export class NpcRuntime {
     if (!this.#enforceDeclaredPacks || !binding.requiresPack) return;
     if (!findSoulPack(binding.soulId, this.#projectRoot)) {
       throw new Error(`Declared Soul pack not found: ${binding.soulId}`);
+    }
+  }
+
+  #assertAdmitting(): void {
+    if (this.#admissionsClosed) throw new Error('NPC runtime is quiescing; new work is not admitted');
+  }
+
+  async #runOperation<T>(parent: AbortSignal | undefined, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    this.#assertAdmitting();
+    const id = Symbol('npc-runtime-operation');
+    const controller = new AbortController();
+    const abortFromParent = () => controller.abort(parent?.reason ?? new Error('NPC operation aborted'));
+    if (parent?.aborted) abortFromParent();
+    else parent?.addEventListener('abort', abortFromParent, { once: true });
+    let resolveDone!: () => void;
+    const done = new Promise<void>((resolve) => { resolveDone = resolve; });
+    this.#activeOperations.set(id, { controller, done });
+    try {
+      return await run(controller.signal);
+    } finally {
+      parent?.removeEventListener('abort', abortFromParent);
+      this.#activeOperations.delete(id);
+      resolveDone();
+    }
+  }
+
+  async #quiesce(options: NpcRuntimeQuiesceOptions): Promise<NpcRuntimeQuiesceResult> {
+    const abortAccepted = () => {
+      for (const { controller } of this.#activeOperations.values()) {
+        controller.abort(options.signal?.reason ?? new Error('NPC runtime is quiescing'));
+      }
+    };
+    if (options.signal?.aborted) abortAccepted();
+    else options.signal?.addEventListener('abort', abortAccepted, { once: true });
+    try {
+      // Admission is closed before the snapshot, so this complete set cannot
+      // grow. This barrier protects a following durable-outbox stop.
+      await Promise.all([...this.#activeOperations.values()].map(({ done }) => done));
+      const sessions = [...this.#sessions.values()];
+      let settled = 0;
+      // Working state is keyed by game/player/NPC rather than transport
+      // session. Sequential end() lets the first durable handoff dispose a
+      // shared state before a duplicate session observes it.
+      for (const session of sessions) settled += await this.end(session);
+      return { sessions: sessions.length, settled };
+    } finally {
+      options.signal?.removeEventListener('abort', abortAccepted);
     }
   }
 }

@@ -26,96 +26,97 @@
  *     written, throw — a required-tools turn must not silently degrade to a
  *     tool-less run.
  */
-import type { ToolSpec, TurnRequest } from '@forgeax/agent-runtime';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join, resolve as resolvePath } from 'node:path';
-import { defaultProjectRoot } from '@forgeax/platform-io';
-import { isProjectMcpToolName } from '../project-mcp';
-import { resolveBundledBunExecutable } from '../../cli-providers/mcp/permission-server-entry';
+import type { ToolSpec, TurnRequest } from "@forgeax/agent-runtime";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve as resolvePath } from "node:path";
+import { defaultProjectRoot } from "@forgeax/platform-io";
+import { isProjectMcpToolName } from "../project-mcp";
+import { issueKernelToolCapability } from "../kernel-tool-capability";
+import { resolveBundledBunExecutable } from "../../cli-providers/mcp/permission-server-entry";
 
 /** Tools the `fxt` MCP server implements locally (not host-bridged). Kept in
  *  sync with `forgeax-tools-server.mjs`'s builtin `TOOLS` map. Exported as the
  *  single source of truth so kernel profiles don't each hardcode the list. */
 export const FXT_BUILTIN_TOOLS: ReadonlySet<string> = new Set([
-  'echo',
-  'list_games',
-  'memory_search',
-  'remember',
-  'query_world',
-  'capture_frame',
-  'ui_snapshot',
-  'ui_invoke',
-  'ui_screenshot',
+	"echo",
+	"list_games",
+	"memory_search",
+	"remember",
+	"query_world",
+	"capture_frame",
+	"ui_snapshot",
+	"ui_invoke",
+	"ui_screenshot",
 ]);
 
 export interface ForgeaxToolsRuntime {
-  /** Executable to spawn the MCP server (node / current runtime). */
-  command: string;
-  /** Argv for the MCP server script. */
-  args: string[];
-  /** Per-turn tool allowlist (deduped, order-preserving), derived from req.tools. */
-  enabledTools: string[];
-  /** FORGEAX_* env the MCP child inherits (server url, sid, agent, specs, expose). */
-  env: Record<string, string>;
-  /** Absolute path to the per-turn temp dir (owned by this runtime). */
-  dir: string;
-  /** Absolute path to the written specs JSON. */
-  specsFile: string;
-  /** Idempotent teardown of the temp dir. Safe to call multiple times. */
-  cleanup(): Promise<void>;
+	/** Executable to spawn the MCP server (node / current runtime). */
+	command: string;
+	/** Argv for the MCP server script. */
+	args: string[];
+	/** Per-turn tool allowlist (deduped, order-preserving), derived from req.tools. */
+	enabledTools: string[];
+	/** FORGEAX_* env the MCP child inherits (server url, sid, agent, specs, expose). */
+	env: Record<string, string>;
+	/** Absolute path to the per-turn temp dir (owned by this runtime). */
+	dir: string;
+	/** Absolute path to the written specs JSON. */
+	specsFile: string;
+	/** Idempotent teardown of the temp dir. Safe to call multiple times. */
+	cleanup(): Promise<void>;
 }
 
 export interface MaterializeOptions {
-  /** Stable-ish id folded into the temp dir name for traceability (e.g. callId). */
-  runtimeId: string;
-  /** Per-kernel posture for MCP clients whose native permission callback does
-   * not observe tools executed through this per-turn server. */
-  permissionMode?: 'gated' | 'unrestricted';
-  /** Drop perception tools (query_world / capture_frame) from the server. */
-  disablePerception?: boolean;
-  /** Drop the ui_* bridge tools from the server. */
-  disableUiBridge?: boolean;
-  /**
-   * Project MCP execution path. `host` keeps canonical project tools in the
-   * fxt specs so they cross the server trust gate; `native` leaves those tools
-   * to the provider's native MCP config and removes them from fxt entirely.
-   */
-  projectMcpMode?: 'host' | 'native';
+	/** Stable-ish id folded into the temp dir name for traceability (e.g. callId). */
+	runtimeId: string;
+	/** Per-kernel posture for MCP clients whose native permission callback does
+	 * not observe tools executed through this per-turn server. */
+	permissionMode?: "gated" | "unrestricted";
+	/** Drop perception tools (query_world / capture_frame) from the server. */
+	disablePerception?: boolean;
+	/** Drop the ui_* bridge tools from the server. */
+	disableUiBridge?: boolean;
+	/**
+	 * Project MCP execution path. `host` keeps canonical project tools in the
+	 * fxt specs so they cross the server trust gate; `native` leaves those tools
+	 * to the provider's native MCP config and removes them from fxt entirely.
+	 */
+	projectMcpMode?: "host" | "native";
 }
 
-const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
+const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? "18900";
 
 /** Resolve the stdio MCP entry outside the compiled server sidecar. Bun embeds
  * source modules under /$bunfs/root, but a child Bun process cannot execute
  * that virtual path. Desktop packaging therefore stages the entry as a real
  * resource and injects its absolute path. */
 export function resolveForgeaxToolsServerEntry(
-  env: NodeJS.ProcessEnv = process.env,
+	env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const staged = env.FORGEAX_TOOLS_SERVER_ENTRY?.trim();
-  return staged
-    ? resolvePath(staged)
-    : resolvePath(import.meta.dirname, 'forgeax-tools-server.mjs');
+	const staged = env.FORGEAX_TOOLS_SERVER_ENTRY?.trim();
+	return staged
+		? resolvePath(staged)
+		: resolvePath(import.meta.dirname, "forgeax-tools-server.mjs");
 }
 
 /** Deduplicate tool names, preserving first-seen order. */
 function dedupeToolNames(tools: readonly ToolSpec[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const t of tools) {
-    const name = t?.name?.trim();
-    if (name && !seen.has(name)) {
-      seen.add(name);
-      out.push(name);
-    }
-  }
-  return out;
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const t of tools) {
+		const name = t?.name?.trim();
+		if (name && !seen.has(name)) {
+			seen.add(name);
+			out.push(name);
+		}
+	}
+	return out;
 }
 
 /** Sanitize a runtime id into a filesystem-safe temp-dir fragment. */
 function safeFragment(id: string): string {
-  return (id || 'turn').replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 40) || 'turn';
+	return (id || "turn").replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 40) || "turn";
 }
 
 /**
@@ -126,77 +127,108 @@ function safeFragment(id: string): string {
  * (fail-closed: a required-tools turn must not proceed tool-less).
  */
 export async function materializeForgeaxToolsRuntime(
-  req: TurnRequest,
-  options: MaterializeOptions,
+	req: TurnRequest,
+	options: MaterializeOptions,
 ): Promise<ForgeaxToolsRuntime | undefined> {
-  const enabledTools = dedupeToolNames(req.tools ?? []);
-  if (enabledTools.length === 0) return undefined;
+	const enabledTools = dedupeToolNames(req.tools ?? []);
+	if (enabledTools.length === 0) return undefined;
 
-  // Unique per-turn temp dir: mkdtemp appends random chars, and we prefix the
-  // runtime id so concurrent turns of the same sid never collide (plan §5.1).
-  const dir = await mkdtemp(join(tmpdir(), `forgeax-fxt-${safeFragment(options.runtimeId)}-`));
-  const specsFile = join(dir, 'tool-specs.json');
+	// Unique per-turn temp dir: mkdtemp appends random chars, and we prefix the
+	// runtime id so concurrent turns of the same sid never collide (plan §5.1).
+	const dir = await mkdtemp(
+		join(tmpdir(), `forgeax-fxt-${safeFragment(options.runtimeId)}-`),
+	);
+	const specsFile = join(dir, "tool-specs.json");
 
-  // Specs file carries EVERY ToolSpec of the turn (name/description/inputSchema);
-  // the MCP server dedupes names it already implements as builtins. Written 0600.
-  const projectRoot = defaultProjectRoot();
-  const specs = (req.tools ?? [])
-    .filter((t) => options.projectMcpMode !== 'native' || !isProjectMcpToolName(t.name, projectRoot))
-    .map((t) => ({
-    name: t.name,
-    ...(t.capabilityId ? { capabilityId: t.capabilityId } : {}),
-    ...(t.capabilityGeneration !== undefined ? { capabilityGeneration: t.capabilityGeneration } : {}),
-    description: t.description ?? '',
-    inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
-    }));
+	// Specs file carries EVERY ToolSpec of the turn (name/description/inputSchema);
+	// the MCP server dedupes names it already implements as builtins. Written 0600.
+	const projectRoot = defaultProjectRoot();
+	const specs = (req.tools ?? [])
+		.filter(
+			(t) =>
+				options.projectMcpMode !== "native" ||
+				!isProjectMcpToolName(t.name, projectRoot),
+		)
+		.map((t) => ({
+			name: t.name,
+			...(t.capabilityId ? { capabilityId: t.capabilityId } : {}),
+			...(t.capabilityGeneration !== undefined
+				? { capabilityGeneration: t.capabilityGeneration }
+				: {}),
+			description: t.description ?? "",
+			inputSchema: t.inputSchema ?? { type: "object", properties: {} },
+		}));
 
-  const cleanup = async (): Promise<void> => {
-    try {
-      await rm(dir, { recursive: true, force: true });
-    } catch {
-      /* best-effort; a leftover temp dir is harmless */
-    }
-  };
+	const sid = req.hostSessionId?.trim() || req.session.threadId?.trim() || "";
+	const agentPath = req.session.agentId?.trim() || "forge";
+	const hostRoutedTools = specs.map((spec) => spec.name);
+	const sourceCapability = issueKernelToolCapability({
+		sid,
+		agentPath,
+		enabledTools: hostRoutedTools,
+	});
+	const sourceCapabilityFile = sourceCapability
+		? join(dir, "kernel-tool-capability")
+		: undefined;
 
-  try {
-    await writeFile(specsFile, JSON.stringify(specs), { mode: 0o600 });
-  } catch (e) {
-    // Fail closed: required tools but no specs → tear down and surface.
-    await cleanup();
-    throw new Error(
-      `forgeax-tools-runtime: failed to write specs file (${enabledTools.length} tools): ${(e as Error).message}`,
-    );
-  }
+	const cleanup = async (): Promise<void> => {
+		sourceCapability?.revoke();
+		try {
+			await rm(dir, { recursive: true, force: true });
+		} catch {
+			/* best-effort; a leftover temp dir is harmless */
+		}
+	};
 
-  const env: Record<string, string> = {
-    FORGEAX_PROJECT_ROOT: projectRoot,
-    FORGEAX_SOUL_AGENT: req.session.agentId?.trim() || 'default',
-    FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
-    // Real sid the UI listens on wins; synthetic thread id is only a fallback.
-    FORGEAX_SID: req.hostSessionId?.trim() || req.session.threadId?.trim() || '',
-    FORGEAX_AGENT: req.session.agentId?.trim() || 'forge',
-    FORGEAX_TOOL_SPECS_FILE: specsFile,
-    ...(options.permissionMode ? { FORGEAX_KERNEL_PERMISSION_MODE: options.permissionMode } : {}),
-    // Double-allowlist client side: the server filters BOTH list and call.
-    FORGEAX_FXT_EXPOSE: enabledTools.join(','),
-    ...(req.capabilityGeneration !== undefined
-      ? { FORGEAX_CAPABILITY_GENERATION: String(req.capabilityGeneration) }
-      : {}),
-    // The fxt child is never allowed to start project-local MCP itself. In
-    // `host` mode its specs are routed through /kernel-tool; in `native` mode
-    // the provider config owns the only project MCP process.
-    FORGEAX_DISABLE_PROJECT_MCP: '1',
-  };
-  if (options.disablePerception) env.FORGEAX_DISABLE_PERCEPTION = '1';
-  if (options.disableUiBridge) env.FORGEAX_DISABLE_UI_BRIDGE = '1';
+	try {
+		await writeFile(specsFile, JSON.stringify(specs), { mode: 0o600 });
+		if (sourceCapabilityFile && sourceCapability) {
+			await writeFile(sourceCapabilityFile, sourceCapability.token, {
+				mode: 0o600,
+			});
+		}
+	} catch (e) {
+		// Fail closed: required tools but no specs → tear down and surface.
+		await cleanup();
+		throw new Error(
+			`forgeax-tools-runtime: failed to write specs file (${enabledTools.length} tools): ${(e as Error).message}`,
+		);
+	}
 
-  return {
-    command: resolveBundledBunExecutable(),
-    args: [resolveForgeaxToolsServerEntry()],
-    enabledTools,
-    env,
-    dir,
-    specsFile,
-    cleanup,
-  };
+	const env: Record<string, string> = {
+		FORGEAX_PROJECT_ROOT: projectRoot,
+		FORGEAX_SOUL_AGENT: req.session.agentId?.trim() || "default",
+		FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
+		// Real sid the UI listens on wins; synthetic thread id is only a fallback.
+		FORGEAX_SID: sid,
+		FORGEAX_AGENT: agentPath,
+		...(sourceCapabilityFile
+			? { FORGEAX_KERNEL_TOOL_TOKEN_FILE: sourceCapabilityFile }
+			: {}),
+		FORGEAX_TOOL_SPECS_FILE: specsFile,
+		...(options.permissionMode
+			? { FORGEAX_KERNEL_PERMISSION_MODE: options.permissionMode }
+			: {}),
+		// Double-allowlist client side: the server filters BOTH list and call.
+		FORGEAX_FXT_EXPOSE: enabledTools.join(","),
+		...(req.capabilityGeneration !== undefined
+			? { FORGEAX_CAPABILITY_GENERATION: String(req.capabilityGeneration) }
+			: {}),
+		// The fxt child is never allowed to start project-local MCP itself. In
+		// `host` mode its specs are routed through /kernel-tool; in `native` mode
+		// the provider config owns the only project MCP process.
+		FORGEAX_DISABLE_PROJECT_MCP: "1",
+	};
+	if (options.disablePerception) env.FORGEAX_DISABLE_PERCEPTION = "1";
+	if (options.disableUiBridge) env.FORGEAX_DISABLE_UI_BRIDGE = "1";
+
+	return {
+		command: resolveBundledBunExecutable(),
+		args: [resolveForgeaxToolsServerEntry()],
+		enabledTools,
+		env,
+		dir,
+		specsFile,
+		cleanup,
+	};
 }

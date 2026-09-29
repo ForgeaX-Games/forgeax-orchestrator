@@ -113,7 +113,9 @@ describe('PRD M0-M2 deterministic acceptance', () => {
     for (const item of spotlight) brain.attach('acceptance', item.npcId);
 
     expect(await brain.decideBatch(spotlight)).toHaveLength(30);
-    expect(calls).toBe(1);
+    // The wire protocol can carry larger batches, while each structured-output
+    // model request is capped at eight NPCs for provider compatibility.
+    expect(calls).toBe(4);
     expect(frameMs).toBeLessThan(16.67);
   });
 

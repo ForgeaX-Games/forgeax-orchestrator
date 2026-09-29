@@ -38,7 +38,7 @@ describe('ui.surface.* ledger replay - DUAL-MODALITY 9.8', () => {
     await app.request('/api/bus/ui/surfaces', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: 'ui9.8r.a', layer: 'plugin', initialSnapshot: { v: 1 } }),
+      body: JSON.stringify({ id: 'ui9.8r.a', layer: 'plugin', initialSnapshot: { v: 1 }, actions: [{ id: 'select', exposedToAI: true }, { id: 'rename', exposedToAI: true }] }),
     });
     const events = getEventBus().recent('ui.surface.registered', 10);
     expect(events).toHaveLength(1);
@@ -84,7 +84,7 @@ describe('ui.surface.* ledger replay - DUAL-MODALITY 9.8', () => {
     await app.request('/api/bus/ui/surfaces', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: 'ui9.8r.a', layer: 'host' }),
+      body: JSON.stringify({ id: 'ui9.8r.a', layer: 'host', actions: [{ id: 'select', exposedToAI: true }, { id: 'rename', exposedToAI: true }]}),
     });
     const token = dispatchToSurface('ui9.8r.a', 'select', { id: 'fox' });
 
@@ -132,7 +132,7 @@ describe('ui.surface.* ledger replay - DUAL-MODALITY 9.8', () => {
     await app.request('/api/bus/ui/surfaces', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: 'ui9.8r.a', initialSnapshot: { v: 1 } }),
+      body: JSON.stringify({ id: 'ui9.8r.a', initialSnapshot: { v: 1 }, actions: [{ id: 'rename', exposedToAI: true }] }),
     });
     await app.request('/api/bus/ui/surfaces/ui9.8r.a/snapshot', {
       method: 'PUT',

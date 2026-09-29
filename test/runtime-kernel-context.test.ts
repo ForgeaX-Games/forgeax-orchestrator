@@ -712,6 +712,7 @@ describe("runtime kernel context", () => {
         message: "再回答一次口令",
         providerOverride: OVERRIDE_KERNEL,
         callId: "cli-runtime-turn",
+        clientMsgId: "client-echo-1",
       }),
     });
     expect(cli.status).toBe(200);
@@ -720,6 +721,12 @@ describe("runtime kernel context", () => {
     expect(sse).toContain("answer-3");
     expect(sse).toContain("event: done");
     expect(overrideRequests).toHaveLength(3);
+    const cliUserInput = (await session.getOrCreateLedger("root").readAllEvents())
+      .find((event) =>
+        event.type === "user_input" &&
+        event.payload?.content === "再回答一次口令"
+      );
+    expect(cliUserInput?.payload?.clientMsgId).toBe("client-echo-1");
     expect(overrideRequests[2]?.context?.messages).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

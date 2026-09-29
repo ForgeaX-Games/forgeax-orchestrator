@@ -298,6 +298,32 @@ describe('codex-appserver mapNotification', () => {
     expect(res.result).toEqual({ text: 't', structuredContent: { a: 1 } });
   });
 
+  test('mcpToolCall preserves result _meta beside model-visible text', async () => {
+    const st = createCodexNotifState();
+    const q = new KernelEventQueue();
+    mapCodexNotification('item/started', { item: { id: 'm-meta', type: 'mcpToolCall', server: 'fxt', tool: 'q' } }, st, q);
+    mapCodexNotification('item/completed', {
+      item: {
+        id: 'm-meta',
+        type: 'mcpToolCall',
+        server: 'fxt',
+        tool: 'q',
+        status: 'completed',
+        result: {
+          content: [{ type: 'text', text: 'BUSINESS_OK' }],
+          _meta: { forgeax: { toolExecutionId: 'fxt-codex-1' } },
+        },
+      },
+    }, st, q);
+    q.end();
+    const events = await collect(q);
+    const res = events.find((event) => event.kind === 'tool.result') as Extract<typeof events[number], { kind: 'tool.result' }>;
+    expect(res.result).toEqual({
+      text: 'BUSINESS_OK',
+      _meta: { forgeax: { toolExecutionId: 'fxt-codex-1' } },
+    });
+  });
+
   test('duplicate item/started for same id emits only one tool.call', async () => {
     const st = createCodexNotifState();
     const q = new KernelEventQueue();

@@ -134,13 +134,16 @@ describe('咽喉改道收口在能力实现层(两张嘴共用)', () => {
         peek: () => fakeSession,
         open: async () => fakeSession,
       })) as never,
+      projectRoot: () => root,
       loadAgentRecord: (async () => ({ trustTier: 'own' })) as never,
       checkKernelTool: (() => ({ outcome: 'allow' })) as never,
     });
 
     const out = await bridge('ui_invoke', { actionId: 'panel.toggle_chatpanel', args: {} }, 'sid-reroute', 'forge') as Record<string, unknown>;
+    const result = out.result as Record<string, unknown>;
 
-    expect(out.via).toBe('editor_ui_browse');
+    expect(out).toMatchObject({ status: 'completed', started: true });
+    expect(result.via).toBe('editor_ui_browse');
     expect(browseCalls[0]).toMatchObject({ verb: 'open', node: 'menu:window/聊天' });
   });
 });

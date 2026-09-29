@@ -1,6 +1,7 @@
 /** server↔sidecar 控制面冒烟:server 的 SidecarClient 连真 agent-host 进程,跑监督闭环。 */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { Subprocess } from 'bun';
+import { createServer } from 'node:net';
 import { resolve } from 'node:path';
 import { rmSync } from 'node:fs';
 import { SidecarClient, type ExitInfo, type SessionGrant } from '../src/kernel/sidecar-client';
@@ -87,5 +88,46 @@ describe('SidecarClient ↔ agent-host', () => {
 
     await c.shutdownSession('sc-write');
     c.close();
+  }, 20000);
+
+  test('guardian-owned session preserves null pgid in SessionGrant and getProcess', async () => {
+    const server = createServer((connection) => {
+      let buf = '';
+      connection.on('data', (chunk) => {
+        buf += chunk.toString();
+        let i: number;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i); buf = buf.slice(i + 1);
+          if (!line.trim()) continue;
+          const request = JSON.parse(line) as { id: number; method: string };
+          const result = request.method === 'startSession'
+            ? { sessionId: 'guardian-owned', pid: 4242, pgid: null }
+            : request.method === 'getProcess'
+              ? { pid: 4242, pgid: null }
+              : {};
+          connection.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n');
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(sock, () => resolve());
+    });
+
+    try {
+      const c = await SidecarClient.connect(sock);
+      try {
+        const grant = await c.startSession({
+          sessionId: 'guardian-owned', agentId: 'a', trustTier: 'own',
+          kernel: { kind: 'codex', credential: 'user-managed', cmd: 'true', args: [] },
+        });
+        expect(grant).toEqual({ sessionId: 'guardian-owned', pid: 4242, pgid: null });
+        expect(await c.getProcess('guardian-owned')).toEqual({ pid: 4242, pgid: null });
+      } finally {
+        c.close();
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   }, 20000);
 });

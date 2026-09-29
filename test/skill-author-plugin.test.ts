@@ -1,8 +1,7 @@
 /**
  * Phase D6 (1/4) — meta:author-plugin discovery + dispatch contract.
  *
- * Mirrors the real marketplace plugin at
- *   packages/marketplace/extensions/skill-author-plugin/
+ * Mirrors the exact published skill-author-plugin devDependency
  * into a /tmp scratch user root and verifies:
  *   1. The skill is registered with id `meta:author-plugin` and slash trigger
  *      `/author-plugin`.
@@ -15,7 +14,8 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, copyFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
 import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
@@ -24,10 +24,9 @@ import { _resetToolHandlerCacheForTests } from '../src/tools/registry';
 import { runSkill, listSkills } from '../src/skills/runner';
 import { _resetEventBusForTests } from '../src/events/bus';
 
-const REPO_ROOT = resolve(import.meta.dir, '../../..');
 const TMP = `/tmp/forgeax-skill-author-${process.pid}`;
 const PLUGIN_DIR = join(TMP, 'user', 'skill-author-plugin');
-const SRC_DIR = resolve(REPO_ROOT, 'packages/marketplace/extensions/skill-author-plugin');
+const SRC_DIR = dirname(createRequire(import.meta.url).resolve('@forgeax-extension/skill-author-plugin/package.json'));
 
 async function reload() {
   const scan = await scanAllExtensionOrigins({

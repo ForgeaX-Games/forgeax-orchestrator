@@ -18,6 +18,11 @@ import { _resetSnapshotForTests, _setSnapshotForTests } from '../src/extensions/
 import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { callTool, _resetConfirmsForTests, _resetToolHandlerCacheForTests } from '../src/tools/registry';
 import { initOrchestrationSeams, resetOrchestrationSeams } from '../src/orchestration-seams';
+import {
+  authorizeKernelToolCapability,
+  issueKernelToolCapability,
+  resetKernelToolCapabilitiesForTests,
+} from '../src/kernel/kernel-tool-capability';
 
 let root: string;
 let extensionRoot: string;
@@ -28,6 +33,7 @@ let innerCards: number;
 let innerDecision: 'allow' | 'deny';
 let executionMarker: string;
 let savedProjectRoot: string | undefined;
+let savedConformanceFlag: string | undefined;
 
 function bridgedTool(name: string, hostToolId: string): ToolDefinition {
   return markHostToolDefinition({
@@ -104,9 +110,18 @@ async function postTool(
   toolName: string,
   identity: { toolExecutionId?: string; callId?: string; turnCallId?: string } = {},
 ): Promise<any> {
+  const capability = issueKernelToolCapability({
+    sid,
+    agentPath: 'market-agent',
+    enabledTools: [toolName],
+  });
+  if (!capability) throw new Error('failed to issue kernel-tool capability for test');
   const response = await app.request(`/api/sessions/${sid}/kernel-tool`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'x-forgeax-kernel-token': capability.token,
+    },
     body: JSON.stringify({ agentPath: 'market-agent', toolName, args: {}, ...identity }),
   });
   return response.json();
@@ -117,6 +132,7 @@ beforeEach(async () => {
   extensionRoot = mkdtempSync(join(tmpdir(), 'forgeax-kernel-confirm-plugins-'));
   executionMarker = join(root, 'import-executions.log');
   savedProjectRoot = process.env.FORGEAX_PROJECT_ROOT;
+  savedConformanceFlag = process.env.FORGEAX_PRODUCT_AI_NATIVE_CONFORMANCE;
   process.env.FORGEAX_PROJECT_ROOT = root;
   const importedSoul = join(root, '.forgeax', 'souls-imported', 'market-agent', 'persona');
   mkdirSync(importedSoul, { recursive: true });
@@ -127,6 +143,7 @@ beforeEach(async () => {
   _resetToolHandlerCacheForTests();
   _resetConfirmsForTests();
   _resetEventBusForTests();
+  resetKernelToolCapabilitiesForTests();
   await loadTools();
 
   const pathManager = initPathManager({ userRoot: root });
@@ -150,12 +167,20 @@ beforeEach(async () => {
   // Model the current runtime contract: authorization starts from a live
   // instance's templateRef, then resolves trust through the Catalog.
   const fakeInstance = {
+    sid: session.sid,
+    runtimeConfig: { current: () => ({ value: {} }) },
     instanceId: 'res_market_agent',
     templateRef: 'tpl_market_agent',
     residentPath: 'market-agent',
     parentInstanceId: null,
     lifetime: 'resident',
     template: { definition: { id: 'market-agent' }, configuration: { toolGrants: { projectMcp: ['mcp__project__read'] } } },
+  };
+  const fakeChildInstance = {
+    ...fakeInstance,
+    instanceId: 'child-instance',
+    residentPath: undefined,
+    parentInstanceId: fakeInstance.instanceId,
   };
   (session.tree as unknown as { resolve: () => unknown }).resolve = () =>
     fakeInstance;
@@ -168,6 +193,10 @@ beforeEach(async () => {
     session as unknown as { initializeAgentHost: () => Promise<unknown> }
   ).initializeAgentHost = async () => fakeAgent;
   (session as unknown as { getAgentHost: () => unknown }).getAgentHost = () => fakeAgent;
+  (session.runtimeTree as unknown as { list: () => readonly unknown[] }).list = () => [
+    fakeInstance,
+    fakeChildInstance,
+  ];
 
   app = new Hono().route('/api/sessions', createSessionsRouter());
   outerCards = 0;
@@ -199,15 +228,101 @@ afterEach(async () => {
   _resetEventBusForTests();
   _resetToolHandlerCacheForTests();
   _resetSnapshotForTests();
+  resetKernelToolCapabilitiesForTests();
   await resetSessionManager();
   resetPathManager();
   if (savedProjectRoot === undefined) delete process.env.FORGEAX_PROJECT_ROOT;
   else process.env.FORGEAX_PROJECT_ROOT = savedProjectRoot;
+  if (savedConformanceFlag === undefined) delete process.env.FORGEAX_PRODUCT_AI_NATIVE_CONFORMANCE;
+  else process.env.FORGEAX_PRODUCT_AI_NATIVE_CONFORMANCE = savedConformanceFlag;
   rmSync(root, { recursive: true, force: true });
   rmSync(extensionRoot, { recursive: true, force: true });
 });
 
 describe('POST /:sid/kernel-tool Host confirmation delegation', () => {
+  test('capability route is disabled by default', async () => {
+    delete process.env.FORGEAX_PRODUCT_AI_NATIVE_CONFORMANCE;
+    const response = await app.request(`/api/sessions/${sid}/kernel-tool-capability`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ agentPath: 'market-agent', tools: ['echo'] }),
+    });
+
+    expect(response.status).toBe(404);
+  });
+
+  test('capability route rejects an agent that is not live', async () => {
+    process.env.FORGEAX_PRODUCT_AI_NATIVE_CONFORMANCE = '1';
+    const response = await app.request(`/api/sessions/${sid}/kernel-tool-capability`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ agentPath: 'missing-agent' }),
+    });
+
+    expect(response.status).toBe(404);
+  });
+
+  test('conformance capability is fixed to ui tools and binds the live agent', async () => {
+    process.env.FORGEAX_PRODUCT_AI_NATIVE_CONFORMANCE = '1';
+    const response = await app.request(`/api/sessions/${sid}/kernel-tool-capability`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ agentPath: 'market-agent', tools: ['echo'] }),
+    });
+    const json = await response.json() as {
+      ok: boolean;
+      sid: string;
+      agentPath: string;
+      token: string;
+      expiresAt: number;
+      tools: string[];
+    };
+
+    expect(response.status).toBe(200);
+    expect(json.ok).toBe(true);
+    expect(json.sid).toBe(sid);
+    expect(json.agentPath).toBe('market-agent');
+    expect(json.tools).toEqual(['ui_snapshot', 'ui_invoke']);
+    expect(json.expiresAt).toBeGreaterThan(Date.now());
+    expect(authorizeKernelToolCapability(json.token, sid, 'ui_snapshot')).toMatchObject({
+      sid,
+      agentPath: 'market-agent',
+    });
+    expect(authorizeKernelToolCapability(json.token, sid, 'ui_invoke')).toMatchObject({
+      sid,
+      agentPath: 'market-agent',
+    });
+    expect(authorizeKernelToolCapability(json.token, sid, 'echo')).toBeUndefined();
+  });
+
+  test('conformance capability binds a child runtime instance independently', async () => {
+    process.env.FORGEAX_PRODUCT_AI_NATIVE_CONFORMANCE = '1';
+    const response = await app.request(`/api/sessions/${sid}/kernel-tool-capability`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ agentPath: 'child-instance' }),
+    });
+    const json = await response.json() as {
+      ok: boolean;
+      sid: string;
+      agentPath: string;
+      token: string;
+    };
+
+    expect(response.status).toBe(200);
+    expect(json.ok).toBe(true);
+    expect(json.sid).toBe(sid);
+    expect(json.agentPath).toBe('child-instance');
+    expect(authorizeKernelToolCapability(json.token, sid, 'ui_invoke')).toMatchObject({
+      sid,
+      agentPath: 'child-instance',
+    });
+    expect(authorizeKernelToolCapability(json.token, sid, 'ui_snapshot')).toMatchObject({
+      sid,
+      agentPath: 'child-instance',
+    });
+  });
+
   test('下游 requireConfirm 工具只出现一张 ToolRegistry 卡', async () => {
     const json = await postTool('aiasset_import-to-engine');
 

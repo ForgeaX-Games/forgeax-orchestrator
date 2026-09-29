@@ -23,7 +23,7 @@
     },
     {
       "name": "ui_invoke",
-      "description": "Invoke one action from the connected UI surface's action manifest. Discover actions and their schemas via ui_snapshot first. Arguments are validated by the surface against the action's declared schema. Returns { status, reason?, stateDigest? } where status is 'completed' (done — stateDigest carries the observable state change), 'accepted' (the surface started a longer-running operation: do NOT wait for it and do NOT retry this invoke; continue with other work and call ui_snapshot later if you need to confirm the outcome), or 'rejected' (not executed — read reason before deciding what to do). Returns { unavailable, reason } when no UI surface is connected.",
+      "description": "Invoke one action from the connected UI surface's action manifest. Discover actions and their schemas via ui_snapshot first. Arguments are validated by the surface against the action's declared schema. Returns one terminal receipt whose status is exactly one of three values: 'completed' (started and finished — result/readback carry the observable state change), 'rejected' (started:false — nothing ran and no side effect exists, so read reason, fix the cause, and it is safe to invoke again), or 'failed' (started:true — execution began and its side effects are unknown, so do NOT retry blindly; read effectState ('none' | 'partial' | 'unknown') and confirm the real state with ui_snapshot before deciding). There is no fourth status: a missing terminal receipt is incomplete ledger state, not an outcome. Returns { unavailable, reason } when no UI surface is connected.",
       "inputSchema": {
         "type": "object",
         "properties": {

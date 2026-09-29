@@ -1,28 +1,14 @@
 /**
- * Phase D3 — wb-character ToolRegistry contract.
- *
- * Verifies the real (pinned) marketplace plugin manifest at user default location:
- *   1. every declared character: tool lands in the snapshot
- *   2. backendPath resolves to ./server/tool-handlers.ts (the D3 file)
- *   3. callTool dispatches to the actual tool-handlers module
- *   4. unimplemented pipelines surface a structured `not_implemented` error
- *   5. listTools reports `hasHandler: true` for every entry
- *
- * We use a /tmp scratch manifest copy rather than the real marketplace path
- * to keep the snapshot deterministic and avoid pulling in scene-kit etc.,
- * but the manifest body is exactly the same JSON.
- *
- * SSOT = the pinned wb-character submodule's forgeax-extension.json. It currently
- * declares 10 character: tools — 5 AI-facing (portrait/turnaround/list/get/
- * rename) and 5 internal P4-funnel stubs (exposedToAI:false). The earlier
- * 16-tool consolidation (generate-sprite-sheet/pixel/monster/vehicle +
- * save-scene-defaults + upsert-manifest) never landed in the pinned manifest;
- * this test mirrors what the plugin actually provides, not the aspiration.
- * Image generation is injected by the host via ctx.imageGen.
+ * ToolRegistry consumer contract against the exact published character package.
+ * The isolated user install uses its real manifest and schemas, and dispatches
+ * to the package's declared backend. No retired Marketplace checkout is needed.
+ * Keep all ten tools, AI exposure, structured not_implemented and not_found checks.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdirSync, rmSync, writeFileSync, copyFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { mkdirSync, rmSync, writeFileSync, copyFileSync, cpSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { scanAllExtensionOrigins } from '../src/extensions/scanner';
 import { mergeManifests } from '../src/extensions/merger';
 import { buildKindRegistry } from '../src/extensions/kinds';
@@ -30,7 +16,7 @@ import { _setSnapshotForTests, _resetSnapshotForTests } from '../src/extensions/
 import { callTool, listTools, _resetToolHandlerCacheForTests } from '../src/tools/registry';
 import { _resetEventBusForTests } from '../src/events/bus';
 
-const REPO_ROOT = resolve(import.meta.dir, '../../..');
+const SRC_DIR = dirname(createRequire(import.meta.url).resolve('@forgeax-extension/character/package.json'));
 const TMP = `/tmp/forgeax-wbc-tools-${process.pid}`;
 const PLUGIN_DIR = join(TMP, 'user', 'wb-character');
 
@@ -58,39 +44,13 @@ const AI_EXPOSED_TOOL_IDS = TOOL_IDS.slice(0, 5);
 
 function mirrorPluginToTmp() {
   mkdirSync(join(PLUGIN_DIR, 'server'), { recursive: true });
-  mkdirSync(join(PLUGIN_DIR, 'schemas'), { recursive: true });
-  // Copy the live manifest (D3 already updated entry.backend in it).
-  const manifestSrc = resolve(REPO_ROOT, 'packages/marketplace/extensions/character/forgeax-extension.json');
-  copyFileSync(manifestSrc, join(PLUGIN_DIR, 'forgeax-extension.json'));
-  // Schema files don't need to exist for ToolRegistry dispatch (they're
-  // referenced by argsSchema/returnsSchema as path strings only). Touch
-  // them so the kind loader doesn't warn about missing refs.
-  for (const id of TOOL_IDS) {
-    const base = id.replace(/^character:/, '');
-    // `list` and `get` and `rename` use list-characters / get-character / rename-character.
-    const slug = base === 'list' ? 'list-characters'
-      : base === 'get' ? 'get-character'
-      : base === 'rename' ? 'rename-character'
-      : base;
-    writeFileSync(
-      join(PLUGIN_DIR, 'schemas', `${slug}.args.json`),
-      JSON.stringify({ type: 'object' }),
-    );
-    writeFileSync(
-      join(PLUGIN_DIR, 'schemas', `${slug}.returns.json`),
-      JSON.stringify({ type: 'object' }),
-    );
-  }
-  // Symlink the real tool-handlers.ts under tmp so `import * as forge from
-  // '../../../../server/src/lib/character-forge/index'` resolves correctly
-  // (the relative path is hard-coded in tool-handlers.ts and assumes the
-  // canonical layout). Easier: just write a thin handler file referencing
-  // an absolute import via the project's path.
+  copyFileSync(join(SRC_DIR, 'forgeax-extension.json'), join(PLUGIN_DIR, 'forgeax-extension.json'));
+  cpSync(join(SRC_DIR, 'schemas'), join(PLUGIN_DIR, 'schemas'), { recursive: true });
+  // Preserve package-local dependency resolution for the published backend.
+  const backend = pathToFileURL(resolve(SRC_DIR, 'server/tool-handlers.ts')).href;
   writeFileSync(
     join(PLUGIN_DIR, 'server', 'tool-handlers.ts'),
-    `// scratch copy — points to the in-repo tool-handlers.ts via re-export
-     export { default, tools } from '${resolve(REPO_ROOT, 'packages/marketplace/extensions/character/server/tool-handlers')}';
-    `,
+    `export { default, tools } from ${JSON.stringify(backend)};\n`,
   );
 }
 
@@ -100,7 +60,9 @@ async function reload() {
     user: join(TMP, 'user'),
     project: join(TMP, 'project'),
   });
+  expect(scan.errors).toEqual([]);
   const merge = mergeManifests(scan.found);
+  expect(merge.issues).toEqual([]);
   const kinds = buildKindRegistry(merge.manifests);
   _setSnapshotForTests({
     generation: 1,
@@ -140,7 +102,7 @@ describe('wb-character ToolRegistry wiring', () => {
       const t = charTools.find((x) => x.id === id);
       expect(t).toBeDefined();
       expect(t!.hasHandler).toBe(true);
-      // Only the 9 AI-facing tools opt into exposedToAI; the P4-funnel
+      // Only the 5 AI-facing tools opt into exposedToAI; the P4-funnel
       // stubs are internal (UI/save buttons), exposedToAI:false.
       const expectAi = AI_EXPOSED_TOOL_IDS.includes(id);
       expect(t!.exposedToAI).toBe(expectAi);

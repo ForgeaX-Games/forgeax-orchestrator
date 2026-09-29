@@ -85,8 +85,9 @@ function envFilePath(): string {
 // spawn 时冻结**(cred-vault issueScoped 现取 ANTHROPIC_API_KEY、转发时现取 ANTHROPIC_BASE_URL,
 // 均从冻结的 process.env 读)。仅把新值写进 .env + live-apply server 自己的 process.env 到不了
 // 已在跑的 sidecar,故这些 key 变更后必须重启 sidecar,否则新凭据要等整进程重启才生效
-// (正是本 bug:设置 litellm key 不生效,必须改 .env + 重启)。model/多模态图像 key 不在此列:
-// model 每轮下发、图像 key 由 server 侧插件现读 process.env,无需重启 sidecar。
+// (正是本 bug:设置 litellm key 不生效,必须改 .env + 重启)。external-only host 不属于本
+// 进程,此时保存仍成功但响应显式要求 owner restart。model/多模态图像 key 不在此列: model
+// 每轮下发、图像 key 由 server 侧插件现读 process.env,无需重启 sidecar。
 const SIDECAR_CRED_KEYS = new Set([
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
@@ -251,18 +252,31 @@ export function createSettingsRouter(): Hono {
       await writeFile(envPath, serializeEnv(env, originalText), 'utf-8');
       // sidecar 的 cred-vault 冻结了旧凭据(spawn 时的 env 快照)——重启它,让下一次对话用
       // 刚写入的新凭据 spawn。不重启则新 key/base-url 要等整进程重启才生效(本 bug 根因)。
-      // best-effort:重启失败不该让"已保存"的写回退;失败只记 warning,用户仍可手动重启兜底。
+      // best-effort:重启失败不该让"已保存"的写回退;失败要返回 warning,用户仍可手动重启兜底。
+      let restartWarning: string | undefined;
+      let restartRequired = false;
       if (credChanged) {
         invalidateModelCatalogCache();
         invalidateLiveCatalogCache();
         try {
           const { restartSidecar } = await import('../kernel/sidecar-singleton');
-          await restartSidecar();
+          const outcome = await restartSidecar();
+          if (outcome.restartRequired) {
+            restartRequired = true;
+            restartWarning = outcome.warning;
+          }
         } catch (e) {
-          console.warn(`[settings] 凭据已写入 .env,但 sidecar 重启失败(新凭据可能要手动重启才生效):${(e as Error).message}`);
+          restartRequired = true;
+          restartWarning = `Credentials saved, but sidecar restart failed; restart the server or sidecar owner to apply them: ${(e as Error).message}`;
+          console.warn(`[settings] ${restartWarning}`);
         }
       }
-      return c.json({ ok: true, touched, envPath: friendlyPath(envPath) });
+      return c.json({
+        ok: true,
+        touched,
+        envPath: friendlyPath(envPath),
+        ...(restartRequired ? { restartRequired: true, warning: restartWarning } : {}),
+      });
     } catch (e) {
       return c.json({ error: (e as Error).message }, 500);
     }

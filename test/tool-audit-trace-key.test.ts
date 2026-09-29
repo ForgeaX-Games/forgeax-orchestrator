@@ -14,6 +14,10 @@ import { join } from 'node:path';
 
 import { makeInProcessExecuteTool } from '../src/kernel/host-tool-bridge';
 import { initPathManager, resetPathManager } from '../src/fs/path-manager';
+import {
+  issueKernelToolCapability,
+  resetKernelToolCapabilitiesForTests,
+} from '../src/kernel/kernel-tool-capability';
 
 const SID = 'audit-trace-key';
 let root: string;
@@ -53,8 +57,10 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'fx-audit-trace-'));
   resetPathManager();
   initPathManager({ userRoot: root });
+  resetKernelToolCapabilitiesForTests();
 });
 afterEach(() => {
+  resetKernelToolCapabilitiesForTests();
   resetPathManager();
   rmSync(root, { recursive: true, force: true });
 });
@@ -89,9 +95,18 @@ describe('kernel-tool HTTP 口的连接键(租用内核)', () => {
     await resetSessionManager();
     const session = await initSessionManager(getPathManager()).create({ autoStart: false });
     try {
+      const capability = issueKernelToolCapability({
+        sid: session.sid,
+        agentPath: 'not-live',
+        enabledTools: ['echo'],
+      });
+      if (!capability) throw new Error('failed to issue kernel-tool capability for test');
       const res = await createSessionsRouter().request(`/${session.sid}/kernel-tool`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-forgeax-kernel-token': capability.token,
+        },
         // agentPath 不在线 → 命中第一个审计出口(被拒/失败那几行恰恰最该带键)。
         body: JSON.stringify({ agentPath: 'not-live', toolName: 'echo', args: {}, toolExecutionId: 'fxt-http-1' }),
       });
@@ -115,9 +130,18 @@ describe('kernel-tool HTTP 口的连接键(租用内核)', () => {
     await resetSessionManager();
     const session = await initSessionManager(getPathManager()).create({ autoStart: false });
     try {
+      const capability = issueKernelToolCapability({
+        sid: session.sid,
+        agentPath: 'not-live',
+        enabledTools: ['echo'],
+      });
+      if (!capability) throw new Error('failed to issue kernel-tool capability for test');
       await createSessionsRouter().request(`/${session.sid}/kernel-tool`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-forgeax-kernel-token': capability.token,
+        },
         body: JSON.stringify({ agentPath: 'not-live', toolName: 'echo', args: {} }),
       });
       const p = join(root, 'sessions', session.sid, 'kernel-tool-audit.jsonl');

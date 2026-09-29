@@ -275,6 +275,9 @@ function checkUiInvoke(tier: TrustTier, ctx: TrustContext): TrustDecision {
   if (TIER_DENY[tier].has(cap)) {
     return decide('deny', cap, `ui action "${decl.title}" (${actionId}) denied for ${tier} pack (capability "${cap}")`);
   }
+  if (decl.requireConfirm) {
+    return decide('ask', cap, `confirm ui action: "${decl.title}" (${actionId})`);
+  }
   if (TIER_ASK[tier].has(cap)) {
     return decide('ask', cap, `confirm ${cap} ui action: "${decl.title}" (${actionId})`);
   }

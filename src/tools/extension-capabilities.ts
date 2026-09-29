@@ -7,13 +7,30 @@ import type { ToolCall } from '@forgeax/types';
  * validates it. Once the public contract is released with the wider caller
  * union this local alias can collapse back to the published type.
  */
-export type ExtensionCaller = ToolCall['caller'] | {
+type IdentifiedExtensionCaller = {
   readonly kind: 'extension';
   readonly extensionId: string;
   readonly instanceId: string;
   readonly sessionId?: string;
   readonly threadId?: string;
 };
+
+type AnonymousExtensionCaller = {
+  readonly kind: 'extension';
+  /** Extension Host 0.3.x scopes capabilities only by game. Keep that missing
+   * identity explicit so the ledger cannot mistake an invented id for the
+   * original caller. */
+  readonly identityState: 'unavailable';
+  readonly extensionId?: never;
+  readonly instanceId?: never;
+  readonly sessionId?: never;
+  readonly threadId?: never;
+};
+
+export type ExtensionCaller =
+  | ToolCall['caller']
+  | IdentifiedExtensionCaller
+  | AnonymousExtensionCaller;
 
 export type ExtensionToolCall = Omit<ToolCall, 'caller'> & {
   readonly caller: ExtensionCaller;

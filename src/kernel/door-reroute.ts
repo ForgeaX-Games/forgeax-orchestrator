@@ -129,6 +129,8 @@ export async function walkDoorInstead(
   return {
     result: {
       ok: true,
+      status: 'completed',
+      started: true,
       via: 'editor_ui_browse',
       actionId,
       door: door.path ?? door.walk.chain,

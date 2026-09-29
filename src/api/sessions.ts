@@ -11,66 +11,101 @@
  *  abort 寻址：POST `/:sid/abort` 不带 `agent` query → 中断整棵树当前 turn；
  *  带 `?agent=<path>` → 只中断一个实例。AbortController 只归 RuntimeController。 */
 
-import { executionToolScope } from '../agents/execution-tool-scope';
-import { Hono } from 'hono';
-import { getSessionManager } from '../core/session-manager';
-import type { Session } from '../core/session';
-import type { Event } from '../core/types';
-import { defaultProjectRoot } from '@forgeax/platform-io';
-import { getPathManager } from '../fs/path-manager';
+import { executionToolScope } from "../agents/execution-tool-scope";
+import { Hono } from "hono";
+import { getSessionManager } from "../core/session-manager";
+import type { Session } from "../core/session";
+import type { Event } from "../core/types";
+import { defaultProjectRoot } from "@forgeax/platform-io";
+import { getPathManager } from "../fs/path-manager";
+import { resolveAskReply, type AskReply } from "../core/ask-user-registry";
+import { randomUUID } from "node:crypto";
+import { isValidSummonAgentId } from "../kernel/summon-agent";
 import {
-  resolveAskReply,
-  type AskReply,
-} from '../core/ask-user-registry';
-import { randomUUID } from 'node:crypto';
-import { isValidSummonAgentId } from '../kernel/summon-agent';
-import { registerPermission, resolvePermission } from '../core/permission-registry';
-import { registerPerception, resolvePerception, pushPerceptionNote } from './lib/perception-registry';
-import { acquireUiLease, claimAvailableUiLease, renewUiLease, setUiManifest, uiInvokeTimeoutMs } from './lib/ui-manifest-registry';
-import { createSessionWithBootstrap, ensureSessionWithBootstrap } from './lib/session-create';
-import { getHostTool } from '../orchestration-seams';
-import type { PerceptionKind } from '../kernel/forgeax-builtin-tools';
-import { executeTool } from '../kits/tool/tool-executor';
+	registerPermission,
+	resolvePermission,
+} from "../core/permission-registry";
 import {
-  isForgeaxBuiltinTool,
-  runForgeaxBuiltinTool,
-  hostToolRunCtx,
-  preflightUiToolDispatch,
-} from '../kernel/forgeax-builtin-tools';
-import { checkKernelTool } from '../kernel/trust-gate';
-import { requestToolApproval, applyRememberOnReply } from '../kernel/tool-approval';
-import { getCheckpointManager, type RewindMode } from '../checkpoint/checkpoint-manager';
-import { appendToolAudit } from '../kernel/tool-audit';
-import { consultTurnGate } from '../kernel/cc-profile';
-import { evaluateSettingsRules, loadSettingsPermissionRules, ruleLabel } from './lib/permission-settings';
-import { shouldDelegateHostToolConfirmation } from '../kernel/host-tool-confirmation';
-import { resolveKernel } from '../kernel/resolve-kernel';
-import { orchestrationProfileOf } from '../kernel/kernel-profile';
+	registerPerception,
+	resolvePerception,
+	pushPerceptionNote,
+} from "./lib/perception-registry";
 import {
-  createProjectMcpBridge,
-  isProjectMcpToolName,
-  ProjectMcpToolNotFoundError,
-} from '../kernel/project-mcp';
-import { runSkillKernelTool } from '../skills/kernel-tool-bridge';
-import { recordSessionHostToolWrites } from '../kernel/host-tool-written-files';
-import { visibleTools } from '../runtime/visible-tools';
+	acquireUiLease,
+	claimAvailableUiLease,
+	renewUiLease,
+	setUiManifest,
+	uiInvokeTimeoutMs,
+	uiWriteOriginAllowed,
+} from "./lib/ui-manifest-registry";
 import {
-  filterVisibleAgentManagementTools,
-  visibleAgentManagementToolsForAgent,
-  type AgentManagementToolName,
-} from '../kits/agent-management-visibility';
-import { canonicalAgentManagementTool } from './lib/host-tools-for-agent';
-import { prepareUserAttachmentPayload } from '../message/materialize-user-attachments';
-import { resolve as resolvePath, basename, join } from 'node:path';
-import { existsSync, statSync } from 'node:fs';
-import { isPathInside } from '../kernel/materialize-file-attachments';
-import type { AgentTemplateDraft } from '../agents/template-types';
-import { ResidentDefinitionStore } from '../agents/resident-definition-store';
-import { AgentMaterializationError } from '../core/session';
-import { resolveTemplateTrust } from '../agents/agent-template-catalog';
-import { agentToolPermissions } from '../kernel/agent-permissions';
-import { isBuiltinToolEnabled } from '../kernel/builtin-tool-policy';
-import { withAgentHostToolDefinitions } from '../tools/agent-host-tool-surface';
+	createSessionWithBootstrap,
+	ensureSessionWithBootstrap,
+} from "./lib/session-create";
+import { getHostTool } from "../orchestration-seams";
+import type { PerceptionKind } from "../kernel/forgeax-builtin-tools";
+import { executeTool } from "../kits/tool/tool-executor";
+import {
+	isForgeaxBuiltinTool,
+	runForgeaxBuiltinTool,
+	hostToolRunCtx,
+	preflightUiToolDispatch,
+} from "../kernel/forgeax-builtin-tools";
+import { checkKernelTool } from "../kernel/trust-gate";
+import {
+	requestToolApproval,
+	applyRememberOnReply,
+} from "../kernel/tool-approval";
+import {
+	getCheckpointManager,
+	type RewindMode,
+} from "../checkpoint/checkpoint-manager";
+import { appendToolAudit } from "../kernel/tool-audit";
+import { consultTurnGate } from "../kernel/cc-profile";
+import {
+	evaluateSettingsRules,
+	loadSettingsPermissionRules,
+	ruleLabel,
+} from "./lib/permission-settings";
+import { shouldDelegateHostToolConfirmation } from "../kernel/host-tool-confirmation";
+import { resolveKernel } from "../kernel/resolve-kernel";
+import { orchestrationProfileOf } from "../kernel/kernel-profile";
+import {
+	createProjectMcpBridge,
+	isProjectMcpToolName,
+	ProjectMcpToolNotFoundError,
+} from "../kernel/project-mcp";
+import { runSkillKernelTool } from "../skills/kernel-tool-bridge";
+import { recordSessionHostToolWrites } from "../kernel/host-tool-written-files";
+import { visibleTools } from "../runtime/visible-tools";
+import {
+	filterVisibleAgentManagementTools,
+	visibleAgentManagementToolsForAgent,
+	type AgentManagementToolName,
+} from "../kits/agent-management-visibility";
+import { canonicalAgentManagementTool } from "./lib/host-tools-for-agent";
+import { prepareUserAttachmentPayload } from "../message/materialize-user-attachments";
+import { resolve as resolvePath, basename, join } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { isPathInside } from "../kernel/materialize-file-attachments";
+import type { AgentTemplateDraft } from "../agents/template-types";
+import { ResidentDefinitionStore } from "../agents/resident-definition-store";
+import { AgentMaterializationError } from "../core/session";
+import { resolveTemplateTrust } from "../agents/agent-template-catalog";
+import { agentToolPermissions } from "../kernel/agent-permissions";
+import { isBuiltinToolEnabled } from "../kernel/builtin-tool-policy";
+import {
+	beginProductActionInvocation,
+	inspectProductActionInvocation,
+	readProductActionLedger,
+	resolveTrustedRootActorId,
+} from "../kernel/product-ai-native-ledger";
+import {
+	authorizeKernelToolCapability,
+	issueConformanceKernelToolCapability,
+	CONFORMANCE_KERNEL_TOOL_NAMES,
+} from "../kernel/kernel-tool-capability";
+import { withAgentHostToolDefinitions } from "../tools/agent-host-tool-surface";
 
 /** 寻址 + 懒创建兜底：session.tree 已有 → 直接用；带 `#` 的 fullId 要求已存在
  *  （懒创建只对简单名字有意义——fullId 天然指一个已经活着的实例）；简单名字
@@ -79,1369 +114,2026 @@ import { withAgentHostToolDefinitions } from '../tools/agent-host-tool-surface';
  *  嵌套 resident 路径（含 `/`）不进这条懒创建路，维持严格 404——只有"第一次跟
  *  一个顶层 persona 说话"这一种场景需要现场造。 */
 async function resolveAgentPath(session: Session, to: string): Promise<string> {
-  if (to.includes('#')) {
-    const node = session.tree.getByFullId(to);
-    if (!node) throw new Error(`agent fullId not found: ${to}`);
-    return node.path;
-  }
-  if (session.tree.get(to)) return to;
-  if (to.includes('/')) {
-    throw new Error(`agent path not found: ${to}`);
-  }
-  return session.ensureResidentAgent(to);
+	if (to.includes("#")) {
+		const node = session.tree.getByFullId(to);
+		if (!node) throw new Error(`agent fullId not found: ${to}`);
+		return node.path;
+	}
+	if (session.tree.get(to)) return to;
+	if (to.includes("/")) {
+		throw new Error(`agent path not found: ${to}`);
+	}
+	return session.ensureResidentAgent(to);
 }
 
 export function createSessionsRouter() {
-  const r = new Hono();
+	const r = new Hono();
 
-  r.get('/', (c) => {
-    const sm = getSessionManager();
-    // Scope the list to a single game (整个 session 面板按 game 收口). `?game=<slug>`
-    // wins; absent → fall back to the active game so every surface (TopBar dropdown
-    // / TabStrip) only ever shows the current game's sessions. The bound game slug
-    // is the path-derived `defaultDir` carried on each list entry. No game resolvable
-    // (generic / brand-new workspace with no active game) → return everything,
-    // preserving the un-scoped behaviour.
-    const game = c.req.query('game') || getPathManager().resolveScope() || null;
-    // Scope pushed down into sm.list({game}): non-matching sids are skipped
-    // BEFORE their config read / activity walk (list is a hot sync path — see
-    // SessionManager.list header), instead of paying full cost then filtering.
-    const sessions = sm.list(game ? { game } : {});
-    return c.json({ sessions });
-  });
+	r.get("/", (c) => {
+		const sm = getSessionManager();
+		// Scope the list to a single game (整个 session 面板按 game 收口). `?game=<slug>`
+		// wins; absent → fall back to the active game so every surface (TopBar dropdown
+		// / TabStrip) only ever shows the current game's sessions. The bound game slug
+		// is the path-derived `defaultDir` carried on each list entry. No game resolvable
+		// (generic / brand-new workspace with no active game) → return everything,
+		// preserving the un-scoped behaviour.
+		const game = c.req.query("game") || getPathManager().resolveScope() || null;
+		// Scope pushed down into sm.list({game}): non-matching sids are skipped
+		// BEFORE their config read / activity walk (list is a hot sync path — see
+		// SessionManager.list header), instead of paying full cost then filtering.
+		const sessions = sm.list(game ? { game } : {});
+		return c.json({ sessions });
+	});
 
-  r.post('/', async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    // 「建 session + bootstrap 入口 agent」的实现抽在 lib/session-create.ts(SSOT):
-    // headless 的 `session.create` UI action(ui-headless-actions)与本路由共用同一份。
-    const out = await createSessionWithBootstrap(body);
-    return c.json(out);
-  });
+	r.post("/", async (c) => {
+		const body = await c.req.json().catch(() => ({}));
+		// 「建 session + bootstrap 入口 agent」的实现抽在 lib/session-create.ts(SSOT):
+		// headless 的 `session.create` UI action(ui-headless-actions)与本路由共用同一份。
+		const out = await createSessionWithBootstrap(body);
+		return c.json(out);
+	});
 
-  r.post('/ensure', async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const out = await ensureSessionWithBootstrap(body);
-    return c.json(out);
-  });
+	r.post("/ensure", async (c) => {
+		const body = await c.req.json().catch(() => ({}));
+		const out = await ensureSessionWithBootstrap(body);
+		return c.json(out);
+	});
 
-  r.post('/:sid/open', async (c) => {
-    const sm = getSessionManager();
-    const session = await sm.open(c.req.param('sid'));
-    return c.json({ sid: session.sid });
-  });
+	r.post("/:sid/open", async (c) => {
+		const sm = getSessionManager();
+		const session = await sm.open(c.req.param("sid"));
+		return c.json({ sid: session.sid });
+	});
 
-  r.post('/:sid/reload', async (c) => {
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      await session.reloadRuntime();
-      return c.json({
-        ok: true,
-        sid: session.sid,
-        agents: session.runtimeTree.list().map((instance) => ({
-          instanceId: instance.instanceId,
-          runtimeEpochId: instance.runtimeEpochId,
-          lifetime: instance.lifetime,
-          residentPath: instance.residentPath,
-          templateRef: instance.templateRef,
-          state: instance.state,
-        })),
-      });
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 409);
-    }
-  });
+	r.post("/:sid/reload", async (c) => {
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			await session.reloadRuntime();
+			return c.json({
+				ok: true,
+				sid: session.sid,
+				agents: session.runtimeTree.list().map((instance) => ({
+					instanceId: instance.instanceId,
+					runtimeEpochId: instance.runtimeEpochId,
+					lifetime: instance.lifetime,
+					residentPath: instance.residentPath,
+					templateRef: instance.templateRef,
+					state: instance.state,
+				})),
+			});
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				409,
+			);
+		}
+	});
 
-  r.post('/:sid/close', async (c) => {
-    const sm = getSessionManager();
-    await sm.close(c.req.param('sid'));
-    return c.json({ ok: true });
-  });
+	r.post("/:sid/close", async (c) => {
+		const sm = getSessionManager();
+		await sm.close(c.req.param("sid"));
+		return c.json({ ok: true });
+	});
 
-  r.get('/:sid/runtime-agents', async (c) => {
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      const agents = session.runtimeTree.list().map((instance) => ({
-        instanceId: instance.instanceId,
-        runtimeEpochId: instance.runtimeEpochId,
-        parentInstanceId: instance.parentInstanceId,
-        lifetime: instance.lifetime,
-        residentPath: instance.residentPath,
-        templateRef: instance.templateRef,
-        displayName:
-          instance.template.definition.displayName ??
-          instance.template.definition.id,
-        state: instance.state,
-        createdAt: instance.createdAt,
-        eventStore: instance.events.locator,
-      }));
-      return c.json({ sid: session.sid, agents });
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 404);
-    }
-  });
+	r.get("/:sid/runtime-agents", async (c) => {
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			const agents = session.runtimeTree.list().map((instance) => ({
+				instanceId: instance.instanceId,
+				runtimeEpochId: instance.runtimeEpochId,
+				parentInstanceId: instance.parentInstanceId,
+				lifetime: instance.lifetime,
+				residentPath: instance.residentPath,
+				templateRef: instance.templateRef,
+				displayName:
+					instance.template.definition.displayName ??
+					instance.template.definition.id,
+				state: instance.state,
+				createdAt: instance.createdAt,
+				eventStore: instance.events.locator,
+			}));
+			return c.json({ sid: session.sid, agents });
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				404,
+			);
+		}
+	});
 
-  r.get('/:sid/runtime-tree', async (c) => {
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      return c.json({
-        sid: session.sid,
-        agents: session.runtimeTree.list().map((instance) => ({
-          instanceId: instance.instanceId,
-          runtimeEpochId: instance.runtimeEpochId,
-          parentInstanceId: instance.parentInstanceId,
-          lifetime: instance.lifetime,
-          residentPath: instance.residentPath,
-          templateRef: instance.templateRef,
-          displayName:
-            instance.template.definition.displayName ??
-            instance.template.definition.id,
-          state: instance.state,
-          createdAt: instance.createdAt,
-          definitionRevision: instance.template.definitionRevision,
-          runtimeConfigRevision: instance.runtimeConfig.next().revision,
-          executionRevision: instance.execution.next().revision,
-        })),
-      });
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 404);
-    }
-  });
+	r.post("/:sid/kernel-tool-capability", async (c) => {
+		if (process.env.FORGEAX_PRODUCT_AI_NATIVE_CONFORMANCE !== "1")
+			return c.notFound();
+		const sid = c.req.param("sid");
+		const body = await c.req.json().catch(() => ({}));
+		const requestedAgentPath =
+			typeof body.agentPath === "string" ? body.agentPath.trim() : "";
+		if (!requestedAgentPath)
+			return c.json({ ok: false, error: "agentPath required" }, 400);
 
-  r.get('/:sid/resident-definitions', async (c) => {
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      const store = ResidentDefinitionStore.scan(
-        session.sid,
-        session.paths.agentsDir(),
-      );
-      return c.json({
-        sid: session.sid,
-        definitions: store.list().map((definition) => ({
-          logicalPath: definition.logicalPath,
-          parentLogicalPath: definition.parentLogicalPath,
-          instanceId: definition.identity.instanceId,
-        })),
-      });
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 404);
-    }
-  });
+		const session = getSessionManager().peek(sid);
+		if (!session) {
+			return c.json({ ok: false, error: `session '${sid}' is not live` }, 404);
+		}
+		const instance = session.runtimeTree
+			.list()
+			.find(
+				(candidate) =>
+					(candidate.residentPath === requestedAgentPath ||
+						candidate.instanceId === requestedAgentPath) &&
+					!["cancelled", "failed", "disposed"].includes(candidate.state),
+			);
+		const agentPath = instance?.residentPath ?? instance?.instanceId;
+		if (!instance || !agentPath) {
+			return c.json(
+				{
+					ok: false,
+					error: `agent '${requestedAgentPath}' not live in session`,
+				},
+				404,
+			);
+		}
+		try {
+			await session.initializeAgentHost(agentPath);
+		} catch (error) {
+			return c.json(
+				{
+					ok: false,
+					error: error instanceof Error ? error.message : String(error),
+				},
+				404,
+			);
+		}
+		if (!session.getAgentHost(agentPath)) {
+			return c.json(
+				{ ok: false, error: `agent '${agentPath}' has no live runtime host` },
+				404,
+			);
+		}
+		const capability = issueConformanceKernelToolCapability({ sid, agentPath });
+		if (!capability)
+			return c.json({ ok: false, error: "failed to issue capability" }, 500);
+		return c.json({
+			ok: true,
+			sid,
+			agentPath,
+			token: capability.token,
+			expiresAt: capability.expiresAt,
+			tools: [...CONFORMANCE_KERNEL_TOOL_NAMES],
+		});
+	});
 
-  r.get('/:sid/instances/:instanceId', async (c) => {
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      const instance = session.runtimeTree.get(c.req.param('instanceId'));
-      if (!instance) return c.json({ error: 'runtime instance not found' }, 404);
-      return c.json({
-        sid: session.sid,
-        instance: {
-          instanceId: instance.instanceId,
-          runtimeEpochId: instance.runtimeEpochId,
-          parentInstanceId: instance.parentInstanceId,
-          children: session.runtimeTree
-            .childrenOf(instance.instanceId)
-            .map((child) => child.instanceId),
-          lifetime: instance.lifetime,
-          residentPath: instance.residentPath,
-          templateRef: instance.templateRef,
-          state: instance.state,
-          definitionRevision: instance.template.definitionRevision,
-          runtimeConfigRevision: instance.runtimeConfig.next().revision,
-          executionRevision: instance.execution.next().revision,
-          eventStore: instance.events.locator,
-        },
-      });
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 404);
-    }
-  });
+	r.get("/:sid/runtime-tree", async (c) => {
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			return c.json({
+				sid: session.sid,
+				agents: session.runtimeTree.list().map((instance) => ({
+					instanceId: instance.instanceId,
+					runtimeEpochId: instance.runtimeEpochId,
+					parentInstanceId: instance.parentInstanceId,
+					lifetime: instance.lifetime,
+					residentPath: instance.residentPath,
+					templateRef: instance.templateRef,
+					displayName:
+						instance.template.definition.displayName ??
+						instance.template.definition.id,
+					state: instance.state,
+					createdAt: instance.createdAt,
+					definitionRevision: instance.template.definitionRevision,
+					runtimeConfigRevision: instance.runtimeConfig.next().revision,
+					executionRevision: instance.execution.next().revision,
+				})),
+			});
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				404,
+			);
+		}
+	});
 
-  r.get('/:sid/agent-templates', async (c) => {
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      return c.json({
-        sid: session.sid,
-        templates: session.templateCatalog.list().map((entry) => ({
-          templateRef: entry.templateRef,
-          entryId: entry.entryId,
-          medium: entry.locator.medium,
-          scope: entry.scope,
-          registrationLifetime: entry.registrationLifetime,
-          trust: entry.trust,
-          provenance: entry.provenance,
-          revisionPolicy: entry.revisionPolicy,
-        })),
-      });
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 404);
-    }
-  });
+	r.get("/:sid/resident-definitions", async (c) => {
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			const store = ResidentDefinitionStore.scan(
+				session.sid,
+				session.paths.agentsDir(),
+			);
+			return c.json({
+				sid: session.sid,
+				definitions: store.list().map((definition) => ({
+					logicalPath: definition.logicalPath,
+					parentLogicalPath: definition.parentLogicalPath,
+					instanceId: definition.identity.instanceId,
+				})),
+			});
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				404,
+			);
+		}
+	});
 
-  r.post('/:sid/agent-templates', async (c) => {
-    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
-    if (typeof body.entryId !== 'string') {
-      return c.json({ error: 'entryId is required' }, 400);
-    }
-    if (body.medium === 'memory' && !body.template) {
-      return c.json({ error: 'memory registration requires template' }, 400);
-    }
-    if (body.medium !== 'memory' && typeof body.root !== 'string') {
-      return c.json({ error: 'filesystem registration requires root' }, 400);
-    }
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      const templateRef = body.medium === 'memory'
-        ? session.registerMemoryTemplate({
-            sourceId:
-              typeof body.sourceId === 'string'
-                ? body.sourceId
-                : `memory:${randomUUID()}`,
-            entryId: body.entryId,
-            template: body.template as AgentTemplateDraft,
-          })
-        : session.registerFileSystemTemplate({
-            root: body.root as string,
-            entryId: body.entryId,
-            ...(typeof body.sourceId === 'string'
-              ? { sourceId: body.sourceId }
-              : {}),
-          });
-      const snapshot = await session.templateCatalog.resolve(templateRef);
-      return c.json({
-        ok: true,
-        templateRef,
-        definitionRevision: snapshot.definitionRevision,
-        executionRevision: snapshot.execution.revision,
-      });
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 400);
-    }
-  });
+	r.get("/:sid/instances/:instanceId", async (c) => {
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			const instance = session.runtimeTree.get(c.req.param("instanceId"));
+			if (!instance)
+				return c.json({ error: "runtime instance not found" }, 404);
+			return c.json({
+				sid: session.sid,
+				instance: {
+					instanceId: instance.instanceId,
+					runtimeEpochId: instance.runtimeEpochId,
+					parentInstanceId: instance.parentInstanceId,
+					children: session.runtimeTree
+						.childrenOf(instance.instanceId)
+						.map((child) => child.instanceId),
+					lifetime: instance.lifetime,
+					residentPath: instance.residentPath,
+					templateRef: instance.templateRef,
+					state: instance.state,
+					definitionRevision: instance.template.definitionRevision,
+					runtimeConfigRevision: instance.runtimeConfig.next().revision,
+					executionRevision: instance.execution.next().revision,
+					eventStore: instance.events.locator,
+				},
+			});
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				404,
+			);
+		}
+	});
 
-  r.post('/:sid/ephemeral-agents', async (c) => {
-    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
-    if (typeof body.templateRef !== 'string') {
-      return c.json({ error: 'templateRef is required' }, 400);
-    }
-    if (Object.prototype.hasOwnProperty.call(body, 'input')) {
-      return c.json({
-        error:
-          'ephemeral creation does not accept input; create first, then POST /messages to the returned instanceId',
-      }, 400);
-    }
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      let parentInstanceId: string | null = null;
-      if (typeof body.parentInstanceId === 'string') {
-        const parent = session.tree.resolve(body.parentInstanceId);
-        if (!parent) {
-          return c.json({
-            error: `parent runtime agent not found: ${body.parentInstanceId}`,
-          }, 404);
-        }
-        parentInstanceId = parent.instanceId;
-      }
-      const handle = await session.spawnEphemeral({
-        parentInstanceId,
-        templateRef: body.templateRef,
-        ...(body.runtimeConfigPatch && typeof body.runtimeConfigPatch === 'object'
-          ? { runtimeConfigPatch: body.runtimeConfigPatch as Record<string, unknown> }
-          : {}),
-      });
-      return c.json({ ok: true, instanceId: handle.instanceId }, 202);
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 400);
-    }
-  });
+	r.get("/:sid/agent-templates", async (c) => {
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			return c.json({
+				sid: session.sid,
+				templates: session.templateCatalog.list().map((entry) => ({
+					templateRef: entry.templateRef,
+					entryId: entry.entryId,
+					medium: entry.locator.medium,
+					scope: entry.scope,
+					registrationLifetime: entry.registrationLifetime,
+					trust: entry.trust,
+					provenance: entry.provenance,
+					revisionPolicy: entry.revisionPolicy,
+				})),
+			});
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				404,
+			);
+		}
+	});
 
-  r.post('/:sid/ephemeral-agents/:instanceId/cancel', async (c) => {
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      const instanceId = c.req.param('instanceId');
-      const instance = session.runtimeTree.get(instanceId);
-      if (!instance || instance.lifetime !== 'ephemeral') {
-        return c.json({ error: `ephemeral agent not found: ${instanceId}` }, 404);
-      }
-      await session.supervisor.cancel(instanceId, 'cancelled by API');
-      return c.json({ ok: true, instanceId });
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 400);
-    }
-  });
+	r.post("/:sid/agent-templates", async (c) => {
+		const body = (await c.req.json().catch(() => ({}))) as Record<
+			string,
+			unknown
+		>;
+		if (typeof body.entryId !== "string") {
+			return c.json({ error: "entryId is required" }, 400);
+		}
+		if (body.medium === "memory" && !body.template) {
+			return c.json({ error: "memory registration requires template" }, 400);
+		}
+		if (body.medium !== "memory" && typeof body.root !== "string") {
+			return c.json({ error: "filesystem registration requires root" }, 400);
+		}
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			const templateRef =
+				body.medium === "memory"
+					? session.registerMemoryTemplate({
+							sourceId:
+								typeof body.sourceId === "string"
+									? body.sourceId
+									: `memory:${randomUUID()}`,
+							entryId: body.entryId,
+							template: body.template as AgentTemplateDraft,
+						})
+					: session.registerFileSystemTemplate({
+							root: body.root as string,
+							entryId: body.entryId,
+							...(typeof body.sourceId === "string"
+								? { sourceId: body.sourceId }
+								: {}),
+						});
+			const snapshot = await session.templateCatalog.resolve(templateRef);
+			return c.json({
+				ok: true,
+				templateRef,
+				definitionRevision: snapshot.definitionRevision,
+				executionRevision: snapshot.execution.revision,
+			});
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				400,
+			);
+		}
+	});
 
-  r.post('/:sid/instances/:instanceId/cancel', async (c) => {
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      const instanceId = c.req.param('instanceId');
-      const instance = session.runtimeTree.get(instanceId);
-      if (!instance) return c.json({ error: 'runtime instance not found' }, 404);
-      if (instance.lifetime === 'resident') {
-        session.interruptRuntime(instanceId, 'resident turn cancelled by API');
-      } else {
-        await session.supervisor.cancel(instanceId, 'cancelled by API');
-      }
-      return c.json({ ok: true, instanceId, lifetime: instance.lifetime });
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 400);
-    }
-  });
+	r.post("/:sid/ephemeral-agents", async (c) => {
+		const body = (await c.req.json().catch(() => ({}))) as Record<
+			string,
+			unknown
+		>;
+		if (typeof body.templateRef !== "string") {
+			return c.json({ error: "templateRef is required" }, 400);
+		}
+		if (Object.prototype.hasOwnProperty.call(body, "input")) {
+			return c.json(
+				{
+					error:
+						"ephemeral creation does not accept input; create first, then POST /messages to the returned instanceId",
+				},
+				400,
+			);
+		}
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			let parentInstanceId: string | null = null;
+			if (typeof body.parentInstanceId === "string") {
+				const parent = session.tree.resolve(body.parentInstanceId);
+				if (!parent) {
+					return c.json(
+						{
+							error: `parent runtime agent not found: ${body.parentInstanceId}`,
+						},
+						404,
+					);
+				}
+				parentInstanceId = parent.instanceId;
+			}
+			const handle = await session.spawnEphemeral({
+				parentInstanceId,
+				templateRef: body.templateRef,
+				...(body.runtimeConfigPatch &&
+				typeof body.runtimeConfigPatch === "object"
+					? {
+							runtimeConfigPatch: body.runtimeConfigPatch as Record<
+								string,
+								unknown
+							>,
+						}
+					: {}),
+			});
+			return c.json({ ok: true, instanceId: handle.instanceId }, 202);
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				400,
+			);
+		}
+	});
 
-  r.delete('/:sid/resident-agents', async (c) => {
-    const logicalPath = c.req.query('path');
-    if (!logicalPath) return c.json({ error: 'path query is required' }, 400);
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      const result = await session.deleteResident(logicalPath);
-      return c.json(result, result.ok ? 200 : 500);
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 404);
-    }
-  });
+	r.post("/:sid/ephemeral-agents/:instanceId/cancel", async (c) => {
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			const instanceId = c.req.param("instanceId");
+			const instance = session.runtimeTree.get(instanceId);
+			if (!instance || instance.lifetime !== "ephemeral") {
+				return c.json(
+					{ error: `ephemeral agent not found: ${instanceId}` },
+					404,
+				);
+			}
+			await session.supervisor.cancel(instanceId, "cancelled by API");
+			return c.json({ ok: true, instanceId });
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				400,
+			);
+		}
+	});
 
-  r.delete('/:sid/residents/:instanceId', async (c) => {
-    try {
-      const session = await getSessionManager().open(c.req.param('sid'));
-      const instance = session.runtimeTree.get(c.req.param('instanceId'));
-      if (!instance || instance.lifetime !== 'resident' || !instance.residentPath) {
-        return c.json({ error: 'resident runtime instance not found' }, 404);
-      }
-      const result = await session.deleteResident(instance.residentPath);
-      return c.json(result, result.ok ? 200 : 500);
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-      }, 409);
-    }
-  });
+	r.post("/:sid/instances/:instanceId/cancel", async (c) => {
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			const instanceId = c.req.param("instanceId");
+			const instance = session.runtimeTree.get(instanceId);
+			if (!instance)
+				return c.json({ error: "runtime instance not found" }, 404);
+			if (instance.lifetime === "resident") {
+				session.interruptRuntime(instanceId, "resident turn cancelled by API");
+			} else {
+				await session.supervisor.cancel(instanceId, "cancelled by API");
+			}
+			return c.json({ ok: true, instanceId, lifetime: instance.lifetime });
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				400,
+			);
+		}
+	});
 
-  // DELETE /:sid —— 关掉 + rm -rf session 目录（含 ledger / blobs / scaffold 全清）。
-  // 跟 close 的区别：close 软释放（只解除 in-memory bindings，盘上不动），delete
-  // 把这个 sid 整个从盘上抹掉，sm.delete 内部对 unknown sid 是 idempotent（不抛）。
-  //
-  // 路线对齐：session 容器 CRUD 走纯 REST（list/create/delete/close/abort），与
-  // `/api/commands/*` 的 query/execute 模式互不重叠 —— 用户在 2026-05-20 钉死「session
-  // 本体的控制不走 commands」之后，原 `builtin/commands/sessions.ts` 整个模块被删，
-  // 只留下 agent 树 + 历史查询（list_agents / fetch_session_events / fetch_blob）在 commands。
-  r.delete('/:sid', async (c) => {
-    const sm = getSessionManager();
-    const sid = c.req.param('sid');
-    try {
-      await sm.delete(sid);
-      return c.json({ ok: true, sid });
-    } catch (err: any) {
-      return c.json({ ok: false, error: err?.message ?? String(err) }, 500);
-    }
-  });
+	r.delete("/:sid/resident-agents", async (c) => {
+		const logicalPath = c.req.query("path");
+		if (!logicalPath) return c.json({ error: "path query is required" }, 400);
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			const result = await session.deleteResident(logicalPath);
+			return c.json(result, result.ok ? 200 : 500);
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				404,
+			);
+		}
+	});
 
-  // ─── File-activity ledger query (SSOT for "who touched what") ────────────
-  // GET /:sid/file-activity?path=&agent=&limit=&since=
-  // - path:  abs path filter (matches record.path or record.fromPath)
-  // - agent: agentPath filter
-  // - limit: 1..1000, default 50
-  // - since: unix-ms lower bound
-  // Returns newest-first array. Reads `<sid>/file-activity.jsonl` directly via
-  // the ledger; no caching — caller should poll at most every 2s.
-  r.get('/:sid/file-activity', (c) => {
-    const sm = getSessionManager();
-    const sid = c.req.param('sid');
-    const session = sm.peek(sid);
-    if (!session) return c.json({ error: `session not open: ${sid}` }, 404);
-    const path = c.req.query('path') || undefined;
-    const agent = c.req.query('agent') || undefined;
-    const limit = c.req.query('limit') ? Number(c.req.query('limit')) : 50;
-    const since = c.req.query('since') ? Number(c.req.query('since')) : undefined;
-    const records = session.fileActivity.query({
-      ...(path ? { path } : {}),
-      ...(agent ? { agent } : {}),
-      ...(Number.isFinite(limit) ? { limit } : {}),
-      ...(since != null && Number.isFinite(since) ? { sinceTs: since } : {}),
-    });
-    return c.json({ sid, records, mtime: session.fileActivity.mtimeMs() });
-  });
+	r.delete("/:sid/residents/:instanceId", async (c) => {
+		try {
+			const session = await getSessionManager().open(c.req.param("sid"));
+			const instance = session.runtimeTree.get(c.req.param("instanceId"));
+			if (
+				!instance ||
+				instance.lifetime !== "resident" ||
+				!instance.residentPath
+			) {
+				return c.json({ error: "resident runtime instance not found" }, 404);
+			}
+			const result = await session.deleteResident(instance.residentPath);
+			return c.json(result, result.ok ? 200 : 500);
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+				},
+				409,
+			);
+		}
+	});
 
-  // GET /:sid/file-locks — current in-memory lock map. Snapshots `Map<absPath,
-  // {agentPath, op, since}>` as plain object for UI rendering of 🔒 indicator.
-  r.get('/:sid/file-locks', (c) => {
-    const sm = getSessionManager();
-    const sid = c.req.param('sid');
-    const session = sm.peek(sid);
-    if (!session) return c.json({ error: `session not open: ${sid}` }, 404);
-    const locks: Record<string, { agentPath: string; op: string; since: number }> = {};
-    for (const [path, snap] of session.fileLocks.entries()) {
-      locks[path] = { agentPath: snap.agentPath, op: snap.op, since: snap.since };
-    }
-    return c.json({ sid, locks });
-  });
+	// DELETE /:sid —— 关掉 + rm -rf session 目录（含 ledger / blobs / scaffold 全清）。
+	// 跟 close 的区别：close 软释放（只解除 in-memory bindings，盘上不动），delete
+	// 把这个 sid 整个从盘上抹掉，sm.delete 内部对 unknown sid 是 idempotent（不抛）。
+	//
+	// 路线对齐：session 容器 CRUD 走纯 REST（list/create/delete/close/abort），与
+	// `/api/commands/*` 的 query/execute 模式互不重叠 —— 用户在 2026-05-20 钉死「session
+	// 本体的控制不走 commands」之后，原 `builtin/commands/sessions.ts` 整个模块被删，
+	// 只留下 agent 树 + 历史查询（list_agents / fetch_session_events / fetch_blob）在 commands。
+	r.delete("/:sid", async (c) => {
+		const sm = getSessionManager();
+		const sid = c.req.param("sid");
+		try {
+			await sm.delete(sid);
+			return c.json({ ok: true, sid });
+		} catch (err: any) {
+			return c.json({ ok: false, error: err?.message ?? String(err) }, 500);
+		}
+	});
 
-  r.post('/:sid/abort', async (c) => {
-    const sm = getSessionManager();
-    const sid = c.req.param('sid');
-    const agent = c.req.query('agent') || undefined;
-    const session = sm.peek(sid);
-    if (!session) return c.json({ error: `session not open: ${sid}` }, 404);
-    if (agent && !session.tree.resolve(agent)) {
-      return c.json({ error: `runtime agent not found: ${agent}` }, 404);
-    }
-    session.stopRuntime(agent, "aborted by API");
-    return c.json({ ok: true, sid, agent: agent ?? null });
-  });
+	// ─── File-activity ledger query (SSOT for "who touched what") ────────────
+	// GET /:sid/file-activity?path=&agent=&limit=&since=
+	// - path:  abs path filter (matches record.path or record.fromPath)
+	// - agent: agentPath filter
+	// - limit: 1..1000, default 50
+	// - since: unix-ms lower bound
+	// Returns newest-first array. Reads `<sid>/file-activity.jsonl` directly via
+	// the ledger; no caching — caller should poll at most every 2s.
+	r.get("/:sid/file-activity", (c) => {
+		const sm = getSessionManager();
+		const sid = c.req.param("sid");
+		const session = sm.peek(sid);
+		if (!session) return c.json({ error: `session not open: ${sid}` }, 404);
+		const path = c.req.query("path") || undefined;
+		const agent = c.req.query("agent") || undefined;
+		const limit = c.req.query("limit") ? Number(c.req.query("limit")) : 50;
+		const since = c.req.query("since")
+			? Number(c.req.query("since"))
+			: undefined;
+		const records = session.fileActivity.query({
+			...(path ? { path } : {}),
+			...(agent ? { agent } : {}),
+			...(Number.isFinite(limit) ? { limit } : {}),
+			...(since != null && Number.isFinite(since) ? { sinceTs: since } : {}),
+		});
+		return c.json({ sid, records, mtime: session.fileActivity.mtimeMs() });
+	});
 
-  // Progress control is deliberately a separate acknowledgement channel:
-  // ordinary messages never silently resume a paused long-running task.
-  r.get('/:sid/progress', async (c) => {
-    const sid = c.req.param('sid');
-    const session = getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
-    const requested = c.req.query('agent') || undefined;
-    const agent = requested
-      ? session.tree.get(requested)?.path
-        ?? session.tree.getByFullId(requested)?.path
-      : session.tree.list().find((node) => node.depth === 1)?.path;
-    if (!agent) return c.json({ error: 'runtime agent not found' }, 404);
-    const snapshot = session.getProgressSnapshot(agent);
-    if (!snapshot) {
-      return c.json({
-        error: 'progress control is not enabled for this agent',
-        code: 'progress_disabled',
-      }, 409);
-    }
-    return c.json({ sid, agent, snapshot });
-  });
+	// GET /:sid/file-locks — current in-memory lock map. Snapshots `Map<absPath,
+	// {agentPath, op, since}>` as plain object for UI rendering of 🔒 indicator.
+	r.get("/:sid/file-locks", (c) => {
+		const sm = getSessionManager();
+		const sid = c.req.param("sid");
+		const session = sm.peek(sid);
+		if (!session) return c.json({ error: `session not open: ${sid}` }, 404);
+		const locks: Record<
+			string,
+			{ agentPath: string; op: string; since: number }
+		> = {};
+		for (const [path, snap] of session.fileLocks.entries()) {
+			locks[path] = {
+				agentPath: snap.agentPath,
+				op: snap.op,
+				since: snap.since,
+			};
+		}
+		return c.json({ sid, locks });
+	});
 
-  r.post('/:sid/progress/continue', async (c) => {
-    const sid = c.req.param('sid');
-    const session = getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
-    const body = await c.req.json().catch(() => ({}));
-    const requested = typeof body.agent === 'string' && body.agent
-      ? body.agent
-      : c.req.query('agent') || undefined;
-    const agent = requested
-      ? session.tree.get(requested)?.path
-        ?? session.tree.getByFullId(requested)?.path
-      : session.tree.list().find((node) => node.depth === 1)?.path;
-    if (!agent) return c.json({ error: 'runtime agent not found' }, 404);
-    try {
-      const decision = await session.continueProgress(agent);
-      return c.json({ sid, agent, ...decision });
-    } catch (error) {
-      return c.json({
-        error: error instanceof Error ? error.message : String(error),
-        code: 'progress_disabled',
-      }, 409);
-    }
-  });
+	r.post("/:sid/abort", async (c) => {
+		const sm = getSessionManager();
+		const sid = c.req.param("sid");
+		const agent = c.req.query("agent") || undefined;
+		const session = sm.peek(sid);
+		if (!session) return c.json({ error: `session not open: ${sid}` }, 404);
+		if (agent && !session.tree.resolve(agent)) {
+			return c.json({ error: `runtime agent not found: ${agent}` }, 404);
+		}
+		session.stopRuntime(agent, "aborted by API");
+		return c.json({ ok: true, sid, agent: agent ?? null });
+	});
 
-  r.post('/:sid/messages', async (c) => {
-    const sid = c.req.param('sid');
-    const body = await c.req.json().catch(() => ({}));
-    const content = body.content;
-    const requestedKernelId = (() => {
-      const nested =
-        body.payload && typeof body.payload === 'object'
-          ? body.payload as Record<string, unknown>
-          : {};
-      const raw =
-        typeof body.kernelId === 'string'
-          ? body.kernelId.trim()
-          : typeof body.providerOverride === 'string'
-            ? body.providerOverride.trim()
-            : typeof nested.kernelId === 'string'
-              ? nested.kernelId.trim()
-              : typeof nested.providerOverride === 'string'
-                ? nested.providerOverride.trim()
-            : '';
-      if (!raw) return undefined;
-      return raw === 'forgeax' ? 'forgeax-core' : raw;
-    })();
-    const rawPayloadEarly = body.payload && typeof body.payload === 'object'
-      ? body.payload as Record<string, unknown>
-      : {};
-    // `summonAgentId` is a three-state wire field: absence is legacy-compatible,
-    // null means the user explicitly cleared the chip, and only a safe single
-    // agent-id segment may be carried onward to the durable event/WAL.
-    if (
-      Object.prototype.hasOwnProperty.call(rawPayloadEarly, 'summonAgentId')
-      && rawPayloadEarly.summonAgentId !== null
-      && !isValidSummonAgentId(rawPayloadEarly.summonAgentId)
-    ) {
-      return c.json({ error: 'payload.summonAgentId must be null or match /^[A-Za-z0-9_-]+$/' }, 400);
-    }
-    const hasAttachments = Array.isArray(rawPayloadEarly.attachments)
-      && (rawPayloadEarly.attachments as unknown[]).length > 0;
-    // Allow empty content when the user only pasted attachments — UI projects a
-    // placeholder, but also accept "" so image-only clients don't 400.
-    if (typeof content !== 'string' || (!content && !hasAttachments)) {
-      return c.json({ error: 'content (string) required' }, 400);
-    }
-    const sm = getSessionManager();
-    const resolvedContent = content || '(see attached file)';
-    // 写时迁移(plan B PR2-compat):这是 UI 的主发消息端点。若 sid 还是 pre-PR2 老 session
-    // (home/扁平),先把整份目录迁进当前项目 games/<bound-slug>/sessions/<sid>/,确保老历史 +
-    // 新记录都落项目下。幂等;已在项目内 / 非老 session → no-op。必须在 open 之前(迁移会先
-    // close 再 move,open 随后从新位置 hydrate)。
-    await sm.prepareForWrite(sid);
-    const session = await sm.open(sid);
+	// Progress control is deliberately a separate acknowledgement channel:
+	// ordinary messages never silently resume a paused long-running task.
+	r.get("/:sid/progress", async (c) => {
+		const sid = c.req.param("sid");
+		const session =
+			getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
+		const requested = c.req.query("agent") || undefined;
+		const agent = requested
+			? (session.tree.get(requested)?.path ??
+				session.tree.getByFullId(requested)?.path)
+			: session.tree.list().find((node) => node.depth === 1)?.path;
+		if (!agent) return c.json({ error: "runtime agent not found" }, 404);
+		const snapshot = session.getProgressSnapshot(agent);
+		if (!snapshot) {
+			return c.json(
+				{
+					error: "progress control is not enabled for this agent",
+					code: "progress_disabled",
+				},
+				409,
+			);
+		}
+		return c.json({ sid, agent, snapshot });
+	});
 
-    let target: string | undefined;
-    if (typeof body.to === 'string' && body.to) {
-      const candidate = body.to as string;
-      try {
-        target = await resolveAgentPath(session, candidate);
-      } catch (err: any) {
-        // Persona simply doesn't exist → 404 (caller's fault, pick a known id).
-        // Found it but scaffolding/registering it failed → 500/409, not 404 —
-        // a materialization failure looks nothing like "unknown agent" to the
-        // Studio UI and would otherwise be silently mis-reported as one.
-        const status = err instanceof AgentMaterializationError ? err.status : 404;
-        return c.json({ error: err?.message ?? String(err) }, status);
-      }
-    }
+	r.post("/:sid/progress/continue", async (c) => {
+		const sid = c.req.param("sid");
+		const session =
+			getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
+		const body = await c.req.json().catch(() => ({}));
+		const requested =
+			typeof body.agent === "string" && body.agent
+				? body.agent
+				: c.req.query("agent") || undefined;
+		const agent = requested
+			? (session.tree.get(requested)?.path ??
+				session.tree.getByFullId(requested)?.path)
+			: session.tree.list().find((node) => node.depth === 1)?.path;
+		if (!agent) return c.json({ error: "runtime agent not found" }, 404);
+		try {
+			const decision = await session.continueProgress(agent);
+			return c.json({ sid, agent, ...decision });
+		} catch (error) {
+			return c.json(
+				{
+					error: error instanceof Error ? error.message : String(error),
+					code: "progress_disabled",
+				},
+				409,
+			);
+		}
+	});
 
-    // Materialize the instance-bound Kit/AgentContext host before the first
-    // message. RuntimeTree identity already exists; this only initializes
-    // capabilities and does not create a second lifecycle.
-    const ensurePath = target ?? session.tree.list().find((n) => n.depth === 1)?.path;
-    if (ensurePath) {
-      try {
-        await session.initializeAgentHost(ensurePath);
-      } catch (err: any) {
-        process.stderr.write(
-          `[sessions] ensure attach+start '${ensurePath}' for ${session.sid} failed: ${err?.message ?? err}\n`,
-        );
-      }
-    }
+	r.post("/:sid/messages", async (c) => {
+		const sid = c.req.param("sid");
+		const body = await c.req.json().catch(() => ({}));
+		const content = body.content;
+		const requestedKernelId = (() => {
+			const nested =
+				body.payload && typeof body.payload === "object"
+					? (body.payload as Record<string, unknown>)
+					: {};
+			const raw =
+				typeof body.kernelId === "string"
+					? body.kernelId.trim()
+					: typeof body.providerOverride === "string"
+						? body.providerOverride.trim()
+						: typeof nested.kernelId === "string"
+							? nested.kernelId.trim()
+							: typeof nested.providerOverride === "string"
+								? nested.providerOverride.trim()
+								: "";
+			if (!raw) return undefined;
+			return raw === "forgeax" ? "forgeax-core" : raw;
+		})();
+		const rawPayloadEarly =
+			body.payload && typeof body.payload === "object"
+				? (body.payload as Record<string, unknown>)
+				: {};
+		// `summonAgentId` is a three-state wire field: absence is legacy-compatible,
+		// null means the user explicitly cleared the chip, and only a safe single
+		// agent-id segment may be carried onward to the durable event/WAL.
+		if (
+			Object.prototype.hasOwnProperty.call(rawPayloadEarly, "summonAgentId") &&
+			rawPayloadEarly.summonAgentId !== null &&
+			!isValidSummonAgentId(rawPayloadEarly.summonAgentId)
+		) {
+			return c.json(
+				{
+					error:
+						"payload.summonAgentId must be null or match /^[A-Za-z0-9_-]+$/",
+				},
+				400,
+			);
+		}
+		const hasAttachments =
+			Array.isArray(rawPayloadEarly.attachments) &&
+			(rawPayloadEarly.attachments as unknown[]).length > 0;
+		// Allow empty content when the user only pasted attachments — UI projects a
+		// placeholder, but also accept "" so image-only clients don't 400.
+		if (typeof content !== "string" || (!content && !hasAttachments)) {
+			return c.json({ error: "content (string) required" }, 400);
+		}
+		const sm = getSessionManager();
+		const resolvedContent = content || "(see attached file)";
+		// 写时迁移(plan B PR2-compat):这是 UI 的主发消息端点。若 sid 还是 pre-PR2 老 session
+		// (home/扁平),先把整份目录迁进当前项目 games/<bound-slug>/sessions/<sid>/,确保老历史 +
+		// 新记录都落项目下。幂等;已在项目内 / 非老 session → no-op。必须在 open 之前(迁移会先
+		// close 再 move,open 随后从新位置 hydrate)。
+		await sm.prepareForWrite(sid);
+		const session = await sm.open(sid);
 
-    // ── root 兜底必须显式写进 `to` ──
-    // EventBus.emit 只路由带 `to` 的事件(event-bus.ts route);不带 to 的事件只过
-    // observers(headless log 记一笔),不进任何 agent 队列 → turn 永不启动、消息
-    // 静默丢失。上面的 attach+start 只保证兜底 agent 的队列存在,不改变路由——
-    // 所以「无 to → root 兜底」这个语义必须在这里落成 event.to,不能指望总线
-    // (它保持 dumb,不做 type-based 路由)。树上一个 agent 都没有 → 409 fail-fast。
-    target ??= ensurePath;
-    if (!target) {
-      return c.json(
-        { error: 'session has no agents — message would be silently dropped', code: 'no_agent' },
-        409,
-      );
-    }
+		let target: string | undefined;
+		if (typeof body.to === "string" && body.to) {
+			const candidate = body.to as string;
+			try {
+				target = await resolveAgentPath(session, candidate);
+			} catch (err: any) {
+				// Persona simply doesn't exist → 404 (caller's fault, pick a known id).
+				// Found it but scaffolding/registering it failed → 500/409, not 404 —
+				// a materialization failure looks nothing like "unknown agent" to the
+				// Studio UI and would otherwise be silently mis-reported as one.
+				const status =
+					err instanceof AgentMaterializationError ? err.status : 404;
+				return c.json({ error: err?.message ?? String(err) }, status);
+			}
+		}
 
-    // ── checkpoint 回退点 ──
-    // 仅 user_input:① 有挂起的软回退 → 先定格(此后 cancel 失效,UI 移除置灰段);
-    // ② emit 前打消息锚点快照(失败不阻塞聊天)。msgId 是回退体系的稳定外键。
-    const isUserInput = (body.type ?? 'user_input') === 'user_input';
-    const requestedMsgId =
-      typeof rawPayloadEarly.clientMsgId === 'string' &&
-      rawPayloadEarly.clientMsgId.trim()
-        ? rawPayloadEarly.clientMsgId.trim()
-        : undefined;
-    const msgId: string | undefined = isUserInput
-      ? requestedMsgId ?? randomUUID()
-      : undefined;
-    if (isUserInput && msgId) {
-      const cpm = getCheckpointManager();
-      try { await cpm.finalizePending(session); } catch (err: any) {
-        process.stderr.write(`[checkpoint] finalizePending failed: ${err?.message ?? err}\n`);
-      }
-      try { await cpm.snapshotForMessage(session, msgId); } catch (err: any) {
-        process.stderr.write(`[checkpoint] snapshotForMessage failed: ${err?.message ?? err}\n`);
-      }
-    }
+		// Materialize the instance-bound Kit/AgentContext host before the first
+		// message. RuntimeTree identity already exists; this only initializes
+		// capabilities and does not create a second lifecycle.
+		const ensurePath =
+			target ?? session.tree.list().find((n) => n.depth === 1)?.path;
+		if (ensurePath) {
+			try {
+				await session.initializeAgentHost(ensurePath);
+			} catch (err: any) {
+				process.stderr.write(
+					`[sessions] ensure attach+start '${ensurePath}' for ${session.sid} failed: ${err?.message ?? err}\n`,
+				);
+			}
+		}
 
-    // Authoritative pre-ledger attachment ingress. Materialize before EventBus so
-    // neither the queue nor WAL ever sees inline base64. Keep `content` as the UI
-    // projection and carry model-only durable context separately; Kernel turn
-    // assembly publishes exactly one inbound_message from that context.
-    const rawPayload: Record<string, unknown> = {
-      ...(body.payload && typeof body.payload === 'object'
-        ? body.payload as Record<string, unknown>
-        : {}),
-      ...(requestedKernelId ? { kernelId: requestedKernelId } : {}),
-    };
-    let safePayload: Record<string, unknown> = { ...rawPayload, content: resolvedContent };
-    if (isUserInput) {
-      try {
-        const targetInstance = session.tree.resolve(target);
-        const kernel = resolveKernel(
-          target,
-          requestedKernelId ??
-            targetInstance?.template.definition.kernelId,
-        );
-        safePayload = prepareUserAttachmentPayload({
-          content: resolvedContent,
-          payload: rawPayload,
-          uploadDir: resolvePath(getPathManager().session(sid).root(), 'uploads'),
-          nativeAttachmentKinds: orchestrationProfileOf(kernel).nativeAttachmentKinds,
-        });
-      } catch (err) {
-        const { attachments: _inlineAttachments, contextContent: _context, ...rest } = rawPayload;
-        safePayload = {
-          ...rest,
-          content: resolvedContent,
-          contextContent: `${resolvedContent}\n\n[Attachments could not be prepared: ${err instanceof Error ? err.message : String(err)}]`,
-        };
-      }
-    }
-    const event: Event = {
-      source: 'user',
-      type: body.type ?? 'user_input',
-      payload: {
-        ...safePayload,
-        ...(msgId ? { msgId } : {}),
-      },
-      to: target,
-      handoff: body.handoff ?? 'turn',
-      ts: Date.now(),
-    };
-    // RuntimeController owns the queue. Publish once for UI/history, then pass
-    // the same immutable input to the selected instance. `agent_command` has
-    // its own Session observer because command transport also publishes it;
-    // do not enqueue it a second time here.
-    session.eventBus.publish(event);
-    if (event.type !== 'agent_command') {
-      void session.enqueueAgent(target, event).catch((error) => {
-        session.logger.error(
-          target!,
-          undefined,
-          `runtime turn failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
-    }
-    return c.json({ ok: true, to: target, msgId });
-  });
+		// ── root 兜底必须显式写进 `to` ──
+		// EventBus.emit 只路由带 `to` 的事件(event-bus.ts route);不带 to 的事件只过
+		// observers(headless log 记一笔),不进任何 agent 队列 → turn 永不启动、消息
+		// 静默丢失。上面的 attach+start 只保证兜底 agent 的队列存在,不改变路由——
+		// 所以「无 to → root 兜底」这个语义必须在这里落成 event.to,不能指望总线
+		// (它保持 dumb,不做 type-based 路由)。树上一个 agent 都没有 → 409 fail-fast。
+		target ??= ensurePath;
+		if (!target) {
+			return c.json(
+				{
+					error: "session has no agents — message would be silently dropped",
+					code: "no_agent",
+				},
+				409,
+			);
+		}
 
-  // Serve session upload files for chat history thumbnails (path-only ledger).
-  // Filename is basename-only; must resolve inside <session>/uploads/.
-  r.get('/:sid/uploads/:fileName', async (c) => {
-    const sid = c.req.param('sid');
-    const fileName = basename(c.req.param('fileName') || '');
-    if (!fileName || fileName === '.' || fileName === '..') {
-      return c.json({ error: 'invalid file name' }, 400);
-    }
-    let session: Session;
-    try {
-      session = await getSessionManager().open(sid);
-    } catch {
-      return c.json({ error: 'session not found' }, 404);
-    }
-    const uploadsDir = resolvePath(session.paths.root(), 'uploads');
-    const full = resolvePath(join(uploadsDir, fileName));
-    if (!isPathInside(uploadsDir, full) && full !== uploadsDir) {
-      return c.json({ error: 'path escape' }, 400);
-    }
-    if (!existsSync(full) || !statSync(full).isFile()) {
-      return c.json({ error: 'file not found' }, 404);
-    }
-    const ext = fileName.split('.').pop()?.toLowerCase();
-    const type =
-      ext === 'png' ? 'image/png'
-      : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
-      : ext === 'gif' ? 'image/gif'
-      : ext === 'webp' ? 'image/webp'
-      : ext === 'pdf' ? 'application/pdf'
-      : 'application/octet-stream';
-    return new Response(Bun.file(full), {
-      headers: {
-        'content-type': type,
-        'content-disposition': `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`,
-        'cache-control': 'private, max-age=3600',
-        'content-length': String(statSync(full).size),
-      },
-    });
-  });
+		// ── checkpoint 回退点 ──
+		// 仅 user_input:① 有挂起的软回退 → 先定格(此后 cancel 失效,UI 移除置灰段);
+		// ② emit 前打消息锚点快照(失败不阻塞聊天)。msgId 是回退体系的稳定外键。
+		const isUserInput = (body.type ?? "user_input") === "user_input";
+		const requestedMsgId =
+			typeof rawPayloadEarly.clientMsgId === "string" &&
+			rawPayloadEarly.clientMsgId.trim()
+				? rawPayloadEarly.clientMsgId.trim()
+				: undefined;
+		const msgId: string | undefined = isUserInput
+			? (requestedMsgId ?? randomUUID())
+			: undefined;
+		if (isUserInput && msgId) {
+			const cpm = getCheckpointManager();
+			try {
+				await cpm.finalizePending(session);
+			} catch (err: any) {
+				process.stderr.write(
+					`[checkpoint] finalizePending failed: ${err?.message ?? err}\n`,
+				);
+			}
+			try {
+				await cpm.snapshotForMessage(session, msgId);
+			} catch (err: any) {
+				process.stderr.write(
+					`[checkpoint] snapshotForMessage failed: ${err?.message ?? err}\n`,
+				);
+			}
+		}
 
-  // ── checkpoint 回退点路由 ────────────────────────────────────────────────
-  r.get('/:sid/checkpoints', async (c) => {
-    const sm = getSessionManager();
-    let session: Session;
-    try {
-      session = await sm.open(c.req.param('sid'));
-    } catch {
-      return c.json({ error: 'session not found' }, 404);
-    }
-    const cpm = getCheckpointManager();
-    return c.json({ checkpoints: cpm.list(session), pending: cpm.pendingOf(session) });
-  });
+		// Authoritative pre-ledger attachment ingress. Materialize before EventBus so
+		// neither the queue nor WAL ever sees inline base64. Keep `content` as the UI
+		// projection and carry model-only durable context separately; Kernel turn
+		// assembly publishes exactly one inbound_message from that context.
+		const rawPayload: Record<string, unknown> = {
+			...(body.payload && typeof body.payload === "object"
+				? (body.payload as Record<string, unknown>)
+				: {}),
+			...(requestedKernelId ? { kernelId: requestedKernelId } : {}),
+		};
+		let safePayload: Record<string, unknown> = {
+			...rawPayload,
+			content: resolvedContent,
+		};
+		if (isUserInput) {
+			try {
+				const targetInstance = session.tree.resolve(target);
+				const kernel = resolveKernel(
+					target,
+					requestedKernelId ?? targetInstance?.template.definition.kernelId,
+				);
+				safePayload = prepareUserAttachmentPayload({
+					content: resolvedContent,
+					payload: rawPayload,
+					uploadDir: resolvePath(
+						getPathManager().session(sid).root(),
+						"uploads",
+					),
+					nativeAttachmentKinds:
+						orchestrationProfileOf(kernel).nativeAttachmentKinds,
+				});
+			} catch (err) {
+				const {
+					attachments: _inlineAttachments,
+					contextContent: _context,
+					...rest
+				} = rawPayload;
+				safePayload = {
+					...rest,
+					content: resolvedContent,
+					contextContent: `${resolvedContent}\n\n[Attachments could not be prepared: ${err instanceof Error ? err.message : String(err)}]`,
+				};
+			}
+		}
+		const event: Event = {
+			source: "user",
+			type: body.type ?? "user_input",
+			payload: {
+				...safePayload,
+				...(msgId ? { msgId } : {}),
+			},
+			to: target,
+			handoff: body.handoff ?? "turn",
+			ts: Date.now(),
+		};
+		// RuntimeController owns the queue. Publish once for UI/history, then pass
+		// the same immutable input to the selected instance. `agent_command` has
+		// its own Session observer because command transport also publishes it;
+		// do not enqueue it a second time here.
+		session.eventBus.publish(event);
+		if (event.type !== "agent_command") {
+			void session.enqueueAgent(target, event).catch((error) => {
+				session.logger.error(
+					target!,
+					undefined,
+					`runtime turn failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			});
+		}
+		return c.json({ ok: true, to: target, msgId });
+	});
 
-  r.post('/:sid/rewind/preview', async (c) => {
-    const sm = getSessionManager();
-    const session = await sm.open(c.req.param('sid'));
-    const body = await c.req.json().catch(() => ({}));
-    if (typeof body.msgId !== 'string') return c.json({ error: 'msgId required' }, 400);
-    const result = await getCheckpointManager().preview(session, body.msgId);
-    if ('error' in result) return c.json({ error: result.error }, result.status as 404);
-    return c.json(result);
-  });
+	// Serve session upload files for chat history thumbnails (path-only ledger).
+	// Filename is basename-only; must resolve inside <session>/uploads/.
+	r.get("/:sid/uploads/:fileName", async (c) => {
+		const sid = c.req.param("sid");
+		const fileName = basename(c.req.param("fileName") || "");
+		if (!fileName || fileName === "." || fileName === "..") {
+			return c.json({ error: "invalid file name" }, 400);
+		}
+		let session: Session;
+		try {
+			session = await getSessionManager().open(sid);
+		} catch {
+			return c.json({ error: "session not found" }, 404);
+		}
+		const uploadsDir = resolvePath(session.paths.root(), "uploads");
+		const full = resolvePath(join(uploadsDir, fileName));
+		if (!isPathInside(uploadsDir, full) && full !== uploadsDir) {
+			return c.json({ error: "path escape" }, 400);
+		}
+		if (!existsSync(full) || !statSync(full).isFile()) {
+			return c.json({ error: "file not found" }, 404);
+		}
+		const ext = fileName.split(".").pop()?.toLowerCase();
+		const type =
+			ext === "png"
+				? "image/png"
+				: ext === "jpg" || ext === "jpeg"
+					? "image/jpeg"
+					: ext === "gif"
+						? "image/gif"
+						: ext === "webp"
+							? "image/webp"
+							: ext === "pdf"
+								? "application/pdf"
+								: "application/octet-stream";
+		return new Response(Bun.file(full), {
+			headers: {
+				"content-type": type,
+				"content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+				"cache-control": "private, max-age=3600",
+				"content-length": String(statSync(full).size),
+			},
+		});
+	});
 
-  r.post('/:sid/rewind', async (c) => {
-    const sm = getSessionManager();
-    const session = await sm.open(c.req.param('sid'));
-    const body = await c.req.json().catch(() => ({}));
-    if (typeof body.msgId !== 'string') return c.json({ error: 'msgId required' }, 400);
-    const mode: RewindMode = body.mode === 'code' || body.mode === 'conversation' ? body.mode : 'both';
-    const result = await getCheckpointManager().rewind(session, body.msgId, mode);
-    if ('error' in result) return c.json({ error: result.error }, result.status as 404);
-    return c.json(result);
-  });
+	// ── checkpoint 回退点路由 ────────────────────────────────────────────────
+	r.get("/:sid/checkpoints", async (c) => {
+		const sm = getSessionManager();
+		let session: Session;
+		try {
+			session = await sm.open(c.req.param("sid"));
+		} catch {
+			return c.json({ error: "session not found" }, 404);
+		}
+		const cpm = getCheckpointManager();
+		return c.json({
+			checkpoints: cpm.list(session),
+			pending: cpm.pendingOf(session),
+		});
+	});
 
-  r.post('/:sid/rewind/cancel', async (c) => {
-    const sm = getSessionManager();
-    const session = await sm.open(c.req.param('sid'));
-    const body = await c.req.json().catch(() => ({}));
-    if (typeof body.boundaryId !== 'string') return c.json({ error: 'boundaryId required' }, 400);
-    const result = await getCheckpointManager().cancel(session, body.boundaryId);
-    if ('error' in result) return c.json({ error: result.error }, result.status as 409);
-    return c.json(result);
-  });
+	r.post("/:sid/rewind/preview", async (c) => {
+		const sm = getSessionManager();
+		const session = await sm.open(c.req.param("sid"));
+		const body = await c.req.json().catch(() => ({}));
+		if (typeof body.msgId !== "string")
+			return c.json({ error: "msgId required" }, 400);
+		const result = await getCheckpointManager().preview(session, body.msgId);
+		if ("error" in result)
+			return c.json({ error: result.error }, result.status as 404);
+		return c.json(result);
+	});
 
-  r.post('/:sid/rewind/overwrite-dirty', async (c) => {
-    const sm = getSessionManager();
-    const session = await sm.open(c.req.param('sid'));
-    const body = await c.req.json().catch(() => ({}));
-    if (typeof body.boundaryId !== 'string') return c.json({ error: 'boundaryId required' }, 400);
-    const result = await getCheckpointManager().overwriteDirty(session, body.boundaryId);
-    if ('error' in result) return c.json({ error: result.error }, result.status as 409);
-    return c.json(result);
-  });
+	r.post("/:sid/rewind", async (c) => {
+		const sm = getSessionManager();
+		const session = await sm.open(c.req.param("sid"));
+		const body = await c.req.json().catch(() => ({}));
+		if (typeof body.msgId !== "string")
+			return c.json({ error: "msgId required" }, 400);
+		const mode: RewindMode =
+			body.mode === "code" || body.mode === "conversation" ? body.mode : "both";
+		const result = await getCheckpointManager().rewind(
+			session,
+			body.msgId,
+			mode,
+		);
+		if ("error" in result)
+			return c.json({ error: result.error }, result.status as 404);
+		return c.json(result);
+	});
 
-  r.post('/:sid/rewind/undo-overwrite', async (c) => {
-    const sm = getSessionManager();
-    const session = await sm.open(c.req.param('sid'));
-    const body = await c.req.json().catch(() => ({}));
-    if (typeof body.boundaryId !== 'string') return c.json({ error: 'boundaryId required' }, 400);
-    const result = await getCheckpointManager().undoOverwrite(session, body.boundaryId);
-    if ('error' in result) return c.json({ error: result.error }, result.status as 409);
-    return c.json(result);
-  });
+	r.post("/:sid/rewind/cancel", async (c) => {
+		const sm = getSessionManager();
+		const session = await sm.open(c.req.param("sid"));
+		const body = await c.req.json().catch(() => ({}));
+		if (typeof body.boundaryId !== "string")
+			return c.json({ error: "boundaryId required" }, 400);
+		const result = await getCheckpointManager().cancel(
+			session,
+			body.boundaryId,
+		);
+		if ("error" in result)
+			return c.json({ error: result.error }, result.status as 409);
+		return c.json(result);
+	});
 
-  // POST /:sid/ask-reply —— 解开 `ask_user` 工具阻塞的 Promise。前端在用户选完
-  // 选项后调用。键 = sid::agent(agent 默认串行,同一 agent 同刻至多一个 ask
-  // pending,见 core/ask-user-registry.ts)。未命中(已超时/已答/键不对)返回
-  // ok:false,前端忽略即可——不报错、不污染聊天历史、不触发新 turn。
-  r.post('/:sid/ask-reply', async (c) => {
-    const sid = c.req.param('sid');
-    const body = await c.req.json().catch(() => ({}));
-    const agent = typeof body.agent === 'string' && body.agent ? body.agent : null;
-    const values = Array.isArray(body.values)
-      ? body.values.filter((v: unknown): v is string => typeof v === 'string')
-      : null;
-    const answers: AskReply | null = Array.isArray(body.answers) &&
-        body.answers.every((answer: unknown) => {
-          if (!answer || typeof answer !== 'object') return false;
-          const candidate = answer as { questionId?: unknown; values?: unknown };
-          return typeof candidate.questionId === 'string' &&
-            candidate.questionId.length > 0 &&
-            Array.isArray(candidate.values) &&
-            candidate.values.every((value: unknown) => typeof value === 'string');
-        })
-      ? body.answers
-      : null;
-    const reply = answers ?? values;
-    if (!agent || !reply) {
-      return c.json({
-        error: 'agent (string) and answers ({ questionId, values[] }[]) or values (string[]) required',
-      }, 400);
-    }
-    const identity = {
-      ...(typeof body.requestId === 'string'
-        ? { requestId: body.requestId }
-        : {}),
-      ...(typeof body.agentInstanceId === 'string'
-        ? { instanceId: body.agentInstanceId }
-        : {}),
-      ...(typeof body.runtimeEpochId === 'string'
-        ? { runtimeEpochId: body.runtimeEpochId }
-        : {}),
-    };
-    const ok = await resolveAskReply(sid, agent, reply, identity);
-    return c.json({ ok, ...(ok ? {} : { reason: 'no-pending' }) });
-  });
+	r.post("/:sid/rewind/overwrite-dirty", async (c) => {
+		const sm = getSessionManager();
+		const session = await sm.open(c.req.param("sid"));
+		const body = await c.req.json().catch(() => ({}));
+		if (typeof body.boundaryId !== "string")
+			return c.json({ error: "boundaryId required" }, 400);
+		const result = await getCheckpointManager().overwriteDirty(
+			session,
+			body.boundaryId,
+		);
+		if ("error" in result)
+			return c.json({ error: result.error }, result.status as 409);
+		return c.json(result);
+	});
 
-  // POST /:sid/permission-request —— 命令审批闭环的「弹卡 + 阻塞」端。由 spawn 出来
-  // 的 MCP permission-server.mjs(permission-prompt 工具)在 CLI 要权限时 HTTP 调
-  // 进来。我们经 EventBus 弹一张 permission:request 卡到前端,注册一个阻塞 Promise,
-  // **hold 住本 HTTP 响应**直到用户在 UI 点「允许/拒绝」(走 /permission-reply 解开)
-  // 或超时(fail closed=deny)。响应 {allow} 回灌给 MCP → 命令据此执行或拦下。见
-  // core/permission-registry.ts。
-  const PERMISSION_TIMEOUT_MS = 10 * 60_000;
-  // AskUserQuestion answer side-channel: the registry only carries the allow/deny
-  // boolean. For AskUserQuestion the user picks an answer, not just allow —
-  // /permission-reply stashes the chosen answers here keyed by reqId;
-  // /permission-request reads + clears them after the await and returns them so
-  // the MCP can inject updatedInput.answers back into the CLI.
-  const permissionAnswers = new Map<string, Record<string, string>>();
-  // One router-owned handle backed by the shared project-MCP pool. The bridge
-  // itself is cheap; the stdio children remain pooled across turns.
-  const projectMcp = createProjectMcpBridge(defaultProjectRoot());
-  // POST /:sid/kernel-tool —— host-tool 桥(T-A)。内核 CC 经 fxt MCP server 把对
-  // host-tool 的调用 HTTP 回调到这里:定位活 agent → 信任闸 → host 侧执行 → 回结果。
-  // 信任闸(T-D)在此**唯一闸口**:trustTier 权威 = live instance 对应的 Catalog
-  // registration,不信子进程上报。缺失 registration fail-closed 为 imported。
-  r.post('/:sid/kernel-tool', async (c) => {
-    const sid = c.req.param('sid');
-    const start = Date.now();
-    const body = await c.req.json().catch(() => ({}));
-    const agentPath = typeof body.agentPath === 'string' && body.agentPath ? body.agentPath : 'forge';
-    let toolName = typeof body.toolName === 'string' ? body.toolName : '';
-    let args = body.args && typeof body.args === 'object' ? (body.args as Record<string, unknown>) : {};
-    const auditCallId = typeof body.callId === 'string' && body.callId.trim() ? body.callId.trim() : undefined;
-    const auditTurnCallId = typeof body.turnCallId === 'string' && body.turnCallId.trim() ? body.turnCallId.trim() : undefined;
-    const auditToolExecutionId = typeof body.toolExecutionId === 'string' && body.toolExecutionId.trim() ? body.toolExecutionId.trim() : undefined;
-    const trace = {
-      ...(auditCallId ? { callId: auditCallId } : {}),
-      ...(auditTurnCallId ? { turnCallId: auditTurnCallId } : {}),
-      ...(auditToolExecutionId ? { toolExecutionId: auditToolExecutionId } : {}),
-    };
-    if (!toolName) return c.json({ ok: false, error: 'toolName required' }, 400);
-    // Normalize catalog-derived ui_act_* and reject missing declarations before trust policy.
-    const requestedToolName = toolName;
-    const preflight = preflightUiToolDispatch(toolName, args, sid);
-    if (preflight.rejection) return c.json({ ok: true, result: preflight.rejection });
-    toolName = preflight.name;
-    args = preflight.args as Record<string, unknown>;
+	r.post("/:sid/rewind/undo-overwrite", async (c) => {
+		const sm = getSessionManager();
+		const session = await sm.open(c.req.param("sid"));
+		const body = await c.req.json().catch(() => ({}));
+		if (typeof body.boundaryId !== "string")
+			return c.json({ error: "boundaryId required" }, 400);
+		const result = await getCheckpointManager().undoOverwrite(
+			session,
+			body.boundaryId,
+		);
+		if ("error" in result)
+			return c.json({ error: result.error }, result.status as 409);
+		return c.json(result);
+	});
 
-    const session = getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
-    const runtimeInstance = session.tree.resolve(agentPath);
-    if (runtimeInstance) {
-      await session.initializeAgentHost(agentPath);
-    }
-    const agent = session.getAgentHost(agentPath);
-    if (!agent || !runtimeInstance) {
-      // agent 不在线 —— 审计记录 allow=false
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier: 'unknown', allow: false, error: `agent '${agentPath}' not live in session`, durationMs: Date.now() - start, ts: start });
-      return c.json({ ok: false, error: `agent '${agentPath}' not live in session` });
-    }
+	// POST /:sid/ask-reply —— 解开 `ask_user` 工具阻塞的 Promise。前端在用户选完
+	// 选项后调用。键 = sid::agent(agent 默认串行,同一 agent 同刻至多一个 ask
+	// pending,见 core/ask-user-registry.ts)。未命中(已超时/已答/键不对)返回
+	// ok:false,前端忽略即可——不报错、不污染聊天历史、不触发新 turn。
+	r.post("/:sid/ask-reply", async (c) => {
+		const sid = c.req.param("sid");
+		const body = await c.req.json().catch(() => ({}));
+		const agent =
+			typeof body.agent === "string" && body.agent ? body.agent : null;
+		const values = Array.isArray(body.values)
+			? body.values.filter((v: unknown): v is string => typeof v === "string")
+			: null;
+		const answers: AskReply | null =
+			Array.isArray(body.answers) &&
+			body.answers.every((answer: unknown) => {
+				if (!answer || typeof answer !== "object") return false;
+				const candidate = answer as { questionId?: unknown; values?: unknown };
+				return (
+					typeof candidate.questionId === "string" &&
+					candidate.questionId.length > 0 &&
+					Array.isArray(candidate.values) &&
+					candidate.values.every((value: unknown) => typeof value === "string")
+				);
+			})
+				? body.answers
+				: null;
+		const reply = answers ?? values;
+		if (!agent || !reply) {
+			return c.json(
+				{
+					error:
+						"agent (string) and answers ({ questionId, values[] }[]) or values (string[]) required",
+				},
+				400,
+			);
+		}
+		const identity = {
+			...(typeof body.requestId === "string"
+				? { requestId: body.requestId }
+				: {}),
+			...(typeof body.agentInstanceId === "string"
+				? { instanceId: body.agentInstanceId }
+				: {}),
+			...(typeof body.runtimeEpochId === "string"
+				? { runtimeEpochId: body.runtimeEpochId }
+				: {}),
+		};
+		const ok = await resolveAskReply(sid, agent, reply, identity);
+		return c.json({ ok, ...(ok ? {} : { reason: "no-pending" }) });
+	});
 
-    // 信任闸:own=full;imported=deny 危险集。Catalog 缺项按 imported 处理。
-    const trustTier = resolveTemplateTrust(
-      session.templateCatalog,
-      runtimeInstance.templateRef,
-    );
-    if (!isBuiltinToolEnabled(toolName)) {
-      const error = `builtin tool not enabled: ${toolName}`;
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: false, error, durationMs: Date.now() - start, ts: start });
-      return c.json({ ok: false, error });
-    }
-    // R2-08:imported 写禁但「该 session 绑定的 game 目录内」豁免。永久绑定(PR2)下豁免基准
-    // 必须是 session 自己绑的 game(config.defaultDir 由路径派生),**不是**全局 active game——
-    // 否则绑 A、active 切 B 时会误判 A 自己的写。session 未绑则回落 active game。
-    const projectRoot = defaultProjectRoot();
-    const scopeGame = session.config?.defaultDir ?? getPathManager().resolveScope();
-    // sid 供 ui_invoke 的 per-action catalog projection 查询(见 trust-gate)。
-    // rules = settings.permissions 分层载出(046 楔子1-补:settings deny/ask/allow 叠加 tier 基线)。
-    const decision = checkKernelTool(trustTier, toolName, {
-      ...agentToolPermissions(session, runtimeInstance, projectRoot),
-      args,
-      projectRoot,
-      activeGame: scopeGame,
-      sid,
-      rules: loadSettingsPermissionRules(projectRoot),
-    });
-    if (decision.outcome === 'deny') {
-      // 信任闸硬拒 —— 审计记录 allow=false
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: false, error: decision.reason ?? 'denied by trust tier', durationMs: Date.now() - start, ts: start });
-      return c.json({ ok: false, error: decision.reason ?? 'denied by trust tier' });
-    }
-    // ask:弹权限卡阻塞等用户(命中本会话 remember 直放);拒绝/超时 → 审计 + 拒。
-    // Kit registries deliberately retain hidden entries for hot reload. The
-    // kernel-tool endpoint is another execution authority, so it must apply
-    // the same canonical agent_manage projection as composition before a
-    // stale in-memory registry can resolve a disabled tool.
-    const visibleAgentManagementTools = new Set(
-      visibleAgentManagementToolsForAgent(sid, agentPath),
-    );
-    const visible = filterVisibleAgentManagementTools(
-      visibleTools(
-        withAgentHostToolDefinitions(agent.agentContext.tools.list(), agent.agentContext),
-        agent.agentContext,
-      ),
-      visibleAgentManagementTools,
-    );
-    const toolScope = await executionToolScope(
-      runtimeInstance.template, visible.map((tool) => tool.name), projectRoot, scopeGame,
-    );
-    if (!toolScope.allows(requestedToolName)) {
-      const error = `tool not granted to agent: ${requestedToolName}`;
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: requestedToolName, trustTier, allow: false, error, durationMs: Date.now() - start, ts: start });
-      return c.json({ ok: false, error });
-    }
-    const delegateConfirmation =
-      decision.outcome === 'ask' &&
-      !isForgeaxBuiltinTool(toolName) &&
-      !getHostTool(toolName)?.run &&
-      shouldDelegateHostToolConfirmation(toolName, visible);
-    if (decision.outcome === 'ask' && !delegateConfirmation) {
-      const approved = await requestToolApproval({
-        eventBus: session.eventBus,
-        sid,
-        agent: agentPath,
-        toolName,
-        ...(decision.capability ? { capability: decision.capability } : {}),
-        args,
-        ...(decision.reason ? { reason: decision.reason } : {}),
-      });
-      if (!approved) {
-        appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: false, error: 'denied by user', durationMs: Date.now() - start, ts: start });
-        return c.json({ ok: false, error: `denied by user: ${toolName}` });
-      }
-    }
+	// POST /:sid/permission-request —— 命令审批闭环的「弹卡 + 阻塞」端。由 spawn 出来
+	// 的 MCP permission-server.mjs(permission-prompt 工具)在 CLI 要权限时 HTTP 调
+	// 进来。我们经 EventBus 弹一张 permission:request 卡到前端,注册一个阻塞 Promise,
+	// **hold 住本 HTTP 响应**直到用户在 UI 点「允许/拒绝」(走 /permission-reply 解开)
+	// 或超时(fail closed=deny)。响应 {allow} 回灌给 MCP → 命令据此执行或拦下。见
+	// core/permission-registry.ts。
+	const PERMISSION_TIMEOUT_MS = 10 * 60_000;
+	// AskUserQuestion answer side-channel: the registry only carries the allow/deny
+	// boolean. For AskUserQuestion the user picks an answer, not just allow —
+	// /permission-reply stashes the chosen answers here keyed by reqId;
+	// /permission-request reads + clears them after the await and returns them so
+	// the MCP can inject updatedInput.answers back into the CLI.
+	const permissionAnswers = new Map<string, Record<string, string>>();
+	// One router-owned handle backed by the shared project-MCP pool. The bridge
+	// itself is cheap; the stdio children remain pooled across turns.
+	const projectMcp = createProjectMcpBridge(defaultProjectRoot());
+	// POST /:sid/kernel-tool —— host-tool 桥(T-A)。内核 CC 经 fxt MCP server 把对
+	// host-tool 的调用 HTTP 回调到这里:定位活 agent → 信任闸 → host 侧执行 → 回结果。
+	// 信任闸(T-D)在此**唯一闸口**:trustTier 权威 = live instance 对应的 Catalog
+	// registration,不信子进程上报。缺失 registration fail-closed 为 imported。
+	r.post("/:sid/kernel-tool", async (c) => {
+		const sid = c.req.param("sid");
+		const start = Date.now();
+		const body = await c.req.json().catch(() => ({}));
+		let toolName = typeof body.toolName === "string" ? body.toolName : "";
+		let args =
+			body.args && typeof body.args === "object"
+				? (body.args as Record<string, unknown>)
+				: {};
+		const auditCallId =
+			typeof body.callId === "string" && body.callId.trim()
+				? body.callId.trim()
+				: undefined;
+		const auditTurnCallId =
+			typeof body.turnCallId === "string" && body.turnCallId.trim()
+				? body.turnCallId.trim()
+				: undefined;
+		const auditToolExecutionId =
+			typeof body.toolExecutionId === "string" && body.toolExecutionId.trim()
+				? body.toolExecutionId.trim()
+				: undefined;
+		const trace = {
+			...(auditCallId ? { callId: auditCallId } : {}),
+			...(auditTurnCallId ? { turnCallId: auditTurnCallId } : {}),
+			...(auditToolExecutionId
+				? { toolExecutionId: auditToolExecutionId }
+				: {}),
+		};
+		if (!toolName)
+			return c.json({ ok: false, error: "toolName required" }, 400);
 
-    try {
-      // 执行解析顺序(与 host-tool-bridge 同口径,对称的两个 host 工具执行口):
-      //   ①内置 forgeax 工具走宿主侧实现;②产品壳 seam 注入且带 run 的 host 工具
-      //   (list_games/query_world/capture_frame,P1-7)走 `HostToolSpec.run`;
-      //   ③其余查 agent kit 注册表。租用内核(外部 CLI 内核)的内置批在 .mjs 本地跑,
-      //   但 ui_snapshot/ui_invoke 例外 —— 它们经 .mjs → 此路由,以复用这里的 per-action
-      //   信任闸(ui_invoke 可触达 delete 级 action,必须过闸)。seam 工具无 .mjs 本地
-      //   实现 → 经 BRIDGED specs 桥到本路由执行。
-      const seamTool = getHostTool(toolName);
-      const configuredProjectMcp = isProjectMcpToolName(toolName, projectRoot);
-      const builtinCtx = {
-        projectRoot,
-        agentId: agentPath,
-        ...(scopeGame ? { game: scopeGame } : {}),
-        ...(auditCallId ? { callId: auditCallId } : {}),
-        ...(auditTurnCallId ? { turnCallId: auditTurnCallId } : {}),
-        ...(auditToolExecutionId ? { toolExecutionId: auditToolExecutionId } : {}),
-        eventBus: session.eventBus,
-        sid,
-      };
-      let kitExecuted = false;
-      const runKit = () => {
-        kitExecuted = true;
-        return executeTool(toolName, args, visible, agent.agentContext);
-      };
-      const canonicalAgentTool = visibleAgentManagementTools.has(toolName as AgentManagementToolName)
-        ? canonicalAgentManagementTool(toolName as AgentManagementToolName)
-        : undefined;
-      const out = configuredProjectMcp
-        ? await (async () => {
-            const projectResult = await projectMcp.callIfKnown(toolName, args);
-            if (projectResult === undefined) {
-              throw new ProjectMcpToolNotFoundError(toolName);
-            }
-            return projectResult;
-          })()
-        : isForgeaxBuiltinTool(toolName)
-        ? await runForgeaxBuiltinTool(toolName, args, builtinCtx)
-        : canonicalAgentTool
-          ? await executeTool(toolName, args, [canonicalAgentTool], agent.agentContext)
-        : seamTool?.run
-          ? await seamTool.run(args, hostToolRunCtx(builtinCtx))
-          : toolName.startsWith('skill_')
-            ? await runSkillKernelTool(toolName, args, {
-                kind: 'ai',
-                sessionId: sid,
-                agentId: agentPath,
-              })
-            : toolName.startsWith('mcp__')
-              ? await (async () => {
-                  const projectResult = await projectMcp.callIfKnown(toolName, args);
-                  return projectResult === undefined ? await runKit() : projectResult;
-                })()
-              : await runKit();
-      if (out && typeof out === 'object' && !Array.isArray(out) && 'error' in out) {
-        const rawErr = (out as { error: unknown }).error;
-        const errMsg = typeof rawErr === 'string' ? rawErr
-          : rawErr instanceof Error ? rawErr.message
-          : JSON.stringify(rawErr);
-        // 工具执行返回 error 字段 —— ok=false
-        appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: false, error: errMsg, durationMs: Date.now() - start, ts: start });
-        return c.json({ ok: false, error: errMsg });
-      }
-      // 工具执行成功
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: true, durationMs: Date.now() - start, ts: start });
-      if (kitExecuted) {
-        recordSessionHostToolWrites(session, {
-          result: out,
-          agentPath,
-          ...(auditCallId ? { toolCallId: auditCallId } : {}),
-          ...(scopeGame ? { gameSlug: scopeGame } : {}),
-        });
-      }
-      return c.json({ ok: true, result: out });
-    } catch (err: any) {
-      const errMsg = err?.message ?? String(err);
-      // 工具执行抛出异常
-      appendToolAudit({ ...trace, sid, agent: agentPath, tool: toolName, trustTier, allow: true, ok: false, error: errMsg, durationMs: Date.now() - start, ts: start });
-      const code = typeof err?.code === 'string' && err.code.trim() ? err.code : undefined;
-      return c.json({ ok: false, error: errMsg, ...(code ? { code } : {}) });
-    }
-  });
+		const claimedAgentPath =
+			typeof body.agentPath === "string" ? body.agentPath.trim() : "";
+		const sourceToken = c.req.header("x-forgeax-kernel-token")?.trim();
+		const sourceBinding = authorizeKernelToolCapability(
+			sourceToken,
+			sid,
+			toolName,
+		);
+		if (sourceToken && !sourceBinding) {
+			return c.json(
+				{
+					ok: false,
+					error: "invalid or expired kernel-tool source capability",
+				},
+				401,
+			);
+		}
+		if (!sourceToken && claimedAgentPath) {
+			return c.json(
+				{
+					ok: false,
+					error: "kernel-tool agentPath requires a source capability",
+				},
+				401,
+			);
+		}
+		// Tokenless localhost callers retain the documented standalone MCP path, but they are
+		// always an imported external actor and cannot choose a live agent identity/trust tier.
+		const agentPath = sourceBinding?.agentPath ?? "forge";
+		const actorId = sourceBinding?.agentPath ?? "external-mcp";
+		// Normalize catalog-derived ui_act_* and reject missing declarations before trust policy.
+		const requestedToolName = toolName;
 
-  r.post('/:sid/permission-request', async (c) => {
-    const sid = c.req.param('sid');
-    const body = await c.req.json().catch(() => ({}));
-    const toolName = typeof body.toolName === 'string' ? body.toolName : 'tool';
-    const command = typeof body.command === 'string' ? body.command : '';
-    const agent = typeof body.agent === 'string' && body.agent ? body.agent : 'forge';
-    let session: Session | undefined;
-    try {
-      // peek 返回 Session | null；收成 undefined 以匹配局部声明 + catch 兜底。
-      session = getSessionManager().peek(sid) ?? undefined;
-    } catch {
-      session = undefined; // 管理器未初始化 → 按无 session 走(fail-closed 回执,不 500)。
-    }
-    if (!session) return c.json({ allow: false, reason: 'no-session' }, 200);
-    const input = body.input ?? (command ? { command } : null);
+		const session =
+			getSessionManager().peek(sid) ?? (await getSessionManager().open(sid));
+		const runtimeInstance = session.tree.resolve(agentPath);
+		if (runtimeInstance) {
+			await session.initializeAgentHost(agentPath);
+		}
+		const agent = session.getAgentHost(agentPath);
+		if (!agent || !runtimeInstance) {
+			// agent 不在线 —— 审计记录 allow=false
+			appendToolAudit({
+				...trace,
+				sid,
+				agent: agentPath,
+				tool: toolName,
+				trustTier: "unknown",
+				allow: false,
+				error: `agent '${agentPath}' not live in session`,
+				durationMs: Date.now() - start,
+				ts: start,
+			});
+			return c.json({
+				ok: false,
+				error: `agent '${agentPath}' not live in session`,
+			});
+		}
 
-    // 046 楔子3 — settings.permissions 规则先行(deny/allow 免卡直断、ask 强制弹卡):
-    // 这让 CC 原生权限提示路由(--permission-prompt-tool)也吃到「配置里写一条 deny」。
-    // 未命中 → undefined → 走原有 turn-gate/弹卡流程,零行为变化。
-    const verdict = evaluateSettingsRules(loadSettingsPermissionRules(), toolName, input);
-    if (verdict?.behavior === 'deny' || verdict?.behavior === 'allow') {
-      const allow = verdict.behavior === 'allow';
-      appendToolAudit({ sid, agent, tool: toolName, trustTier: 'kernel-native', allow, ...(allow ? {} : { error: `denied by rule ${ruleLabel(verdict.rule)}` }), durationMs: 0, ts: Date.now() });
-      return c.json({ allow, ...(allow ? {} : { reason: `denied by rule ${ruleLabel(verdict.rule)}` }) });
-    }
+		// The live RuntimeTree has established the trusted actor. Product actions now mint and
+		// persist an attempt before catalog exposure/schema/trust/confirmation/business checks.
+		const projectRoot = defaultProjectRoot();
+		const productCandidate = inspectProductActionInvocation(
+			toolName,
+			args,
+			sid,
+		);
+		const productInvocation = productCandidate
+			? beginProductActionInvocation({
+					projectRoot,
+					sessionId: sid,
+					actorKind: "ai",
+					actorId,
+					trustedRootActorId: sourceBinding
+						? resolveTrustedRootActorId(session.tree, agentPath)
+						: actorId,
+					actionId: productCandidate.actionId,
+					actionArgs: productCandidate.actionArgs,
+					effect: productCandidate.effect,
+					...((auditToolExecutionId ?? auditCallId)
+						? { clientCallId: (auditToolExecutionId ?? auditCallId)! }
+						: {}),
+				})
+			: undefined;
+		// Normalize catalog-derived ui_act_* and reject missing declarations before trust policy.
+		const preflight = preflightUiToolDispatch(toolName, args, sid);
+		if (preflight.rejection) {
+			return c.json({
+				ok: true,
+				result: productInvocation
+					? productInvocation.reject(
+							preflight.rejection.code,
+							preflight.rejection.reason,
+						)
+					: preflight.rejection,
+			});
+		}
+		toolName = preflight.name;
+		args = preflight.args as Record<string, unknown>;
 
-    // A1#4 — 咨询本轮中立权限闸(TurnRequest.requestPermission,经 cc-profile 的
-    // per-turn registry 按真 sid 登记)。命中即直接回执,免去弹卡;这让「编排层的
-    // checkTool/requestPermission 成为 CC 内核的唯一闸」真正闭合。未登记(无内核闸
-    // 或非内核路径)→ undefined → 回落到下面既有的「弹卡 + 阻塞」流程,行为不变。
-    // fail-closed:闸内部抛错时 consultTurnGate 已返回 deny(不静默放行)。
-    // settings ask(verdict.behavior==='ask')**跳过** turn-gate 直落弹卡——用户显式
-    // 要求「这类工具问我」,不许任何自动闸代答(cc 的 ask 语义)。
-    if (verdict?.behavior !== 'ask') {
-      const gateDecision = await consultTurnGate(sid, { name: toolName, args: input });
-      if (gateDecision) {
-        const allowed = gateDecision.behavior === 'allow';
-        return c.json({
-          allow: allowed,
-          ...(allowed ? {} : { reason: gateDecision.message || 'denied by turn gate' }),
-        });
-      }
-    }
+		// 信任闸:own=full;imported=deny 危险集。Catalog 缺项按 imported 处理。
+		const trustTier = sourceBinding
+			? resolveTemplateTrust(
+					session.templateCatalog,
+					runtimeInstance.templateRef,
+				)
+			: "imported";
+		if (!isBuiltinToolEnabled(toolName)) {
+			const error = `builtin tool not enabled: ${toolName}`;
+			appendToolAudit({
+				...trace,
+				sid,
+				agent: agentPath,
+				tool: toolName,
+				trustTier,
+				allow: false,
+				error,
+				durationMs: Date.now() - start,
+				ts: start,
+			});
+			if (productInvocation) {
+				return c.json({
+					ok: true,
+					result: productInvocation.reject("builtin-disabled", error),
+				});
+			}
+			return c.json({ ok: false, error });
+		}
+		// R2-08:imported 写禁但「该 session 绑定的 game 目录内」豁免。永久绑定(PR2)下豁免基准
+		// 必须是 session 自己绑的 game(config.defaultDir 由路径派生),**不是**全局 active game——
+		// 否则绑 A、active 切 B 时会误判 A 自己的写。session 未绑则回落 active game。
+		const scopeGame =
+			session.config?.defaultDir ?? getPathManager().resolveScope();
+		// sid 供 ui_invoke 的 per-action catalog projection 查询(见 trust-gate)。
+		// rules = settings.permissions 分层载出(046 楔子1-补:settings deny/ask/allow 叠加 tier 基线)。
+		const decision = checkKernelTool(trustTier, toolName, {
+			...agentToolPermissions(session, runtimeInstance, projectRoot),
+			args,
+			projectRoot,
+			activeGame: scopeGame,
+			sid,
+			rules: loadSettingsPermissionRules(projectRoot),
+		});
+		if (decision.outcome === "deny") {
+			// 信任闸硬拒 —— 审计记录 allow=false
+			appendToolAudit({
+				...trace,
+				sid,
+				agent: agentPath,
+				tool: toolName,
+				trustTier,
+				allow: false,
+				error: decision.reason ?? "denied by trust tier",
+				durationMs: Date.now() - start,
+				ts: start,
+			});
+			if (productInvocation) {
+				return c.json({
+					ok: true,
+					result: productInvocation.reject(
+						"trust-denied",
+						decision.reason ?? "denied by trust tier",
+					),
+				});
+			}
+			return c.json({
+				ok: false,
+				error: decision.reason ?? "denied by trust tier",
+			});
+		}
+		// ask:弹权限卡阻塞等用户(命中本会话 remember 直放);拒绝/超时 → 审计 + 拒。
+		// Kit registries deliberately retain hidden entries for hot reload. The
+		// kernel-tool endpoint is another execution authority, so it must apply
+		// the same canonical agent_manage projection as composition before a
+		// stale in-memory registry can resolve a disabled tool.
+		const visibleAgentManagementTools = new Set(
+			visibleAgentManagementToolsForAgent(sid, agentPath),
+		);
+		const visible = filterVisibleAgentManagementTools(
+			visibleTools(
+				withAgentHostToolDefinitions(
+					agent.agentContext.tools.list(),
+					agent.agentContext,
+				),
+				agent.agentContext,
+			),
+			visibleAgentManagementTools,
+		);
+		const toolScope = await executionToolScope(
+			runtimeInstance.template,
+			visible.map((tool) => tool.name),
+			projectRoot,
+			scopeGame,
+		);
+		if (!toolScope.allows(requestedToolName)) {
+			const error = `tool not granted to agent: ${requestedToolName}`;
+			appendToolAudit({
+				...trace,
+				sid,
+				agent: agentPath,
+				tool: requestedToolName,
+				trustTier,
+				allow: false,
+				error,
+				durationMs: Date.now() - start,
+				ts: start,
+			});
+			return c.json({ ok: false, error });
+		}
+		const delegateConfirmation =
+			decision.outcome === "ask" &&
+			!isForgeaxBuiltinTool(toolName) &&
+			!getHostTool(toolName)?.run &&
+			shouldDelegateHostToolConfirmation(toolName, visible);
+		if (decision.outcome === "ask" && !delegateConfirmation) {
+			const approved = await requestToolApproval({
+				eventBus: session.eventBus,
+				sid,
+				agent: agentPath,
+				toolName,
+				...(decision.capability ? { capability: decision.capability } : {}),
+				args,
+				...(decision.reason ? { reason: decision.reason } : {}),
+			});
+			if (!approved) {
+				appendToolAudit({
+					...trace,
+					sid,
+					agent: agentPath,
+					tool: toolName,
+					trustTier,
+					allow: false,
+					error: "denied by user",
+					durationMs: Date.now() - start,
+					ts: start,
+				});
+				if (productInvocation) {
+					return c.json({
+						ok: true,
+						result: productInvocation.reject(
+							"user-denied",
+							`denied by user: ${toolName}`,
+						),
+					});
+				}
+				return c.json({ ok: false, error: `denied by user: ${toolName}` });
+			}
+		}
 
-    const { allow, answers } = await askViaPermissionCard(session, { sid, agent, toolName, command, input });
-    return c.json({ allow, ...(answers ? { answers } : {}) });
-  });
+		try {
+			// 执行解析顺序(与 host-tool-bridge 同口径,对称的两个 host 工具执行口):
+			//   ①内置 forgeax 工具走宿主侧实现;②产品壳 seam 注入且带 run 的 host 工具
+			//   (list_games/query_world/capture_frame,P1-7)走 `HostToolSpec.run`;
+			//   ③其余查 agent kit 注册表。租用内核(外部 CLI 内核)的内置批在 .mjs 本地跑,
+			//   但 ui_snapshot/ui_invoke 例外 —— 它们经 .mjs → 此路由,以复用这里的 per-action
+			//   信任闸(ui_invoke 可触达 delete 级 action,必须过闸)。seam 工具无 .mjs 本地
+			//   实现 → 经 BRIDGED specs 桥到本路由执行。
+			const seamTool = getHostTool(toolName);
+			const configuredProjectMcp = isProjectMcpToolName(toolName, projectRoot);
+			const builtinCtx = {
+				projectRoot,
+				agentId: agentPath,
+				...(scopeGame ? { game: scopeGame } : {}),
+				...(auditCallId ? { callId: auditCallId } : {}),
+				...(auditTurnCallId ? { turnCallId: auditTurnCallId } : {}),
+				...(auditToolExecutionId
+					? { toolExecutionId: auditToolExecutionId }
+					: {}),
+				...(productInvocation
+					? { executionId: productInvocation.executionId }
+					: {}),
+				eventBus: session.eventBus,
+				sid,
+			};
+			let kitExecuted = false;
+			const runKit = () => {
+				kitExecuted = true;
+				return executeTool(toolName, args, visible, agent.agentContext);
+			};
+			const canonicalAgentTool = visibleAgentManagementTools.has(
+				toolName as AgentManagementToolName,
+			)
+				? canonicalAgentManagementTool(toolName as AgentManagementToolName)
+				: undefined;
+			const out = configuredProjectMcp
+				? await (async () => {
+						const projectResult = await projectMcp.callIfKnown(toolName, args);
+						if (projectResult === undefined) {
+							throw new ProjectMcpToolNotFoundError(toolName);
+						}
+						return projectResult;
+					})()
+				: isForgeaxBuiltinTool(toolName)
+					? await runForgeaxBuiltinTool(toolName, args, builtinCtx)
+					: canonicalAgentTool
+						? await executeTool(
+								toolName,
+								args,
+								[canonicalAgentTool],
+								agent.agentContext,
+							)
+						: seamTool?.run
+							? await seamTool.run(args, hostToolRunCtx(builtinCtx))
+							: toolName.startsWith("skill_")
+								? await runSkillKernelTool(toolName, args, {
+										kind: "ai",
+										sessionId: sid,
+										agentId: agentPath,
+									})
+								: toolName.startsWith("mcp__")
+									? await (async () => {
+											const projectResult = await projectMcp.callIfKnown(
+												toolName,
+												args,
+											);
+											return projectResult === undefined
+												? await runKit()
+												: projectResult;
+										})()
+									: await runKit();
+			if (
+				out &&
+				typeof out === "object" &&
+				!Array.isArray(out) &&
+				"error" in out
+			) {
+				const rawErr = (out as { error: unknown }).error;
+				const errMsg =
+					typeof rawErr === "string"
+						? rawErr
+						: rawErr instanceof Error
+							? rawErr.message
+							: JSON.stringify(rawErr);
+				// 工具执行返回 error 字段 —— ok=false
+				appendToolAudit({
+					...trace,
+					sid,
+					agent: agentPath,
+					tool: toolName,
+					trustTier,
+					allow: true,
+					ok: false,
+					error: errMsg,
+					durationMs: Date.now() - start,
+					ts: start,
+				});
+				if (productInvocation) {
+					return c.json({
+						ok: true,
+						result: productInvocation.fail("action-execution-error", errMsg),
+					});
+				}
+				return c.json({ ok: false, error: errMsg });
+			}
+			// 工具执行成功
+			appendToolAudit({
+				...trace,
+				sid,
+				agent: agentPath,
+				tool: toolName,
+				trustTier,
+				allow: true,
+				ok: true,
+				durationMs: Date.now() - start,
+				ts: start,
+			});
+			if (kitExecuted) {
+				recordSessionHostToolWrites(session, {
+					result: out,
+					agentPath,
+					...(auditCallId ? { toolCallId: auditCallId } : {}),
+					...(scopeGame ? { gameSlug: scopeGame } : {}),
+				});
+			}
+			return c.json({
+				ok: true,
+				result: productInvocation
+					? productInvocation.settleBusinessResult(out)
+					: out,
+			});
+		} catch (err: any) {
+			const errMsg = err?.message ?? String(err);
+			// 工具执行抛出异常
+			appendToolAudit({
+				...trace,
+				sid,
+				agent: agentPath,
+				tool: toolName,
+				trustTier,
+				allow: true,
+				ok: false,
+				error: errMsg,
+				durationMs: Date.now() - start,
+				ts: start,
+			});
+			if (productInvocation) {
+				return c.json({
+					ok: true,
+					result: productInvocation.fail(
+						"action-execution-error",
+						errMsg || "Product action execution failed",
+					),
+				});
+			}
+			const code =
+				typeof err?.code === "string" && err.code.trim() ? err.code : undefined;
+			return c.json({ ok: false, error: errMsg, ...(code ? { code } : {}) });
+		}
+	});
 
-  /** 弹权限卡 + 阻塞等用户(permission-request 与 hook-gate 共用)。
-   *  经 EventBus 发 `permission:request` 卡,registerPermission hold 到
-   *  /permission-reply 解开或超时(fail-closed deny);无论如何结算都补发
-   *  `permission:resolved` 撤卡。answers = AskUserQuestion 的选择答案侧信道。 */
-  async function askViaPermissionCard(
-    session: Session,
-    req: { sid: string; agent: string; toolName: string; command: string; input: unknown },
-  ): Promise<{ allow: boolean; answers?: Record<string, string> }> {
-    const { sid, agent, toolName, command, input } = req;
-    const reqId = randomUUID();
-    // Register before publishing. EventBus observers are synchronous and may
-    // resolve or abort the request in the same tick as the card is published.
-    // Registering after publish loses that decision and leaves the HTTP call
-    // waiting until timeout.
-    const handle = registerPermission(reqId, PERMISSION_TIMEOUT_MS, { sid, agent });
-    let allow = false;
-    // Pop the approval card in the Studio UI. Reuses the per-session WS fan-out
-    // (same channel as file-activity:*); the client's permission-stream handler
-    // renders a modal keyed by reqId.
-    try {
-      session.eventBus.publish(
-        {
-          type: 'permission:request',
-          ts: Date.now(),
-          source: `agent:${agent}`,
-          payload: { reqId, toolName, command, input: input ?? null, agent },
-        },
-        agent,
-      );
-      allow = await handle.promise;
-    } finally {
-      handle.dispose();
-      // Tell the UI to dismiss the card regardless of how it settled (reply /
-      // timeout / abort) so a stale prompt never lingers.
-      session.eventBus.publish(
-        {
-          type: 'permission:resolved',
-          ts: Date.now(),
-          source: `agent:${agent}`,
-          payload: { reqId, allow },
-        },
-        agent,
-      );
-    }
-    // For AskUserQuestion: hand back the user's chosen answers so the MCP can
-    // inject updatedInput.answers (without these, CC gets "did not answer").
-    const answers = permissionAnswers.get(reqId);
-    permissionAnswers.delete(reqId);
-    return { allow, ...(answers ? { answers } : {}) };
-  }
+	r.get("/:sid/product-ai-native/ledger", async (c) => {
+		const sid = c.req.param("sid");
+		try {
+			await (getSessionManager().peek(sid) ?? getSessionManager().open(sid));
+		} catch {
+			return c.json({ error: `session '${sid}' not found` }, 404);
+		}
+		const limitValue = Number(c.req.query("limit"));
+		const items = readProductActionLedger(defaultProjectRoot(), {
+			sessionId: sid,
+			...(c.req.query("executionId")
+				? { executionId: c.req.query("executionId") }
+				: {}),
+			...(c.req.query("clientCallId")
+				? { clientCallId: c.req.query("clientCallId") }
+				: {}),
+			...(c.req.query("actionId") ? { actionId: c.req.query("actionId") } : {}),
+			...(c.req.query("from") ? { from: c.req.query("from") } : {}),
+			...(c.req.query("to") ? { to: c.req.query("to") } : {}),
+			...(Number.isInteger(limitValue) && limitValue > 0
+				? { limit: Math.min(limitValue, 1_000) }
+				: {}),
+		});
+		return c.json({ items, count: items.length });
+	});
 
-  // POST /:sid/hook-gate —— 外部内核 hook 的统一决策端点(046 楔子3)。
-  // cc(--settings 注入 PreToolUse)/ codex(<workspace>/.codex/hooks.json PreToolUse)/
-  // cursor(<workspace>/.cursor/hooks.json beforeShellExecution|beforeMCPExecution)的
-  // 薄 hook 脚本(kernel/hooks/*.mjs)在内核**自己进程内的内置工具**执行前同步 HTTP
-  // 回调到这里 —— 这是墙B(外部内核内置工具自执行,forgeax 旁观 stream-json 只能事后
-  // 观察)的唯一拦截面。host-routed 工具(mcp__fxt__*)不经此(hook 脚本跳过),它们
-  // 在 /:sid/kernel-tool 的 trust-gate 把闸,不双卡；原生 project MCP 工具则在同一
-  // endpoint 复用 trust-gate，因为它们由 Claude/Cursor 的原生 MCP 进程直接执行。
-  //
-  // 决策 = 原生 project MCP 先走 trust-tier + settings 规则；其余内置工具走
-  // settings.permissions 规则(内核内置工具跑在子进程,tier 政策管不到,规则是唯一声明
-  // 面):deny → 即拒;ask → 弹卡阻塞交人;allow → 直放;
-  // 未命中 → 'none'(hook 脚本零输出,内核走自己的默认权限流,零行为变化)。
-  // fail-safe:session 不在 → 'none'(不因编排面缺位把内核整轮卡死;deny 规则仍由
-  // 各内核 sandbox/approval 基线兜,§9)。
-  r.post('/:sid/hook-gate', async (c) => {
-    const sid = c.req.param('sid');
-    const start = Date.now();
-    const body = await c.req.json().catch(() => ({}));
-    const toolName = typeof body.toolName === 'string' && body.toolName ? body.toolName : '';
-    const kernel = typeof body.kernel === 'string' ? body.kernel : 'unknown';
-    const agent = typeof body.agent === 'string' && body.agent ? body.agent : 'forge';
-    const input = body.input && typeof body.input === 'object' ? body.input : {};
-    if (!toolName) return c.json({ decision: 'none', reason: 'toolName required' });
+	r.post("/:sid/permission-request", async (c) => {
+		const sid = c.req.param("sid");
+		const body = await c.req.json().catch(() => ({}));
+		const toolName = typeof body.toolName === "string" ? body.toolName : "tool";
+		const command = typeof body.command === "string" ? body.command : "";
+		const agent =
+			typeof body.agent === "string" && body.agent ? body.agent : "forge";
+		let session: Session | undefined;
+		try {
+			// peek 返回 Session | null；收成 undefined 以匹配局部声明 + catch 兜底。
+			session = getSessionManager().peek(sid) ?? undefined;
+		} catch {
+			session = undefined; // 管理器未初始化 → 按无 session 走(fail-closed 回执,不 500)。
+		}
+		if (!session) return c.json({ allow: false, reason: "no-session" }, 200);
+		const input = body.input ?? (command ? { command } : null);
 
-    const projectRoot = defaultProjectRoot();
-    const rules = loadSettingsPermissionRules(projectRoot);
-    let session: Session | undefined;
-    try {
-      // peek 返回 Session | null；收成 undefined 以匹配局部声明 + catch 兜底。
-      session = getSessionManager().peek(sid) ?? undefined;
-    } catch {
-      session = undefined;
-    }
-    let activeGame: string | undefined;
-    try {
-      activeGame = session?.config?.defaultDir ?? getPathManager().resolveScope();
-    } catch {
-      // Missing scope is handled fail-closed by checkKernelTool for scoped tools.
-    }
+		// 046 楔子3 — settings.permissions 规则先行(deny/allow 免卡直断、ask 强制弹卡):
+		// 这让 CC 原生权限提示路由(--permission-prompt-tool)也吃到「配置里写一条 deny」。
+		// 未命中 → undefined → 走原有 turn-gate/弹卡流程,零行为变化。
+		const verdict = evaluateSettingsRules(
+			loadSettingsPermissionRules(),
+			toolName,
+			input,
+		);
+		if (verdict?.behavior === "deny" || verdict?.behavior === "allow") {
+			const allow = verdict.behavior === "allow";
+			appendToolAudit({
+				sid,
+				agent,
+				tool: toolName,
+				trustTier: "kernel-native",
+				allow,
+				...(allow
+					? {}
+					: { error: `denied by rule ${ruleLabel(verdict.rule)}` }),
+				durationMs: 0,
+				ts: Date.now(),
+			});
+			return c.json({
+				allow,
+				...(allow
+					? {}
+					: { reason: `denied by rule ${ruleLabel(verdict.rule)}` }),
+			});
+		}
 
-    let decision: ReturnType<typeof checkKernelTool>;
-    if (isProjectMcpToolName(toolName, projectRoot)) {
-      // Native project MCP tools do not pass through /kernel-tool. Use the
-      // live session template catalog as the trust authority so settings-none
-      // cannot turn credential/delete calls into a passthrough.
-      let trustTier: 'own' | 'imported' = 'imported';
-      const runtimeInstance = session?.tree.resolve(agent);
-      if (runtimeInstance && session) {
-        trustTier = resolveTemplateTrust(session.templateCatalog, runtimeInstance.templateRef);
-      }
-      const host = runtimeInstance && session ? await session.initializeAgentHost(agent) : undefined;
-      const nativeVisible = host ? visibleTools(
-        withAgentHostToolDefinitions(host.agentContext.tools.list(), host.agentContext), host.agentContext,
-      ) : [];
-      const nativeScope = await executionToolScope(
-        runtimeInstance?.template, nativeVisible.map((tool) => tool.name), projectRoot, activeGame,
-      );
-      if (!nativeScope.allows(toolName)) {
-        const reason = `tool not granted to agent: ${toolName}`;
-        appendToolAudit({ sid, agent, tool: toolName, trustTier, allow: false, error: reason, durationMs: Date.now() - start, ts: start });
-        return c.json({ decision: 'deny', reason });
-      }
+		// A1#4 — 咨询本轮中立权限闸(TurnRequest.requestPermission,经 cc-profile 的
+		// per-turn registry 按真 sid 登记)。命中即直接回执,免去弹卡;这让「编排层的
+		// checkTool/requestPermission 成为 CC 内核的唯一闸」真正闭合。未登记(无内核闸
+		// 或非内核路径)→ undefined → 回落到下面既有的「弹卡 + 阻塞」流程,行为不变。
+		// fail-closed:闸内部抛错时 consultTurnGate 已返回 deny(不静默放行)。
+		// settings ask(verdict.behavior==='ask')**跳过** turn-gate 直落弹卡——用户显式
+		// 要求「这类工具问我」,不许任何自动闸代答(cc 的 ask 语义)。
+		if (verdict?.behavior !== "ask") {
+			const gateDecision = await consultTurnGate(sid, {
+				name: toolName,
+				args: input,
+			});
+			if (gateDecision) {
+				const allowed = gateDecision.behavior === "allow";
+				return c.json({
+					allow: allowed,
+					...(allowed
+						? {}
+						: { reason: gateDecision.message || "denied by turn gate" }),
+				});
+			}
+		}
 
-      decision = checkKernelTool(trustTier, toolName, {
-        ...(session ? agentToolPermissions(session, runtimeInstance, projectRoot) : {}),
-        args: input,
-        projectRoot,
-        ...(activeGame ? { activeGame } : {}),
-        sid,
-        rules,
-      });
-    } else {
-      // Non-MCP native CLI tools retain the existing settings-only hook
-      // contract; their provider owns the native permission posture.
-      const verdict = evaluateSettingsRules(rules, toolName, input);
-      if (!verdict) return c.json({ decision: 'none' });
+		const { allow, answers } = await askViaPermissionCard(session, {
+			sid,
+			agent,
+			toolName,
+			command,
+			input,
+		});
+		return c.json({ allow, ...(answers ? { answers } : {}) });
+	});
 
-      const label = ruleLabel(verdict.rule);
-      if (verdict.behavior === 'deny' || verdict.behavior === 'allow') {
-        const allow = verdict.behavior === 'allow';
-        appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow, ...(allow ? {} : { error: `denied by rule ${label}` }), durationMs: Date.now() - start, ts: start });
-        return c.json({ decision: verdict.behavior, reason: `${verdict.behavior} by rule ${label}` });
-      }
-      decision = { allow: false, outcome: 'ask', reason: `confirm (rule ${label}): ${toolName}` };
-    }
+	/** 弹权限卡 + 阻塞等用户(permission-request 与 hook-gate 共用)。
+	 *  经 EventBus 发 `permission:request` 卡,registerPermission hold 到
+	 *  /permission-reply 解开或超时(fail-closed deny);无论如何结算都补发
+	 *  `permission:resolved` 撤卡。answers = AskUserQuestion 的选择答案侧信道。 */
+	async function askViaPermissionCard(
+		session: Session,
+		req: {
+			sid: string;
+			agent: string;
+			toolName: string;
+			command: string;
+			input: unknown;
+		},
+	): Promise<{ allow: boolean; answers?: Record<string, string> }> {
+		const { sid, agent, toolName, command, input } = req;
+		const reqId = randomUUID();
+		// Register before publishing. EventBus observers are synchronous and may
+		// resolve or abort the request in the same tick as the card is published.
+		// Registering after publish loses that decision and leaves the HTTP call
+		// waiting until timeout.
+		const handle = registerPermission(reqId, PERMISSION_TIMEOUT_MS, {
+			sid,
+			agent,
+		});
+		let allow = false;
+		// Pop the approval card in the Studio UI. Reuses the per-session WS fan-out
+		// (same channel as file-activity:*); the client's permission-stream handler
+		// renders a modal keyed by reqId.
+		try {
+			session.eventBus.publish(
+				{
+					type: "permission:request",
+					ts: Date.now(),
+					source: `agent:${agent}`,
+					payload: { reqId, toolName, command, input: input ?? null, agent },
+				},
+				agent,
+			);
+			allow = await handle.promise;
+		} finally {
+			handle.dispose();
+			// Tell the UI to dismiss the card regardless of how it settled (reply /
+			// timeout / abort) so a stale prompt never lingers.
+			session.eventBus.publish(
+				{
+					type: "permission:resolved",
+					ts: Date.now(),
+					source: `agent:${agent}`,
+					payload: { reqId, allow },
+				},
+				agent,
+			);
+		}
+		// For AskUserQuestion: hand back the user's chosen answers so the MCP can
+		// inject updatedInput.answers (without these, CC gets "did not answer").
+		const answers = permissionAnswers.get(reqId);
+		permissionAnswers.delete(reqId);
+		return { allow, ...(answers ? { answers } : {}) };
+	}
 
-    if (decision.outcome === 'deny') {
-      appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow: false, error: decision.reason ?? 'denied by trust tier', durationMs: Date.now() - start, ts: start });
-      return c.json({ decision: 'deny', reason: decision.reason ?? 'denied by trust tier' });
-    }
-    if (decision.outcome === 'allow') {
-      appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow: true, durationMs: Date.now() - start, ts: start });
-      return c.json({ decision: 'allow', ...(decision.reason ? { reason: decision.reason } : {}) });
-    }
+	// POST /:sid/hook-gate —— 外部内核 hook 的统一决策端点(046 楔子3)。
+	// cc(--settings 注入 PreToolUse)/ codex(<workspace>/.codex/hooks.json PreToolUse)/
+	// cursor(<workspace>/.cursor/hooks.json beforeShellExecution|beforeMCPExecution)的
+	// 薄 hook 脚本(kernel/hooks/*.mjs)在内核**自己进程内的内置工具**执行前同步 HTTP
+	// 回调到这里 —— 这是墙B(外部内核内置工具自执行,forgeax 旁观 stream-json 只能事后
+	// 观察)的唯一拦截面。host-routed 工具(mcp__fxt__*)不经此(hook 脚本跳过),它们
+	// 在 /:sid/kernel-tool 的 trust-gate 把闸,不双卡；原生 project MCP 工具则在同一
+	// endpoint 复用 trust-gate，因为它们由 Claude/Cursor 的原生 MCP 进程直接执行。
+	//
+	// 决策 = 原生 project MCP 先走 trust-tier + settings 规则；其余内置工具走
+	// settings.permissions 规则(内核内置工具跑在子进程,tier 政策管不到,规则是唯一声明
+	// 面):deny → 即拒;ask → 弹卡阻塞交人;allow → 直放;
+	// 未命中 → 'none'(hook 脚本零输出,内核走自己的默认权限流,零行为变化)。
+	// fail-safe:session 不在 → 'none'(不因编排面缺位把内核整轮卡死;deny 规则仍由
+	// 各内核 sandbox/approval 基线兜,§9)。
+	r.post("/:sid/hook-gate", async (c) => {
+		const sid = c.req.param("sid");
+		const start = Date.now();
+		const body = await c.req.json().catch(() => ({}));
+		const toolName =
+			typeof body.toolName === "string" && body.toolName ? body.toolName : "";
+		const kernel = typeof body.kernel === "string" ? body.kernel : "unknown";
+		const agent =
+			typeof body.agent === "string" && body.agent ? body.agent : "forge";
+		const input =
+			body.input && typeof body.input === "object" ? body.input : {};
+		if (!toolName)
+			return c.json({ decision: "none", reason: "toolName required" });
 
-    // ask:弹卡阻塞交人(与 permission-request 共用同一张卡/同一 WS 通道)。session 不在
-    // (headless / 会话已收 / session-manager 未起)→ 无处弹卡,fail-closed deny(用户
-    // 显式要求 ask 的操作,不能因没人可问而静默放行)。
-    if (!session) {
-      appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow: false, error: `${decision.reason ?? 'permission required'} with no live session (fail-closed)`, durationMs: Date.now() - start, ts: start });
-      return c.json({ decision: 'deny', reason: `${decision.reason ?? 'permission required'}, but no live session to ask (fail-closed)` });
-    }
-    const command = typeof (input as Record<string, unknown>).command === 'string'
-      ? ((input as Record<string, unknown>).command as string)
-      : '';
-    const { allow } = await askViaPermissionCard(session, { sid, agent, toolName, command, input });
-    appendToolAudit({ sid, agent, tool: toolName, trustTier: `kernel:${kernel}`, allow, ...(allow ? {} : { error: 'denied by user' }), durationMs: Date.now() - start, ts: start });
-    return c.json({ decision: allow ? 'allow' : 'deny', reason: allow ? 'user approved' : 'denied by user' });
-  });
+		const projectRoot = defaultProjectRoot();
+		const rules = loadSettingsPermissionRules(projectRoot);
+		let session: Session | undefined;
+		try {
+			// peek 返回 Session | null；收成 undefined 以匹配局部声明 + catch 兜底。
+			session = getSessionManager().peek(sid) ?? undefined;
+		} catch {
+			session = undefined;
+		}
+		let activeGame: string | undefined;
+		try {
+			activeGame =
+				session?.config?.defaultDir ?? getPathManager().resolveScope();
+		} catch {
+			// Missing scope is handled fail-closed by checkKernelTool for scoped tools.
+		}
 
-  // POST /:sid/permission-reply —— 前端审批卡上点「允许/拒绝」后调用,解开上面
-  // hold 住的 /permission-request。未命中(已超时/已答)返回 ok:false,前端忽略。
-  r.post('/:sid/permission-reply', async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const reqId = typeof body.reqId === 'string' ? body.reqId : '';
-    const allow = body.allow === true;
-    if (!reqId) return c.json({ error: 'reqId (string) required' }, 400);
-    // AskUserQuestion: the reply carries `answers` ({ [questionText]: label });
-    // stash before resolving so /permission-request can return them.
-    if (allow && body.answers && typeof body.answers === 'object') {
-      const a: Record<string, string> = {};
-      for (const [k, v] of Object.entries(body.answers as Record<string, unknown>)) {
-        if (typeof v === 'string') a[k] = v;
-      }
-      if (Object.keys(a).length > 0) permissionAnswers.set(reqId, a);
-    }
-    // 「记住本会话」:allow && remember → 记住该 agent 的该 capability,本会话内同类免卡。
-    // 必须在 resolvePermission 之前(此时 pendingCtx 仍在)。
-    applyRememberOnReply(reqId, allow, body.remember === true);
-    const ok = resolvePermission(reqId, allow);
-    return c.json({ ok, ...(ok ? {} : { reason: 'no-pending' }) });
-  });
+		let decision: ReturnType<typeof checkKernelTool>;
+		if (isProjectMcpToolName(toolName, projectRoot)) {
+			// Native project MCP tools do not pass through /kernel-tool. Use the
+			// live session template catalog as the trust authority so settings-none
+			// cannot turn credential/delete calls into a passthrough.
+			let trustTier: "own" | "imported" = "imported";
+			const runtimeInstance = session?.tree.resolve(agent);
+			if (runtimeInstance && session) {
+				trustTier = resolveTemplateTrust(
+					session.templateCatalog,
+					runtimeInstance.templateRef,
+				);
+			}
+			const host =
+				runtimeInstance && session
+					? await session.initializeAgentHost(agent)
+					: undefined;
+			const nativeVisible = host
+				? visibleTools(
+						withAgentHostToolDefinitions(
+							host.agentContext.tools.list(),
+							host.agentContext,
+						),
+						host.agentContext,
+					)
+				: [];
+			const nativeScope = await executionToolScope(
+				runtimeInstance?.template,
+				nativeVisible.map((tool) => tool.name),
+				projectRoot,
+				activeGame,
+			);
+			if (!nativeScope.allows(toolName)) {
+				const reason = `tool not granted to agent: ${toolName}`;
+				appendToolAudit({
+					sid,
+					agent,
+					tool: toolName,
+					trustTier,
+					allow: false,
+					error: reason,
+					durationMs: Date.now() - start,
+					ts: start,
+				});
+				return c.json({ decision: "deny", reason });
+			}
 
-  // ── 感知接地(R5 §C / M8 运行期错误回灌)——————————————————————————————
-  // 取数往返(host-forced verification, "仅取数, 不当裁判"):内核 turn 调
-  // query_world/capture_frame → fxt MCP server HTTP 回打这里 → 经 EventBus 把
-  // perception:query 推给 interface → interface 向 preview iframe postMessage 取真值
-  // → 拿到后 POST /perception-reply 解开本 hold 住的响应。镜像 permission 往返,但
-  // 回的是 snapshot;超时 fail-soft(取数失败不挂死 turn,只是少一份证据)。
-  const PERCEPTION_TIMEOUT_MS = 8_000;
-  /** ui_invoke 通道默认超时(略宽:要等 action 执行/受理);catalog 声明 timeoutMs 可放宽。 */
-  const UI_INVOKE_TIMEOUT_MS = 10_000;
-  const PERCEPTION_KINDS: ReadonlySet<string> = new Set(['world', 'frame', 'ui_snapshot', 'ui_invoke']);
-  r.post('/:sid/perception-query', async (c) => {
-    const sid = c.req.param('sid');
-    const body = await c.req.json().catch(() => ({}));
-    const kind = (PERCEPTION_KINDS.has(body.kind) ? body.kind : 'world') as PerceptionKind;
-    const isUiKind = kind === 'ui_snapshot' || kind === 'ui_invoke';
-    const agent = typeof body.agent === 'string' && body.agent ? body.agent : 'forge';
-    const reqId = typeof body.reqId === 'string' && body.reqId ? body.reqId : randomUUID();
-    const session = getSessionManager().peek(sid);
-    if (!session) return c.json({ ok: false, reason: 'no-session', snapshot: { unavailable: true, reason: 'no-session' } }, 200);
+			decision = checkKernelTool(trustTier, toolName, {
+				...(session
+					? agentToolPermissions(session, runtimeInstance, projectRoot)
+					: {}),
+				args: input,
+				projectRoot,
+				...(activeGame ? { activeGame } : {}),
+				sid,
+				rules,
+			});
+		} else {
+			// Non-MCP native CLI tools retain the existing settings-only hook
+			// contract; their provider owns the native permission posture.
+			const verdict = evaluateSettingsRules(rules, toolName, input);
+			if (!verdict) return c.json({ decision: "none" });
 
-    // 推 perception:query 给前端(同 permission:request 的 per-session WS fan-out)。
-    session.eventBus.publish(
-      {
-        type: 'perception:query',
-        ts: Date.now(),
-        source: `agent:${agent}`,
-        payload: { reqId, kind, query: body.query ?? null, agent },
-      },
-      agent,
-    );
+			const label = ruleLabel(verdict.rule);
+			if (verdict.behavior === "deny" || verdict.behavior === "allow") {
+				const allow = verdict.behavior === "allow";
+				appendToolAudit({
+					sid,
+					agent,
+					tool: toolName,
+					trustTier: `kernel:${kernel}`,
+					allow,
+					...(allow ? {} : { error: `denied by rule ${label}` }),
+					durationMs: Date.now() - start,
+					ts: start,
+				});
+				return c.json({
+					decision: verdict.behavior,
+					reason: `${verdict.behavior} by rule ${label}`,
+				});
+			}
+			decision = {
+				allow: false,
+				outcome: "ask",
+				reason: `confirm (rule ${label}): ${toolName}`,
+			};
+		}
 
-    // ui_invoke:超时按 catalog 声明放宽;ui_* 回灌须持有效 lease(声明与执行方同源)。
-    const timeoutMs =
-      kind === 'ui_invoke'
-        ? uiInvokeTimeoutMs(sid, (body.query as { actionId?: unknown } | null)?.actionId, UI_INVOKE_TIMEOUT_MS)
-        : PERCEPTION_TIMEOUT_MS;
-    const handle = registerPerception(reqId, timeoutMs, isUiKind ? { requireLease: { sid } } : {});
-    let snapshot: unknown;
-    try {
-      snapshot = await handle.promise;
-    } finally {
-      handle.dispose();
-    }
-    return c.json({ ok: true, reqId, snapshot });
-  });
+		if (decision.outcome === "deny") {
+			appendToolAudit({
+				sid,
+				agent,
+				tool: toolName,
+				trustTier: `kernel:${kernel}`,
+				allow: false,
+				error: decision.reason ?? "denied by trust tier",
+				durationMs: Date.now() - start,
+				ts: start,
+			});
+			return c.json({
+				decision: "deny",
+				reason: decision.reason ?? "denied by trust tier",
+			});
+		}
+		if (decision.outcome === "allow") {
+			appendToolAudit({
+				sid,
+				agent,
+				tool: toolName,
+				trustTier: `kernel:${kernel}`,
+				allow: true,
+				durationMs: Date.now() - start,
+				ts: start,
+			});
+			return c.json({
+				decision: "allow",
+				...(decision.reason ? { reason: decision.reason } : {}),
+			});
+		}
 
-  // 前端把 preview iframe 回的 VAG_WORLD_STATE/VAG_FRAME(或 ActionRegistry 的 ui_* 应答)
-  // 经此回灌,解开 /perception-query。ui_* 类 pending 要求 body.leaseId 有效(lease 校验
-  // 不通过时不消费 pending,真正持有者仍可回灌)。
-  r.post('/:sid/perception-reply', async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const reqId = typeof body.reqId === 'string' ? body.reqId : '';
-    if (!reqId) return c.json({ error: 'reqId (string) required' }, 400);
-    const ok = resolvePerception(reqId, body.snapshot ?? null, body.leaseId);
-    return c.json({ ok, ...(ok ? {} : { reason: 'no-pending-or-bad-lease' }) });
-  });
+		// ask:弹卡阻塞交人(与 permission-request 共用同一张卡/同一 WS 通道)。session 不在
+		// (headless / 会话已收 / session-manager 未起)→ 无处弹卡,fail-closed deny(用户
+		// 显式要求 ask 的操作,不能因没人可问而静默放行)。
+		if (!session) {
+			appendToolAudit({
+				sid,
+				agent,
+				tool: toolName,
+				trustTier: `kernel:${kernel}`,
+				allow: false,
+				error: `${decision.reason ?? "permission required"} with no live session (fail-closed)`,
+				durationMs: Date.now() - start,
+				ts: start,
+			});
+			return c.json({
+				decision: "deny",
+				reason: `${decision.reason ?? "permission required"}, but no live session to ask (fail-closed)`,
+			});
+		}
+		const command =
+			typeof (input as Record<string, unknown>).command === "string"
+				? ((input as Record<string, unknown>).command as string)
+				: "";
+		const { allow } = await askViaPermissionCard(session, {
+			sid,
+			agent,
+			toolName,
+			command,
+			input,
+		});
+		appendToolAudit({
+			sid,
+			agent,
+			tool: toolName,
+			trustTier: `kernel:${kernel}`,
+			allow,
+			...(allow ? {} : { error: "denied by user" }),
+			durationMs: Date.now() - start,
+			ts: start,
+		});
+		return c.json({
+			decision: allow ? "allow" : "deny",
+			reason: allow ? "user approved" : "denied by user",
+		});
+	});
 
-  // ── UI 语义操作层(产品 AI 化 P0)—————————————————————————————————————
-  // lease:多标签同 sid 时「最后获焦 tab」持有;runtime manifest projection 与 ui_*
-  // 应答方都绑定到持有者(displace 语义,心跳续期)。权限声明来自 server catalog;
-  // manifest 写入仍必须持有效 lease,且这两个端点**不进** MCP 桥出面(.mjs 不暴露)。
-  //
-  // Origin 收口(架构师嘱咐,B6):这两个写端点是 runtime executor binding 的信任锚——
-  // 浏览器跨站发起的写一律拒(防恶意页面冒充本机 UI surface)。规则:无 Origin 头
-  // (curl / 同进程 / 非浏览器)放行;有 Origin 时 hostname 须为 loopback、与本次
-  // 请求 Host 同名,或落在 FORGEAX_UI_BRIDGE_ORIGINS(逗号分隔,给桌面 tauri://
-  // 等形态)白名单内。fail-closed 403。
-  const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
-  const EXTRA_UI_ORIGINS = new Set(
-    (process.env.FORGEAX_UI_BRIDGE_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
-  );
-  const uiWriteOriginAllowed = (c: { req: { header: (n: string) => string | undefined } }): boolean => {
-    const origin = c.req.header('origin');
-    if (!origin) return true; // 非浏览器调用(无 Origin)——与 perception-reply 同级信任面
-    if (EXTRA_UI_ORIGINS.has(origin)) return true;
-    try {
-      const o = new URL(origin);
-      if (LOOPBACK_HOSTS.has(o.hostname)) return true;
-      const host = c.req.header('host') ?? '';
-      const hostName = host.includes(':') && !host.startsWith('[') ? host.slice(0, host.indexOf(':')) : host;
-      return !!hostName && o.hostname === hostName;
-    } catch {
-      return false; // Origin 不可解析 → fail-closed
-    }
-  };
+	// POST /:sid/permission-reply —— 前端审批卡上点「允许/拒绝」后调用,解开上面
+	// hold 住的 /permission-request。未命中(已超时/已答)返回 ok:false,前端忽略。
+	r.post("/:sid/permission-reply", async (c) => {
+		const body = await c.req.json().catch(() => ({}));
+		const reqId = typeof body.reqId === "string" ? body.reqId : "";
+		const allow = body.allow === true;
+		if (!reqId) return c.json({ error: "reqId (string) required" }, 400);
+		// AskUserQuestion: the reply carries `answers` ({ [questionText]: label });
+		// stash before resolving so /permission-request can return them.
+		if (allow && body.answers && typeof body.answers === "object") {
+			const a: Record<string, string> = {};
+			for (const [k, v] of Object.entries(
+				body.answers as Record<string, unknown>,
+			)) {
+				if (typeof v === "string") a[k] = v;
+			}
+			if (Object.keys(a).length > 0) permissionAnswers.set(reqId, a);
+		}
+		// 「记住本会话」:allow && remember → 记住该 agent 的该 capability,本会话内同类免卡。
+		// 必须在 resolvePermission 之前(此时 pendingCtx 仍在)。
+		applyRememberOnReply(reqId, allow, body.remember === true);
+		const ok = resolvePermission(reqId, allow);
+		return c.json({ ok, ...(ok ? {} : { reason: "no-pending" }) });
+	});
 
-  r.post('/:sid/ui-lease', async (c) => {
-    const sid = c.req.param('sid');
-    if (!uiWriteOriginAllowed(c)) return c.json({ ok: false, reason: 'origin-not-allowed' }, 403);
-    const body = await c.req.json().catch(() => ({}));
-    const clientId = typeof body.clientId === 'string' && body.clientId ? body.clientId : '';
-    if (!clientId) return c.json({ ok: false, reason: 'clientId (string) required' }, 400);
-    if (!getSessionManager().peek(sid)) return c.json({ ok: false, reason: 'no-session' }, 200);
-    const lease = Object.prototype.hasOwnProperty.call(body, 'leaseId')
-      ? renewUiLease(sid, clientId, body.leaseId)
-      : body.claimOnly === true ? claimAvailableUiLease(sid, clientId) : acquireUiLease(sid, clientId);
-    if (!lease) return c.json({ ok: false, reason: 'lease-lost' }, 200);
-    return c.json({ ok: true, ...lease });
-  });
+	// ── 感知接地(R5 §C / M8 运行期错误回灌)——————————————————————————————
+	// 取数往返(host-forced verification, "仅取数, 不当裁判"):内核 turn 调
+	// query_world/capture_frame → fxt MCP server HTTP 回打这里 → 经 EventBus 把
+	// perception:query 推给 interface → interface 向 preview iframe postMessage 取真值
+	// → 拿到后 POST /perception-reply 解开本 hold 住的响应。镜像 permission 往返,但
+	// 回的是 snapshot;超时 fail-soft(取数失败不挂死 turn,只是少一份证据)。
+	const PERCEPTION_TIMEOUT_MS = 8_000;
+	/** ui_invoke 通道默认超时(略宽:要等 action 执行/受理);catalog 声明 timeoutMs 可放宽。 */
+	const UI_INVOKE_TIMEOUT_MS = 10_000;
+	const PERCEPTION_KINDS: ReadonlySet<string> = new Set([
+		"world",
+		"frame",
+		"ui_snapshot",
+		"ui_invoke",
+	]);
+	r.post("/:sid/perception-query", async (c) => {
+		const sid = c.req.param("sid");
+		const body = await c.req.json().catch(() => ({}));
+		const kind = (
+			PERCEPTION_KINDS.has(body.kind) ? body.kind : "world"
+		) as PerceptionKind;
+		const isUiKind = kind === "ui_snapshot" || kind === "ui_invoke";
+		const agent =
+			typeof body.agent === "string" && body.agent ? body.agent : "forge";
+		const reqId =
+			typeof body.reqId === "string" && body.reqId ? body.reqId : randomUUID();
+		const session = getSessionManager().peek(sid);
+		if (!session)
+			return c.json(
+				{
+					ok: false,
+					reason: "no-session",
+					snapshot: { unavailable: true, reason: "no-session" },
+				},
+				200,
+			);
 
-  r.post('/:sid/ui-manifest', async (c) => {
-    const sid = c.req.param('sid');
-    if (!uiWriteOriginAllowed(c)) return c.json({ ok: false, reason: 'origin-not-allowed' }, 403);
-    const body = await c.req.json().catch(() => ({}));
-    if (!getSessionManager().peek(sid)) return c.json({ ok: false, reason: 'no-session' }, 200);
-    const res = setUiManifest(sid, body.actions, body.leaseId);
-    return c.json(res, res.ok ? 200 : 403);
-  });
+		// 推 perception:query 给前端(同 permission:request 的 per-session WS fan-out)。
+		session.eventBus.publish(
+			{
+				type: "perception:query",
+				ts: Date.now(),
+				source: `agent:${agent}`,
+				payload: { reqId, kind, query: body.query ?? null, agent },
+			},
+			agent,
+		);
 
-  // 运行期错误回灌:游戏运行期 console error / preview error → per-sid 环形缓冲,
-  // 下一轮 composeTurnRequest drain 进 dynamicSuffix(轮间 user 后缀注入)。
-  r.post('/:sid/perception', async (c) => {
-    const sid = c.req.param('sid');
-    const body = await c.req.json().catch(() => ({}));
-    const level = body.level === 'warn' ? 'warn' : body.level === 'error' ? 'error' : null;
-    const text = typeof body.text === 'string' ? body.text : '';
-    if (!level || !text.trim()) return c.json({ ok: false, reason: 'level(error|warn)+text required' }, 200);
-    pushPerceptionNote(sid, { level, text: text.slice(0, 2000), ts: Date.now() });
-    return c.json({ ok: true });
-  });
+		// ui_invoke:超时按 catalog 声明放宽;ui_* 回灌须持有效 lease(声明与执行方同源)。
+		const timeoutMs =
+			kind === "ui_invoke"
+				? uiInvokeTimeoutMs(
+						sid,
+						(body.query as { actionId?: unknown } | null)?.actionId,
+						UI_INVOKE_TIMEOUT_MS,
+					)
+				: PERCEPTION_TIMEOUT_MS;
+		const handle = registerPerception(
+			reqId,
+			timeoutMs,
+			isUiKind ? { requireLease: { sid } } : {},
+		);
+		let snapshot: unknown;
+		try {
+			snapshot = await handle.promise;
+		} finally {
+			handle.dispose();
+		}
+		return c.json({ ok: true, reqId, snapshot });
+	});
 
-  return r;
+	// 前端把 preview iframe 回的 VAG_WORLD_STATE/VAG_FRAME(或 ActionRegistry 的 ui_* 应答)
+	// 经此回灌,解开 /perception-query。ui_* 类 pending 要求 body.leaseId 有效(lease 校验
+	// 不通过时不消费 pending,真正持有者仍可回灌)。
+	r.post("/:sid/perception-reply", async (c) => {
+		const body = await c.req.json().catch(() => ({}));
+		const reqId = typeof body.reqId === "string" ? body.reqId : "";
+		if (!reqId) return c.json({ error: "reqId (string) required" }, 400);
+		const ok = resolvePerception(reqId, body.snapshot ?? null, body.leaseId);
+		return c.json({ ok, ...(ok ? {} : { reason: "no-pending-or-bad-lease" }) });
+	});
+
+	// ── UI 语义操作层(产品 AI 化 P0)—————————————————————————————————————
+	// lease:多标签同 sid 时「最后获焦 tab」持有;runtime manifest projection 与 ui_*
+	// 应答方都绑定到持有者(displace 语义,心跳续期)。权限声明来自 server catalog;
+	// manifest 写入仍必须持有效 lease,且这两个端点**不进** MCP 桥出面(.mjs 不暴露)。
+	//
+	// Origin 收口(架构师嘱咐,B6):这两个写端点是 runtime executor binding 的信任锚——
+	// 浏览器跨站发起的写一律拒(防恶意页面冒充本机 UI surface)。规则:无 Origin 头
+	// (curl / 同进程 / 非浏览器)放行;有 Origin 时 hostname 须为 loopback、与本次
+	// 请求 Host 同名,或落在 FORGEAX_UI_BRIDGE_ORIGINS(逗号分隔,给桌面 tauri://
+	// 等形态)白名单内。fail-closed 403。
+	r.post("/:sid/ui-lease", async (c) => {
+		const sid = c.req.param("sid");
+		if (!uiWriteOriginAllowed(c))
+			return c.json({ ok: false, reason: "origin-not-allowed" }, 403);
+		const body = await c.req.json().catch(() => ({}));
+		const clientId =
+			typeof body.clientId === "string" && body.clientId ? body.clientId : "";
+		if (!clientId)
+			return c.json({ ok: false, reason: "clientId (string) required" }, 400);
+		if (!getSessionManager().peek(sid))
+			return c.json({ ok: false, reason: "no-session" }, 200);
+		const lease = Object.prototype.hasOwnProperty.call(body, "leaseId")
+			? renewUiLease(sid, clientId, body.leaseId)
+			: body.claimOnly === true
+				? claimAvailableUiLease(sid, clientId)
+				: acquireUiLease(sid, clientId);
+		if (!lease) return c.json({ ok: false, reason: "lease-lost" }, 200);
+		return c.json({ ok: true, ...lease });
+	});
+
+	r.post("/:sid/ui-manifest", async (c) => {
+		const sid = c.req.param("sid");
+		if (!uiWriteOriginAllowed(c))
+			return c.json({ ok: false, reason: "origin-not-allowed" }, 403);
+		const body = await c.req.json().catch(() => ({}));
+		if (!getSessionManager().peek(sid))
+			return c.json({ ok: false, reason: "no-session" }, 200);
+		const res = setUiManifest(sid, body.actions, body.leaseId);
+		return c.json(res, res.ok ? 200 : 403);
+	});
+
+	// 运行期错误回灌:游戏运行期 console error / preview error → per-sid 环形缓冲,
+	// 下一轮 composeTurnRequest drain 进 dynamicSuffix(轮间 user 后缀注入)。
+	r.post("/:sid/perception", async (c) => {
+		const sid = c.req.param("sid");
+		const body = await c.req.json().catch(() => ({}));
+		const level =
+			body.level === "warn" ? "warn" : body.level === "error" ? "error" : null;
+		const text = typeof body.text === "string" ? body.text : "";
+		if (!level || !text.trim())
+			return c.json(
+				{ ok: false, reason: "level(error|warn)+text required" },
+				200,
+			);
+		pushPerceptionNote(sid, {
+			level,
+			text: text.slice(0, 2000),
+			ts: Date.now(),
+		});
+		return c.json({ ok: true });
+	});
+
+	return r;
 }

@@ -24,23 +24,21 @@
  *
  * 日后整包外迁到 `packages/kernel-adaptors/codebuddy` 时,搬「本文件 + cbc-kernel.ts」。
  */
-import type { PermissionMode, TurnRequest } from '@forgeax/agent-runtime';
-import { existsSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
-import { resolve as resolvePath } from 'node:path';
-import { defaultProjectRoot } from '@forgeax/platform-io';
+import type { PermissionMode, TurnRequest } from "@forgeax/agent-runtime";
+import { chmodSync, existsSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { resolve as resolvePath } from "node:path";
+import { defaultProjectRoot } from "@forgeax/platform-io";
 // 复用 cc-profile 的稳定件(cbc 与 cc 完全一致):线事件→KernelEvent 映射、
 // permission-mode 枚举翻译、跨进程权限闸 registry。单一来源,避免 drift。
-import {
-  toCcPermissionMode,
-  type CcPermissionMode,
-} from './cc-profile';
-import { buildKernelTask } from './kernel-context';
-import { DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
-import { resolveForgeaxToolsServerEntry } from './mcp/forgeax-tools-runtime';
-import { resolveBundledBunExecutable } from '../cli-providers/mcp/permission-server-entry';
+import { toCcPermissionMode, type CcPermissionMode } from "./cc-profile";
+import { buildKernelTask } from "./kernel-context";
+import { DEFAULT_KERNEL_PERMISSION_MODE } from "./permission-config";
+import { resolveForgeaxToolsServerEntry } from "./mcp/forgeax-tools-runtime";
+import { issueKernelToolCapability } from "./kernel-tool-capability";
+import { resolveBundledBunExecutable } from "../cli-providers/mcp/permission-server-entry";
 
-const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
+const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? "18900";
 
 // ─── 模型目录(cbc-isms) ─────────────────────────────────────────────
 // 真实通道 = cc 同款 stream-json 控制面(cbc 分叉保留了该协议):initialize
@@ -52,26 +50,27 @@ const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
 // 下方静态表只是回退链最后一层兜底。id 是 cbc 点号方言的**展示 id**;
 // chat 路径的连字符→点号翻译见 {@link toCbcModelId}。
 
-export { probeStreamJsonModels } from './cc-profile';
+export { probeStreamJsonModels } from "./cc-profile";
 
-export const CODEBUDDY_DRIVER_LABEL = 'codebuddy · subscription runtime · no local cost';
+export const CODEBUDDY_DRIVER_LABEL =
+	"codebuddy · subscription runtime · no local cost";
 
 export const CODEBUDDY_FALLBACK_MODELS = [
-  'default-model',
-  'gemini-3.1-pro',
-  'gemini-3.0-flash',
-  'gemini-3.5-flash',
-  'gemini-2.5-pro',
-  'gemini-2.5-flash',
-  'gemini-3.1-flash-lite',
-  'gpt-5.5',
-  'gpt-5.4',
-  'gpt-5.3-codex',
-  'gpt-5.1-codex',
-  'gpt-5.1-codex-mini',
-  'deepseek-v3-2-volc',
-  'glm-5.0',
-  'kimi-k2.5',
+	"default-model",
+	"gemini-3.1-pro",
+	"gemini-3.0-flash",
+	"gemini-3.5-flash",
+	"gemini-2.5-pro",
+	"gemini-2.5-flash",
+	"gemini-3.1-flash-lite",
+	"gpt-5.5",
+	"gpt-5.4",
+	"gpt-5.3-codex",
+	"gpt-5.1-codex",
+	"gpt-5.1-codex-mini",
+	"deepseek-v3-2-volc",
+	"glm-5.0",
+	"kimi-k2.5",
 ];
 
 /** cbc `--permission-mode` 取值枚举(与 cc 同:default/acceptEdits/plan/bypassPermissions)。 */
@@ -81,10 +80,14 @@ export type CbcPermissionMode = CcPermissionMode;
 export const toCbcPermissionMode = toCcPermissionMode;
 
 export const CBC_SUPPORTED_PERMISSION_MODES: readonly PermissionMode[] = [
-  'gated', 'autoEdits', 'planning', 'unrestricted',
+	"gated",
+	"autoEdits",
+	"planning",
+	"unrestricted",
 ];
 
-export const CBC_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMISSION_MODE;
+export const CBC_DEFAULT_PERMISSION_MODE: PermissionMode =
+	DEFAULT_KERNEL_PERMISSION_MODE;
 
 /**
  * 模型 id 方言翻译:forgeax 用**连字符**版本号(`claude-opus-4-8`,可带 `[1m]`),
@@ -97,38 +100,43 @@ export const CBC_DEFAULT_PERMISSION_MODE: PermissionMode = DEFAULT_KERNEL_PERMIS
  * 返回 undefined ⇒ 不下发 `--model`,cbc 用账户默认(亦可用)。
  */
 export function toCbcModel(m?: string): string | undefined {
-  const t = m?.trim();
-  if (!t) return undefined;
-  const oneM = /\[1m\]/i.test(t) || /-1m$/i.test(t);
-  let base = t.replace(/\[1m\]/gi, '').replace(/-1m$/i, '').trim();
-  // claude 家族:把版本号里的 `<digit>-<digit>` 连字符改成点号(只第一处版本段)。
-  if (/^claude-/i.test(base)) base = base.replace(/(\d)-(\d)/, '$1.$2');
-  return oneM ? `${base}-1m` : base;
+	const t = m?.trim();
+	if (!t) return undefined;
+	const oneM = /\[1m\]/i.test(t) || /-1m$/i.test(t);
+	let base = t
+		.replace(/\[1m\]/gi, "")
+		.replace(/-1m$/i, "")
+		.trim();
+	// claude 家族:把版本号里的 `<digit>-<digit>` 连字符改成点号(只第一处版本段)。
+	if (/^claude-/i.test(base)) base = base.replace(/(\d)-(\d)/, "$1.$2");
+	return oneM ? `${base}-1m` : base;
 }
 
 /** 是否已有该 thread 的 cbc on-disk session 文件(决定 resume vs 新建,重启安全)。
  *  cbc 编码:去掉前导 `/`、把 `/` 换 `-`、**保留点号**(与 cc 的 `[/.]→-` 不同)。 */
 export function cbcSessionExists(cwd: string, tid: string): boolean {
-  try {
-    const encoded = cwd.replace(/^\/+/, '').replace(/\//g, '-');
-    return existsSync(resolvePath(homedir(), '.codebuddy', 'projects', encoded, `${tid}.jsonl`));
-  } catch {
-    return false;
-  }
+	try {
+		const encoded = cwd.replace(/^\/+/, "").replace(/\//g, "-");
+		return existsSync(
+			resolvePath(homedir(), ".codebuddy", "projects", encoded, `${tid}.jsonl`),
+		);
+	} catch {
+		return false;
+	}
 }
 
 /** session 续接:UUID threadId 首次 `--session-id`,后续(本进程起过/磁盘已有)`-r`。 */
 export function buildCbcSessionArgs(
-  tid: string | undefined,
-  projectRoot: string,
-  startedThreadIds: ReadonlySet<string>,
+	tid: string | undefined,
+	projectRoot: string,
+	startedThreadIds: ReadonlySet<string>,
 ): { args: string[]; threadId?: string; fresh: boolean } {
-  const t = tid?.trim();
-  if (!t || !/^[0-9a-f-]{36}$/i.test(t)) return { args: [], fresh: true };
-  if (startedThreadIds.has(t) || cbcSessionExists(projectRoot, t)) {
-    return { args: ['--resume', t], threadId: t, fresh: false };
-  }
-  return { args: ['--session-id', t], threadId: t, fresh: true };
+	const t = tid?.trim();
+	if (!t || !/^[0-9a-f-]{36}$/i.test(t)) return { args: [], fresh: true };
+	if (startedThreadIds.has(t) || cbcSessionExists(projectRoot, t)) {
+		return { args: ["--resume", t], threadId: t, fresh: false };
+	}
+	return { args: ["--session-id", t], threadId: t, fresh: true };
 }
 
 /**
@@ -145,51 +153,57 @@ export function buildCbcSessionArgs(
  * 完整 system prompt、不再追加在 cbc 内置之后。tool 定义仍由 API 注入,charter 本身是
  * 完整操作手册,可独立成 prompt。POSIX(含 macOS)的 ARG_MAX ~256KB–2MB,inline 不溢出,
  * **保持原 append 行为不变**。 */
-function buildCbcSystemPromptArgs(text: string, mode: 'append' | 'replace', key: string): string[] {
-  const writeToFile = (): string[] | null => {
-    try {
-      const path = resolvePath(tmpdir(), `forgeax-cbc-sysprompt-${key}.txt`);
-      writeFileSync(path, text);
-      return ['--system-prompt-file', path];
-    } catch {
-      return null;
-    }
-  };
-  if (mode === 'replace') {
-    // replace 写盘失败 → cbc 无其它替换通道,退回 inline append(诚实降级,不静默丢身份)。
-    return writeToFile() ?? ['--append-system-prompt', text];
-  }
-  // append on Windows → cmd.exe 命令行上限,大 charter inline 会溢出 → 改走 file(replace 语义)。
-  if (process.platform === 'win32') {
-    const fileArgs = writeToFile();
-    if (fileArgs) return fileArgs;
-  }
-  return ['--append-system-prompt', text];
+function buildCbcSystemPromptArgs(
+	text: string,
+	mode: "append" | "replace",
+	key: string,
+): string[] {
+	const writeToFile = (): string[] | null => {
+		try {
+			const path = resolvePath(tmpdir(), `forgeax-cbc-sysprompt-${key}.txt`);
+			writeFileSync(path, text);
+			return ["--system-prompt-file", path];
+		} catch {
+			return null;
+		}
+	};
+	if (mode === "replace") {
+		// replace 写盘失败 → cbc 无其它替换通道,退回 inline append(诚实降级,不静默丢身份)。
+		return writeToFile() ?? ["--append-system-prompt", text];
+	}
+	// append on Windows → cmd.exe 命令行上限,大 charter inline 会溢出 → 改走 file(replace 语义)。
+	if (process.platform === "win32") {
+		const fileArgs = writeToFile();
+		if (fileArgs) return fileArgs;
+	}
+	return ["--append-system-prompt", text];
 }
 
 /** 工具面策略 argv(中立 toolPolicy → cbc `--tools` / `--disallowedTools`,与 cc 一致)。 */
-function buildCbcToolPolicyArgs(policy: TurnRequest['toolPolicy']): string[] {
-  const out: string[] = [];
-  const allow = policy?.allow?.filter((t) => typeof t === 'string' && t.trim());
-  if (allow && allow.length) out.push('--tools', allow.join(','));
-  const deny = new Set(['TodoWrite', ...(policy?.deny ?? [])].filter(
-    (t): t is string => typeof t === 'string' && t.trim().length > 0,
-  ));
-  out.push('--disallowedTools', ...deny);
-  return out;
+function buildCbcToolPolicyArgs(policy: TurnRequest["toolPolicy"]): string[] {
+	const out: string[] = [];
+	const allow = policy?.allow?.filter((t) => typeof t === "string" && t.trim());
+	if (allow && allow.length) out.push("--tools", allow.join(","));
+	const deny = new Set(
+		["TodoWrite", ...(policy?.deny ?? [])].filter(
+			(t): t is string => typeof t === "string" && t.trim().length > 0,
+		),
+	);
+	out.push("--disallowedTools", ...deny);
+	return out;
 }
 
 /** 预算硬闸 argv:cbc 只有 `--max-turns`(无 `--max-budget-usd`)。 */
-function buildCbcBudgetArgs(budget: TurnRequest['budget']): string[] {
-  return typeof budget?.maxTurns === 'number' && budget.maxTurns > 0
-    ? ['--max-turns', String(budget.maxTurns)]
-    : [];
+function buildCbcBudgetArgs(budget: TurnRequest["budget"]): string[] {
+	return typeof budget?.maxTurns === "number" && budget.maxTurns > 0
+		? ["--max-turns", String(budget.maxTurns)]
+		: [];
 }
 
 /** 模型级联回退 argv:`--fallback-model a,b`(与 cc 一致,opaque 透传)。 */
-function buildCbcFallbackArgs(models: TurnRequest['fallbackModels']): string[] {
-  const list = models?.filter((m) => typeof m === 'string' && m.trim());
-  return list && list.length ? ['--fallback-model', list.join(',')] : [];
+function buildCbcFallbackArgs(models: TurnRequest["fallbackModels"]): string[] {
+	const list = models?.filter((m) => typeof m === "string" && m.trim());
+	return list && list.length ? ["--fallback-model", list.join(",")] : [];
 }
 
 /**
@@ -206,10 +220,10 @@ function buildCbcFallbackArgs(models: TurnRequest['fallbackModels']): string[] {
  * `--setting-sources ''`(切断 operator 的 user/project settings + CLAUDE.md + hooks)仅
  * `imported`(不可信 pack)叠加;`own`/`builtin`(forge)保留以继承必要的项目配置。
  */
-function buildCbcHermeticArgs(trustTier: TurnRequest['trustTier']): string[] {
-  const out = ['--strict-mcp-config'];
-  if (trustTier === 'imported') out.push('--setting-sources', '');
-  return out;
+function buildCbcHermeticArgs(trustTier: TurnRequest["trustTier"]): string[] {
+	const out = ["--strict-mcp-config"];
+	if (trustTier === "imported") out.push("--setting-sources", "");
+	return out;
 }
 
 /**
@@ -218,55 +232,90 @@ function buildCbcHermeticArgs(trustTier: TurnRequest['trustTier']): string[] {
  * `--permission-mode` + 下方 `--allowedTools`(host-tool 显式放行)。
  * 仅当编排层声明了工具时,下发 fxt 工具 server + `--allowedTools`。
  */
-export function buildCbcMcpArgs(req: TurnRequest, permSid: string, projectRoot = defaultProjectRoot()): string[] {
-  // 关掉 cbc 的感知工具(query_world / capture_frame):cbc 基线上下文 ~56k(cc 仅 ~2.8k)
-  // 且 MCP 工具被 ToolSearch 延迟加载,agent 反射式调 query_world 再等不可用的预览,会把
-  // 多次 model 往返叠成 60-90s「卡死」感。cbc 去掉感知后单轮闲聊 ~1-2 次往返即收尾;
-  // cc / forgeax-core 基线轻,保留全套感知(见 forgeax-tools-server.mjs 的 env 闸)。
-  const PERCEPTION = new Set(['query_world', 'capture_frame']);
-  const tools = req.tools.filter((t) => !PERCEPTION.has(t.name));
-  if (tools.length === 0) return [];
+export function buildCbcMcpArgs(
+	req: TurnRequest,
+	permSid: string,
+	projectRoot = defaultProjectRoot(),
+): string[] {
+	// 关掉 cbc 的感知工具(query_world / capture_frame):cbc 基线上下文 ~56k(cc 仅 ~2.8k)
+	// 且 MCP 工具被 ToolSearch 延迟加载,agent 反射式调 query_world 再等不可用的预览,会把
+	// 多次 model 往返叠成 60-90s「卡死」感。cbc 去掉感知后单轮闲聊 ~1-2 次往返即收尾;
+	// cc / forgeax-core 基线轻,保留全套感知(见 forgeax-tools-server.mjs 的 env 闸)。
+	const PERCEPTION = new Set(["query_world", "capture_frame"]);
+	const tools = req.tools.filter((t) => !PERCEPTION.has(t.name));
+	if (tools.length === 0) return [];
 
-  const env: Record<string, string> = {
-    FORGEAX_PROJECT_ROOT: projectRoot,
-    FORGEAX_SOUL_AGENT: req.session.agentId?.trim() || 'default',
-    FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
-    FORGEAX_SID: req.hostSessionId?.trim() || permSid,
-    FORGEAX_AGENT: req.session.agentId?.trim() || 'forge',
-    FORGEAX_DISABLE_PROJECT_MCP: '1',
-    // 让 fxt server 也从 tools/list 里剔除感知工具(双保险:模型既看不到也调不动)。
-    FORGEAX_DISABLE_PERCEPTION: '1',
-  };
+	const sid = req.hostSessionId?.trim() || permSid;
+	const agentPath = req.session.agentId?.trim() || "forge";
+	const sourceCapability = issueKernelToolCapability({
+		sid,
+		agentPath,
+		enabledTools: tools.map((tool) => tool.name),
+	});
 
-  // host-tool 桥:非内置工具经 MCP→HTTP 回调宿主执行(内置工具在 mcp server 内本地处理)。
-  const BUILTIN_FXT = new Set(['echo', 'list_games', 'memory_search', 'remember', 'npc_wire', 'query_world', 'capture_frame']);
-  const bridged = tools.filter((t) => !BUILTIN_FXT.has(t.name));
-  if (bridged.length > 0) {
-    try {
-      const specsPath = resolvePath(tmpdir(), `forgeax-cbc-tools-${permSid || req.session.agentId || 'x'}.json`);
-      writeFileSync(specsPath, JSON.stringify(bridged));
-      env.FORGEAX_TOOL_SPECS_FILE = specsPath;
-    } catch {
-      /* specs 写失败 → 只暴露内置工具(降级,不崩) */
-    }
-  }
+	const env: Record<string, string> = {
+		FORGEAX_PROJECT_ROOT: projectRoot,
+		FORGEAX_SOUL_AGENT: req.session.agentId?.trim() || "default",
+		FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
+		FORGEAX_SID: sid,
+		FORGEAX_AGENT: agentPath,
+		...(sourceCapability
+			? { FORGEAX_KERNEL_TOOL_TOKEN: sourceCapability.token }
+			: {}),
+		FORGEAX_DISABLE_PROJECT_MCP: "1",
+		// 让 fxt server 也从 tools/list 里剔除感知工具(双保险:模型既看不到也调不动)。
+		FORGEAX_DISABLE_PERCEPTION: "1",
+	};
 
-  const mcpServers = {
-    fxt: {
-      command: resolveBundledBunExecutable(),
-      args: [resolveForgeaxToolsServerEntry()],
-      env,
-    },
-  };
+	// host-tool 桥:非内置工具经 MCP→HTTP 回调宿主执行(内置工具在 mcp server 内本地处理)。
+	const BUILTIN_FXT = new Set([
+		"echo",
+		"list_games",
+		"memory_search",
+		"remember",
+		"npc_wire",
+		"query_world",
+		"capture_frame",
+	]);
+	const bridged = tools.filter((t) => !BUILTIN_FXT.has(t.name));
+	if (bridged.length > 0) {
+		try {
+			const specsPath = resolvePath(
+				tmpdir(),
+				`forgeax-cbc-tools-${permSid || req.session.agentId || "x"}.json`,
+			);
+			writeFileSync(specsPath, JSON.stringify(bridged));
+			env.FORGEAX_TOOL_SPECS_FILE = specsPath;
+		} catch {
+			/* specs 写失败 → 只暴露内置工具(降级,不崩) */
+		}
+	}
 
-  try {
-    const cfgPath = resolvePath(tmpdir(), `forgeax-cbc-mcp-${permSid || req.session.agentId || 'x'}.json`);
-    writeFileSync(cfgPath, JSON.stringify({ mcpServers }));
-    // 编排层显式放行声明的工具 → headless 不卡审批(= 权限归编排层)。感知工具已剔除。
-    return ['--mcp-config', cfgPath, '--allowedTools', ...tools.map((t) => `mcp__fxt__${t.name}`)];
-  } catch {
-    return [];
-  }
+	const mcpServers = {
+		fxt: {
+			command: resolveBundledBunExecutable(),
+			args: [resolveForgeaxToolsServerEntry()],
+			env,
+		},
+	};
+
+	try {
+		const cfgPath = resolvePath(
+			tmpdir(),
+			`forgeax-cbc-mcp-${permSid || req.session.agentId || "x"}.json`,
+		);
+		writeFileSync(cfgPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
+		chmodSync(cfgPath, 0o600);
+		// 编排层显式放行声明的工具 → headless 不卡审批(= 权限归编排层)。感知工具已剔除。
+		return [
+			"--mcp-config",
+			cfgPath,
+			"--allowedTools",
+			...tools.map((t) => `mcp__fxt__${t.name}`),
+		];
+	} catch {
+		return [];
+	}
 }
 
 /**
@@ -274,48 +323,58 @@ export function buildCbcMcpArgs(req: TurnRequest, permSid: string, projectRoot =
  * 结构对齐 cc-profile 的 buildCcArgs,差异仅在上述三处(MCP/systemPrompt/budget)。
  */
 export function buildCbcArgs(
-  req: TurnRequest,
-  _projectRoot: string,
-  sessionArgs: string[],
-  permissionMode: PermissionMode | CbcPermissionMode = req.permissionMode ?? CBC_DEFAULT_PERMISSION_MODE,
-  bootstrapContext = false,
+	req: TurnRequest,
+	_projectRoot: string,
+	sessionArgs: string[],
+	permissionMode: PermissionMode | CbcPermissionMode = req.permissionMode ??
+		CBC_DEFAULT_PERMISSION_MODE,
+	bootstrapContext = false,
 ): string[] {
-  const sp = req.systemPrompt;
-  const systemPrompt = sp.persona?.trim()
-    ? `${sp.charter}\n\n---\n\n## Persona\n\n${sp.persona.trim()}`
-    : sp.charter;
+	const sp = req.systemPrompt;
+	const systemPrompt = sp.persona?.trim()
+		? `${sp.charter}\n\n---\n\n## Persona\n\n${sp.persona.trim()}`
+		: sp.charter;
 
-  const tid = req.session.threadId?.trim();
-  const mcpArgs = buildCbcMcpArgs(req, tid || '', _projectRoot);
-  const toolPolicyArgs = buildCbcToolPolicyArgs(req.toolPolicy);
-  // 始终 --strict-mcp-config(忽略用户全局 ~/.codebuddy MCP,防 30s 流超时卡死);imported 再叠 --setting-sources ''。
-  const hermeticArgs = buildCbcHermeticArgs(req.trustTier);
-  const budgetArgs = buildCbcBudgetArgs(req.budget);
-  const fallbackArgs = buildCbcFallbackArgs(req.fallbackModels);
+	const tid = req.session.threadId?.trim();
+	const mcpArgs = buildCbcMcpArgs(req, tid || "", _projectRoot);
+	const toolPolicyArgs = buildCbcToolPolicyArgs(req.toolPolicy);
+	// 始终 --strict-mcp-config(忽略用户全局 ~/.codebuddy MCP,防 30s 流超时卡死);imported 再叠 --setting-sources ''。
+	const hermeticArgs = buildCbcHermeticArgs(req.trustTier);
+	const budgetArgs = buildCbcBudgetArgs(req.budget);
+	const fallbackArgs = buildCbcFallbackArgs(req.fallbackModels);
 
-  const spKey = req.hostSessionId?.trim() || tid || req.session.agentId?.trim() || 'x';
-  const systemPromptArgs = buildCbcSystemPromptArgs(systemPrompt, sp.mode ?? 'append', spKey);
+	const spKey =
+		req.hostSessionId?.trim() || tid || req.session.agentId?.trim() || "x";
+	const systemPromptArgs = buildCbcSystemPromptArgs(
+		systemPrompt,
+		sp.mode ?? "append",
+		spKey,
+	);
 
-  const message = buildKernelTask(req, bootstrapContext);
+	const message = buildKernelTask(req, bootstrapContext);
 
-  return [
-    '-p',
-    '--output-format=stream-json',
-    '--include-partial-messages',
-    '--verbose',
-    '--permission-mode', toCbcPermissionMode(permissionMode),
-    ...hermeticArgs,
-    ...mcpArgs,
-    ...toolPolicyArgs,
-    ...budgetArgs,
-    ...fallbackArgs,
-    ...((): string[] => { const m = toCbcModel(req.model); return m ? ['--model', m] : []; })(),
-    ...sessionArgs,
-    ...systemPromptArgs,
-    message,
-  ];
+	return [
+		"-p",
+		"--output-format=stream-json",
+		"--include-partial-messages",
+		"--verbose",
+		"--permission-mode",
+		toCbcPermissionMode(permissionMode),
+		...hermeticArgs,
+		...mcpArgs,
+		...toolPolicyArgs,
+		...budgetArgs,
+		...fallbackArgs,
+		...((): string[] => {
+			const m = toCbcModel(req.model);
+			return m ? ["--model", m] : [];
+		})(),
+		...sessionArgs,
+		...systemPromptArgs,
+		message,
+	];
 }
 
 // 线事件映射(stream-json → KernelEvent)cbc 与 cc 完全一致:从 cc-profile 复用,
 // 单一来源避免 drift。re-export 给 cbc-kernel 用,保持「kernel 只 import 自己的 profile」。
-export { chatEventToKernel, wireStopToKernel } from './cc-profile';
+export { chatEventToKernel, wireStopToKernel } from "./cc-profile";

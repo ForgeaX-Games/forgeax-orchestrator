@@ -30,7 +30,6 @@ import {
   getDefaultProvider,
   getProvider,
   listProviders,
-  resolveProvider,
 } from "../../cli-providers/registry";
 import type { ChatEvent, ChatRequest } from "../../cli-providers/types";
 import { AgentMaterializationError, type Session } from "../../core/session";
@@ -71,11 +70,10 @@ import { orchestrationProfileOf } from "../../kernel/kernel-profile";
 import { Hook } from "../../hooks/types";
 import { hasProjectMcpServers, projectMcpExecutionMode } from "../../kernel/project-mcp";
 import { defaultProjectRoot } from "@forgeax/platform-io";
+import { handleCliWarm } from "./warm";
 
 interface ChatBody {
   message?: string;
-  /** Client-generated id used by the initiating UI to suppress its WS echo. */
-  clientMsgId?: string;
   agentId?: string;
   threadId?: string;
   sessionId?: string;
@@ -84,6 +82,7 @@ interface ChatBody {
   model?: string;
   /** Doc 05 section 7 -- per-call id for `POST /api/cli/cancel`. */
   callId?: string;
+  clientMsgId?: string;
   /** Doc 05 section 7 -- per-call deadline; the provider auto-aborts and
    *  surfaces `code: 'driver-timeout'` on expiry. */
   timeoutMs?: number;
@@ -106,11 +105,6 @@ interface CancelBody {
 export function normalizeChatModelOverride(model: unknown): string | undefined {
   if (typeof model !== "string") return undefined;
   return model.trim() || undefined;
-}
-
-export function normalizeClientMessageId(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  return value.trim() || undefined;
 }
 
 const DEPRECATION_NOTICE = deprecation({
@@ -267,7 +261,10 @@ async function runSessionRuntimeChat(
     };
   }
   const selectedModel = normalizeChatModelOverride(body.model);
-  const clientMsgId = normalizeClientMessageId(body.clientMsgId);
+  const clientMsgId =
+    typeof body.clientMsgId === "string" && body.clientMsgId.trim()
+      ? body.clientMsgId.trim()
+      : undefined;
   payload = {
     ...payload,
     msgId: callId,
@@ -546,69 +543,6 @@ export function createCliRouter() {
       return c.json({ ok: false, providers: [], detail: "no cli-provider registered" }, 503);
     }
     return c.json({ ok: overallOk, providers: snaps });
-  });
-
-  // POST /api/cli/warm — lightweight readiness probe used by the Composer
-  // before the first real turn. It must never create a chat session or spawn a
-  // model turn; probe the same kernel/provider that /chat will select.
-  r.post("/warm", async (c) => {
-    let body: { agentId?: string; providerOverride?: string } = {};
-    try {
-      const parsed = await c.req.json();
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        body = parsed as typeof body;
-      }
-    } catch {
-      // The warm request is intentionally body-optional for older clients.
-    }
-    const requested = typeof body.providerOverride === "string"
-      ? body.providerOverride.trim()
-      : "";
-
-    if (kernelEnabled()) {
-      try {
-        const kernel = resolveKernel(
-          body.agentId ?? "default",
-          requested ? normalizeKernelId(requested) : undefined,
-        );
-        const health = await kernel.probe();
-        return c.json({
-          ok: health.ok,
-          providerId: kernel.id,
-          ...(health.detail ? { detail: health.detail } : {}),
-        }, health.ok ? 200 : 503);
-      } catch (error) {
-        return c.json({
-          ok: false,
-          providerId: normalizeKernelId(requested) ?? requested,
-          error: error instanceof Error ? error.message : String(error),
-        }, 503);
-      }
-    }
-
-    const provider = requested
-      ? getProvider(requested)
-      : resolveProvider(body.agentId);
-    if (!provider) {
-      return c.json({
-        ok: false,
-        error: requested ? `no cli-provider registered: ${requested}` : "no cli-provider registered",
-      }, 503);
-    }
-    try {
-      const health = await provider.health(1500);
-      return c.json({
-        ok: health.ok,
-        providerId: provider.id,
-        ...(health.detail ? { detail: health.detail } : {}),
-      }, health.ok ? 200 : 503);
-    } catch (error) {
-      return c.json({
-        ok: false,
-        providerId: provider.id,
-        error: error instanceof Error ? error.message : String(error),
-      }, 503);
-    }
   });
 
   r.post("/chat", async (c) => {
@@ -1096,6 +1030,8 @@ export function createCliRouter() {
   // `{ type: 'done', stopReason: 'cancelled', code: 'cancelled' }` terminal
   // on its own SSE stream. Idempotent: unknown callIds return ok:true so
   // the UI can fire-and-forget without races against natural completion.
+  r.post("/warm", handleCliWarm);
+
   r.post("/cancel", async (c) => {
     let body: CancelBody;
     try {

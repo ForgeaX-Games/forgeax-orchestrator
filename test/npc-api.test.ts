@@ -271,6 +271,155 @@ describe('createNpcRouter (M0 HTTP path)', () => {
     expect(await runtime.end(session)).toBe(1);
     expect(calls).toBe(1);
   });
+
+  test('quiesce closes admission, waits for an accepted decision, then settles sessions sequentially', async () => {
+    let releaseDecision!: () => void;
+    const decisionStarted = new Promise<void>((resolve) => { releaseDecision = resolve; });
+    let allowDecision!: () => void;
+    const decisionGate = new Promise<void>((resolve) => { allowDecision = resolve; });
+    let activeSettlements = 0;
+    let maxActiveSettlements = 0;
+    let settlementCalls = 0;
+    const brain = {
+      decide: async () => {
+        releaseDecision();
+        await decisionGate;
+        return undefined;
+      },
+      settle: async () => {
+        activeSettlements += 1;
+        maxActiveSettlements = Math.max(maxActiveSettlements, activeSettlements);
+        settlementCalls += 1;
+        activeSettlements -= 1;
+        return 0;
+      },
+    } as unknown as NpcBrainService;
+    const runtime = new NpcRuntime({ projectRoot: root(), brain });
+    const first = runtime.createSession({ game: 'demo', npcIds: ['guide'] });
+    const second = runtime.createSession({ game: 'demo', npcIds: ['guide'] });
+    const session = runtime.authorize(first.sessionId, first.token)!;
+    const decision = runtime.decide(session, snapshot());
+    await decisionStarted;
+
+    const quiescing = runtime.quiesce();
+    expect(() => runtime.createSession({ game: 'demo', npcIds: ['later'] })).toThrow(/quiescing/);
+    expect(settlementCalls).toBe(0);
+    allowDecision();
+
+    await expect(decision).resolves.toBeUndefined();
+    await expect(quiescing).resolves.toEqual({ sessions: 2, settled: 0 });
+    expect(settlementCalls).toBe(2);
+    expect(maxActiveSettlements).toBe(1);
+    expect(runtime.authorize(second.sessionId, second.token)).toBeUndefined();
+  });
+
+  test('quiesce aborts an accepted batch only when its shutdown signal aborts and never settles in the background', async () => {
+    let batchSignal: AbortSignal | undefined;
+    let batchStarted!: () => void;
+    const started = new Promise<void>((resolve) => { batchStarted = resolve; });
+    let settled = 0;
+    const brain = {
+      decideBatch: async (
+        snapshots: Array<{ npcId: string }>,
+        optionsFor: (snapshot: { npcId: string }) => { signal?: AbortSignal },
+      ) => {
+        batchSignal = optionsFor(snapshots[0]!).signal;
+        batchStarted();
+        await new Promise<void>((resolve) => batchSignal!.addEventListener('abort', () => resolve(), { once: true }));
+        return [];
+      },
+      settle: async () => { settled += 1; return 0; },
+    } as unknown as NpcBrainService;
+    const runtime = new NpcRuntime({ projectRoot: root(), brain });
+    const grant = runtime.createSession({ game: 'demo', npcIds: ['guide'] });
+    const session = runtime.authorize(grant.sessionId, grant.token)!;
+    const batch = runtime.decideBatch(session, [snapshot()]);
+    await started;
+    expect(batchSignal?.aborted).toBe(false);
+
+    const shutdown = new AbortController();
+    const quiescing = runtime.quiesce({ signal: shutdown.signal });
+    expect(settled).toBe(0);
+    shutdown.abort(new Error('process shutdown deadline reached'));
+
+    await expect(batch).resolves.toEqual([]);
+    await expect(quiescing).resolves.toEqual({ sessions: 1, settled: 0 });
+    expect(batchSignal?.aborted).toBe(true);
+    expect(settled).toBe(1);
+  });
+
+  test('a failed quiesce settlement remains retryable while admission stays closed', async () => {
+    let fail = true;
+    const brain = {
+      settle: async () => {
+        if (fail) throw new Error('durable handoff unavailable');
+        return 0;
+      },
+    } as unknown as NpcBrainService;
+    const runtime = new NpcRuntime({ projectRoot: root(), brain });
+    runtime.createSession({ game: 'demo', npcIds: ['guide'] });
+
+    await expect(runtime.quiesce()).rejects.toThrow('durable handoff unavailable');
+    expect(() => runtime.createSession({ game: 'demo', npcIds: ['later'] })).toThrow(/quiescing/);
+    fail = false;
+    await expect(runtime.quiesce()).resolves.toEqual({ sessions: 1, settled: 0 });
+  });
+
+  test('quiesce waits for admitted preload and attach work before settlement', async () => {
+    let releasePreload!: () => void;
+    const preloadStarted = new Promise<void>((resolve) => { releasePreload = resolve; });
+    let allowPreload!: () => void;
+    const preloadGate = new Promise<void>((resolve) => { allowPreload = resolve; });
+    const events: string[] = [];
+    const brain = {
+      preload: async () => {
+        releasePreload();
+        await preloadGate;
+        events.push('preload');
+        return [];
+      },
+      attach: () => events.push('attach'),
+      settle: async () => { events.push('settle'); return 0; },
+    } as unknown as NpcBrainService;
+    const runtime = new NpcRuntime({ projectRoot: root(), brain });
+    const grant = runtime.createSession({ game: 'demo', npcIds: ['guide'] });
+    const session = runtime.authorize(grant.sessionId, grant.token)!;
+    const preload = runtime.preloadSession(session);
+    await preloadStarted;
+    const quiescing = runtime.quiesce();
+    expect(events).toEqual([]);
+    allowPreload();
+    await expect(preload).resolves.toBeUndefined();
+    await expect(quiescing).resolves.toEqual({ sessions: 1, settled: 0 });
+    expect(events).toEqual(['preload', 'attach', 'settle']);
+  });
+
+  test('quiesce reuses an already in-flight explicit end settlement', async () => {
+    let releaseSettlement!: () => void;
+    const settlementStarted = new Promise<void>((resolve) => { releaseSettlement = resolve; });
+    let allowSettlement!: () => void;
+    const settlementGate = new Promise<void>((resolve) => { allowSettlement = resolve; });
+    let calls = 0;
+    const brain = {
+      settle: async () => {
+        calls += 1;
+        releaseSettlement();
+        await settlementGate;
+        return 1;
+      },
+    } as unknown as NpcBrainService;
+    const runtime = new NpcRuntime({ projectRoot: root(), brain });
+    const grant = runtime.createSession({ game: 'demo', npcIds: ['guide'] });
+    const session = runtime.authorize(grant.sessionId, grant.token)!;
+    const explicitEnd = runtime.end(session);
+    await settlementStarted;
+    const quiescing = runtime.quiesce();
+    allowSettlement();
+
+    await expect(explicitEnd).resolves.toBe(1);
+    await expect(quiescing).resolves.toEqual({ sessions: 1, settled: 1 });
+    expect(calls).toBe(1);
+  });
 });
 
 describe('createNpcWebSocketHandler (M1 WS path)', () => {

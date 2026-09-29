@@ -27,7 +27,7 @@ import type {
 } from '@forgeax/agent-runtime';
 import { DEFAULT_KERNEL_PERMISSION_MODE } from './permission-config';
 import { spawn } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
 import {
@@ -43,6 +43,7 @@ import {
   resolveForgeaxToolsServerEntry,
 } from './mcp/forgeax-tools-runtime';
 import { canonicalToolFields } from './canonical-tool-name';
+import { issueKernelToolCapability } from './kernel-tool-capability';
 
 const SERVER_PORT = process.env.FORGEAX_SERVER_PORT ?? '18900';
 
@@ -491,6 +492,13 @@ export function buildMcpArgs(
   }
 
   if (req.tools.length > 0) {
+    const sid = req.hostSessionId?.trim() || permSid;
+    const agentPath = req.session.agentId?.trim() || 'forge';
+    const nativeProjectMcp = req.trustTier !== 'imported';
+    const hostRoutedTools = req.tools
+      .filter((tool) => !nativeProjectMcp || !isProjectMcpToolName(tool.name, projectRoot))
+      .map((tool) => tool.name);
+    const sourceCapability = issueKernelToolCapability({ sid, agentPath, enabledTools: hostRoutedTools });
     const env: Record<string, string> = {
       FORGEAX_PROJECT_ROOT: projectRoot,
       // FORGEAX_SOUL_AGENT 让 memory_search 定位该 soul 的分层记忆库。
@@ -499,8 +507,9 @@ export function buildMcpArgs(
       // 工具(query_world/capture_frame)也要 HTTP 回打 /:sid/perception-query。
       // threadId 已是合成 UUID,故定位活 agent / session 用 hostSessionId。
       FORGEAX_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`,
-      FORGEAX_SID: req.hostSessionId?.trim() || permSid,
-      FORGEAX_AGENT: req.session.agentId?.trim() || 'forge',
+      FORGEAX_SID: sid,
+      FORGEAX_AGENT: agentPath,
+      ...(sourceCapability ? { FORGEAX_KERNEL_TOOL_TOKEN: sourceCapability.token } : {}),
       // The fxt process is a per-turn registry. Native project providers mount
       // their own MCP config; the fxt child must never start a second copy.
       FORGEAX_FXT_EXPOSE: req.tools.map((tool) => tool.name).join(','),
@@ -512,7 +521,6 @@ export function buildMcpArgs(
     // builtins; these two compose-owned adoption names are handled by the same
     // ForgeaX builtin surface and must not be misclassified as arbitrary specs.
     const BUILTIN_FXT = new Set([...FXT_BUILTIN_TOOLS, 'soul_create', 'npc_wire']);
-    const nativeProjectMcp = req.trustTier !== 'imported';
     const bridged = req.tools.filter((tool) =>
       !BUILTIN_FXT.has(tool.name)
       && (!nativeProjectMcp || !isProjectMcpToolName(tool.name, projectRoot)),
@@ -565,7 +573,8 @@ export function buildMcpArgs(
   if (Object.keys(mcpServers).length === 0) return [];
   try {
     const cfgPath = resolvePath(tmpdir(), `forgeax-kernel-mcp-${permSid || req.session.agentId || 'x'}.json`);
-    writeFileSync(cfgPath, JSON.stringify({ mcpServers }));
+    writeFileSync(cfgPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
+    chmodSync(cfgPath, 0o600);
     return ['--mcp-config', cfgPath, ...flags];
   } catch {
     return [];

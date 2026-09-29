@@ -7,11 +7,11 @@
       "dependencies": {
         "@agentclientprotocol/sdk": "^0.23.0",
         "@forgeax/agent-host": "link:../agent-host",
-        "@forgeax/agent-runtime": "^0.1.2",
+        "@forgeax/agent-runtime": "^0.1.3",
         "@forgeax/extension-host": "0.3.0",
         "@forgeax/platform-io": "link:../platform-io",
         "@forgeax/toolkit": "0.1.2",
-        "@forgeax/types": "^0.1.2",
+        "@forgeax/types": "^0.5.0",
         "@google/genai": "^1.0.0",
         "chokidar": "^4.0.0",
         "hono": "^4.6.0",
@@ -36,7 +36,7 @@
 
     "@forgeax/agent-host": ["@forgeax/agent-host@link:../agent-host", { "bin": { "forgeax-agent-host": "./dist/main.js" } }],
 
-    "@forgeax/agent-runtime": ["@forgeax/agent-runtime@0.1.2", "", { "dependencies": { "@forgeax/types": "^0.1.2" } }, "sha512-C1pE8wyIOUuwM09dZ9b0FUoEFurtKI6leB+132dfebUWrSCDOcV9iDazn72VhUScW8zLOgzaSG6+iQwqnZIaXQ=="],
+    "@forgeax/agent-runtime": ["@forgeax/agent-runtime@0.1.3", "", { "dependencies": { "@forgeax/types": "^0.1.2" } }, "sha512-ePnrWMUKFVDIjSURFyqw4UtilsuA7VBwJFgpVHDP3d4AkkUG7NNYjH2nacTqqpp9TjOJKc+LW9AGnfjW3f5wYA=="],
 
     "@forgeax/extension-host": ["@forgeax/extension-host@0.3.0", "", { "dependencies": { "@forgeax/extension-platform": "0.0.2", "ajv": "^8.17.1", "zod": "^3.25.0" }, "peerDependencies": { "fastify": "^5.0.0", "hono": "^4.0.0", "react": "^19.0.0", "vite": "^6.0.0" }, "optionalPeers": ["fastify", "hono", "react", "vite"] }, "sha512-GNIGwyL7ApEOGyYcCIPUSja+sTAamyZQfguUREij/KKz+GyNo/6YJnHw+RiI2FHVowiw94xrVqipJEsUCoWygw=="],
 
@@ -46,7 +46,7 @@
 
     "@forgeax/toolkit": ["@forgeax/toolkit@0.1.2", "", { "dependencies": { "commander": "^14.0.3", "react": "^18.3.1", "react-dom": "^18.3.1", "tsdown": "^0.22.14", "vite": "^8.2.2", "zod": "^3.25.76" }, "peerDependencies": { "@vitejs/devtools": "^0.5.2" }, "optionalPeers": ["@vitejs/devtools"], "bin": { "forgeax-toolkit": "dist/bin/forgeax-toolkit.mjs" } }, "sha512-G3q6UeDIw6D9oN42Cto+a8Z7VYdH0HihX/EFy9FGVJcNIlYEwAJ9YwGHCM68fzCLwfErUQOz8m2CAvMSoPBKKA=="],
 
-    "@forgeax/types": ["@forgeax/types@0.1.3", "", { "dependencies": { "zod": "^3.25.0", "zod-to-json-schema": "^3.25.0" } }, "sha512-scZrimhGBO3mwgFwvyQ+pJD68/WwAgCzeSY+ulwVk2nQTukYMMa+wGNlQ7+c9dFcQLG2EBjtvN21MYAJqnX8nQ=="],
+    "@forgeax/types": ["@forgeax/types@0.5.0", "", { "dependencies": { "zod": "^3.25.0", "zod-to-json-schema": "^3.25.0" } }, "sha512-dQn3z4sB5TGcsNJNYrVlU5zjXAiCzhWVr36FhHC3IpnFwWoJLGkmUj0aDI7Jlw/2mVDgpYve/f8y9Mfj5a8SuA=="],
 
     "@google/genai": ["@google/genai@1.52.0", "https://registry.npmjs.org/@google/genai/-/genai-1.52.0.tgz", { "dependencies": { "google-auth-library": "^10.3.0", "p-retry": "^4.6.2", "protobufjs": "^7.5.4", "ws": "^8.18.0" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.25.2" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q=="],
 
@@ -483,6 +483,8 @@
     "zod": ["zod@3.25.76", "https://registry.npmjs.org/zod/-/zod-3.25.76.tgz", {}, "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="],
 
     "zod-to-json-schema": ["zod-to-json-schema@3.25.2", "https://registry.npmmirror.com/zod-to-json-schema/-/zod-to-json-schema-3.25.2.tgz", { "peerDependencies": { "zod": "^3.25.28 || ^4" } }, "sha512-O/PgfnpT1xKSDeQYSCfRI5Gy3hPf91mKVDuYLUHZJMiDFptvP41MSnWofm8dnCm0256ZNfZIM7DSzuSMAFnjHA=="],
+
+    "@forgeax/agent-runtime/@forgeax/types": ["@forgeax/types@0.1.4", "", { "dependencies": { "zod": "^3.25.0", "zod-to-json-schema": "^3.25.0" } }, "sha512-2hFYZNEodKc65vuektOrIlQKLdNLyvI/8gmR5yy6FtgiITBECRQjCfRth+86wywfZ/FSmM5DT6JyTAQ6Hk7NeA=="],
 
     "tinyglobby/picomatch": ["picomatch@4.0.7", "", {}, "sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA=="],
 

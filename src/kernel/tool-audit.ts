@@ -35,7 +35,7 @@ export interface ToolAuditEntry {
   turnCallId?: string;
   /** MCP shim 自铸的**这一次宿主执行**的 id(`fxt-<uuid>`)。租用内核(codex 等)经 MCP
    *  调宿主工具时,内核铸的 callId 结构上过不来(`tools/call` 只有 name+arguments),
-   *  这条路上就只有它。它随工具结果的 `structuredContent` 回给内核,编排层再据此把
+   *  这条路上就只有它。它随工具结果的 `_meta.forgeax` 回给内核宿主,编排层再据此把
    *  `内核 callId → toolExecutionId → 本行` 连起来。
    *  **与 callId 是两个语义,谁都不许顶替谁** —— 前者标识模型发起的那次调用,后者标识
    *  落到宿主的那一次执行。同一轮里连跑两个一模一样的 act,只有后者分得开。 */
